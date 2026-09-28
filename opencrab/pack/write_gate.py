@@ -231,7 +231,7 @@ def authorize_fork_copy(sql: Any, principal: Principal, pack_id: str) -> dict[st
 # Identity slot classification
 # ---------------------------------------------------------------------------
 
-ByIdVerdict = Literal["own", "foreign", "unattributed", "absent"]
+ByIdVerdict = Literal["own", "foreign", "unattributed", "absent", "unverifiable"]
 
 
 def classify_by_id_rows(rows: Any, pack_id: str) -> ByIdVerdict:
@@ -241,6 +241,15 @@ def classify_by_id_rows(rows: Any, pack_id: str) -> ByIdVerdict:
     A qualified graph target has one row per global node_id; the plural probe
     still fails closed when it encounters duplicate legacy or corrupt rows.
 
+    - any row carries ``property_decode_error`` (#402: its ``pack_id`` could
+      not be decoded, so it is indistinguishable from "no pack_id" without
+      this marker) -> ``unverifiable``, checked ACROSS ALL ROWS FIRST and
+      taking priority over every other verdict -- otherwise an "own" or
+      "foreign" row appearing earlier in scan order would short-circuit the
+      loop before the corrupted row is ever reached, making the verdict
+      depend on row order (design.md §3.2 control 5: a decode error on ANY
+      row must never read as "own" nor as plain "foreign" just because
+      another row happened to resolve first)
     - any row already in ``pack_id`` -> ``own`` (this is the owner updating
       their node; the exact typed slot probe remains authoritative)
     - else any row attributed elsewhere -> ``foreign``, INCLUDING when
@@ -255,20 +264,31 @@ def classify_by_id_rows(rows: Any, pack_id: str) -> ByIdVerdict:
     if not rows:
         return "absent"
     seen_foreign = False
+    seen_own = False
+    seen_corrupted = False
     for row in rows:
         if not isinstance(row, Mapping):
             raise TypeError(f"expected row mappings, got {type(row).__name__}")
+        if row.get("property_decode_error"):
+            seen_corrupted = True
+            continue
         row_pack = row.get("pack_id")
         if row_pack == pack_id:
-            return "own"
-        if row_pack:
+            seen_own = True
+        elif row_pack:
             seen_foreign = True
+    if seen_corrupted:
+        return "unverifiable"
+    if seen_own:
+        return "own"
     return "foreign" if seen_foreign else "unattributed"
 
 
 def by_id_conflict(rows: Any, pack_id: str) -> bool:
-    """True when the by-id axis says this write would take a foreign slot."""
-    return classify_by_id_rows(rows, pack_id) == "foreign"
+    """True when the by-id axis says this write would take a foreign slot,
+    or (#402) cannot be verified at all -- a decode error must fail closed,
+    same direction as a confirmed foreign slot."""
+    return classify_by_id_rows(rows, pack_id) in ("foreign", "unverifiable")
 
 
 def normalize_tags(tags: MutableMapping[str, Any]) -> None:
@@ -362,7 +382,11 @@ def _check_by_id_axis(graph: Any, node_id: str, pack_id: str) -> str | None:
         verdict = classify_by_id_rows(rows, pack_id)
     except TypeError:
         return CONFLICT_UNVERIFIABLE
-    return CONFLICT_FOREIGN if verdict == "foreign" else None
+    if verdict == "foreign":
+        return CONFLICT_FOREIGN
+    if verdict == "unverifiable":
+        return CONFLICT_UNVERIFIABLE
+    return None
 
 
 def node_identity_conflict(
@@ -468,4 +492,8 @@ def endpoint_pack_conflict(graph: Any, node_id: str, pack_id: str) -> str | None
         verdict = classify_by_id_rows(rows, pack_id)
     except TypeError:
         return CONFLICT_UNVERIFIABLE
-    return CONFLICT_FOREIGN if verdict == "foreign" else None
+    if verdict == "foreign":
+        return CONFLICT_FOREIGN
+    if verdict == "unverifiable":
+        return CONFLICT_UNVERIFIABLE
+    return None

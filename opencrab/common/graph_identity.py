@@ -101,6 +101,21 @@ class GraphMigrationConflict(RuntimeError):  # noqa: N818 - public domain except
     """A migration source, plan, target, or ledger identity no longer matches."""
 
 
+class GraphPropertyCorruptionError(RuntimeError):  # noqa: N818 - public domain exception name
+    """A stored graph node/edge ``properties`` column does not decode to a
+    JSON object (#402): malformed JSON, a JSON array/scalar, duplicate
+    object keys, NaN/Infinity, or any other shape ``parse_properties_object``
+    rejects. Raised by single-identity graph reads (``get_node``/
+    ``get_edge``/digests/upsert-time re-verification) instead of the old
+    ``_as_dict``/``decode_properties`` silent ``{}`` collapse, which made a
+    corrupted row indistinguishable from a legitimately empty one and let a
+    damaged row silently pass pack-ownership checks (see
+    ``opencrab/pack/write_gate.py``). Same message-safety rule as
+    ``GraphPropertyValidationError``: never repeats the offending value or
+    another pack's data in the message.
+    """
+
+
 class FrozenDict(Mapping[str, Any]):
     """Recursively immutable JSON object used by public graph receipts."""
 

@@ -18,6 +18,7 @@ import pytest
 
 from opencrab.common.graph_identity import (
     EdgeIdentityConflict,
+    GraphPropertyCorruptionError,
     GraphReadCapabilityUnavailable,
     NodeIdentityConflict,
 )
@@ -933,6 +934,135 @@ def test_get_node_identity_by_id_missing_returns_none():
     assert store.get_node_identity_by_id("nope") is None
 
 
+def _corrupt_node_properties(store, node_id: str, raw: str = "[1, 2, 3]") -> None:
+    """Directly writes a corrupted ``properties`` value for ``node_id``,
+    bypassing ``upsert_node``'s validation (the only way to reach the
+    corrupted-row paths this file's #402 tests exercise). The default is a
+    JSON ARRAY, not truly malformed text: SQLite's own ``json_extract``
+    raises ``OperationalError: malformed JSON`` for syntactically-broken
+    text (e.g. ``"not json"``), so that shape can never reach the BFS SQL
+    pushdown path at all -- it fails before Python ever sees the row. A JSON
+    array is syntactically valid (``json_extract('[1,2,3]', '$.pack_id')``
+    resolves to NULL, same as "key absent"), so SQL happily treats it as
+    "no pack_id" while ``decode_properties``/``parse_properties_object``
+    still correctly reject it (top-level value is not an object) -- this is
+    exactly the shape the BFS leak (§10 item 6) is about. ``idx_nodes_pack``
+    is an expression index over ``json_extract(properties, ...)`` -- SQLite
+    recomputes it on every UPDATE and refuses non-JSON text outright, so it
+    must be dropped first (same trick ``test_get_node_identity_by_id_reports
+    _property_error_unlike_get_node`` already uses)."""
+    store._conn.execute("DROP INDEX IF EXISTS idx_nodes_pack")
+    store._conn.execute(
+        "UPDATE graph_nodes SET properties = :raw WHERE node_id = :id", {"raw": raw, "id": node_id}
+    )
+    store._conn.commit()
+
+
+def _corrupt_edge_properties(store, from_id: str, to_id: str, raw: str = "[1, 2, 3]") -> None:
+    """Edge counterpart of ``_corrupt_node_properties`` (see its docstring
+    for why the default is a JSON array, not malformed text). No expression
+    index exists over ``graph_edges.properties`` (only ``idx_edges_from``/
+    ``idx_edges_to``, both plain column indexes), so no DROP INDEX is
+    needed here."""
+    store._conn.execute(
+        "UPDATE graph_edges SET properties = :raw WHERE from_id = :fid AND to_id = :tid",
+        {"raw": raw, "fid": from_id, "tid": to_id},
+    )
+    store._conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Cluster B BFS corruption leak (#402, lead's critical correction, §10 item 6)
+#
+# Mechanism (see design.md §4.2): a corrupted node's `properties` column
+# decodes to `{}`. Pre-fix, `_batch_node_props` merged that `{}` with the
+# node's own (independently valid) `space_id` COLUMN via `_merge_space`,
+# producing a truthy `{"space": ...}` dict that survived `_expand`'s
+# `if not other_props: continue` skip. `_node_passes` then saw no `pack_id`
+# key and returned `include_unpackaged` -- i.e. corruption disguised itself
+# as "unpackaged" and leaked through whenever `include_unpackaged=True`.
+# The analogous edge-side leak: a corrupted edge's properties also decode to
+# `{}`, which has no `pack_id` key, so `_edge_passes` falls through to
+# `src_passes and dst_passes` -- exposing the edge whenever both endpoints
+# already pass, with no `include_unpackaged`-style opt-out.
+#
+# 6a/6c were run against the pre-#402-fix `_sql_graph_base.py` (git show
+# 6e1fd76:opencrab/stores/_sql_graph_base.py, the commit immediately
+# preceding this fix) to confirm RED before the fix restored them to GREEN;
+# see the PR description for the exact commands and captured output.
+# ---------------------------------------------------------------------------
+
+
+def test_find_neighbors_corrupted_node_excluded_when_include_unpackaged_true():
+    """6a: RED pre-fix (the corrupted node WAS reachable here whenever its
+    space_id column was set -- see mechanism note above) -> GREEN post-fix
+    (always excluded)."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "corrupt", {}, space_id="s1")
+    store.upsert_edge("Hub", "hub", "touches", "Item", "corrupt")
+    _corrupt_node_properties(store, "corrupt")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"], include_unpackaged=True)
+    # `to_id` (not `properties["id"]`) is the detector: the corrupted node's
+    # leaked entry has properties `{"space": "s1"}` with NO "id" key at all
+    # (the corruption wiped out the id `upsert_node` normally stamps), so a
+    # `properties.get("id")`-based check would silently pass either way --
+    # `to_id` is set by `_expand` from the raw node_id independent of
+    # whatever the (possibly corrupted) properties decoded to.
+    to_ids = {r["to_id"] for r in res}
+    assert "corrupt" not in to_ids
+
+
+def test_find_neighbors_corrupted_node_excluded_when_include_unpackaged_false():
+    """6b control: include_unpackaged=False already excluded the corrupted
+    node before this fix (no include_unpackaged escape hatch to leak
+    through) and still does after -- unchanged behavior, no RED needed."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "corrupt", {}, space_id="s1")
+    store.upsert_edge("Hub", "hub", "touches", "Item", "corrupt")
+    _corrupt_node_properties(store, "corrupt")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"], include_unpackaged=False)
+    to_ids = {r["to_id"] for r in res}
+    assert "corrupt" not in to_ids
+
+
+def test_find_neighbors_corrupted_edge_always_excluded():
+    """6c: RED pre-fix (a corrupted edge whose both endpoints already pass
+    the pack filter WAS exposed -- _edge_passes saw no pack_id key on the
+    decoded-to-{} edge and fell through to `src_passes and dst_passes`) ->
+    GREEN post-fix (unconditionally excluded; no control group exists for
+    this path, there is no include_unpackaged-style switch for edges)."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "leaf", {"pack_id": "p1"})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "leaf", {})
+    _corrupt_edge_properties(store, "hub", "leaf")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"], include_unpackaged=False)
+    to_ids = {r["to_id"] for r in res}
+    assert "leaf" not in to_ids
+
+
+def test_find_neighbors_normal_node_and_edge_unaffected_control():
+    """6d control: a normal, uncorrupted node/edge pair -- one packed, one
+    unpackaged -- must surface in BFS results exactly the same whether or
+    not the #402 fix is present, since decode_properties(valid_dict) is a
+    passthrough with corrupted=False."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "packed", {"pack_id": "p1"})
+    store.upsert_node("Item", "unpackaged", {})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "packed")
+    store.upsert_edge("Hub", "hub", "touches", "Item", "unpackaged")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"], include_unpackaged=True)
+    ids = {r["properties"]["id"] for r in res}
+    assert ids == {"packed", "unpackaged"}
+
+
 def test_get_node_identity_by_id_matches_normal_row_shape():
     store = _store()
     store.upsert_node("Person", "p1", {"name": "Alice", "pack_id": "pack-x"}, space_id="space-a")
@@ -948,10 +1078,8 @@ def test_get_node_identity_by_id_matches_normal_row_shape():
 
 
 def test_get_node_identity_by_id_reports_property_error_unlike_get_node():
-    # get_node()/get_node_by_id() go through _as_dict() and silently coerce
-    # malformed properties to {} (#402-class bug). get_node_identity_by_id()
-    # must not: it reuses _node_inventory_row(), the same decode path
-    # diagnose() relies on to reject a node as healable.
+    # get_node_identity_by_id() reuses _node_inventory_row(), the same decode
+    # path diagnose() relies on to reject a node as healable.
     store = _store()
     store.upsert_node("Person", "p1", {"name": "Alice"})
     # idx_nodes_pack is a json_extract() expression index: SQLite recomputes
@@ -967,7 +1095,11 @@ def test_get_node_identity_by_id_reports_property_error_unlike_get_node():
     row = store.get_node_identity_by_id("p1")
     assert row.property_error == "malformed_json"
 
-    # Contrast: the pre-existing accessors coerce silently instead of
-    # surfacing the corruption.
-    assert store.get_node("Person", "p1") == {}
-    assert store.get_node_by_id("p1")["node_type"] == "Person"
+    # Contrast (#402): the single-identity accessor now fails loud instead of
+    # silently coercing to {} -- while the bulk/export-style accessor keeps
+    # returning the row, only marked with property_decode_error.
+    with pytest.raises(GraphPropertyCorruptionError):
+        store.get_node("Person", "p1")
+    node = store.get_node_by_id("p1")
+    assert node["node_type"] == "Person"
+    assert node["property_decode_error"] is True

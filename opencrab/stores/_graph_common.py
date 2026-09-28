@@ -36,6 +36,11 @@ import logging
 import re
 from typing import Any
 
+from opencrab.common.graph_identity import (
+    GraphPropertyValidationError,
+    parse_properties_object,
+)
+
 logger = logging.getLogger(__name__)
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -192,7 +197,15 @@ def _space_passes(props: dict[str, Any], space_set: set[str] | None) -> bool:
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
-    """psycopg2 auto-decodes JSONB into dict/list; tolerate str/None too."""
+    """psycopg2 auto-decodes JSONB into dict/list; tolerate str/None too.
+
+    Kept byte-for-byte as-is (#402): this lenient, corruption-swallowing
+    decode is still correct for the handful of call sites that deliberately
+    never distinguish "empty" from "malformed" (cluster D, see
+    ``_target_graph_matches_plan``). Every call site that feeds a pack-
+    authorization or identity decision must use ``decode_properties`` below
+    instead, never this function.
+    """
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
@@ -202,6 +215,35 @@ def _as_dict(value: Any) -> dict[str, Any]:
         except (TypeError, ValueError):
             return {}
     return {}
+
+
+def decode_properties(value: Any) -> tuple[dict[str, Any], bool]:
+    """Decode a stored graph node/edge ``properties`` column as ``(props,
+    corrupted)`` (#402).
+
+    Unlike ``_as_dict``, a malformed value is never silently collapsed to an
+    indistinguishable ``{}`` -- ``corrupted`` is ``True`` whenever the stored
+    value is not a valid JSON object (malformed JSON, a JSON array/scalar,
+    duplicate object keys, NaN/Infinity, or an empty string), and callers
+    that feed pack-ownership or identity decisions must treat that case as
+    fail-closed (raise, or exclude the row) rather than as "no properties".
+
+    ``None`` is not corruption -- it is the ordinary "no row" / nullable-
+    column signal -- and decodes to ``({}, False)`` (matches the existing
+    ``tests/test_graph_common.py`` fixed expectations for the pre-existing
+    ``_as_dict(None) == {}`` case). A ``dict`` value is returned as-is
+    (identity preserved, no defensive copy) with ``corrupted=False``.
+    Anything else is validated through ``parse_properties_object`` -- no new
+    parsing logic, reusing the parser already used at write time.
+    """
+    if value is None:
+        return {}, False
+    if isinstance(value, dict):
+        return value, False
+    try:
+        return parse_properties_object(value), False
+    except GraphPropertyValidationError:
+        return {}, True
 
 
 def _valid_space(value: Any) -> str | None:

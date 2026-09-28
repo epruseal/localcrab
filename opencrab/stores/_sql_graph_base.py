@@ -125,6 +125,7 @@ from opencrab.common.graph_identity import (
     FrozenDict,
     GraphInventory,
     GraphMigrationConflict,
+    GraphPropertyCorruptionError,
     GraphReadCapabilityUnavailable,
     GraphSchemaMigrationRequired,
     LegacyEdgeRow,
@@ -162,6 +163,7 @@ from opencrab.stores._graph_common import (
     _node_passes,
     _space_passes,
     _validate_search_fields,
+    decode_properties,
 )
 from opencrab.stores._json import dump_props
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
@@ -593,7 +595,10 @@ class _SqlGraphStoreBase(abc.ABC):
             if row is None:
                 raise RuntimeError("graph node insert did not produce a row")
             stored_type, stored_space, stored_raw = row
-            stored_props = _merge_space(_as_dict(stored_raw), stored_space)
+            stored_props_raw, stored_corrupted = decode_properties(stored_raw)
+            stored_props = _merge_space(stored_props_raw, stored_space)
+            if stored_corrupted:
+                raise GraphPropertyCorruptionError(f"node properties corrupted: {node_id}")
             try:
                 stored_digest = canonical_node_digest(stored_type, stored_space or stored_props.get("space"), stored_props)
             except (TypeError, ValueError):
@@ -617,7 +622,12 @@ class _SqlGraphStoreBase(abc.ABC):
             " WHERE node_type=:node_type AND node_id=:node_id"
         )
         row = self._fetch_one(sql, {"node_type": node_type, "node_id": node_id})
-        return _merge_space(_as_dict(row[0]), row[1]) if row else None
+        if row is None:
+            return None
+        props, corrupted = decode_properties(row[0])
+        if corrupted:
+            raise GraphPropertyCorruptionError(f"node properties corrupted: {node_type}/{node_id}")
+        return _merge_space(props, row[1])
 
     def lookup_node_type(self, node_id: str) -> str | None:
         """Resolve a node_id's type: present (str), absent (None), or raise.
@@ -738,7 +748,12 @@ class _SqlGraphStoreBase(abc.ABC):
             if row is None:
                 raise RuntimeError("graph edge insert did not produce a row")
             stored_ft, stored_tt, stored_raw = row
-            stored_props = normalize_edge_properties(from_id, relation, to_id, _as_dict(stored_raw))
+            stored_props_raw, stored_corrupted = decode_properties(stored_raw)
+            if stored_corrupted:
+                raise GraphPropertyCorruptionError(
+                    f"edge properties corrupted: ({from_id}, {relation}, {to_id})"
+                )
+            stored_props = normalize_edge_properties(from_id, relation, to_id, stored_props_raw)
             try:
                 stored_digest = canonical_edge_digest(from_id, relation, to_id, stored_ft, stored_tt, stored_props)
             except (TypeError, ValueError):
@@ -777,7 +792,12 @@ class _SqlGraphStoreBase(abc.ABC):
         )
         if not row or row[0] != from_type or row[1] != to_type:
             return None
-        return normalize_edge_properties(from_id, relation, to_id, _as_dict(row[2]))
+        props, corrupted = decode_properties(row[2])
+        if corrupted:
+            raise GraphPropertyCorruptionError(
+                f"edge properties corrupted: ({from_id}, {relation}, {to_id})"
+            )
+        return normalize_edge_properties(from_id, relation, to_id, props)
 
     def get_node_digest(self, node_id: str, *, node_type: str | None = None) -> str | None:
         self._require_available()
@@ -789,7 +809,10 @@ class _SqlGraphStoreBase(abc.ABC):
         row = self._fetch_one(sql, params)
         if not row:
             return None
-        props = _merge_space(_as_dict(row[2]), row[1])
+        raw_props, corrupted = decode_properties(row[2])
+        if corrupted:
+            raise GraphPropertyCorruptionError(f"node properties corrupted: {node_id}")
+        props = _merge_space(raw_props, row[1])
         try:
             return canonical_node_digest(row[0], row[1] or props.get("space"), props)
         except (TypeError, ValueError):
@@ -805,8 +828,13 @@ class _SqlGraphStoreBase(abc.ABC):
         )
         if not row or (from_type is not None and row[0] != from_type) or (to_type is not None and row[1] != to_type):
             return None
+        raw_props, corrupted = decode_properties(row[2])
+        if corrupted:
+            raise GraphPropertyCorruptionError(
+                f"edge properties corrupted: ({from_id}, {relation}, {to_id})"
+            )
         try:
-            props = normalize_edge_properties(from_id, relation, to_id, _as_dict(row[2]))
+            props = normalize_edge_properties(from_id, relation, to_id, raw_props)
             return canonical_edge_digest(from_id, relation, to_id, row[0], row[1], props)
         except (TypeError, ValueError):
             return None
@@ -2490,7 +2518,10 @@ class _SqlGraphStoreBase(abc.ABC):
             row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {nodes} WHERE node_id=:nid", {"nid": node_id})
             if row is None:
                 raise NodeIdentityConflict(f"stale node update: {node_id}")
-            current_props = _merge_space(_as_dict(row[2]), row[1])
+            current_props_raw, current_corrupted = decode_properties(row[2])
+            if current_corrupted:
+                raise GraphPropertyCorruptionError(f"node properties corrupted: {node_id}")
+            current_props = _merge_space(current_props_raw, row[1])
             try:
                 current_digest = canonical_node_digest(row[0], row[1] or current_props.get("space"), current_props)
             except (TypeError, ValueError):
@@ -2579,7 +2610,12 @@ class _SqlGraphStoreBase(abc.ABC):
             row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": from_id, "rel": relation, "tid": to_id})
             if not row:
                 raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
-            current = normalize_edge_properties(from_id, relation, to_id, _as_dict(row[2]))
+            current_raw, current_corrupted = decode_properties(row[2])
+            if current_corrupted:
+                raise GraphPropertyCorruptionError(
+                    f"edge properties corrupted: ({from_id}, {relation}, {to_id})"
+                )
+            current = normalize_edge_properties(from_id, relation, to_id, current_raw)
             if current.get("pack_id") != owner_pack_id:
                 raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
             current_digest = canonical_edge_digest(from_id, relation, to_id, row[0], row[1], current)
@@ -2605,13 +2641,23 @@ class _SqlGraphStoreBase(abc.ABC):
         logger.warning("run_cypher() is not supported in %s mode; returning [].", self._dialect.name)
         return []
 
-    def _fetch_node_props_by_id(self, node_id: str) -> dict[str, Any] | None:
+    def _fetch_node_props_by_id(self, node_id: str) -> tuple[dict[str, Any] | None, bool]:
+        """Returns ``(props, corrupted)``. Type-agnostic anchor lookup (#347)
+        -- ``get_node`` cannot be reused here, it requires ``node_type``."""
         sql = (
             f"SELECT properties, space_id FROM {self._table('graph_nodes')}"
             " WHERE node_id=:nid LIMIT 1"
         )
         row = self._fetch_one(sql, {"nid": node_id})
-        return _merge_space(_as_dict(row[0]), row[1]) if row else None
+        if row is None:
+            return None, False
+        props, corrupted = decode_properties(row[0])
+        if corrupted:
+            logger.warning(
+                "corrupted graph node as BFS anchor: node_id=%s", node_id,
+            )
+            return None, True
+        return _merge_space(props, row[1]), False
 
     def _fetch_edges_for_node(
         self,
@@ -2694,7 +2740,18 @@ class _SqlGraphStoreBase(abc.ABC):
         overrides this with a single unnest+JOIN batch query."""
         result: dict[tuple[str, str], dict[str, Any]] = {}
         for node_type, node_id in pairs:
-            props = self.get_node(node_type, node_id)
+            try:
+                props = self.get_node(node_type, node_id)
+            except GraphPropertyCorruptionError:
+                # #402: a corrupted node must never enter props_cache disguised
+                # as an "unpackaged" node (see _expand's pack_set branch) --
+                # omitting it here makes the existing `if not other_props:
+                # continue` in _expand exclude it, same as a missing pair.
+                logger.warning(
+                    "skipping corrupted graph node during BFS expansion: node_type=%s node_id=%s",
+                    node_type, node_id,
+                )
+                continue
             if props:
                 result[(node_type, node_id)] = props
         return result
@@ -2750,7 +2807,19 @@ class _SqlGraphStoreBase(abc.ABC):
                 other_pass = _node_passes(other_props, pack_set, include_unpackaged)
                 if not other_pass:
                     continue
-                edge_props = _as_dict(edge_props_raw)
+                edge_props, edge_corrupted = decode_properties(edge_props_raw)
+                if edge_corrupted:
+                    # #402: without this, a corrupted edge whose properties
+                    # decode to {} has no "pack_id" key, so _edge_passes falls
+                    # through to `src_passes and dst_passes` and the edge is
+                    # exposed as if it had no pack_id at all -- there is no
+                    # include_unpackaged-style opt-out for this leak, it must
+                    # always be excluded.
+                    logger.warning(
+                        "skipping corrupted graph edge during BFS expansion: from_id=%s relation=%s to_id=%s",
+                        current_id if is_out else other_id, relation, other_id if is_out else current_id,
+                    )
+                    continue
                 # The `True` here says "the anchor side already passed". That
                 # holds for the anchor this call was given, but NOT for a
                 # same-node_id row in another pack: the edge fetch matches on
@@ -2811,8 +2880,8 @@ class _SqlGraphStoreBase(abc.ABC):
         space_set: set[str] | None = set(spaces) if spaces else None
 
         if pack_set is not None or space_set is not None:
-            anchor_props = self._fetch_node_props_by_id(node_id)
-            if not _node_passes(anchor_props or {}, pack_set, include_unpackaged):
+            anchor_props, anchor_corrupted = self._fetch_node_props_by_id(node_id)
+            if anchor_corrupted or not _node_passes(anchor_props or {}, pack_set, include_unpackaged):
                 return []
             if not _space_passes(anchor_props or {}, space_set):
                 return []
@@ -2893,7 +2962,13 @@ class _SqlGraphStoreBase(abc.ABC):
             sql = f"SELECT to_type, to_id, relation FROM {table} WHERE from_id=:fid"
             rows = self._fetch_all(sql, {"fid": current_id})
             for to_type, nid, rel in rows:
-                node = self.get_node(to_type, nid) or {"id": nid}
+                try:
+                    node = self.get_node(to_type, nid) or {"id": nid}
+                except GraphPropertyCorruptionError:
+                    # Pre-existing falsy-fallback behavior preserved (#402):
+                    # this is a pre-authorization graph-walk helper, not a
+                    # pack-visibility decision.
+                    node = {"id": nid}
                 new_path = path + [{"node": node, "relation": rel}]
 
                 if nid == to_id:
@@ -3257,14 +3332,18 @@ class _SqlGraphStoreBase(abc.ABC):
             f"WHERE {' AND '.join(where_parts)} LIMIT :lim"
         )
         rows = self._fetch_all(sql, params)
-        return [
-            {
-                "props": _merge_space(_as_dict(properties), space_id),
+        results = []
+        for node_type, space_id, properties in rows:
+            props_raw, corrupted = decode_properties(properties)
+            entry = {
+                "props": _merge_space(props_raw, space_id),
                 "labels": [node_type],
                 "node_type": node_type,
             }
-            for node_type, space_id, properties in rows
-        ]
+            if corrupted:
+                entry["property_decode_error"] = True
+            results.append(entry)
+        return results
 
     def count_exported_nodes_scoped(
         self, pack_ids: list[str], space: str | None = None
@@ -3337,14 +3416,20 @@ class _SqlGraphStoreBase(abc.ABC):
         """
         params = {"sc_packs": transform(sorted(set(pack_ids))), "lim": limit}
         rows = self._fetch_all(sql, params)
-        return [
-            {
-                "source_props": _merge_space(_as_dict(r[1]), r[6]), "source_labels": [r[0]],
-                "target_props": _merge_space(_as_dict(r[3]), r[7]), "target_labels": [r[2]],
-                "rel_props": _as_dict(r[4]), "relation": r[5],
+        results = []
+        for r in rows:
+            source_props, source_corrupted = decode_properties(r[1])
+            target_props, target_corrupted = decode_properties(r[3])
+            rel_props, rel_corrupted = decode_properties(r[4])
+            entry = {
+                "source_props": _merge_space(source_props, r[6]), "source_labels": [r[0]],
+                "target_props": _merge_space(target_props, r[7]), "target_labels": [r[2]],
+                "rel_props": rel_props, "relation": r[5],
             }
-            for r in rows
-        ]
+            if source_corrupted or target_corrupted or rel_corrupted:
+                entry["property_decode_error"] = True
+            results.append(entry)
+        return results
 
     def count_exported_edges_scoped(self, pack_ids: list[str]) -> int:
         """Exact ``COUNT(*)`` counterpart to ``export_edges_scoped``, same
@@ -3399,8 +3484,11 @@ class _SqlGraphStoreBase(abc.ABC):
         row = self._fetch_one(sql, params)
         if not row:
             return None
-        props = dict(_merge_space(_as_dict(row[1]), row[2]))
+        node_props, corrupted = decode_properties(row[1])
+        props = dict(_merge_space(node_props, row[2]))
         props["node_type"] = row[0]
+        if corrupted:
+            props["property_decode_error"] = True
         return props
 
     def find_by_relations_scoped(
@@ -3461,7 +3549,10 @@ class _SqlGraphStoreBase(abc.ABC):
                 **rel_params,
             }
             for other_ntype, other_nid, relation in self._fetch_all(sql, params):
-                props = self.get_node(other_ntype, other_nid)
+                try:
+                    props = self.get_node(other_ntype, other_nid)
+                except GraphPropertyCorruptionError:
+                    continue  # pre-existing falsy-skip behavior preserved (#402)
                 if props:
                     results.append(
                         {
@@ -3501,7 +3592,10 @@ class _SqlGraphStoreBase(abc.ABC):
             )
             rows = self._fetch_all(sql, {"nid": node_id, "lim": limit, **rel_params})
             for to_type, to_id, relation in rows:
-                props = self.get_node(to_type, to_id)
+                try:
+                    props = self.get_node(to_type, to_id)
+                except GraphPropertyCorruptionError:
+                    continue  # pre-existing falsy-skip behavior preserved (#402)
                 if props:
                     results.append({
                         "properties": props,
@@ -3519,7 +3613,10 @@ class _SqlGraphStoreBase(abc.ABC):
                 )
                 rows = self._fetch_all(sql, {"nid": node_id, "lim": remaining, **rel_params})
                 for from_type, from_id, relation in rows:
-                    props = self.get_node(from_type, from_id)
+                    try:
+                        props = self.get_node(from_type, from_id)
+                    except GraphPropertyCorruptionError:
+                        continue  # pre-existing falsy-skip behavior preserved (#402)
                     if props:
                         results.append({
                             "properties": props,
@@ -3539,8 +3636,11 @@ class _SqlGraphStoreBase(abc.ABC):
         row = self._fetch_one(sql, {"nid": node_id})
         if not row:
             return None
-        props = dict(_merge_space(_as_dict(row[1]), row[2]))
+        node_props, corrupted = decode_properties(row[1])
+        props = dict(_merge_space(node_props, row[2]))
         props["node_type"] = row[0]
+        if corrupted:
+            props["property_decode_error"] = True
         return props
 
     def get_nodes_by_id(self, node_id: str) -> list[dict[str, Any]]:
@@ -3560,8 +3660,11 @@ class _SqlGraphStoreBase(abc.ABC):
         rows = self._fetch_all(sql, {"nid": node_id})
         results = []
         for node_type, properties, space_id in rows:
-            props = dict(_merge_space(_as_dict(properties), space_id))
+            node_props, corrupted = decode_properties(properties)
+            props = dict(_merge_space(node_props, space_id))
             props["node_type"] = node_type
+            if corrupted:
+                props["property_decode_error"] = True
             results.append(props)
         return results
 
@@ -3619,14 +3722,18 @@ class _SqlGraphStoreBase(abc.ABC):
         params = {**params, "lim": limit}
         sql = f"SELECT node_type, space_id, properties FROM {table}{where_sql} LIMIT :lim"
         rows = self._fetch_all(sql, params)
-        return [
-            {
-                "props": _merge_space(_as_dict(properties), space_id),
+        results = []
+        for node_type, space_id, properties in rows:
+            node_props, corrupted = decode_properties(properties)
+            entry = {
+                "props": _merge_space(node_props, space_id),
                 "labels": [node_type],
                 "node_type": node_type,
             }
-            for node_type, space_id, properties in rows
-        ]
+            if corrupted:
+                entry["property_decode_error"] = True
+            results.append(entry)
+        return results
 
     def count_exported_nodes(
         self, pack_id: str | None = None, space: str | None = None
@@ -3737,14 +3844,18 @@ class _SqlGraphStoreBase(abc.ABC):
             f"WHERE {' AND '.join(where_parts)} LIMIT :lim"
         )
         rows = self._fetch_all(sql, params)  # noqa: S608
-        return [
-            {
-                "props": _merge_space(_as_dict(properties), space_id),
+        results = []
+        for node_type, space_id, properties in rows:
+            node_props, corrupted = decode_properties(properties)
+            entry = {
+                "props": _merge_space(node_props, space_id),
                 "labels": [node_type],
                 "node_type": node_type,
             }
-            for node_type, space_id, properties in rows
-        ]
+            if corrupted:
+                entry["property_decode_error"] = True
+            results.append(entry)
+        return results
 
     def export_edges(
         self,
@@ -3783,14 +3894,20 @@ class _SqlGraphStoreBase(abc.ABC):
             rows = self._fetch_all(sql, {"pid": pack_id, "lim": limit})
         else:
             rows = self._fetch_all(base_select + " LIMIT :lim", {"lim": limit})
-        return [
-            {
-                "source_props": _merge_space(_as_dict(r[1]), r[6]), "source_labels": [r[0]],
-                "target_props": _merge_space(_as_dict(r[3]), r[7]), "target_labels": [r[2]],
-                "rel_props": _as_dict(r[4]), "relation": r[5],
+        results = []
+        for r in rows:
+            source_props, source_corrupted = decode_properties(r[1])
+            target_props, target_corrupted = decode_properties(r[3])
+            rel_props, rel_corrupted = decode_properties(r[4])
+            entry = {
+                "source_props": _merge_space(source_props, r[6]), "source_labels": [r[0]],
+                "target_props": _merge_space(target_props, r[7]), "target_labels": [r[2]],
+                "rel_props": rel_props, "relation": r[5],
             }
-            for r in rows
-        ]
+            if source_corrupted or target_corrupted or rel_corrupted:
+                entry["property_decode_error"] = True
+            results.append(entry)
+        return results
 
     def upsert_nodes_batch(self, nodes: list[dict[str, Any]], *, return_receipt: bool = False) -> Any:
         self._require_write_available()
@@ -3832,7 +3949,10 @@ class _SqlGraphStoreBase(abc.ABC):
             for _nt, nid, _props, _sid, digest in prepared:
                 if nid in rows:
                     row = rows[nid]
-                    stored = _merge_space(_as_dict(row[2]), row[1])
+                    stored_raw, stored_corrupted = decode_properties(row[2])
+                    if stored_corrupted:
+                        raise GraphPropertyCorruptionError(f"node properties corrupted: {nid}")
+                    stored = _merge_space(stored_raw, row[1])
                     if canonical_node_digest(row[0], row[1] or stored.get("space"), stored) != digest:
                         raise NodeIdentityConflict(f"node identity conflict: {nid}")
             receipts = []
@@ -3847,7 +3967,10 @@ class _SqlGraphStoreBase(abc.ABC):
                     row = rows[nid]
                 if row is None:
                     raise RuntimeError("graph node insert did not produce a row")
-                stored = _merge_space(_as_dict(row[2]), row[1])
+                stored_raw, stored_corrupted = decode_properties(row[2])
+                if stored_corrupted:
+                    raise GraphPropertyCorruptionError(f"node properties corrupted: {nid}")
+                stored = _merge_space(stored_raw, row[1])
                 digest = canonical_node_digest(row[0], row[1] or stored.get("space"), stored)
                 if return_receipt:
                     receipts.append(NodeWriteReceipt(operation, nid, row[0], row[1], stored, digest))
@@ -3897,7 +4020,10 @@ class _SqlGraphStoreBase(abc.ABC):
                 row = tx.fetchone(f"SELECT node_type, space_id, properties FROM {nodes_table} WHERE node_id=:nid", {"nid": nid})
                 if row is None:
                     raise NodeIdentityConflict(f"stale node update: {nid}")
-                current = _merge_space(_as_dict(row[2]), row[1])
+                current_raw, current_corrupted = decode_properties(row[2])
+                if current_corrupted:
+                    raise GraphPropertyCorruptionError(f"node properties corrupted: {nid}")
+                current = _merge_space(current_raw, row[1])
                 if canonical_node_digest(row[0], row[1] or current.get("space"), current) != expected:
                     raise NodeIdentityConflict(f"stale node update: {nid}")
             receipts = []
@@ -3947,7 +4073,12 @@ class _SqlGraphStoreBase(abc.ABC):
                     raise ValueError(f"edge endpoint type mismatch: {mismatch}")
                 row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {table} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": fid, "rel": rel, "tid": tid})
                 if row:
-                    stored = normalize_edge_properties(fid, rel, tid, _as_dict(row[2]))
+                    stored_raw, stored_corrupted = decode_properties(row[2])
+                    if stored_corrupted:
+                        raise GraphPropertyCorruptionError(
+                            f"edge properties corrupted: ({fid}, {rel}, {tid})"
+                        )
+                    stored = normalize_edge_properties(fid, rel, tid, stored_raw)
                     if canonical_edge_digest(fid, rel, tid, row[0], row[1], stored) != digest:
                         raise EdgeIdentityConflict(f"edge identity conflict: ({fid}, {rel}, {tid})")
             receipts = []
@@ -3961,7 +4092,12 @@ class _SqlGraphStoreBase(abc.ABC):
                 if row is None:
                     raise RuntimeError("graph edge insert did not produce a row")
                 if return_receipt:
-                    stored = normalize_edge_properties(fid, rel, tid, _as_dict(row[2]))
+                    stored_raw, stored_corrupted = decode_properties(row[2])
+                    if stored_corrupted:
+                        raise GraphPropertyCorruptionError(
+                            f"edge properties corrupted: ({fid}, {rel}, {tid})"
+                        )
+                    stored = normalize_edge_properties(fid, rel, tid, stored_raw)
                     receipts.append(EdgeWriteReceipt(operation, fid, rel, tid, row[0], row[1], stored, canonical_edge_digest(fid, rel, tid, row[0], row[1], stored)))
             return tuple(receipts) if return_receipt else len(prepared)
         return self._run_mutation_tx(body)
@@ -4000,7 +4136,12 @@ class _SqlGraphStoreBase(abc.ABC):
                 row = tx.fetchone(f"SELECT from_type, to_type, properties FROM {table} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": fid, "rel": rel, "tid": tid})
                 if types.get(fid) != ft or types.get(tid) != tt or row is None:
                     raise EdgeIdentityConflict(f"stale edge update: ({fid}, {rel}, {tid})")
-                current = normalize_edge_properties(fid, rel, tid, _as_dict(row[2]))
+                current_raw, current_corrupted = decode_properties(row[2])
+                if current_corrupted:
+                    raise GraphPropertyCorruptionError(
+                        f"edge properties corrupted: ({fid}, {rel}, {tid})"
+                    )
+                current = normalize_edge_properties(fid, rel, tid, current_raw)
                 if current.get("pack_id") != owner or canonical_edge_digest(fid, rel, tid, row[0], row[1], current) != expected:
                     raise EdgeIdentityConflict(f"stale edge update: ({fid}, {rel}, {tid})")
                 digest = canonical_edge_digest(fid, rel, tid, ft, tt, props)

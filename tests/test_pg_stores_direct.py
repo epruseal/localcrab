@@ -146,6 +146,55 @@ class TestPgGraphBatchHelpers:
             store.close()
             _drop_schema(pg_engine, schema)
 
+    def test_batch_node_props_multi_excludes_corrupted_node_from_bfs_result(self, pg_engine):
+        """PG counterpart of test_sql_graph_base.py's 6a
+        (test_find_neighbors_corrupted_node_excluded_when_include_unpackaged_true)
+        -- issue #402, design.md §2 item 32. ``_batch_node_props_multi`` is
+        PGGraphStore's own single-round-trip override of
+        ``_batch_node_props`` (the shared base's version, already covered by
+        the SQLite-side BFS test); it is the only PG-specific site that
+        needed a dedicated live-PG fixture, since ``_expand`` itself (the
+        edge/pack-authorization logic) is inherited unmodified from
+        ``_SqlGraphStoreBase``.
+
+        Pre-#402 mechanism: a corrupted ``properties`` column decoded to
+        ``{}`` via ``_as_dict``, then ``_merge_space({}, space_id)`` made it
+        truthy again whenever ``space_id`` was set -- surviving
+        ``_expand``'s ``if not other_props: continue`` skip and leaking
+        through as "pack_id-less, unpackaged" whenever
+        ``include_unpackaged=True``. The corruption fixture is a JSON ARRAY
+        (``'[1,2,3]'::jsonb``), not malformed text: PG's own
+        ``properties->>'pack_id'`` on a non-object JSONB value resolves to
+        SQL NULL without error (confirmed live against this instance), so
+        the row survives PG's own ``idx_nodes_pack`` expression index and
+        reaches ``decode_properties`` in Python -- the same "syntactically
+        valid, not an object" shape design.md §12 pins for BFS fixtures,
+        distinct from #415's "malformed JSON text halts the query" shape.
+        """
+        schema = f"t{uuid.uuid4().hex[:12]}_corrupt"
+        store = PGGraphStore(pg_engine, schema=schema)
+        try:
+            store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+            store.upsert_node("Item", "corrupt", {}, space_id="s1")
+            store.upsert_edge("Hub", "hub", "touches", "Item", "corrupt")
+            with pg_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f'UPDATE "{schema}".graph_nodes SET properties = CAST(:raw AS jsonb) '
+                        "WHERE node_id = :id"
+                    ),
+                    {"raw": "[1, 2, 3]", "id": "corrupt"},
+                )
+
+            res = store.find_neighbors(
+                "hub", direction="out", pack_ids=["p1"], include_unpackaged=True
+            )
+            to_ids = {r["to_id"] for r in res}
+            assert "corrupt" not in to_ids
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
 
 # ---------------------------------------------------------------------------
 # _require_available guard contract
@@ -391,6 +440,58 @@ class TestPgDocKoreanKeywordSearch:
             store.upsert_source("kr2", "무관한 다른 내용입니다", {"node_id": "d2", "pack_id": "p"})
             hits = store.keyword_search("AI", pack_ids=["p"], limit=10)
             assert {h["source_id"] for h in hits} == {"kr1"}
+        finally:
+            store.close()
+            _drop_schema(pg_engine, schema)
+
+
+class TestPgDocKeywordSearchCorruptedMetadataReachability:
+    """issue #402, design.md §2 item 33 (``pg_doc_store.py::keyword_search``,
+    Cluster C). Unlike every other Cluster C site in this issue,
+    ``keyword_search``'s ``property_decode_error`` marking on a non-object
+    ``metadata`` value (this issue's target corruption shape, design.md §12
+    -- a syntactically valid JSON array/scalar, not malformed text, which is
+    #415's separate concern) is **architecturally unreachable through the
+    public API**: the method's own docstring documents that its mandatory
+    pack-filter predicate (``json_truthy_text(metadata,'pack_id') = ANY(...)``,
+    issue #147 §3.6) evaluates to SQL NULL for a non-object ``metadata``
+    value, and NULL never satisfies ``= ANY(...)`` -- so a row whose
+    metadata decodes to ``corrupted=True`` is excluded from the result set
+    by the SQL WHERE clause itself, before Python's ``decode_properties()``
+    call (and the ``if corrupted: entry["property_decode_error"] = True``
+    marking after it) ever runs on that row.
+
+    This is confirmed live below (no crash, no leak -- the corrupted row is
+    silently absent from a query that would otherwise match its text), not
+    just reasoned about: unlike items 12/13/32 (BFS), there is no RED/GREEN
+    pair to demonstrate here, because the pre-#402 code (``_as_dict``) hits
+    the exact same SQL exclusion for the exact same reason -- the bug this
+    issue fixes (silent ``{}`` coercion reads as "a normal empty object")
+    never had a chance to manifest through this call path either, since the
+    row carrying it never reached that Python line in old code or new."""
+
+    def test_corrupted_metadata_row_is_excluded_not_marked_or_leaked(self, pg_engine) -> None:
+        schema = f"t{uuid.uuid4().hex[:12]}_kwreach"
+        store = PgDocStore(pg_engine, schema=schema)
+        try:
+            store.upsert_source("normal", "인공지능 연구 문서", {"node_id": "d1", "pack_id": "p"})
+            store.upsert_source("corrupt", "인공지능 연구 손상", {"node_id": "d2", "pack_id": "p"})
+            with pg_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f'UPDATE "{schema}".doc_sources SET metadata = CAST(:raw AS jsonb) '
+                        "WHERE source_id = :id"
+                    ),
+                    {"raw": "[1, 2, 3]", "id": "corrupt"},
+                )
+
+            hits = store.keyword_search("인공지능 연구", pack_ids=["p"], limit=10)
+            ids = {h["source_id"] for h in hits}
+            assert ids == {"normal"}, (
+                "corrupted row must not appear at all (no crash, no leak) -- "
+                f"got {ids}"
+            )
+            assert all(not h.get("property_decode_error") for h in hits)
         finally:
             store.close()
             _drop_schema(pg_engine, schema)

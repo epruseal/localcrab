@@ -106,6 +106,40 @@ class TestNodeDoc:
         doc = store.get_node_doc("s1", "n2")
         assert doc["properties"] == props
 
+    def test_get_node_doc_marks_corrupted_properties_instead_of_coercing(self, store):
+        """#402 클러스터 C(항목34, `_row_to_node`): 손상된(비객체) JSON을 조용히
+        `{}`로 치환하지 않고, 행은 그대로 돌려주되 `property_decode_error`로
+        마킹한다. design.md §12 관례대로 `"[1, 2, 3]"`을 손상 fixture로 쓴다."""
+        store.upsert_node_doc("s1", "T", "n1", {"placeholder": True})
+        store._exec_write(
+            f"UPDATE {store._table('doc_nodes')} SET properties=:properties"
+            " WHERE space=:space AND node_id=:node_id",
+            {"properties": "[1, 2, 3]", "space": "s1", "node_id": "n1"},
+        )
+
+        doc = store.get_node_doc("s1", "n1")
+
+        assert doc is not None
+        assert doc["properties"] == {}
+        assert doc["property_decode_error"] is True
+
+    def test_list_nodes_marks_only_the_corrupted_row(self, store):
+        """같은 손상을 `list_nodes`(다중 행 응답, 클러스터 C) 경로로도 확인 —
+        정상 행은 마킹 없이, 손상 행만 마킹된 채 둘 다 생존한다."""
+        store.upsert_node_doc("s1", "T", "good", {"ok": True})
+        store.upsert_node_doc("s1", "T", "bad", {"placeholder": True})
+        store._exec_write(
+            f"UPDATE {store._table('doc_nodes')} SET properties=:properties"
+            " WHERE space=:space AND node_id=:node_id",
+            {"properties": "[1, 2, 3]", "space": "s1", "node_id": "bad"},
+        )
+
+        by_id = {n["node_id"]: n for n in store.list_nodes(space="s1", limit=100)}
+
+        assert set(by_id) == {"good", "bad"}
+        assert "property_decode_error" not in by_id["good"]
+        assert by_id["bad"]["property_decode_error"] is True
+
 
 # ---------------------------------------------------------------------------
 # get_node_docs_by_id (issue #317, 승격 적용 시점 재확인)
@@ -490,6 +524,22 @@ class TestSource:
         store.upsert_source("s0", "text", {})
         assert store.list_sources(limit=-1) == []
 
+    def test_get_source_marks_corrupted_metadata_instead_of_coercing(self, store):
+        """#402 클러스터 C(항목35, `_row_to_source`): 손상된 metadata를 `{}`로
+        치환하지 않고 행을 그대로 돌려주되 `property_decode_error`로 마킹한다."""
+        store.upsert_source("src1", "hello world", {"user_id": "u1"})
+        store._exec_write(
+            f"UPDATE {store._table('doc_sources')} SET metadata=:metadata"
+            " WHERE source_id=:source_id",
+            {"metadata": "[1, 2, 3]", "source_id": "src1"},
+        )
+
+        src = store.get_source("src1")
+
+        assert src is not None
+        assert src["metadata"] == {}
+        assert src["property_decode_error"] is True
+
 
 # ---------------------------------------------------------------------------
 # issue #139: keyword_search's guard-ORDER defect. The old single guard line
@@ -750,6 +800,22 @@ class TestAuditLog:
     def test_get_audit_log_negative_limit_returns_empty(self, store):
         store.log_event("tick", None, {})
         assert store.get_audit_log(limit=-1) == []
+
+    def test_get_audit_log_marks_corrupted_details_instead_of_coercing(self, store):
+        """#402 클러스터 C(항목36, `_row_to_audit`): 손상된 details를 `{}`로
+        치환하지 않고 행을 그대로 돌려주되 `property_decode_error`로 마킹한다."""
+        event_id = store.log_event("tick", "u1", {"n": 1})
+        store._exec_write(
+            f"UPDATE {store._table('audit_log')} SET details=:details"
+            " WHERE event_id=:event_id",
+            {"details": "[1, 2, 3]", "event_id": event_id},
+        )
+
+        log = store.get_audit_log(limit=10)
+
+        assert len(log) == 1
+        assert log[0]["details"] == {}
+        assert log[0]["property_decode_error"] is True
 
 
 # ---------------------------------------------------------------------------

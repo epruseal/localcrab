@@ -45,7 +45,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from opencrab.stores._graph_common import IDENT_RE as _SCHEMA_IDENT_RE
-from opencrab.stores._graph_common import _as_dict
+from opencrab.stores._graph_common import decode_properties
 from opencrab.stores._sql_dialect import POSTGRES
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 
@@ -286,14 +286,20 @@ class PgDocStore(_SqlDocStoreBase):
 
         out: list[dict[str, Any]] = []
         for source_id, text, meta_raw, rank in rows:
-            meta = _as_dict(meta_raw)
-            out.append({
+            meta, corrupted = decode_properties(meta_raw)
+            entry = {
                 "source_id": source_id,
                 "node_id": meta.get("node_id") or source_id,
                 "text": text,
                 "metadata": meta,
                 "score": float(rank or 0.0),
-            })
+            }
+            if corrupted:
+                # #402: keep the row (multi-row search response, Cluster C)
+                # instead of silently turning a corrupted metadata value into
+                # {} indistinguishable from "no metadata".
+                entry["property_decode_error"] = True
+            out.append(entry)
             if len(out) >= limit:
                 break
         return out

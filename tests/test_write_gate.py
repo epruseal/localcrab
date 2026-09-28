@@ -196,6 +196,32 @@ def test_classify_rejects_non_mapping_row():
         classify_by_id_rows(["pack-a"], "pack-a")
 
 
+# -- #402: a row whose properties failed to decode must read as
+# "unverifiable", not as whatever the OTHER rows happen to say, and that
+# must hold regardless of scan order (design.md §3.2 control 5). --
+
+
+def test_classify_corrupted_row_is_unverifiable_regardless_of_order():
+    foreign_then_corrupt = [{"pack_id": "pack-b"}, {"property_decode_error": True}]
+    corrupt_then_foreign = [{"property_decode_error": True}, {"pack_id": "pack-b"}]
+    assert classify_by_id_rows(foreign_then_corrupt, "pack-a") == "unverifiable"
+    assert classify_by_id_rows(corrupt_then_foreign, "pack-a") == "unverifiable"
+
+
+def test_classify_corrupted_row_beats_an_own_row_too():
+    """Corruption wins even against a row that would otherwise read as "own" --
+    being unable to verify a slot must never be masked by a lucky co-occurring
+    match."""
+    own_then_corrupt = [{"pack_id": "pack-a"}, {"property_decode_error": True}]
+    assert classify_by_id_rows(own_then_corrupt, "pack-a") == "unverifiable"
+
+
+def test_by_id_conflict_true_for_unverifiable():
+    rows = [{"property_decode_error": True}]
+    assert classify_by_id_rows(rows, "pack-a") == "unverifiable"
+    assert by_id_conflict(rows, "pack-a") is True
+
+
 # ---------------------------------------------------------------------------
 # Promoted identity guard (#146 -> #148)
 # ---------------------------------------------------------------------------
@@ -278,6 +304,16 @@ def test_by_id_axis_passes_the_owners_own_row():
     assert _node_conflict(graph=graph) is None
 
 
+def test_by_id_axis_corrupted_row_is_unverifiable_regardless_of_order():
+    """#402: a decode-error row on the by-id axis must fail closed as
+    "unverifiable", never as "foreign" or, worse, silently pass -- checked
+    both scan orders."""
+    foreign_then_corrupt = [{"pack_id": "pack-b"}, {"property_decode_error": True}]
+    corrupt_then_foreign = [{"property_decode_error": True}, {"pack_id": "pack-b"}]
+    assert _node_conflict(graph=_Graph(by_id=foreign_then_corrupt)) == "unverifiable"
+    assert _node_conflict(graph=_Graph(by_id=corrupt_then_foreign)) == "unverifiable"
+
+
 def test_missing_probe_method_is_fail_closed():
     class Bare:
         available = True
@@ -305,3 +341,31 @@ def test_reject_message_never_names_the_other_pack():
 
     msg = identity_reject_message("node", "u1", "foreign")
     assert "pack-b" not in msg and "u1" in msg
+
+
+# ---------------------------------------------------------------------------
+# endpoint_pack_conflict (#402) -- no operational caller today, so its
+# "unverifiable" translation and its unchanged control groups get direct
+# coverage here rather than only through node_identity_conflict.
+# ---------------------------------------------------------------------------
+
+
+def test_endpoint_pack_conflict_unverifiable_for_corrupted_row():
+    from opencrab.pack.write_gate import endpoint_pack_conflict
+
+    graph = _Graph(by_id=[{"pack_id": "pack-b"}, {"property_decode_error": True}])
+    assert endpoint_pack_conflict(graph, "n1", "pack-a") == "unverifiable"
+
+
+def test_endpoint_pack_conflict_foreign_unchanged_control():
+    from opencrab.pack.write_gate import endpoint_pack_conflict
+
+    graph = _Graph(by_id=[{"pack_id": "pack-b"}])
+    assert endpoint_pack_conflict(graph, "n1", "pack-a") == "foreign"
+
+
+def test_endpoint_pack_conflict_own_unchanged_control():
+    from opencrab.pack.write_gate import endpoint_pack_conflict
+
+    graph = _Graph(by_id=[{"pack_id": "pack-a"}])
+    assert endpoint_pack_conflict(graph, "n1", "pack-a") is None
