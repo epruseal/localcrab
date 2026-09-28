@@ -2667,7 +2667,16 @@ class _SqlGraphStoreBase(abc.ABC):
 
     def _fetch_node_props_by_id(self, node_id: str) -> tuple[dict[str, Any] | None, bool]:
         """Returns ``(props, corrupted)``. Type-agnostic anchor lookup (#347)
-        -- ``get_node`` cannot be reused here, it requires ``node_type``."""
+        -- ``get_node`` cannot be reused here, it requires ``node_type``.
+
+        Relies on ``GRAPH_STORE_SCHEMA``'s ``node_id``-only primary key: a
+        second node_type cannot claim the same node_id (``upsert_node``
+        raises ``NodeIdentityConflict`` first), so this type-agnostic query
+        never matches more than one row here. A LEGACY (pre-issue80,
+        composite ``(node_type, node_id)`` key) database can hold same-id
+        homonyms of different types, which this lookup then resolves
+        arbitrarily -- tracked separately as issue #426, out of #402's
+        current-schema scope."""
         sql = (
             f"SELECT properties, space_id FROM {self._table('graph_nodes')}"
             " WHERE node_id=:nid LIMIT 1"

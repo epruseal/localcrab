@@ -848,6 +848,39 @@ def test_find_by_relations_scoped_legacy_homonym_in_leg_anchor_corrupted():
     assert [r["properties"]["id"] for r in res] == ["out-target"]
 
 
+# #402 round 8 (design discarded, see design.md -- lead arbitration: the
+# legacy-homonym read-path bug this round found in find_neighbors()/
+# find_path() is real but out of this PR's current-schema scope, tracked as
+# issue #426). This test pins the CURRENT-schema counterpart of the round-7
+# legacy-homonym tests above: on GRAPH_STORE_SCHEMA (node_id alone is the
+# primary key), a second node_type can never claim an id already in use --
+# upsert_node() rejects it via NodeIdentityConflict before any row is
+# written (see also test_get_nodes_by_id_returns_the_single_global_identity_row).
+# So _fetch_node_props_by_id()'s type-agnostic `WHERE node_id=:nid` --
+# find_neighbors()/find_path()'s start-anchor check -- can never match more
+# than one row on this schema, and is therefore exactly as precise as a
+# type-checked lookup would be. Only a legacy (pre-issue80, composite-key)
+# database can create the homonym ambiguity round 8 found.
+def test_start_anchor_lookup_cannot_see_a_type_homonym_on_current_schema():
+    store = _store()
+    store.upsert_node("TypeA", "shared", {"pack_id": "p1"})
+    with pytest.raises(NodeIdentityConflict):
+        store.upsert_node("TypeB", "shared", {"pack_id": "p1"})
+
+    rows = store._fetch_all(
+        f"SELECT node_type FROM {store._table('graph_nodes')} WHERE node_id=:nid",
+        {"nid": "shared"},
+    )
+    assert [r[0] for r in rows] == ["TypeA"]
+
+    store.upsert_node("Item", "leaf", {"pack_id": "p1"})
+    store.upsert_edge("TypeA", "shared", "next", "Item", "leaf", {"pack_id": "p1"})
+
+    _corrupt_node_properties(store, "shared")
+    assert store.find_neighbors("shared", direction="out") == []
+    assert store.find_path("shared", "leaf") == []
+
+
 # ---------------------------------------------------------------------------
 # get_node_by_id / export_nodes / export_edges / batch upserts
 # ---------------------------------------------------------------------------
