@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from unittest.mock import MagicMock
@@ -768,14 +769,23 @@ def test_398_probe_failure_racing_worker_publish_keeps_hits_and_warnings_from_on
 
 
 def test_398_ready_rebuild_discards_stale_candidate_when_invalidate_wins_the_race(
-    monkeypatch,
+    monkeypatch, caplog,
 ) -> None:
-    """#398 MMP gate (design lines 55/78): once candidate S1 is fully built,
-    if a separate invalidate() raises the epoch before the worker acquires
-    its publish lock, the worker must discard S1 and keep S0. Observation is
-    pinned to the first lock cycle to finish after release, so it stays
-    deterministic regardless of any retries that follow.
+    """#398 candidate-publish two-orderings (invalidate-wins branch).
+
+    Once candidate S1 is fully built, a separate invalidate() may raise
+    the epoch first. The worker must then discard S1 and keep S0.
+
+    The barrier wait records its outcome instead of asserting inside the
+    worker thread. A genuine timing violation now surfaces as a loud
+    failure here. It no longer passes silently through a different
+    _rebuild_loop path.
+
+    Observation is pinned to the first lock cycle that finishes after
+    release. This stays deterministic regardless of any retries that
+    follow.
     """
+    caplog.set_level(logging.WARNING, logger="opencrab.ontology.query")
     doc_store = MagicMock()
     doc_store.list_nodes = MagicMock(return_value=[_node("a", pack_id="A")])
     doc_store.bm25_fingerprint = MagicMock(side_effect=[
@@ -790,14 +800,19 @@ def test_398_ready_rebuild_discards_stale_candidate_when_invalidate_wins_the_rac
 
         candidate_ready = threading.Event()
         release_candidate = threading.Event()
+        made_state_returned = threading.Event()
+        wait_ok = {"v": None}
         original_make_state = bm25._make_state
 
         def paused_make_state(observation):
             candidate = original_make_state(observation)
             candidate_ready.set()
-            assert release_candidate.wait(timeout=2.0), (
-                "invalidate() never signalled before candidate publish attempt"
-            )
+            # No assert here: the worker thread must always return control to
+            # _rebuild_loop, raise or not, so the real discard/publish
+            # comparison always executes. The outcome is recorded and checked
+            # on the main thread below instead.
+            wait_ok["v"] = release_candidate.wait(timeout=2.0)
+            made_state_returned.set()
             return candidate
 
         monkeypatch.setattr(bm25, "_make_state", paused_make_state)
@@ -837,16 +852,38 @@ def test_398_ready_rebuild_discards_stale_candidate_when_invalidate_wins_the_rac
         # after release to finish. Any retries afterward do not call
         # _make_state again, since this test's mock only has two entries.
         assert _wait_until(lambda: release_count["n"] > baseline)
+
+        # Positive observation: the targeted branch's precondition (the
+        # worker thread returning control after the barrier wait) actually
+        # happened, and _rebuild_loop's outer except never fired -- so the
+        # lock cycle observed above is the real discard comparison, not a
+        # coincidental cycle from an unrelated retry after a swallowed
+        # exception (#398 axis B finding).
+        assert made_state_returned.is_set(), (
+            "_make_state monkeypatch never returned control to _rebuild_loop"
+        )
+        assert not any(
+            "BM25 background rebuild failed" in rec.message
+            for rec in caplog.records
+        ), "background rebuild loop swallowed an exception during this test"
+        assert wait_ok["v"] is True, (
+            "release_candidate wait timed out -- the targeted race was not "
+            "actually reproduced, so the discard/publish comparison below cannot be "
+            "trusted as a test of the intended ordering"
+        )
         assert bm25.state is s0
     finally:
         hybrid.shutdown_bm25()
 
 
-def test_398_ready_rebuild_converges_when_publish_wins_the_race() -> None:
-    """#398 MMP gate (design lines 55/78/90): once candidate S1 is published
-    before any competing invalidate arrives, that invalidate must still
-    apply dirty/epoch-increment/wake so the next iteration converges to S2.
+def test_398_ready_rebuild_converges_when_publish_wins_the_race(caplog) -> None:
+    """#398 candidate-publish two-orderings (publish-wins branch).
+
+    Candidate S1 may publish before any competing invalidate arrives.
+    That invalidate must still bump dirty, epoch, and wake. The next
+    iteration then converges to S2.
     """
+    caplog.set_level(logging.WARNING, logger="opencrab.ontology.query")
     doc_store = MagicMock()
     doc_store.list_nodes = MagicMock(side_effect=[
         [_node("a", pack_id="A")],
@@ -865,5 +902,16 @@ def test_398_ready_rebuild_converges_when_publish_wins_the_race() -> None:
         bm25.invalidate()  # only called after publish is confirmed -> ordering is guaranteed
         assert _wait_until(lambda: bm25.state.indexed_rows == 3)  # converges to S2
         assert bm25.dirty is False
+
+        # Defense in depth: this test does not monkeypatch _make_state or
+        # introduce any artificial delay, so an exception here would only
+        # come from a genuine production bug, and the _wait_until calls
+        # above already fail loudly (via timeout) if that bug ever starves a
+        # publish. This assertion just makes the diagnosis point straight at
+        # _rebuild_loop's outer except instead of a generic timeout message.
+        assert not any(
+            "BM25 background rebuild failed" in rec.message
+            for rec in caplog.records
+        ), "background rebuild loop swallowed an exception during this test"
     finally:
         hybrid.shutdown_bm25()
