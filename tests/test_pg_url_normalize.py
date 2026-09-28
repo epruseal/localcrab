@@ -20,7 +20,6 @@ from sqlalchemy.exc import ArgumentError
 
 from opencrab.stores._pg_url import normalize_pg_url
 
-
 # ---------------------------------------------------------------------------
 # 정상 (Normal)
 # ---------------------------------------------------------------------------
