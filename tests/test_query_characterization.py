@@ -238,9 +238,9 @@ class TestBm25CacheSizeReadOnly:
         ``hybrid._bm25_cache_size`` raised AttributeError from inside the
         private ``_Bm25CacheWorker`` helper: the forwarding setter wrote
         ``self._bm25.cache_size``, but the worker's ``cache_size`` is a
-        getter-only property derived from the immutable ``Bm25CacheState``
-        (no in-repo or external caller ever wrote it independently of
-        ``cache`` — see fix-round4-bm25-cache-size-setter.md). The outer
+        getter-only property derived from the immutable ``Bm25CacheState``.
+        No in-repo or external caller ever wrote it independently of
+        ``cache`` (see the PR #418 review discussion for #398). The outer
         setter is now removed so the property is read-only at the public
         surface, and the resulting AttributeError names ``_bm25_cache_size``
         instead of leaking the internal worker class.
