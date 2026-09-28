@@ -427,6 +427,8 @@ class SQLStore:
         try:
             from sqlalchemy import create_engine, text  # type: ignore[import]
 
+            from opencrab.stores._pg_url import normalize_pg_url
+
             connect_args: dict[str, Any] = {}
             if self._is_sqlite:
                 connect_args["check_same_thread"] = False
@@ -448,7 +450,9 @@ class SQLStore:
                 # opencrab.stores.factory.make_billing_sql_store.
                 connect_args["timeout"] = 5.0
 
-            self._engine = create_engine(self._url, connect_args=connect_args)
+            self._engine = create_engine(
+                normalize_pg_url(self._url), connect_args=connect_args
+            )
             self._text = text
 
             if self._is_sqlite:

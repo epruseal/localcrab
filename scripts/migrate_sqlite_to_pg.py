@@ -763,7 +763,13 @@ def main() -> int:
 
     from sqlalchemy import create_engine
 
-    engine = create_engine(pg_url, pool_pre_ping=True, hide_parameters=True) if not args.dry_run else None
+    from opencrab.stores._pg_url import normalize_pg_url
+
+    engine = (
+        create_engine(normalize_pg_url(pg_url), pool_pre_ping=True, hide_parameters=True)
+        if not args.dry_run
+        else None
+    )
 
     if engine is not None and "sql" in only and not args.allow_target_only_auth:
         try:

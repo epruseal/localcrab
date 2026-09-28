@@ -69,7 +69,13 @@ class TestPgEnvError:
         from sqlalchemy import create_engine, text
         from sqlalchemy.exc import OperationalError
 
-        bogus_url = "postgresql://opencrab:opencrab@localhost:59999/opencrab_test"
+        # 이슈 #414: 이 시험은 OPENCRAB_PG_TEST_URL 을 거치지 않고 리터럴로
+        # create_engine() 을 직접 호출하므로, conftest.py 의 정규화를 받지
+        # 않는다. 드라이버를 여기서 직접 명시해야 SQLAlchemy 2.1 에서도
+        # ModuleNotFoundError 대신 이 시험이 의도한 접속 실패로 넘어간다.
+        bogus_url = (
+            "postgresql+psycopg2://opencrab:opencrab@localhost:59999/opencrab_test"
+        )
         engine = create_engine(bogus_url, connect_args={"connect_timeout": 2})
         start = time.monotonic()
         try:

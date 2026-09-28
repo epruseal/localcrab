@@ -170,10 +170,14 @@ class PgVectorStore:
             if isinstance(dsn_or_engine, str):
                 from sqlalchemy import create_engine
 
+                from opencrab.stores._pg_url import normalize_pg_url
+
                 # pool_pre_ping: 풀에 있던 커넥션이 idle 중 끊겼을 때(장수 커넥션
-                # 풀의 흔한 실패 모드) 다음 체크아웃에서 조용히 재연결 — 공유 엔진
+                # 풀의 흔한 실패 모드) 다음 체크아웃에서 조용히 재연결. 공유 엔진
                 # 주입 시에도 이 스토어가 만든 엔진에 한해 켠다.
-                self._engine = create_engine(dsn_or_engine, pool_pre_ping=True)
+                self._engine = create_engine(
+                    normalize_pg_url(dsn_or_engine), pool_pre_ping=True
+                )
                 self._owns_engine = True
             elif isinstance(dsn_or_engine, Engine):
                 self._engine = dsn_or_engine

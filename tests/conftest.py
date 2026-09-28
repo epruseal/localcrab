@@ -56,6 +56,19 @@ os.environ["LOCAL_DATA_DIR"] = _TEST_DATA_DIR
 # (표준 env 로딩 자체를 검증하는 테스트가 이 경로로 실제 파일을 지정한다).
 os.environ.setdefault("LOCALCRAB_ENV_FILE", os.devnull)
 
+# 이슈 #414: SQLAlchemy 2.1 은 드라이버 미명시 postgresql:// 의 기본 DBAPI 를
+# psycopg2 에서 psycopg(v3) 로 바꿨고, 이 저장소는 psycopg2-binary 만 설치한다.
+# OPENCRAB_PG_TEST_URL 로 지정하는 시험용 DSN 이 드라이버를 명시하지 않으면
+# create_engine() 이 fixture setup 단계에서 ModuleNotFoundError 로 죽는다.
+# fixture 가 아니라 모듈 최상단인 이유: LOCAL_DATA_DIR/LOCALCRAB_ENV_FILE 과
+# 동일하게, 이 값을 모듈 임포트 시점에 읽는 시험 파일이 있어 fixture 로는
+# 늦는다. 값이 없으면 아무것도 하지 않는다(미설정 시 스킵 동작 보존).
+_pg_test_url = os.environ.get("OPENCRAB_PG_TEST_URL")
+if _pg_test_url:
+    from opencrab.stores._pg_url import normalize_pg_url
+
+    os.environ["OPENCRAB_PG_TEST_URL"] = normalize_pg_url(_pg_test_url)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _pg_test_db_tripwire():

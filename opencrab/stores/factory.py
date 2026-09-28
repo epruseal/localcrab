@@ -35,7 +35,9 @@ def _get_pg_engine(url: str) -> Any:
     """
     from sqlalchemy import create_engine
 
-    return create_engine(url, pool_pre_ping=True)
+    from opencrab.stores._pg_url import normalize_pg_url
+
+    return create_engine(normalize_pg_url(url), pool_pre_ping=True)
 
 
 def make_graph_store(settings: Settings) -> Any:

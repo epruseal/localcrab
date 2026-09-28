@@ -124,7 +124,9 @@ class PGGraphStore(_SqlGraphStoreBase):
         else:
             from sqlalchemy import create_engine
 
-            self._engine = create_engine(str(dsn_or_engine))
+            from opencrab.stores._pg_url import normalize_pg_url
+
+            self._engine = create_engine(normalize_pg_url(str(dsn_or_engine)))
             self._owns_engine = True
 
         self._init_db()
