@@ -1002,7 +1002,10 @@ def test_422_search_restale_during_inflight_build_does_not_discard_candidate(
         def gated_make_state(observation):
             call_count["n"] += 1
             entered.set()
-            release.wait(timeout=2.0)
+            assert release.wait(timeout=2.0), (
+                "release was not set within the timeout -- the test's gate "
+                "could not enforce the intended in-flight-build interleaving"
+            )
             return original_make_state(observation)
 
         monkeypatch.setattr(bm25, "_make_state", gated_make_state)
@@ -1103,7 +1106,10 @@ def test_422_late_external_write_during_build_needs_one_more_cycle_then_converge
             observation = original_observe(doc_store, probe)
             last_observation["v"] = observation
             entered.set()
-            release.wait(timeout=2.0)
+            assert release.wait(timeout=2.0), (
+                "release was not set within the timeout -- the test's gate "
+                "could not enforce the intended cycle-by-cycle interleaving"
+            )
             release.clear()
             return observation
 
