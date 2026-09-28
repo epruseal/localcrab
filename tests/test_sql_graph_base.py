@@ -1381,3 +1381,81 @@ def test_find_neighbors_corrupted_edge_excluded_on_default_pack_ids_none_path():
     res = store.find_neighbors("hub", direction="out")  # pack_ids=None default
     to_ids = {r["to_id"] for r in res}
     assert "leaf" not in to_ids
+
+
+# --- post-PR#420-dual-verification gap: find_neighbors() only checked the
+# BFS anchor node's own properties for corruption when a pack_ids or spaces
+# filter was active (see the `if pack_set is not None or space_set is not
+# None:` guard around the _fetch_node_props_by_id() call). The unfiltered,
+# default-args call path -- pack_ids=None, spaces=None -- never looked at
+# the anchor's own row at all, so a corrupted anchor's neighbours were
+# returned as if the anchor were healthy. Reproduced by execution (codex,
+# read-only) against pre-fix code before this test was written.
+
+
+def test_find_neighbors_corrupted_anchor_returns_empty_on_default_unfiltered_path():
+    store = _store()
+    store.upsert_node("Hub", "hub", {})
+    store.upsert_node("Item", "leaf", {})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "leaf", {})
+    _corrupt_node_properties(store, "hub")
+
+    res = store.find_neighbors("hub", direction="out")  # pack_ids=None, spaces=None
+    assert res == []
+
+
+def test_find_neighbors_unfiltered_limit_zero_skips_anchor_corruption_query(monkeypatch):
+    """Control for the fix's own regression concern: the pre-existing
+    "limit<=0 -> [] with zero queries" behavior for the unfiltered path
+    (see _graph_protocol.py's find_neighbors docstring, issue #347) must
+    survive this fix unchanged. The new anchor-corruption check must not
+    fire an avoidable query when the BFS loop would return [] regardless.
+    Asserted directly by spying on _fetch_node_props_by_id, not just by
+    checking the return value, since a naive always-check fix would also
+    return [] here and pass a return-value-only assertion."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {})
+    calls: list[str] = []
+    original = store._fetch_node_props_by_id
+
+    def _spy(node_id):
+        calls.append(node_id)
+        return original(node_id)
+
+    monkeypatch.setattr(store, "_fetch_node_props_by_id", _spy)
+
+    assert store.find_neighbors("hub", direction="out", limit=0) == []
+    assert calls == []
+
+
+def test_find_neighbors_unfiltered_depth_zero_skips_anchor_corruption_query(monkeypatch):
+    """Same zero-query contract for depth<=0: the BFS loop already
+    short-circuits to [] via `expandable = [nid for nid, d in level if d <
+    depth]`, so the new anchor-corruption check should not add an avoidable
+    query in this case either (round-4 design-review refinement)."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {})
+    calls: list[str] = []
+    original = store._fetch_node_props_by_id
+
+    def _spy(node_id):
+        calls.append(node_id)
+        return original(node_id)
+
+    monkeypatch.setattr(store, "_fetch_node_props_by_id", _spy)
+
+    assert store.find_neighbors("hub", direction="out", depth=0) == []
+    assert calls == []
+
+
+def test_find_neighbors_corrupted_anchor_with_filter_still_returns_empty_control():
+    """Control: the already-existing, already-verified filtered-path anchor
+    check (pack_ids or spaces set) must be unaffected by this fix."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "leaf", {"pack_id": "p1"})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "leaf", {"pack_id": "p1"})
+    _corrupt_node_properties(store, "hub")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"])
+    assert res == []

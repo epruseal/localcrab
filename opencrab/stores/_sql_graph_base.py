@@ -2912,6 +2912,19 @@ class _SqlGraphStoreBase(abc.ABC):
                 return []
             if not _space_passes(anchor_props or {}, space_set):
                 return []
+        elif limit > 0 and depth > 0:
+            # #402 gap 2: the unfiltered path (no pack_ids/spaces) skipped
+            # the anchor's own corruption check entirely, so a corrupted
+            # anchor's neighbours were returned as if the anchor were
+            # healthy. Gated on limit>0 and depth>0 so the pre-existing,
+            # separately-tracked "limit<=0 (or depth<=0) -> [] with zero
+            # queries" contract for this path (see find_neighbors' docstring
+            # in _graph_protocol.py, issue #347) is not regressed: the BFS
+            # loop below already returns [] with no query in either case, so
+            # this check would only add an avoidable query there.
+            _anchor_props, anchor_corrupted = self._fetch_node_props_by_id(node_id)
+            if anchor_corrupted:
+                return []
 
         visited: set[str] = {node_id}
         results: list[dict[str, Any]] = []

@@ -737,7 +737,14 @@ class Neo4jStore:
         from_type = self._label(from_type)
         to_type = self._label(to_type)
         relation = self._label(relation)
-        props = normalize_edge_properties(from_id, relation, to_id, properties)
+        # #402 gap 1: Neo4j has no JSON-blob decode step and never
+        # synthesizes the SQL stores' "property_decode_error" marker itself,
+        # but a caller could still write it here as a literal property
+        # value. write_gate.py's backend-agnostic corruption check treats
+        # any edge carrying that key as unverifiable regardless of backend,
+        # so an accepted marker here would later be misread as genuine
+        # corruption. Reject at write time, matching the SQL stores' fix.
+        props = normalize_edge_properties(from_id, relation, to_id, properties, reject_reserved_marker=True)
         digest = canonical_edge_digest(from_id, relation, to_id, from_type, to_type, props)
         edge_key = self._edge_key(from_id, relation, to_id)
         lookup = """
@@ -987,7 +994,8 @@ class Neo4jStore:
         from_type, to_type, relation = self._label(from_type), self._label(to_type), self._label(relation)
         if not isinstance(owner_pack_id, str) or not owner_pack_id:
             raise ValueError("graph identity fields must be non-empty strings")
-        props = normalize_edge_properties(from_id, relation, to_id, properties)
+        # #402 gap 1: see the matching comment in upsert_edge() above.
+        props = normalize_edge_properties(from_id, relation, to_id, properties, reject_reserved_marker=True)
         if props.get("pack_id") != owner_pack_id:
             raise EdgeIdentityConflict(f"stale edge update: ({from_id}, {relation}, {to_id})")
         digest = canonical_edge_digest(from_id, relation, to_id, from_type, to_type, props)
