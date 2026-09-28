@@ -344,6 +344,38 @@ def test_reject_message_never_names_the_other_pack():
 
 
 # ---------------------------------------------------------------------------
+# _check_probes top-level property_decode_error marker (#402 rev.6)
+#
+# node_identity_conflict's graph leg raises on a corrupted get_node/get_edge
+# row (caught, translated to "unverifiable" elsewhere) -- but its doc/vector
+# legs, and all of source_identity_conflict, go through _check_probes, which
+# only extracted the leaf value and never looked at the row's own
+# `property_decode_error` marker. A corrupted row decodes its properties to
+# `{}`, so the leaf extraction is falsy and the loop silently moved on to the
+# next probe (or returned None) instead of failing closed. A clean graph
+# slot ahead of a corrupted doc/vector slot must not let that pass through.
+# ---------------------------------------------------------------------------
+
+
+def test_doc_probe_corrupted_row_is_unverifiable_not_silently_passed():
+    docs = _Slot({"property_decode_error": True, "properties": {}})
+    assert _node_conflict(docs=docs) == "unverifiable"
+
+
+def test_vector_probe_corrupted_row_is_unverifiable_not_silently_passed():
+    vector = _Slot({"property_decode_error": True, "metadata": {}})
+    assert _node_conflict(vector=vector) == "unverifiable"
+
+
+def test_source_doc_probe_corrupted_row_is_unverifiable_not_silently_passed():
+    from opencrab.pack.write_gate import source_identity_conflict
+
+    docs = _Slot({"property_decode_error": True, "metadata": {}})
+    vector = _Slot(None)
+    assert source_identity_conflict(docs, vector, source_id="s1", pack_id="pack-a") == "unverifiable"
+
+
+# ---------------------------------------------------------------------------
 # endpoint_pack_conflict (#402) -- no operational caller today, so its
 # "unverifiable" translation and its unchanged control groups get direct
 # coverage here rather than only through node_identity_conflict.

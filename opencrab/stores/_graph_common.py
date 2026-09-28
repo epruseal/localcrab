@@ -228,15 +228,23 @@ def decode_properties(value: Any) -> tuple[dict[str, Any], bool]:
     that feed pack-ownership or identity decisions must treat that case as
     fail-closed (raise, or exclude the row) rather than as "no properties".
 
-    ``None`` is not corruption -- it is the ordinary "no row" / nullable-
-    column signal -- and decodes to ``({}, False)`` (matches the existing
-    ``tests/test_graph_common.py`` fixed expectations for the pre-existing
-    ``_as_dict(None) == {}`` case). A ``dict`` value is returned as-is
+    ``None`` is not corruption -- it decodes to ``({}, False)`` (matches the
+    existing ``tests/test_graph_common.py`` fixed expectations for the
+    pre-existing ``_as_dict(None) == {}`` case). This branch is defensive,
+    not reachable in practice: the ``properties``/``metadata`` columns this
+    function decodes are ``NOT NULL DEFAULT '{}'`` on both SQLite and PG
+    (#402 rev.6 audit, every ``decode_properties(`` call site reads one of
+    these columns directly or re-decodes an already-decoded value), so a
+    live row's SQL value is never ``None`` -- callers branch on "no row"
+    (``if row is None: return None``) before ever calling this function. A
+    ``dict`` value is returned as-is
     (identity preserved, no defensive copy) with ``corrupted=False``.
     Anything else is validated through ``parse_properties_object`` -- no new
     parsing logic, reusing the parser already used at write time.
     """
     if value is None:
+        # DDL상 도달 불가 -- properties/metadata 컬럼은 SQLite/PG 양쪽 다
+        # NOT NULL DEFAULT '{}' (#402 rev.6 실측). 방어적 분기로 유지한다.
         return {}, False
     if isinstance(value, dict):
         return value, False

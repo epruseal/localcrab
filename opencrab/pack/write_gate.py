@@ -356,6 +356,8 @@ def _check_probes(pack_id: str, probes: list[_Probe]) -> str | None:
             continue
         if not isinstance(result, Mapping):
             return CONFLICT_UNVERIFIABLE
+        if result.get("property_decode_error"):
+            return CONFLICT_UNVERIFIABLE
         value = _extract(result, path)
         if value and value != pack_id:
             return CONFLICT_FOREIGN

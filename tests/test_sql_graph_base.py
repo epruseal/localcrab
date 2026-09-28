@@ -238,6 +238,30 @@ def test_delete_node_also_removes_incident_edges():
     assert store.find_by_relations("b", ["knows"], direction="in") == []
 
 
+def test_delete_edge_duplicate_key_row_is_corrupted_not_silently_deleted():
+    """#402 rev.6: delete_edge decodes its ownership check with _as_dict
+    (plain json.loads, no object_pairs_hook), which collapses a duplicate-key
+    `properties` value to its LAST key -- direct-SQL corruption only, a
+    normal upsert can never serialize duplicate keys. Pre-fix: an
+    owner_pack_id matching the last-written key deletes the row even though
+    parse_properties_object/decode_properties -- the shared decode contract
+    every other pack-ownership write path already uses (upsert_edge,
+    update_edge, upsert_node, update_node) -- would reject the row outright.
+    Post-fix: decode_properties rejects the duplicate key and delete_edge
+    raises fail-closed instead, matching update_edge's sibling pattern."""
+    store = _store()
+    store.upsert_node("Person", "a", {"pack_id": "victim-pack"})
+    store.upsert_node("Person", "b", {"pack_id": "victim-pack"})
+    store.upsert_edge("Person", "a", "knows", "Person", "b", {"pack_id": "victim-pack"})
+    _corrupt_edge_properties(
+        store, "a", "b",
+        raw='{"pack_id": "victim-pack", "pack_id": "attacker-pack"}',
+    )
+
+    with pytest.raises(GraphPropertyCorruptionError):
+        store.delete_edge("a", "knows", "b", owner_pack_id="attacker-pack")
+
+
 def test_upsert_edge_conflict_is_rejected_without_mutation():
     store = _store()
     store.upsert_node("Person", "a", {})

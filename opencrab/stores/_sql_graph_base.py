@@ -2578,7 +2578,11 @@ class _SqlGraphStoreBase(abc.ABC):
             row = tx.fetchone(f"SELECT properties FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": from_id, "rel": relation, "tid": to_id})
             if not row:
                 return False
-            props = _as_dict(row[0])
+            props, corrupted = decode_properties(row[0])
+            if corrupted:
+                raise GraphPropertyCorruptionError(
+                    f"edge properties corrupted: ({from_id}, {relation}, {to_id})"
+                )
             if props.get("pack_id") != owner_pack_id:
                 return False
             result = tx.execute(f"DELETE FROM {edges} WHERE from_id=:fid AND relation=:rel AND to_id=:tid", {"fid": from_id, "rel": relation, "tid": to_id})
