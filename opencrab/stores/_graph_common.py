@@ -236,8 +236,9 @@ def decode_properties(value: Any) -> tuple[dict[str, Any], bool]:
     ``NOT NULL DEFAULT '{}'`` on SQLite and PG (#402 rev.6 audit). That rule
     excludes a stored SQL ``NULL`` value on both backends. On PG, that rule
     does not exclude a JSONB scalar ``null`` in the column. The driver can
-    decode that value to Python ``None`` before this function runs. This
-    function treats that value as empty properties, not as corrupted.
+    decode that value to Python ``None`` before this function runs.
+
+    This function treats that value as empty properties, not as corrupted.
     Issue #416, not this issue, decides whether this function should mark
     that value as corrupted.
 
