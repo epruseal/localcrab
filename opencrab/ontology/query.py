@@ -409,20 +409,58 @@ class _Bm25CacheWorker:
             logger.debug("BM25 index cold-built (%d nodes)", candidate.indexed_rows)
             return candidate.index
 
+    def _ensure_worker_awake_locked(self) -> None:
+        """Start the rebuild thread if needed and wake it.
+
+        Caller must hold ``self._lock``.
+        """
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(
+                target=self._rebuild_loop, name="bm25-rebuild", daemon=True
+            )
+            self.thread.start()
+        self._wake.set()
+
     def invalidate(self) -> None:
-        """Atomically mark stale, advance epoch, and wake the worker."""
+        """Atomically mark stale, advance epoch, and wake the worker.
+
+        Call this only when the store actually changed. Advancing the epoch
+        is what makes an in-flight rebuild discard a candidate whose
+        observation may have been taken before this write and so may have
+        missed it (see ``_rebuild_loop``'s epoch comparison).
+        """
         if self._doc_store_getter() is None:
             self.dirty = True
             return
         with self._lock:
             self.dirty = True
             self._epoch += 1
-            if self.thread is None or not self.thread.is_alive():
-                self.thread = threading.Thread(
-                    target=self._rebuild_loop, name="bm25-rebuild", daemon=True
-                )
-                self.thread.start()
-            self._wake.set()
+            self._ensure_worker_awake_locked()
+
+    def mark_stale(self) -> None:
+        """Mark stale and wake the worker, without advancing the epoch.
+
+        Issue #422: the search hot path calls this when it merely re-detects
+        staleness that an already-scheduled (or about-to-start) rebuild will
+        resolve on its own next observation -- the worker always reads
+        current store content, so a redundant re-detection changes nothing
+        about the correctness of the candidate it is building. Advancing the
+        epoch here, as the old single-path ``invalidate()`` did, meant every
+        search that landed during a build window bumped the epoch again with
+        no intervening write, so the publish-time epoch comparison in
+        ``_rebuild_loop`` almost never matched and the worker discarded an
+        otherwise up-to-date candidate indefinitely whenever search traffic
+        arrived faster than one build cycle. A real write must still go
+        through ``invalidate()`` (unchanged): only a write can make an
+        in-flight candidate's already-taken observation miss new content, so
+        only a write may legitimately force a discard.
+        """
+        if self._doc_store_getter() is None:
+            self.dirty = True
+            return
+        with self._lock:
+            self.dirty = True
+            self._ensure_worker_awake_locked()
 
     def _rebuild_loop(self) -> None:
         while not self._stop.is_set():
@@ -853,7 +891,7 @@ class HybridQuery:
             else:
                 # Local containment: a probe (native) or fallback marker
                 # (legacy) failure here must not abort the search below. On
-                # failure we skip only the invalidate attempt. We still capture
+                # failure we skip only the mark_stale attempt. We still capture
                 # one state reference right after this block (next line) and use
                 # that single reference for both the search and its coverage
                 # warnings. A concurrent worker publish during this attempt may
@@ -871,7 +909,15 @@ class HybridQuery:
                     current_fingerprint is not None
                     and current_fingerprint != state.probe_fingerprint
                 ):
-                    self.invalidate_bm25_cache()
+                    # #422: this is a redundant re-detection of staleness that
+                    # an already-scheduled (or about-to-start) rebuild will
+                    # resolve on its own next observation. Use mark_stale()
+                    # (no epoch bump) instead of invalidate() so that search
+                    # traffic during a build window cannot make the
+                    # publish-time epoch comparison discard an otherwise
+                    # up-to-date candidate. A real write still goes through
+                    # invalidate() at its own call sites.
+                    self._bm25.mark_stale()
             state = self._bm25.state
             if state is None:
                 return [], []

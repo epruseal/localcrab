@@ -939,3 +939,328 @@ def test_398_ready_rebuild_converges_when_publish_wins_the_race(caplog) -> None:
         ), "background rebuild loop swallowed an exception during this test"
     finally:
         hybrid.shutdown_bm25()
+
+
+# ---------------------------------------------------------------------------
+# #422 -- search-driven re-detection during a build must not discard it
+# ---------------------------------------------------------------------------
+
+
+def test_422_search_restale_during_inflight_build_does_not_discard_candidate(
+    monkeypatch, caplog,
+) -> None:
+    """#422: search requests that land during an in-flight rebuild must not
+    make the worker discard that rebuild's candidate.
+
+    Root cause: the search hot path used to call ``invalidate()``, which
+    unconditionally bumps ``_epoch``, even when the hot path was only
+    re-detecting a staleness the worker already knows about and is already
+    rebuilding for. Every such redundant re-detection during a build window
+    bumped the epoch again with no real intervening write, so the publish-time
+    ``self._epoch == build_epoch`` comparison in ``_rebuild_loop`` almost
+    never matched and the worker discarded an otherwise up-to-date candidate,
+    forever, as long as search traffic kept arriving faster than one build
+    cycle (this is exactly what ``repro_livelock.py`` demonstrates by
+    execution). The fix: the hot path now calls ``mark_stale()``, which wakes
+    the worker without touching the epoch.
+
+    This test mutates the store's real content once (one real write) and
+    then floods the in-flight build with five redundant re-detections. It
+    counts ``_make_state`` calls instead of polling only the final
+    fingerprint, because a final-fingerprint-only check cannot distinguish
+    "the first candidate was discarded and a second, wasteful cycle had to
+    rebuild the same content" from "the first candidate published directly"
+    -- both eventually converge to the same fingerprint once search traffic
+    stops, but only the former is the bug this issue reports.
+    """
+    caplog.set_level(logging.WARNING, logger="opencrab.ontology.query")
+
+    class LegacyStore:
+        """No ``bm25_fingerprint`` attribute -> forces the legacy marker
+        path, which is what the search hot path uses to detect staleness by
+        recomputing ``compute_fingerprint(nodes)`` on every call."""
+
+        def __init__(self, nodes: list[dict]) -> None:
+            self.nodes = nodes
+
+        def list_nodes(self, limit: int) -> list[dict]:
+            return self.nodes
+
+    store = LegacyStore([_node("a", pack_id="A")])
+    hybrid = _hybrid(store)
+    bm25 = hybrid._bm25
+    try:
+        hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )  # cold build -> S0({a})
+
+        entered = threading.Event()
+        release = threading.Event()
+        call_count = {"n": 0}
+        original_make_state = bm25._make_state
+
+        def gated_make_state(observation):
+            call_count["n"] += 1
+            entered.set()
+            assert release.wait(timeout=2.0), (
+                "release was not set within the timeout -- the test's gate "
+                "could not enforce the intended in-flight-build interleaving"
+            )
+            return original_make_state(observation)
+
+        monkeypatch.setattr(bm25, "_make_state", gated_make_state)
+
+        store.nodes = [_node("a", pack_id="A"), _node("b", pack_id="A")]  # real write
+        hybrid.invalidate_bm25_cache()  # write-path call -> epoch += 1
+        assert _wait_until(lambda: entered.is_set())
+        assert call_count["n"] == 1, (
+            "build did not reach _make_state -- the store mutation did not "
+            "actually change the observed fingerprint"
+        )
+        epoch_after_invalidate = bm25._epoch
+
+        for _ in range(5):
+            hybrid._bm25_search_with_warnings(
+                "alpha", spaces=None, limit=5, pack_ids=["A"]
+            )
+
+        # Recorded, not asserted yet: an early assert here would halt the
+        # test before the call_count evidence below is captured.
+        epoch_after_flood = bm25._epoch
+
+        release.set()
+        target_fp = compute_fingerprint(store.nodes)
+        assert _wait_until(
+            lambda: bm25.state is not None and bm25.state.probe_fingerprint == target_fp
+        )
+
+        assert epoch_after_flood == epoch_after_invalidate, (
+            "five redundant re-detections bumped the epoch -- mark_stale() "
+            "regressed to invalidate()'s behavior"
+        )
+        assert call_count["n"] == 1, (
+            "the first candidate was discarded and rebuilt a second time "
+            "for the same content -- this is the #422 livelock"
+        )
+        assert not any(
+            "BM25 background rebuild failed" in rec.message
+            for rec in caplog.records
+        ), "background rebuild loop swallowed an exception during this test"
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_422_late_external_write_during_build_needs_one_more_cycle_then_converges(
+    monkeypatch, caplog,
+) -> None:
+    """#422 boundary case: a live deployment splits the search gateway
+    process from the pack-loading process, so a loader's write never calls
+    the gateway's ``invalidate()`` -- the gateway only ever learns of a
+    change through the search hot path's fingerprint re-detection
+    (``mark_stale()``). This test drives two such external writes and checks
+    the two-cycle convergence contract end to end, without relying on any
+    epoch bump.
+
+    Two distinct triggers are checked separately, because they are different
+    code paths: (a) a first cycle whose candidate reflects only the write
+    that happened before its observation, which still publishes because
+    ``mark_stale()`` never touched the epoch; and (b) a *new* search issued
+    strictly after that publish, which itself must re-detect the still-stale
+    published state and independently schedule the second cycle -- this is
+    checked separately from any wake left over from before the first
+    publish, since a leftover wake and a fresh post-publish detection are
+    different mechanisms and a symmetric design bug could pass the wrong one
+    silently.
+
+    Termination is checked by counting ``_make_state`` calls, not by
+    checking for the absence of further ``_observe()`` entries: once content
+    stops changing, the worker may still legitimately re-enter ``_observe()``
+    on a leftover wake and take the same-fingerprint early exit without
+    calling ``_make_state`` again -- that is correct behavior, not a bug.
+    """
+    caplog.set_level(logging.WARNING, logger="opencrab.ontology.query")
+
+    class LegacyStore:
+        def __init__(self, nodes: list[dict]) -> None:
+            self.nodes = nodes
+
+        def list_nodes(self, limit: int) -> list[dict]:
+            return self.nodes
+
+    store = LegacyStore([_node("a", pack_id="A")])
+    hybrid = _hybrid(store)
+    bm25 = hybrid._bm25
+    try:
+        hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )  # cold build -> S0({a})
+
+        entered = threading.Event()
+        release = threading.Event()
+        last_observation = {"v": None}
+        rebuild_count = {"n": 0}
+        original_observe = bm25._observe
+        original_make_state = bm25._make_state
+
+        def gated_observe(doc_store, probe=None):
+            observation = original_observe(doc_store, probe)
+            last_observation["v"] = observation
+            entered.set()
+            assert release.wait(timeout=2.0), (
+                "release was not set within the timeout -- the test's gate "
+                "could not enforce the intended cycle-by-cycle interleaving"
+            )
+            release.clear()
+            return observation
+
+        def counting_make_state(observation):
+            rebuild_count["n"] += 1
+            return original_make_state(observation)
+
+        monkeypatch.setattr(bm25, "_observe", gated_observe)
+        monkeypatch.setattr(bm25, "_make_state", counting_make_state)
+
+        # 1. External write #1 (no invalidate_bm25_cache() -- a separate
+        #    loader process is simulated).
+        store.nodes = [_node("a", pack_id="A"), _node("b", pack_id="A")]
+
+        # 2. Exactly one search opens the first cycle. No further searches
+        #    are sent until the first publish is confirmed below, so no
+        #    leftover wake can accumulate.
+        hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert _wait_until(lambda: entered.is_set())
+        baseline_epoch = bm25._epoch
+        assert last_observation["v"].probe.fingerprint == compute_fingerprint(store.nodes)
+        entered.clear()
+
+        # 3. External write #2 lands after the first cycle already observed
+        #    (and thus will not reflect) write #1's content.
+        store.nodes = [_node("a", pack_id="A"), _node("b", pack_id="A"), _node("c", pack_id="A")]
+        write1_fp = compute_fingerprint(
+            [_node("a", pack_id="A"), _node("b", pack_id="A")]
+        )
+
+        # 4. Release the first cycle. It publishes the write-#1-only
+        #    candidate, because mark_stale() never touched the epoch.
+        release.set()
+        assert _wait_until(
+            lambda: bm25.state is not None and bm25.state.probe_fingerprint == write1_fp
+        )
+        g1 = bm25.state.generation
+        assert rebuild_count["n"] == 1
+
+        # 5. No automatic second cycle: nothing set _wake after the single
+        #    search in step 2 was consumed, so the worker must stay idle.
+        assert not entered.wait(timeout=0.3), (
+            "a second _observe() cycle started without any new search -- "
+            "this would be a leftover-wake artifact, not the post-publish "
+            "re-detection this test is isolating"
+        )
+
+        # 6. A *new* search, issued strictly after the first publish, must
+        #    itself detect the still-stale published state and schedule the
+        #    second cycle.
+        hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )
+        assert bm25._epoch == baseline_epoch
+        assert _wait_until(lambda: entered.is_set())
+        assert last_observation["v"].probe.fingerprint == compute_fingerprint(store.nodes)
+
+        # 7. Release the second cycle. It publishes the fully up-to-date
+        #    candidate.
+        release.set()
+        target_fp = compute_fingerprint(store.nodes)
+        assert _wait_until(
+            lambda: bm25.state is not None
+            and bm25.state.probe_fingerprint == target_fp
+            and bm25.state.generation == g1 + 1
+        )
+        assert rebuild_count["n"] == 2
+
+        # 8. Once converged, hammering search must not create further
+        #    rebuilds: content already matches the published fingerprint, so
+        #    the hot path does not even call mark_stale().
+        for _ in range(5):
+            hybrid._bm25_search_with_warnings(
+                "alpha", spaces=None, limit=5, pack_ids=["A"]
+            )
+        assert rebuild_count["n"] == 2
+
+        assert bm25._epoch == baseline_epoch, (
+            "epoch moved even though neither external write went through "
+            "invalidate_bm25_cache()"
+        )
+        assert not any(
+            "BM25 background rebuild failed" in rec.message
+            for rec in caplog.records
+        ), "background rebuild loop swallowed an exception during this test"
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_422_slow_build_with_hammering_search_converges_within_bounded_time() -> None:
+    """#422 boundary case: reuses ``repro_livelock.py``'s exact load
+    conditions (0.5s build, 0.05s search interval, 2.5s of concurrent
+    search, one external write) as a non-deterministic supplementary check
+    that the fix converges before the search load itself stops -- the
+    barrier-based tests above are the deterministic, primary detection.
+    """
+    build_sleep = 0.5
+    search_interval = 0.05
+    search_duration = 2.5
+
+    class LegacyStore:
+        def __init__(self, nodes: list[dict]) -> None:
+            self.nodes = nodes
+
+        def list_nodes(self, limit: int) -> list[dict]:
+            return self.nodes
+
+    initial_nodes = [_node("a", pack_id="A"), _node("a2", pack_id="A")]
+    store = LegacyStore(initial_nodes)
+    hybrid = _hybrid(store)
+    try:
+        hybrid._bm25_search_with_warnings(
+            "alpha", spaces=None, limit=5, pack_ids=["A"]
+        )  # cold build
+        cold_fp = hybrid._bm25.state.probe_fingerprint
+        assert cold_fp == compute_fingerprint(initial_nodes)
+
+        store.nodes = initial_nodes + [_node("b", pack_id="A")]  # one external write
+        new_fp = compute_fingerprint(store.nodes)
+
+        real_make_state = hybrid._bm25._make_state
+
+        def slow_make_state(observation):
+            time.sleep(build_sleep)
+            return real_make_state(observation)
+
+        hybrid._bm25._make_state = slow_make_state
+
+        stop = threading.Event()
+        converged_within_load = {"v": False}
+
+        def search_loop() -> None:
+            while not stop.is_set():
+                hybrid._bm25_search_with_warnings(
+                    "alpha", spaces=None, limit=5, pack_ids=["A"]
+                )
+                if hybrid._bm25.state.probe_fingerprint == new_fp:
+                    converged_within_load["v"] = True
+                time.sleep(search_interval)
+
+        searcher = threading.Thread(target=search_loop, daemon=True)
+        searcher.start()
+        time.sleep(search_duration)
+        stop.set()
+        searcher.join(timeout=2.0)
+
+        assert converged_within_load["v"], (
+            "publication of the up-to-date candidate did not happen before "
+            "the search load itself stopped"
+        )
+    finally:
+        hybrid.shutdown_bm25()
