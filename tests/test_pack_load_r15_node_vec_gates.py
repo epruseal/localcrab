@@ -27,9 +27,10 @@ import sys
 
 import pytest
 
-from opencrab.auth import Principal, principal_scope
+from opencrab.auth import Principal, create_user, principal_scope
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.pack import load as pack_load
+from opencrab.pack.ownership import PackNotFoundError
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 from tests.test_pack_load import (  # noqa: F401 — 기존 픽스처·더블 재사용
@@ -78,7 +79,7 @@ class TestNodeVectorOnlyLossRecoveryEnumerable:
     회수해야 한다(recover_vectors 값과 무관하게 항상 검사)."""
 
     def test_vector_only_loss_is_recovered_as_chg_then_converges_to_same(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         vec0 = _EnumerableVecWithLookup("pack-1")
         builder._vec = vec0
@@ -90,12 +91,12 @@ class TestNodeVectorOnlyLossRecoveryEnumerable:
 
         state = pack_load.live_pack_state("pack-1", graph, docs, vec0)
 
-        # 벡터 슬롯만 유실 재현(부분 복원·백엔드 삭제) — graph/doc 은 그대로.
+        # 벡터 슬롯만 유실 재현(부분 복원, 백엔드 삭제). graph/doc 은 그대로다.
         vec1 = _EnumerableVecWithLookup("pack-1")
         builder._vec = vec1
         n_new, n_chg, n_same, skip2, err2, ids, vu = pack_load.load_nodes_incremental(
             "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-            state["doc_node_spaces"], vec=vec1)
+            state["doc_node_spaces"], vec=vec1, sql=pack_sql)
         assert (n_new, n_chg, n_same, skip2, err2) == (0, 1, 0, 0, 0), (
             f"벡터 유실이 same 으로 방치됐다: new={n_new} chg={n_chg} same={n_same}")
         assert vec1.rows() == {"n1"}, "벡터가 회수되지 않았다"
@@ -106,14 +107,14 @@ class TestNodeVectorOnlyLossRecoveryEnumerable:
         state2 = pack_load.live_pack_state("pack-1", graph, docs, vec1)
         n_new2, n_chg2, n_same2, skip3, err3, _ids2, vu2 = pack_load.load_nodes_incremental(
             "pack-1", f, builder, id_map, state2["nodes"], graph, docs,
-            state2["doc_node_spaces"], vec=vec1)
+            state2["doc_node_spaces"], vec=vec1, sql=pack_sql)
         assert (n_new2, n_chg2, n_same2, skip3, err3, vu2) == (0, 0, 1, 0, 0, 0), (
             f"2회차가 same 으로 수렴하지 않았다: "
             f"{(n_new2, n_chg2, n_same2, skip3, err3, vu2)}")
 
     def test_removing_the_check_would_leave_the_vector_loss_forever(
-            self, live, tmp_path, monkeypatch):
-        """변형(검사 제거) red 확인 — `_live_vec_ids` 를 항상 None 으로
+            self, live, tmp_path, monkeypatch, pack_sql):
+        """변형(검사 제거) red 확인. `_live_vec_ids` 를 항상 None 으로
         되접는 스텁으로 몽키패치해 "검사 삭제" 상태를 흉내낸다. 그러면 벡터
         유실이 same 으로 영구 방치돼야 한다(위 회수 테스트가 실제로 이
         경로에 의존한다는 증거)."""
@@ -130,7 +131,7 @@ class TestNodeVectorOnlyLossRecoveryEnumerable:
         monkeypatch.setattr(pack_load, "_live_vec_ids", lambda vec, pack: None)
         _n, n_chg, n_same, _s, _e, _ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-            state["doc_node_spaces"], vec=vec1)
+            state["doc_node_spaces"], vec=vec1, sql=pack_sql)
         assert (n_chg, n_same) == (0, 1), (
             "검사가 무력화된 변형에서도 same 이 아니면 이 테스트가 회귀를 못 잡는다")
         assert vec1.rows() == set(), "변형에서는 벡터가 회수되면 안 된다(대조군)"
@@ -151,7 +152,7 @@ class TestNodeVectorOnlyLossRecoveryRealSqliteVec:
     """R1 회수가 더블이 아니라 실제 SqliteVecStore에서도 성립함을 보인다."""
 
     def test_vector_only_loss_is_recovered_against_real_sqlite_vec(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         vec = build_vector_store("sqlite-vec", tmp_path)
         assert vec.available, "실 SqliteVecStore가 available=False — 전제 깨짐"
@@ -165,14 +166,14 @@ class TestNodeVectorOnlyLossRecoveryRealSqliteVec:
 
         state = pack_load.live_pack_state("pack-1", graph, docs, vec)
 
-        # 벡터 슬롯만 유실 재현 — 공개 API(delete)로 이 팩의 벡터 행만 지운다.
+        # 벡터 슬롯만 유실 재현. 공개 API(delete)로 이 팩의 벡터 행만 지운다.
         # graph/doc은 그대로다.
         vec.delete(["n1"])
         assert vec.get_by_id("n1") is None, "유실 재현이 실제로 행을 못 지웠다"
 
         n_new, n_chg, n_same, skip2, err2, ids, vu = pack_load.load_nodes_incremental(
             "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-            state["doc_node_spaces"], vec=vec)
+            state["doc_node_spaces"], vec=vec, sql=pack_sql)
         assert (n_new, n_chg, n_same, skip2, err2) == (0, 1, 0, 0, 0), (
             f"실 sqlite-vec에서 벡터 유실이 same 으로 방치됐다: "
             f"new={n_new} chg={n_chg} same={n_same}")
@@ -184,7 +185,7 @@ class TestNodeVectorOnlyLossRecoveryRealSqliteVec:
         state2 = pack_load.live_pack_state("pack-1", graph, docs, vec)
         n_new2, n_chg2, n_same2, skip3, err3, _ids2, vu2 = pack_load.load_nodes_incremental(
             "pack-1", f, builder, id_map, state2["nodes"], graph, docs,
-            state2["doc_node_spaces"], vec=vec)
+            state2["doc_node_spaces"], vec=vec, sql=pack_sql)
         assert (n_new2, n_chg2, n_same2, skip3, err3, vu2) == (0, 0, 1, 0, 0, 0), (
             f"2회차가 same 으로 수렴하지 않았다: "
             f"{(n_new2, n_chg2, n_same2, skip3, err3, vu2)}")
@@ -199,7 +200,7 @@ class TestNodeOptInRecoversViaSingleLookup:
     """열거 불가 백엔드 + `recover_vectors=True` — 단건 조회로 회수한다."""
 
     def test_opt_in_recovers_the_lost_vector_then_converges_to_same(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         vec = _UnenumerableVecWithLookup()
         builder._vec = vec
@@ -210,13 +211,13 @@ class TestNodeOptInRecoversViaSingleLookup:
         assert "n1" in vec.rows, "최초 적재에서 벡터가 안 만들어졌다(전제 깨짐)"
 
         state = pack_load.live_pack_state("pack-1", graph, docs, vec)
-        del vec.rows["n1"]  # 벡터만 유실(부분 삭제) 재현 — graph/doc 은 그대로
+        del vec.rows["n1"]  # 벡터만 유실(부분 삭제) 재현. graph/doc 은 그대로다.
         vec.calls.clear()
         vec.get_by_id_calls.clear()
 
         n_new, n_chg, n_same, skip2, err2, ids, vu = pack_load.load_nodes_incremental(
             "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-            state["doc_node_spaces"], vec=vec, recover_vectors=True)
+            state["doc_node_spaces"], vec=vec, recover_vectors=True, sql=pack_sql)
         assert (n_new, n_chg, n_same, skip2, err2) == (0, 1, 0, 0, 0), (
             f"단건 조회 회수가 chg 경로로 재기록시키지 않았다: "
             f"{(n_new, n_chg, n_same, skip2, err2)}")
@@ -227,7 +228,7 @@ class TestNodeOptInRecoversViaSingleLookup:
         state2 = pack_load.live_pack_state("pack-1", graph, docs, vec)
         n_new2, n_chg2, n_same2, skip3, err3, _ids2, vu2 = pack_load.load_nodes_incremental(
             "pack-1", f, builder, id_map, state2["nodes"], graph, docs,
-            state2["doc_node_spaces"], vec=vec, recover_vectors=True)
+            state2["doc_node_spaces"], vec=vec, recover_vectors=True, sql=pack_sql)
         assert (n_new2, n_chg2, n_same2, skip3, err3, vu2) == (0, 0, 1, 0, 0, 0), (
             f"2회차가 same 으로 수렴하지 않았다: "
             f"{(n_new2, n_chg2, n_same2, skip3, err3, vu2)}")
@@ -308,7 +309,7 @@ class TestNodeOptOutDefaultPreservesBehaviorButFlagsIt:
     않는다. ㉵a(vec=None)의 대조군: `vec`이 있으면 여전히 경고가 난다."""
 
     def test_default_leaves_it_unrecovered_but_counted_and_logged(
-            self, live, tmp_path, caplog):
+            self, live, tmp_path, caplog, pack_sql):
         builder, graph, docs = live
         vec = _UnenumerableVecWithLookup()
         builder._vec = vec
@@ -324,7 +325,7 @@ class TestNodeOptOutDefaultPreservesBehaviorButFlagsIt:
         with caplog.at_level(logging.WARNING, logger="opencrab.pack.load"):
             n_new3, n_chg3, n_same3, skip3, err3, _ids3, vu3 = pack_load.load_nodes_incremental(
                 "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-                state["doc_node_spaces"], vec=vec)  # recover_vectors 기본값(False)
+                state["doc_node_spaces"], vec=vec, sql=pack_sql)  # recover_vectors 기본값(False)
         assert (n_new3, n_chg3, n_same3, skip3, err3) == (0, 0, 1, 0, 0), (
             "recover_vectors 기본값(False)에서 카운트 산출이 달라졌다: "
             f"{(n_new3, n_chg3, n_same3, skip3, err3)}")
@@ -337,7 +338,7 @@ class TestNodeOptOutDefaultPreservesBehaviorButFlagsIt:
         assert vec.get_by_id_calls == [], "opt-out 인데 단건 조회를 시도했다"
 
     def test_opt_out_summary_warning_has_the_right_branch_text(
-            self, live, tmp_path, caplog):
+            self, live, tmp_path, caplog, pack_sql):
         builder, graph, docs = live
         vec = _UnenumerableVecWithLookup()
         builder._vec = vec
@@ -350,7 +351,7 @@ class TestNodeOptOutDefaultPreservesBehaviorButFlagsIt:
         with caplog.at_level(logging.WARNING, logger="opencrab.pack.load"):
             pack_load.load_nodes_incremental(
                 "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-                state["doc_node_spaces"], vec=vec)
+                state["doc_node_spaces"], vec=vec, sql=pack_sql)
         summary = _summary_records(caplog)
         assert len(summary) == 1, (
             f"opt-out 요약 로그는 정확히 1건이어야 한다: "
@@ -444,7 +445,7 @@ class TestNodeVecAccessGatedByPrincipal:
             docs.close()
 
     def test_bound_principal_control_group_recovery_still_fires(
-            self, live, tmp_path, monkeypatch):
+            self, live, tmp_path, monkeypatch, pack_sql):
         """대조군: principal 이 있으면 재배치 뒤에도 R1 회수가 그대로
         동작하고, 열거는 실행당 정확히 1회다."""
         builder, graph, docs = live
@@ -462,10 +463,134 @@ class TestNodeVecAccessGatedByPrincipal:
 
         n_new, n_chg, n_same, skip2, err2, ids, vu = pack_load.load_nodes_incremental(
             "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-            state["doc_node_spaces"], vec=vec1)
+            state["doc_node_spaces"], vec=vec1, sql=pack_sql)
 
         assert enum_calls["n"] == 1, "정상 경로에서 열거가 실행당 1회가 아니다"
         assert (n_new, n_chg, n_same, skip2, err2, vu) == (0, 1, 0, 0, 0, 0), (
             "principal 이 있는 정상 호출에서 R1 회수가 깨졌다")
         assert vec1.rows() == {"n1"}, "벡터가 회수되지 않았다"
         assert ids == {"n1"}
+
+    def test_bound_non_owner_principal_is_blocked_before_vector_access(
+            self, live, tmp_path, monkeypatch, pack_sql):
+        """PR #421 2라운드 리뷰(codex, P2): "same" 판정 행은
+        builder.add_node()의 팩 소유권 authorize()를 거치지 않고 벡터
+        백엔드에 직접 닿는다. 바인딩은 됐지만 이 팩을 소유하지 않은
+        principal이 남의 비공개 팩 벡터 슬롯 존재를 조회할 수 있었다
+        (#143 invariant 7 위반). "바인딩됐지만 비소유"인 이 조합만
+        authorize()에 실제로 도달하는 유일한 실패 경로이므로, 이것이 이번
+        추가의 진짜 역변이 카나리아다.
+
+        `_insert_pack`(ownership.py:242-244)이 visibility를 항상
+        'private'로 고정하므로, 이 fixture가 만드는 `pack-1`은 비공개다.
+        비공개 팩 + 비소유 principal은 `PackForbiddenError`가 아니라
+        `PackNotFoundError`가 난다(#143 불변식 7: 비공개 팩의 존재 자체를
+        비소유자에게 숨긴다, write_gate.py의 authorize() 독스트링).
+        `PackForbiddenError`를 직접 보려면 소유 principal로
+        `set_visibility(..., "public")`을 먼저 불러야 하지만, 이 카나리아의
+        목적(벡터 접근 전에 인가가 막힌다)에는 어느 예외든 동일한 증거라
+        그 추가 단계는 두지 않는다."""
+        builder, graph, docs = live
+        vec0 = _EnumerableVecWithLookup("pack-1")
+        builder._vec = vec0
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        id_map: dict = {}
+        ok, skip, err = pack_load.load_nodes("pack-1", f, builder, id_map)
+        assert (ok, skip, err) == (1, 0, 0), "베이스라인 적재 자체가 실패했다. 전제가 깨졌다"
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec0)
+
+        vec1 = _EnumerableVecWithLookup("pack-1")
+        builder._vec = vec1
+        enum_calls = self._spy_live_vec_ids(monkeypatch)
+        lookup_calls = {"n": 0}
+        real_get_by_id = vec1.get_by_id
+
+        def _spy_get_by_id(doc_id):
+            lookup_calls["n"] += 1
+            return real_get_by_id(doc_id)
+
+        monkeypatch.setattr(vec1, "get_by_id", _spy_get_by_id)
+
+        intruder_id = create_user(pack_sql, "node-vec-intruder", is_local=False)
+        intruder = Principal(user_id=intruder_id, is_local=False, disabled=False)
+        with principal_scope(intruder):
+            with pytest.raises(PackNotFoundError):
+                pack_load.load_nodes_incremental(
+                    "pack-1", f, builder, id_map, state["nodes"], graph, docs,
+                    state["doc_node_spaces"], vec=vec1, sql=pack_sql)
+
+        assert enum_calls["n"] == 0, (
+            "비소유 principal 인데 벡터 열거(_live_vec_ids)가 실행됐다. "
+            "팩 소유권 인가보다 먼저 벡터 백엔드에 닿았다")
+        assert lookup_calls["n"] == 0, (
+            "비소유 principal 인데 단건 조회(get_by_id)가 실행됐다")
+
+    def test_owner_principal_without_sql_raises_value_error(
+            self, live, tmp_path, monkeypatch):
+        """`vec`을 넘기면서 `sql`을 생략하면(#377 2라운드 신규 가드) 소유
+        principal이라도 `ValueError`로 막힌다. `_require_bound_principal()`
+        은 이미 통과한 뒤이므로, 환경이나 바인딩 오류가 먼저 나서 이 가드를
+        못 본다는 우려를 직접 반증한다."""
+        builder, graph, docs = live
+        vec0 = _EnumerableVecWithLookup("pack-1")
+        builder._vec = vec0
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        id_map: dict = {}
+        ok, skip, err = pack_load.load_nodes("pack-1", f, builder, id_map)
+        assert (ok, skip, err) == (1, 0, 0)
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec0)
+
+        vec1 = _EnumerableVecWithLookup("pack-1")
+        builder._vec = vec1
+        enum_calls = self._spy_live_vec_ids(monkeypatch)
+        lookup_calls = {"n": 0}
+        real_get_by_id = vec1.get_by_id
+
+        def _spy_get_by_id(doc_id):
+            lookup_calls["n"] += 1
+            return real_get_by_id(doc_id)
+
+        monkeypatch.setattr(vec1, "get_by_id", _spy_get_by_id)
+
+        with pytest.raises(ValueError, match="sql.*필수"):
+            pack_load.load_nodes_incremental(
+                "pack-1", f, builder, id_map, state["nodes"], graph, docs,
+                state["doc_node_spaces"], vec=vec1)  # sql 생략(None)
+
+        assert enum_calls["n"] == 0, "sql 누락인데 벡터 열거가 실행됐다"
+        assert lookup_calls["n"] == 0, "sql 누락인데 단건 조회가 실행됐다"
+
+    def test_unbound_principal_blocks_opt_in_single_lookup(
+            self, tmp_path, monkeypatch, pack_sql):
+        """P3 보강(codex 1회차): `recover_vectors=True` + 열거 불가 백엔드
+        조합에서도 미바인딩 호출은 `get_by_id` 단건 조회에 닿지 않는다. 이
+        경로는 #377 2라운드 `authorize()` 가드와 무관하다.
+        `_require_bound_principal()`이 이미 막으므로 opt-in 경로도
+        principal 경계 안쪽에 있다는 증거다."""
+        monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+        graph = LocalGraphStore(str(tmp_path / "graph.db"))
+        docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
+        builder = OntologyBuilder(graph, docs, pack_sql)
+
+        vec0 = _UnenumerableVecWithLookup()
+        builder._vec = vec0
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
+        id_map: dict = {}
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            ok, skip, err = pack_load.load_nodes("pack-1", f, builder, id_map)
+        assert (ok, skip, err) == (1, 0, 0), "베이스라인 적재 자체가 실패했다. 전제가 깨졌다"
+        state = pack_load.live_pack_state("pack-1", graph, docs, vec0)
+        del vec0.rows["n1"]  # 벡터만 유실 재현
+        vec0.get_by_id_calls.clear()
+
+        try:
+            with pytest.raises(RuntimeError, match="principal_scope"):
+                pack_load.load_nodes_incremental(
+                    "pack-1", f, builder, id_map, state["nodes"], graph, docs,
+                    state["doc_node_spaces"], vec=vec0, recover_vectors=True)
+            assert vec0.get_by_id_calls == [], (
+                "미바인딩 principal 인데 opt-in 단건 조회(get_by_id)가 실행됐다")
+        finally:
+            graph.close()
+            docs.close()

@@ -52,6 +52,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from opencrab.common.graph_identity import (
     GraphMigrationConflict,
@@ -1775,8 +1776,11 @@ def _require_bound_principal():
     스크립트)의 책임이다.
 
     반환값은 청크 로더가 `write_gate.authorize` 에 넘길 principal 이다(#205).
-    노드·엣지 로더는 종전대로 문장으로만 부른다 — 그쪽 인가는 builder 안에서
-    일어난다.
+    엣지 로더는 종전대로 문장으로만 부른다. 그쪽 인가는 builder 안에서
+    일어난다. 노드 로더 가운데 `load_nodes_incremental`은 다르다(#377
+    2라운드): "same" 판정 행이 builder를 거치지 않고 벡터 백엔드에 직접
+    닿을 수 있어서, 이 반환값을 받아 벡터 접근 직전에 별도로
+    `write_gate.authorize`를 부른다(아래 해당 함수 본문 참고).
     """
     from opencrab.auth import current_principal
 
@@ -1871,6 +1875,7 @@ def load_nodes_incremental(
     doc_node_spaces: dict[str, set[str]],
     *,
     vec=None,
+    sql: Any = None,
     recover_vectors: bool = False,
 ) -> tuple[int, int, int, int, int, set, int]:
     """노드 증분 적재. 라이브와 동일한 행은 완전 스킵(어떤 스토어도 미접촉).
@@ -1880,6 +1885,18 @@ def load_nodes_incremental(
     이유로 명시 파라미터다(#377) — 호출자는 `builder`를 구성할 때 쓴 것과
     동일한 벡터 스토어 인스턴스를 넘겨야 한다. 기본값 `None`은 벡터 축 없는
     배포에서 이 검사 전체를 안전하게 skip한다(아래 R1 설명).
+
+    `sql`(#377 2라운드, PR #421 codex 리뷰): `vec`가 주어질 때만 필수인
+    키워드 전용 인자다. "same" 판정 행은 `builder.add_node()`(팩 소유권
+    `authorize()`가 도는 자리)에 닿지 않고 벡터 백엔드를 직접 건드리므로,
+    이 함수 진입부에서 별도로 `authorize(sql, principal, pack_name)`을
+    부른다. 그래야 바인딩은 됐지만 이 팩을 소유하지 않은 principal이
+    타인의 비공개 팩 벡터 슬롯 존재 여부를 조회하는 경로가 막힌다.
+    `vec is None`(벡터 축 없는 배포)이면 이 인가 자체가 필요 없으므로
+    `sql`도 생략 가능하다. `vec`는 주어졌는데 `sql`이 없으면 `ValueError`로
+    즉시 실패한다(아래 본문). 호출자는 `builder`가 물린 것과 동일한
+    등록부 `SQLStore` 인스턴스를 넘겨야 한다(청크 축의 `sql` 계약과 같은
+    레지스트리 동일성 요구).
 
     `doc_node_spaces`는 F4-b `live_pack_state` 의 반환이다 — **필수 인자**다.
     노드가 이번 적재에서 space X 로 확인됐는데 doc_nodes 에 다른 space Y 의 행이
@@ -1989,7 +2006,22 @@ def load_nodes_incremental(
     # 먼저 실패하면 그 오류가 대신 난다(기존 동작, 이 수정이 바꾸지
     # 않음). 게이트: tests/test_pack_load_r15_node_vec_gates.py::
     # TestNodeVecAccessGatedByPrincipal.
-    _require_bound_principal()
+    principal = _require_bound_principal()
+
+    # PR #421 2라운드 리뷰(codex, P2, 2026-09-28): "same" 판정 행은
+    # builder.add_node()(팩 소유권 authorize()가 도는 자리)에 안 닿고
+    # 아래 _live_vec_ids로 벡터 백엔드를 직접 건드린다. 바인딩은 됐지만
+    # 이 팩을 소유하지 않은 principal이 타인의 비공개 팩 벡터 슬롯 존재를
+    # 조회할 수 있었다(#143 invariant 7 위반). vec 접근 직전에만 건다
+    # (vec is None 이면 벡터 축 자체가 없으므로 이 인가도 불필요, 범위
+    # 밖). 게이트: tests/test_pack_load_r15_node_vec_gates.py::
+    # TestNodeVecAccessGatedByPrincipal.
+    if vec is not None:
+        if sql is None:
+            raise ValueError(
+                "load_nodes_incremental: vec가 주어지면 sql도 필수다"
+                "(팩 소유권 인가, #377 2라운드)")
+        authorize(sql, principal, pack_name)
 
     # R1(#377, load_chunks_incremental의 #142 재리뷰 패턴 이식): 그래프/문서가
     # 라이브와 같아도 벡터만 유실됐을 수 있다. 열거 가능 백엔드에서는
