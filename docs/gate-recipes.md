@@ -41,8 +41,8 @@ python3 -m venv .venv
 `psycopg2-binary`만 설치하고 `psycopg`(v3)는 설치하지 않는다. SQLAlchemy
 2.1부터 드라이버를 명시하지 않은 `postgresql://` URL의 기본 DBAPI가
 psycopg2에서 psycopg로 바뀌었으므로, 정규화 없이 그런 URL로
-`create_engine()`을 호출하면 설치된 SQLAlchemy 버전과 무관하게
-`ModuleNotFoundError: No module named 'psycopg'`가 날 수 있다.
+`create_engine()`을 호출하면 PostgreSQL 서버가 실제로 떠 있는지와
+무관하게 `ModuleNotFoundError: No module named 'psycopg'`가 날 수 있다.
 `opencrab/stores/_pg_url.py`의 `normalize_pg_url()`이 이 저장소의 모든
 `create_engine()` 호출부(프로덕션 스토어, `scripts/` 아래 CLI, `tests/conftest.py`의
 `OPENCRAB_PG_TEST_URL`)에서 드라이버 미명시 URL을 `postgresql+psycopg2://`로
