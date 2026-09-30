@@ -23,6 +23,25 @@ from ._registry import AccessTier, safe_tool_error, tool
 
 logger = logging.getLogger(__name__)
 
+_DECODE_ERROR_NOTE = (
+    "Rows whose stored properties are corrupt (the store marks them "
+    "property_decode_error) are withheld, never returned as empty entries. "
+    "When any were withheld the response carries property_decode_error_count "
+    "(absent otherwise); a larger limit does not return them. (#428)"
+)
+
+
+def _drop_decode_errors(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """The single rule for marker-bearing store rows in MCP list responses
+    (#428): rows the store marked ``property_decode_error`` are removed, and
+    the caller gets the number removed. A corrupt node row has no readable
+    node_id (the id lives in its properties), so surfacing it would still
+    hand back an unidentifiable entry. Stores without the marker (Neo4j's
+    native properties) never set it, so this is a no-op there.
+    """
+    clean = [row for row in rows if not row.get("property_decode_error")]
+    return clean, len(rows) - len(clean)
+
 
 @tool(
     "ontology_manifest",
@@ -335,7 +354,12 @@ def ontology_add_edge(
 @tool(
     "ontology_get_node",
     {
-        "description": "Fetch a single node by node_id regardless of type or space.",
+        "description": (
+            "Fetch a single node by node_id regardless of type or space. When the "
+            "stored properties are corrupt the response still has found=true and "
+            "also carries property_decode_error=true; its properties are not "
+            "trustworthy. (#428)"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -383,7 +407,7 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
     # data.
     node_type = result.get("node_type", "")
     n_space = result.get("space", "")
-    return {
+    response: dict[str, Any] = {
         "found": True,
         "node_id": node_id,
         "node_type": node_type,
@@ -391,6 +415,11 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
         "node": result,
         "properties": result,
     }
+    # #428: the store's marker also sits inside node/properties; surface it
+    # at the top level so a caller does not read {} as a real empty node.
+    if result.get("property_decode_error"):
+        response["property_decode_error"] = True
+    return response
 
 
 @tool(
@@ -404,8 +433,8 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
             "the TRUE count of all matching nodes -- it is NOT capped by `limit` and can be "
             "larger than the number of `nodes` actually returned; if `total` exceeds "
             "len(nodes), the page was truncated and a larger `limit` will return more. Row "
-            "order is not guaranteed. Useful for inspecting a pack's contents after ingest."
-        ),
+            "order is not guaranteed. Useful for inspecting a pack's contents after ingest. "
+        ) + _DECODE_ERROR_NOTE,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -534,7 +563,9 @@ def ontology_list_nodes(
     # Graph store: indexed/native pack_id + space filter → correct rows
     # before limit (all three backends implement the same contract, see
     # _graph_protocol.py#export_nodes).
-    raw = graph_store.export_nodes_scoped(effective, limit=limit, space=cleaned_space)
+    raw, decode_errors = _drop_decode_errors(
+        graph_store.export_nodes_scoped(effective, limit=limit, space=cleaned_space)
+    )
     # export_nodes returns [{"props": dict, "labels": [str]}, ...]
     # normalise to a stable shape. The space check below is now redundant
     # with the backend's own filter (kept as cheap defense-in-depth, same
@@ -557,12 +588,15 @@ def ontology_list_nodes(
             "properties": props,
         })
 
-    return {
+    response: dict[str, Any] = {
         "nodes": nodes,
         "total": total,
         "space_filter": space,
         "pack_id_filter": pack_id,
     }
+    if decode_errors:
+        response["property_decode_error_count"] = decode_errors
+    return response
 
 
 @tool(
@@ -570,8 +604,8 @@ def ontology_list_nodes(
     {
         "description": (
             "List edges, optionally filtered by pack_id. "
-            "Useful for inspecting graph relationships after ingest."
-        ),
+            "Useful for inspecting graph relationships after ingest. "
+        ) + _DECODE_ERROR_NOTE,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -626,8 +660,15 @@ def ontology_list_edges(
     # is a wiring defect and must surface as one, so AttributeError is
     # re-raised rather than folded into the operational-error branch below.
     try:
-        edges = graph.export_edges_scoped(effective, limit=limit)
-        return {"edges": edges, "total": len(edges), "pack_id_filter": pack_id}
+        edges, decode_errors = _drop_decode_errors(
+            graph.export_edges_scoped(effective, limit=limit)
+        )
+        response: dict[str, Any] = {
+            "edges": edges, "total": len(edges), "pack_id_filter": pack_id,
+        }
+        if decode_errors:
+            response["property_decode_error_count"] = decode_errors
+        return response
     except AttributeError:
         raise
     except Exception as exc:
