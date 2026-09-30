@@ -531,20 +531,41 @@ def test_json_truthy_text_json5_style_row_is_a_known_limitation_when_simulated_o
     conn.close()
 
 
-def test_genuinely_malformed_row_excluded_regardless_of_json5_support(monkeypatch):
+def test_genuinely_malformed_row_excluded_when_json5_support_is_simulated_off(monkeypatch):
     """No-regression check (rev.4, 4-0 introduction): a truly broken row must
-    be NULLed out by json_get_safe whether or not this run simulates JSON5
-    support -- 4-0 changes which json_valid() arity is used, never whether a
-    genuinely malformed row is judged invalid."""
+    be NULLed out by json_get_safe under the 1-arg strict fallback, which
+    every SQLite build supports -- always exercised, no skip needed."""
     import opencrab.stores._sql_dialect as dialect_mod
 
     conn = _malformed_properties_db()
-    for supported in (True, False):
-        monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", supported)
-        expr = SQLITE.json_get_safe("properties", "pack_id")
-        rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
-        assert rows["bad"] is None, f"genuinely malformed row leaked through (supported={supported})"
-        assert rows["good"] == "P"
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", False)
+    expr = SQLITE.json_get_safe("properties", "pack_id")
+    rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+    assert rows["bad"] is None, "genuinely malformed row leaked through (supported=False)"
+    assert rows["good"] == "P"
+    conn.close()
+
+
+def test_genuinely_malformed_row_excluded_when_json5_support_is_simulated_on(monkeypatch):
+    """No-regression check (rev.4, 4-0 introduction), JSON5-permissive branch:
+    only meaningful when this build's json_valid genuinely accepts the 2-arg
+    form -- forcing True on a build that lacks it renders SQL this build
+    cannot execute at all (an arity mismatch is a capability gap, not a
+    behavior difference under test), so that case is skipped rather than
+    forced. A prior version of this test forced both branches unconditionally
+    in one function and would raise OperationalError (not an assertion
+    failure) on any SQLite build lacking the 2-arg json_valid overload."""
+    import opencrab.stores._sql_dialect as dialect_mod
+
+    if not sqlite_json5_valid_supported():
+        pytest.skip("this SQLite build has no JSON5 2-arg json_valid to simulate positively")
+
+    conn = _malformed_properties_db()
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", True)
+    expr = SQLITE.json_get_safe("properties", "pack_id")
+    rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+    assert rows["bad"] is None, "genuinely malformed row leaked through (supported=True)"
+    assert rows["good"] == "P"
     conn.close()
 
 
