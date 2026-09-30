@@ -340,7 +340,7 @@ URI가 붙은 레코드(`uris` API로 만들어진 레코드 — 이 시스템�
 
 **삭제 진입점의 소유권 게이트(#434).** `delete_pack` 과 `incremental_finalize` 는 키워드
 전용 필수 `sql`(등록부 `SQLStore`)을 받고, 진입에서 `require_live_data`, 바인딩된
-principal 확인, 소유권 검사 순으로 건 뒤에야 잠금 파일·저널·스토어에 닿는다.
+principal 확인, 소유권 검사 순으로 건 뒤에야 잠금 파일, 저널, 스토어에 닿는다.
 `incremental_finalize` 는 쓰기 진입점과 같은 `write_gate.authorize`(ready 만)를 쓴다.
 `delete_pack` 은 `write_gate.authorize_delete` 를 쓰고 잠금을 잡은 뒤 저널을 읽기 전에
 한 번 더 부른다. 소유자는 팩 상태와 무관하게 지울 수 있다. `creating`/`partial` 팩의

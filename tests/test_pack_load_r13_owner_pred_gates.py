@@ -30,7 +30,7 @@ from opencrab.auth import Principal, principal_scope
 from opencrab.pack import load as pack_load
 from opencrab.pack.ownership import create_pack
 from opencrab.stores._sql_dialect import POSTGRES, SQLITE
-from tests.test_pack_load import (  # noqa: F401 — 실 스토어 픽스처 재사용
+from tests.test_pack_load import (  # noqa: F401 (실 스토어 픽스처 재사용)
     _LIVE_TEST_USER,
     _NoVec,
     live,

@@ -303,6 +303,20 @@ class TestIncrementalFinalizeGate:
 
 
 class TestAuthorizeDelete:
+    def test_decision_uses_exactly_one_registry_read(self, env, monkeypatch):
+        """A second read would reopen a window between the mask and the owner check."""
+        sql, *_ = env
+        begin_pack_creation(sql, OWNER, "inc")
+        import opencrab.pack.ownership as own
+
+        calls = []
+        real = own.get_pack
+        monkeypatch.setattr(own, "get_pack", lambda *a, **k: (calls.append(a), real(*a, **k))[1])
+        with pytest.raises(PackNotFoundError):
+            authorize_delete(sql, _principal(OTHER), "inc")
+        assert authorize_delete(sql, _principal(OWNER), "inc")["pack_id"] == "inc"
+        assert len(calls) == 2, f"expected one read per call, saw {len(calls)}"
+
     def test_paths_for_non_owner_to_reach_delete_are_zero(self, env):
         """Every (status, visibility) for a non-owner raises; nothing returns a row."""
         sql, *_ = env

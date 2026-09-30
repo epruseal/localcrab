@@ -1306,7 +1306,7 @@ def delete_pack(
     저널이 있으면 기본은 **탐지·보고뿐**이다(`DeletePackJournalPending`, 무쓰기).
     `resume=True` 를 명시해야 완주한다. 저널 생성 시점에 팩 동일성 스냅샷(레지스트리
     행의 `created_at`)을 남겼다면, 재개 시점에 `created_at` 이 다르면(부정 신호)
-    `resume=True` 라도 `DeletePackJournalConflict` 로 거부한다. 자동 재개는 없다 —
+    `resume=True` 라도 `DeletePackJournalConflict` 로 거부한다. 자동 재개는 없다.
     모든 재개는 운영자의 명시 확인을 요구한다.
 
     **소유권 인가(#434).** `sql` 은 키워드 전용 필수 인자다(등록부 `SQLStore`).
@@ -1316,6 +1316,8 @@ def delete_pack(
     회수하는 운영자 경로다). 비소유자는 공개 여부와 무관하게 미완성 팩을 못 보고
     (`PackNotFoundError`), ready 팩은 지우지 못한다. 등록부 행이 사라진 팩의 재개는
     이제 `DeletePackJournalConflict` 가 아니라 `PackNotFoundError` 로 먼저 끝난다.
+    호출자는 넘긴 스토어가 속한 등록부 `SQLStore` 를 `sql` 로 넘긴다. 이 함수는 두
+    대상이 같은 팩 집합을 가리키는지 확인하지 않는다(다른 인가 축과 같은 호출자 책임).
     """
     require_live_data("delete_pack")
     principal = _require_bound_principal()

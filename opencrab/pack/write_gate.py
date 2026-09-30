@@ -221,19 +221,19 @@ def authorize_delete(sql: Any, principal: Principal, pack_id: str) -> dict[str, 
             "pack registry unavailable; refusing the delete (ownership cannot "
             "be verified)"
         )
-    from opencrab.pack.ownership import (
-        PACK_STATUSES,
-        PackNotFoundError,
-        assert_writable,
-        get_pack,
-    )
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, get_pack
 
+    # One registry read decides every branch. A second read (for example via
+    # ``assert_writable``) would let a row change between the two reads turn
+    # the mask below into ``PackForbiddenError`` for an incomplete pack.
     row = get_pack(sql, pack_id)
-    if row is None or (
-        row["status"] != PACK_STATUS_READY and row["owner_id"] != principal.user_id
-    ):
+    if row is None:
         raise PackNotFoundError(pack_id)
-    return assert_writable(sql, principal, pack_id, allowed_statuses=PACK_STATUSES)
+    if row["owner_id"] == principal.user_id:
+        return row
+    if row["status"] != PACK_STATUS_READY or row["visibility"] == "private":
+        raise PackNotFoundError(pack_id)
+    raise PackForbiddenError(pack_id)
 
 
 def authorize_fork_copy(sql: Any, principal: Principal, pack_id: str) -> dict[str, Any]:

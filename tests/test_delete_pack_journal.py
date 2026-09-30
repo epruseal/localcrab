@@ -640,7 +640,7 @@ class TestDefaultResumeRequiresExplicitConfirmation:
         self, live, tmp_path
     ):
         """[리드 재정 5 / #434] 저널 생성 시점엔 레지스트리 행이 있었는데 재개
-        시점에 사라졌다 — `resume=True` 를 줘도 거부한다. 소유권 게이트가 저널
+        시점에 사라졌다. `resume=True` 를 줘도 거부한다. 소유권 게이트가 저널
         동일성 검사보다 먼저 행 부재를 잡으므로 예외는 `PackNotFoundError` 다
         (`DeletePackJournalConflict` 가 아니다).
 
@@ -755,12 +755,12 @@ class TestDefaultResumeRequiresExplicitConfirmation:
         self, live, tmp_path
     ):
         """저널에 동일성 스냅샷이 없으면(`"pack_identity": None`) 비교 근거 자체가
-        없다 — 없는 근거로 거부하지 않는다. #434 이후 `sql` 은 필수라 "sql 없이
+        없다. 없는 근거로 거부하지 않는다. #434 이후 `sql` 은 필수라 "sql 없이
         쓴 저널" 대신 스냅샷이 null 인 저널을 손으로 써서 재현한다. `resume=True`
         만으로 `done=False` 축을 완주한다.
 
         역변이: 스냅샷 null 을 "동일성 불확실 = 항상 거부" 로 구현하면, 이 재개
-        경로가 막힌다 — 이 테스트가 그 과잉 차단을 잡는다.
+        경로가 막힌다. 이 테스트가 그 과잉 차단을 잡는다.
         """
         graph, docs = live
         node_ids = ["n1", "n2"]
@@ -1982,8 +1982,8 @@ class TestLockContentionIsReallyObserved:
 # 회귀 대조 — 하위호환(sql 없이 호출)은 이 파일 신설 이후에도 그대로 성립해야 한다.
 # ---------------------------------------------------------------------------
 
-class TestBackwardCompatibilityWithoutSql:
-    def test_sql_omitted_still_deletes_and_returns_the_same_tuple_shape(self, live, tmp_path):
+class TestDeleteWithOwnedRegistryKeepsTupleShape:
+    def test_owner_delete_returns_the_same_tuple_shape(self, live, tmp_path):
         """#434 이후 `sql` 은 필수 키워드다. 소유자가 등록된 팩을 지우면 예전과
         같은 3-튜플 모양을 돌려준다."""
         graph, docs = live
