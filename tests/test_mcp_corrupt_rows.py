@@ -2,9 +2,9 @@
 ``property_decode_error`` as empty nodes or edges.
 
 Node corruption is a duplicate-key JSON object: still valid JSON (so the
-pack scope predicate reaches the row) but rejected by ``decode_properties``.
-Malformed JSON cannot be written to a node here (the SQLite pack index
-refuses it), and the safe scope predicate would exclude it anyway.
+pack scope predicate reaches the row), but ``decode_properties`` rejects it.
+The SQLite pack index rejects malformed JSON in node updates here. The safe
+scope predicate also excludes malformed JSON.
 """
 
 from __future__ import annotations
