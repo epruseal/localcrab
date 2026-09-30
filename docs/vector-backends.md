@@ -85,7 +85,7 @@ sqlite-vec 표준 차원(KURE 1024d)과 맞지 않기 때문이다. sqlite-vec�
 - **단점**
   - **전역(pack 미지정) 브루트포스 검색이 느리다** — 실측 p95 약 868ms(179k×1024d,
     CPU/메모리대역폭 바운드). 전역 고속화는 **binary 2단계 양자화(`VECTOR_ANN=binary`,
-    아래 §4.1)로 해결** — 구현 완료.
+    아래 §4.1)로 해결**, 구현 완료.
   - **KURE(1024d) 전용** — minilm(384d)과 조합 불가(위 §2 참고).
   - pre-v1(v0.1.x) 라이브러리 — 파괴적 변경 가능성.
   - metadata 필터는 vec0 제약(컬럼 최대 16개, `= != < <= > >=` 6연산자, partition key
@@ -205,7 +205,7 @@ opencrab serve
 - **단점**
   - 상시 서버 프로세스(RPi5에서 SQLite/Chroma 인프로세스 대비 자원 점유 증가),
     HNSW 빌드 시 CPU/메모리 스파이크(`maintenance_work_mem`/`max_parallel_maintenance_workers`
-    튜닝 필요 — 아래 §4.3 인프라 주의 참고).
+    튜닝 필요. 아래 §4.3 인프라 주의 참고).
   - `EMBEDDING_BACKEND=local`(minilm)과 조합 불가(sqlite-vec와 동일 가드, `ValueError`).
 - **pack_id 전용 컬럼(JSONB GIN 미채택)**: `pack_id`를 `metadata` JSONB에 묻지 않고
   전용 컬럼 + btree 인덱스로 분리했다 — 프리플라이트 실증상 JSONB GIN 대비 이점이 없었고,

@@ -37,7 +37,7 @@ LocalCrab은 `STORAGE_MODE` 환경변수로 네 가지 백엔드를 선택한다
 graph/vector/doc 3스토어는 factory가 `POSTGRES_URL`당 1회 생성해 캐시하는 **공유
 SQLAlchemy 엔진**(`_get_pg_engine`, 단일 커넥션 풀)을 주입받는다. `SQLStore`만
 기존 시그니처(`url` 인자)를 유지하기 위해 자체 엔진을 연다(같은 DB를 향하지만
-별도 풀). 설치: `pip install ".[pg]"`. 설계·실측:
+별도 풀). 설치: `pip install ".[pg]"`. 설계와 실측:
 `docs/vector-backends.md` pgvector 절.
 
 **운영 권장 구성**: 기본은 `local` — 4스토어(graph/doc/sql/vector)를 SQLite 단일
@@ -720,7 +720,7 @@ make_vector_store(settings)
   쿼리 세션 `hnsw.ef_search=PG_EF_SEARCH` 기본 500. `docs/vector-backends.md` §4.2 Phase 2 게이트 재측정으로
   150→500 상향). `EMBEDDING_BACKEND=local`과 조합 시 ValueError(sqlite-vec와 동일 가드).
   전역 검색도 HNSW로 179,784건 전량 실측 p95 24.61ms라 sqlite-vec의 binary 2단계 같은
-  별도 가속 불필요. 설계·실측: `docs/vector-backends.md` §4.2.
+  별도 가속 불필요. 설계와 실측: `docs/vector-backends.md` §4.2.
 
 모드×옵션 전체 매트릭스는 `docs/vector-backends.md` 참고.
 

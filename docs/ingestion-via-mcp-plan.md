@@ -6,7 +6,7 @@
 
 범위 확정: `pack_purge`(삭제) · `pack_ingest_chunks`(청크 배치) **두 신규 MCP write 도구 신설 포함**. `--fresh`(purge-replace)까지 MCP 무중단으로 달성한다.
 
-관련 문서: `[[vector-backends]]` (3-백엔드 매트릭스·기본값 해석 규칙)
+관련 문서: `[[vector-backends]]` (3-백엔드 매트릭스와 기본값 해석 규칙)
 
 ---
 
@@ -78,7 +78,7 @@ VECTOR_BACKEND 명시됨?
 - 로더가 스토어를 직접 열지 않게 하여, 스토어 API 변경 시 손봐야 할 지점을 하나(MCP)로 좁힌다.
 
 **비목표**
-- 스토어 백엔드 교체 자체(Chroma → sqlite-vec/pgvector). → `docs/vector-backends.md`에서 다룬다. 이미 마이그레이션 스크립트가 존재한다(§9).
+- 스토어 백엔드 교체 자체(Chroma에서 sqlite-vec/pgvector로). `docs/vector-backends.md`에서 다룬다. 이미 마이그레이션 스크립트가 존재한다(§9).
 - 임베딩 모델/청킹 전략 변경.
 - MCP 인증 체계 재설계 (기존 Bearer 토큰 재사용).
 - `write.lock`을 백엔드별로 조건부화(pg MVCC 활용)하는 것 — §1.3에서 향후 과제로만 기록.

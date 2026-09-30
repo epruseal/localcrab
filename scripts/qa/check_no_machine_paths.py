@@ -153,10 +153,7 @@ def main() -> int:
         return 1
 
     if missing_deferred:
-        print(
-            "기록된 보류 위반이 저장소에서 사라졌다. "
-            "DEFERRED_VIOLATIONS에서 해당 쌍을 지운다:"
-        )
+        print("기록된 보류 위반이 저장소에서 사라졌다. DEFERRED_VIOLATIONS에서 해당 쌍을 지운다:")
         for path, matched in sorted(missing_deferred):
             print(f"  {path}: {matched!r}")
         return 1

@@ -309,7 +309,7 @@ class Settings(BaseSettings):
         # Literal["", "binary"] — pydantic-settings 호환을 위해 str 사용
     )
     # binary 2단계의 coarse 후보 수 C (recall 튜닝 노브). C↑ → exact 근접·느려짐.
-    # recall@10 ≥ 0.95 게이트를 통과하는 최소값을 벤치로 채택(docs/vector-backends.md §4.1). vec0 k 상한
+    # recall@10 >= 0.95 게이트를 통과하는 최소값을 벤치로 채택(docs/vector-backends.md §4.1). vec0 k 상한
     # (4096)으로 클램프됨.
     vector_ann_coarse_k: int = Field(default=512, alias="VECTOR_ANN_COARSE_K")
 

@@ -690,7 +690,7 @@ class SqliteVecStore(_SqliteConnMixin):
           exactly the large-scope pack fallback (``pack_scope`` set, issue
           #147 §3.4(c) — ``query()`` clears ``pack_values`` above
           ``_PACK_KNN_MAX`` but the caller is still, structurally, pack-only)
-          binary 2-stage ANN (docs/vector-backends.md §4.1): in-RAM bit-hamming coarse → int8
+          binary 2-stage ANN (docs/vector-backends.md §4.1): in-RAM bit-hamming coarse, then int8
           rerank → exact float refinement of the top ~3n. ``pack_scope``, when
           given, is ALSO applied at the coarse-candidate stage (see
           ``_knn_bit_rerank``) — without that, every query above
