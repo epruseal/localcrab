@@ -113,7 +113,10 @@ def test_list_edges_drops_corrupt_edge_and_reports_count(graph, sql):
     _corrupt_edge(graph, "bad-1")
     res = _call(ontology_list_edges, graph, sql)
     assert res["total"] == 1
-    assert [e["relation"] for e in res["edges"]] == ["raises"]
-    assert res["edges"][0]["rel_props"] is not None
+    survivor = next(
+        e for e in clean["edges"] if e["source_props"].get("node_id") == "good-1"
+        or e["source_props"].get("id") == "good-1"
+    )
+    assert res["edges"] == [survivor]
     assert not any(e.get("property_decode_error") for e in res["edges"])
     assert res["property_decode_error_count"] == 1
