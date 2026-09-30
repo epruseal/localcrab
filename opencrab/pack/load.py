@@ -1260,7 +1260,7 @@ def delete_pack(
     docs,
     vec,
     *,
-    sql=None,
+    sql,
     resume: bool = False,
     lock_timeout: float | None = None,
 ) -> tuple[int, int, int | None]:
@@ -2921,6 +2921,8 @@ def incremental_finalize(
     force_delete: bool,
     nodes_total: int,
     chunks_total: int,
+    *,
+    sql,
 ) -> dict:
     """증분 삭제 + 3원 대사. live는 live_pack_state()의 반환 dict.
 

@@ -106,7 +106,12 @@ import pytest
 
 from opencrab.pack import delete_journal
 from opencrab.pack import load as pack_load
-from opencrab.pack.ownership import create_pack, delete_pack_row, get_pack
+from opencrab.pack.ownership import (
+    PackNotFoundError,
+    create_pack,
+    delete_pack_row,
+    get_pack,
+)
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 from opencrab.stores.sql_store import SQLStore
@@ -171,6 +176,21 @@ def _seed_pack(graph, docs, tmp_path, pack_name: str, node_ids: list[str]):
     with principal_scope(principal):
         builder = OntologyBuilder(graph, docs, pack_sql)
         pack_load.load_nodes(pack_name, f, builder, {})
+
+
+def _registry(tmp_path):
+    """팩 레지스트리 `SQLStore`(`_seed_pack` 이 행을 만드는 같은 파일)."""
+    return SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
+
+
+def _delete(pack_name, graph, docs, vec, **kwargs):
+    """`delete_pack` 을 `_OWNER` 주체에 묶어 부른다(#434 소유권 게이트).
+    `sql=` 은 호출부가 반드시 넘긴다(필수 키워드)."""
+    from opencrab.auth import Principal, principal_scope
+
+    principal = Principal(user_id=_OWNER, is_local=True, disabled=False)
+    with principal_scope(principal):
+        return pack_load.delete_pack(pack_name, graph, docs, vec, **kwargs)
 
 
 def _live_node_ids(graph, node_ids: list[str]) -> set[str]:
@@ -522,7 +542,7 @@ class TestDefaultResumeRequiresExplicitConfirmation:
 
         import unittest.mock as mock
         with mock.patch.object(graph, "delete_node", side_effect=_fail_for_e2):
-            pack_load.delete_pack("explicit-pack", graph, docs, _NoVec())  # 1회차: graph 축 부분 실패
+            _delete("explicit-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))  # 1회차: graph 축 부분 실패
 
         before = _live_node_ids(graph, node_ids)
         assert before == {"e2"}
@@ -544,7 +564,7 @@ class TestDefaultResumeRequiresExplicitConfirmation:
         with mock.patch.object(docs, "delete_node_doc", side_effect=_counted_doc), \
              mock.patch.object(graph, "delete_node", side_effect=_counted_graph):
             with pytest.raises(delete_journal.DeletePackJournalPending) as exc_info:
-                pack_load.delete_pack("explicit-pack", graph, docs, _NoVec())
+                _delete("explicit-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
 
         assert doc_calls == [] and graph_calls == [], (
             "resume 플래그 없이 호출했는데 스토어 축이 실행됐다 — 기본은 무쓰기 보고여야 한다"
@@ -592,12 +612,12 @@ class TestDefaultResumeRequiresExplicitConfirmation:
 
         import unittest.mock as mock
         with mock.patch.object(graph, "delete_node", side_effect=_fail_for_r2):
-            pack_load.delete_pack(  # 1회차: graph 축 부분 실패로 저널만 남긴다
-                "vecpendingfail-pack", graph, docs, _NoVec())
+            _delete(  # 1회차: graph 축 부분 실패로 저널만 남긴다
+                "vecpendingfail-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
 
         vec = _AvailableRaisesAlways()
         with pytest.raises(delete_journal.DeletePackJournalPending) as exc_info:
-            pack_load.delete_pack("vecpendingfail-pack", graph, docs, vec)
+            _delete("vecpendingfail-pack", graph, docs, vec, sql=_registry(tmp_path))
 
         assert "미확인" in str(exc_info.value), (
             "available 읽기 실패로 벡터 카운트를 못 냈는데 안내 문구에 "
@@ -607,11 +627,13 @@ class TestDefaultResumeRequiresExplicitConfirmation:
     def test_resume_flag_with_vanished_registry_row_still_refuses_and_writes_nothing(
         self, live, tmp_path
     ):
-        """[리드 재정 5] 저널 생성 시점엔 레지스트리 행이 있었는데 재개 시점에
-        사라졌다 — `resume=True` 를 줘도 확실한 부정 신호이므로 거부한다.
+        """[리드 재정 5 / #434] 저널 생성 시점엔 레지스트리 행이 있었는데 재개
+        시점에 사라졌다 — `resume=True` 를 줘도 거부한다. 소유권 게이트가 저널
+        동일성 검사보다 먼저 행 부재를 잡으므로 예외는 `PackNotFoundError` 다
+        (`DeletePackJournalConflict` 가 아니다).
 
         역변이: `resume=True` 를 "행 존재 검사를 생략해도 된다" 로 구현하면, 이
-        테스트의 `DeletePackJournalConflict` 단언이 잡는다(스토어 무변형까지
+        테스트의 `PackNotFoundError` 단언이 잡는다(스토어와 저널 무변형까지
         같이 확인한다).
         """
         graph, docs = live
@@ -632,18 +654,23 @@ class TestDefaultResumeRequiresExplicitConfirmation:
             return real_delete_node(node_type, node_id)
 
         with mock.patch.object(graph, "delete_node", side_effect=_fail_for_v2):
-            pack_load.delete_pack("vanish-pack", graph, docs, _NoVec(), sql=pack_sql)  # 저널에 동일성 스냅샷 기록
+            _delete("vanish-pack", graph, docs, _NoVec(), sql=pack_sql)  # 저널에 동일성 스냅샷 기록
 
         # 슬롯 소멸을 흉내낸다 — 오늘 코드에서 유일한 삭제 경로(only_status 없이 강제).
         delete_pack_row(pack_sql, "vanish-pack", _OWNER)
         assert get_pack(pack_sql, "vanish-pack") is None
 
         before = _live_node_ids(graph, node_ids)
-        with pytest.raises(delete_journal.DeletePackJournalConflict):
-            pack_load.delete_pack("vanish-pack", graph, docs, _NoVec(), sql=pack_sql, resume=True)
+        journal_before = delete_journal.load_journal(tmp_path, "vanish-pack")
+        assert journal_before is not None
+        with pytest.raises(PackNotFoundError):
+            _delete("vanish-pack", graph, docs, _NoVec(), sql=pack_sql, resume=True)
         after = _live_node_ids(graph, node_ids)
         assert after == before, (
             f"레지스트리 행 소멸인데 resume=True 에도 행이 바뀌었다: before={before} after={after}"
+        )
+        assert delete_journal.load_journal(tmp_path, "vanish-pack") == journal_before, (
+            "레지스트리 행 소멸 거부인데 저널이 바뀌었다"
         )
 
     def test_resume_flag_with_differing_created_at_still_refuses_and_writes_nothing(
@@ -674,7 +701,7 @@ class TestDefaultResumeRequiresExplicitConfirmation:
 
         before = _live_node_ids(graph, node_ids)
         with pytest.raises(delete_journal.DeletePackJournalConflict):
-            pack_load.delete_pack("mismatch-pack", graph, docs, _NoVec(), sql=pack_sql, resume=True)
+            _delete("mismatch-pack", graph, docs, _NoVec(), sql=pack_sql, resume=True)
         after = _live_node_ids(graph, node_ids)
         assert after == before, (
             f"created_at 불일치인데 resume=True 에도 행이 바뀌었다: before={before} after={after}"
@@ -709,16 +736,19 @@ class TestDefaultResumeRequiresExplicitConfirmation:
             },
         })
 
-        pack_load.delete_pack("match-pack", graph, docs, _NoVec(), sql=pack_sql, resume=True)
+        _delete("match-pack", graph, docs, _NoVec(), sql=pack_sql, resume=True)
         assert _live_node_ids(graph, node_ids) == set()
 
-    def test_resume_flag_without_sql_skips_identity_check_and_completes(self, live, tmp_path):
-        """저널 생성 시점에 `sql` 이 안 주어졌으면 비교 근거 자체가 없다 — 없는
-        근거로 거부하지 않는다. `resume=True` 만으로 `done=False` 축을 완주한다.
+    def test_resume_with_null_identity_snapshot_skips_identity_check_and_completes(
+        self, live, tmp_path
+    ):
+        """저널에 동일성 스냅샷이 없으면(`"pack_identity": None`) 비교 근거 자체가
+        없다 — 없는 근거로 거부하지 않는다. #434 이후 `sql` 은 필수라 "sql 없이
+        쓴 저널" 대신 스냅샷이 null 인 저널을 손으로 써서 재현한다. `resume=True`
+        만으로 `done=False` 축을 완주한다.
 
-        역변이: `sql` 부재를 "동일성 불확실 = 항상 거부" 로 구현하면, `sql` 을
-        아예 안 쓰는 기존 다수 호출부(§ 하위호환 클래스 참고)의 재개 경로가
-        전부 막힌다 — 이 테스트가 그 과잉 차단을 잡는다.
+        역변이: 스냅샷 null 을 "동일성 불확실 = 항상 거부" 로 구현하면, 이 재개
+        경로가 막힌다 — 이 테스트가 그 과잉 차단을 잡는다.
         """
         graph, docs = live
         node_ids = ["n1", "n2"]
@@ -733,9 +763,15 @@ class TestDefaultResumeRequiresExplicitConfirmation:
             return real_delete_node(node_type, node_id)
 
         with mock.patch.object(graph, "delete_node", side_effect=_fail_for_n2):
-            pack_load.delete_pack("nosql-pack", graph, docs, _NoVec())  # sql 없이 1회차
+            _delete("nosql-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))  # 1회차
 
-        pack_load.delete_pack("nosql-pack", graph, docs, _NoVec(), resume=True)
+        journal = delete_journal.load_journal(tmp_path, "nosql-pack")
+        assert journal is not None and journal["axes"]["graph_nodes"].get("done") is not True
+        journal["pack_identity"] = None  # 스냅샷 없음
+        delete_journal.save_journal(tmp_path, "nosql-pack", journal)
+        assert delete_journal.load_journal(tmp_path, "nosql-pack")["pack_identity"] is None
+
+        _delete("nosql-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
         assert _live_node_ids(graph, node_ids) == set()
 
 
@@ -768,7 +804,7 @@ class TestDoneFlagAloneGatesReexecution:
 
         import unittest.mock as mock
         with mock.patch.object(graph, "delete_node", side_effect=_fail_for_p2):
-            pack_load.delete_pack("partial-pack", graph, docs, _NoVec())  # 예외 없이 정상 반환(기존 관용 계약)
+            _delete("partial-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))  # 예외 없이 정상 반환(기존 관용 계약)
 
         journal = delete_journal.load_journal(tmp_path, "partial-pack")
         axis = journal["axes"]["graph_nodes"]
@@ -780,7 +816,7 @@ class TestDoneFlagAloneGatesReexecution:
         assert graph.get_node("Document", "p2") is not None, "p2는 여전히 남아 있어야 한다"
 
         # 재실행 — 명시 플래그로 남은 p2까지 마저 지운다(기본 호출은 이제 무쓰기 보고다).
-        pack_load.delete_pack("partial-pack", graph, docs, _NoVec(), resume=True)
+        _delete("partial-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
         journal2 = delete_journal.load_journal(tmp_path, "partial-pack")
         assert journal2["axes"]["graph_nodes"]["done"] is True
         assert _live_node_ids(graph, node_ids) == set(), "재실행 뒤에도 p2가 남아 있다"
@@ -805,7 +841,7 @@ class TestVectorUnconfirmedNeverBecomesDone:
         vec = _FakeChromaVec({"a1": "vecpack", "a2": "vecpack"})
         vec._collection.malformed_get_wheres = {1: {"no_ids_key": []}}
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("vecpack", graph, docs, vec)
+        _n, _c, chunk_vec_del = _delete("vecpack", graph, docs, vec, sql=_registry(tmp_path))
         assert chunk_vec_del == 0
         assert not vec._collection.delete_calls
 
@@ -818,7 +854,7 @@ class TestVectorUnconfirmedNeverBecomesDone:
 
         # 복구된 뒤(malformed 없이) resume=True로 재실행하면 실제로 지워지고 done=True로 수렴한다.
         vec2 = _FakeChromaVec({"a1": "vecpack", "a2": "vecpack"})
-        pack_load.delete_pack("vecpack", graph, docs, vec2, resume=True)
+        _delete("vecpack", graph, docs, vec2, resume=True, sql=_registry(tmp_path))
         journal2 = delete_journal.load_journal(tmp_path, "vecpack")
         assert journal2["axes"]["vectors"]["done"] is True
         assert vec2._collection.delete_calls, "복구 후 재실행에서 실제 삭제가 안 일어났다"
@@ -833,7 +869,7 @@ class TestVectorUnconfirmedNeverBecomesDone:
         """
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "novec-pack", ["z1"])
-        pack_load.delete_pack("novec-pack", graph, docs, _NoVec())
+        _delete("novec-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "novec-pack")
         assert journal["axes"]["vectors"] == {"done": True, "clean": True, "count": 0}
 
@@ -850,7 +886,7 @@ class TestVectorUnconfirmedNeverBecomesDone:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecfail-pack", ["w1"])
         vec = _ChromaShapedButUnavailable()
-        pack_load.delete_pack("vecfail-pack", graph, docs, vec)
+        _delete("vecfail-pack", graph, docs, vec, sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "vecfail-pack")
         assert journal["axes"]["vectors"]["done"] is False, (
             f"연결 실패(모양은 chroma)인데 done=True로 잘못 확정됐다: {journal['axes']['vectors']!r}"
@@ -858,7 +894,7 @@ class TestVectorUnconfirmedNeverBecomesDone:
 
         # 연결이 복구된 뒤 resume=True로 재실행하면 실제로 확인되고 done=True로 수렴한다.
         vec2 = _FakeChromaVec({"w1": "vecfail-pack"})
-        pack_load.delete_pack("vecfail-pack", graph, docs, vec2, resume=True)
+        _delete("vecfail-pack", graph, docs, vec2, resume=True, sql=_registry(tmp_path))
         journal2 = delete_journal.load_journal(tmp_path, "vecfail-pack")
         assert journal2["axes"]["vectors"]["done"] is True
 
@@ -879,7 +915,7 @@ class TestVectorUnconfirmedNeverBecomesDone:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "shapehostile-pack", ["x1"])
         vec = _ShapeProbeHostile()
-        pack_load.delete_pack("shapehostile-pack", graph, docs, vec)
+        _delete("shapehostile-pack", graph, docs, vec, sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "shapehostile-pack")
         assert journal["axes"]["vectors"]["done"] is False, (
             "모양 판별 실패(available=False)를 구조적 미지원으로 오분류해 "
@@ -957,7 +993,7 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecenginenone-pack", ["h1"])
         vec = _SqlalchemyShapedButEngineNone()
-        pack_load.delete_pack("vecenginenone-pack", graph, docs, vec)
+        _delete("vecenginenone-pack", graph, docs, vec, sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "vecenginenone-pack")
         assert journal["axes"]["vectors"]["done"] is False, (
             "_engine=None(연결 실패, sqlalchemy 모양)인데 done=True로 잘못 "
@@ -979,7 +1015,7 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecconnnone-pack", ["i1"])
         vec = _SqlShapedButConnNone()
-        pack_load.delete_pack("vecconnnone-pack", graph, docs, vec)
+        _delete("vecconnnone-pack", graph, docs, vec, sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "vecconnnone-pack")
         assert journal["axes"]["vectors"]["done"] is False, (
             "_conn=None(연결 실패, sql 모양)인데 done=True로 잘못 "
@@ -1000,7 +1036,7 @@ class TestDoneJournalDriftRecheck:
         """
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "docdrift-pack", ["e1"])
-        n1, *_ = pack_load.delete_pack("docdrift-pack", graph, docs, _NoVec())
+        n1, *_ = _delete("docdrift-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
         assert n1 == 1
         journal = delete_journal.load_journal(tmp_path, "docdrift-pack")
         assert journal["axes"]["doc_node_extra_and_sources"]["done"] is True
@@ -1021,8 +1057,8 @@ class TestDoneJournalDriftRecheck:
             f"VALUES ({','.join('?' * len(vals))})", tuple(vals.values()))
         docs._conn.commit()
 
-        n2, *_ = pack_load.delete_pack(
-            "docdrift-pack", graph, docs, _NoVec(), resume=True)
+        n2, *_ = _delete(
+            "docdrift-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
         assert n2 == 1, (
             f"완료 이후 유입된 고아 doc_nodes 행이 재개에서 안 지워졌다 (실제 {n2})"
         )
@@ -1045,7 +1081,7 @@ class TestDoneJournalDriftRecheck:
         """
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "docsrcdrift-pack", ["j1"])
-        n1, *_ = pack_load.delete_pack("docsrcdrift-pack", graph, docs, _NoVec())
+        n1, *_ = _delete("docsrcdrift-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
         assert n1 == 1
         journal = delete_journal.load_journal(tmp_path, "docsrcdrift-pack")
         assert journal["axes"]["doc_node_extra_and_sources"]["done"] is True
@@ -1057,8 +1093,8 @@ class TestDoneJournalDriftRecheck:
             {"pack_id": "docsrcdrift-pack"},
         )
 
-        n2, *_ = pack_load.delete_pack(
-            "docsrcdrift-pack", graph, docs, _NoVec(), resume=True)
+        n2, *_ = _delete(
+            "docsrcdrift-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
         assert docs.get_source("orphan-chunk-1") is None, (
             "완료 이후 유입된 doc_sources 행이 재개에서 안 지워졌다"
         )
@@ -1080,12 +1116,12 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecdrift-pack", ["f1"])
         vec1 = _FakeChromaVec({"f1": "vecdrift-pack"})
-        pack_load.delete_pack("vecdrift-pack", graph, docs, vec1)
+        _delete("vecdrift-pack", graph, docs, vec1, sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "vecdrift-pack")
         assert journal["axes"]["vectors"]["done"] is True
 
         vec2 = _ChromaShapedButUnavailable()
-        pack_load.delete_pack("vecdrift-pack", graph, docs, vec2, resume=True)
+        _delete("vecdrift-pack", graph, docs, vec2, resume=True, sql=_registry(tmp_path))
         journal2 = delete_journal.load_journal(tmp_path, "vecdrift-pack")
         assert journal2["axes"]["vectors"]["done"] is False, (
             "백엔드가 unavailable 로 바뀌었는데 done=True 저널을 그대로 스킵했다: "
@@ -1112,12 +1148,12 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecnodrift-pack", ["g1"])
         vec1 = _FakeChromaVec({"g1": "vecnodrift-pack"})
-        pack_load.delete_pack("vecnodrift-pack", graph, docs, vec1)
+        _delete("vecnodrift-pack", graph, docs, vec1, sql=_registry(tmp_path))
 
         # 완료 이후 재유입을 흉내낸다 — 새 핸들에 같은 pack_id 로 라이브
         # 벡터가 다시 존재하는 상태를 만든다(동시 writer 나 부분 복원 등).
         vec2 = _FakeChromaVec({"g1": "vecnodrift-pack"})  # available=True, 재유입된 내용
-        pack_load.delete_pack("vecnodrift-pack", graph, docs, vec2, resume=True)
+        _delete("vecnodrift-pack", graph, docs, vec2, resume=True, sql=_registry(tmp_path))
         assert vec2._collection.get_where_calls, (
             "이미 done 이고 available 인 vectors 축인데 재유입 벡터를 peek 하지 않았다"
         )
@@ -1156,7 +1192,7 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecmalformedpeek-pack", ["q1"])
         vec1 = _FakeChromaVec({"q1": "vecmalformedpeek-pack"})
-        pack_load.delete_pack("vecmalformedpeek-pack", graph, docs, vec1)
+        _delete("vecmalformedpeek-pack", graph, docs, vec1, sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "vecmalformedpeek-pack")
         assert journal["axes"]["vectors"]["done"] is True
 
@@ -1165,8 +1201,8 @@ class TestDoneJournalDriftRecheck:
         # peek 의 첫 where= 조회(순번 1)만 malformed 응답("ids" 키 없음)으로
         # 오염시킨다 — 재시도 안의 두 번째 조회(순번 2)는 정상 응답이다.
         vec2._collection.malformed_get_wheres = {1: {}}
-        pack_load.delete_pack(
-            "vecmalformedpeek-pack", graph, docs, vec2, resume=True)
+        _delete(
+            "vecmalformedpeek-pack", graph, docs, vec2, resume=True, sql=_registry(tmp_path))
 
         post = pack_load._live_vec_ids(vec2, "vecmalformedpeek-pack")
         assert "q1" not in post, (
@@ -1199,14 +1235,14 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecpeekreread-pack", ["p1"])
         vec1 = _AvailableCountingChromaVec({"p1": "vecpeekreread-pack"})
-        pack_load.delete_pack("vecpeekreread-pack", graph, docs, vec1)
+        _delete("vecpeekreread-pack", graph, docs, vec1, sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "vecpeekreread-pack")
         assert journal["axes"]["vectors"]["done"] is True
 
         # 재유입 없음 — 완료된 팩에 남은 라이브 벡터가 없는 정상 상태.
         vec2 = _AvailableCountingChromaVec({})
-        pack_load.delete_pack(
-            "vecpeekreread-pack", graph, docs, vec2, resume=True)
+        _delete(
+            "vecpeekreread-pack", graph, docs, vec2, resume=True, sql=_registry(tmp_path))
         assert vec2.reads == 1, (
             f"peek 재확인 경로에서 available 을 {vec2.reads}번 읽었다 — "
             "드리프트 탐침의 최초 1회로 끝나야 한다(캐시한 backend 를 "
@@ -1234,7 +1270,7 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecdoubleread-pack", ["k1"])
         vec = _AvailableRaisesOnSecondRead()
-        pack_load.delete_pack("vecdoubleread-pack", graph, docs, vec)
+        _delete("vecdoubleread-pack", graph, docs, vec, sql=_registry(tmp_path))
         assert vec._reads == 1, (
             f"available 을 {vec._reads}번 읽었다 — 호출당 정확히 1번이어야 한다"
         )
@@ -1261,7 +1297,7 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecreadfail-pack", ["m1"])
         vec = _AvailableRaisesAlways()
-        pack_load.delete_pack("vecreadfail-pack", graph, docs, vec)
+        _delete("vecreadfail-pack", graph, docs, vec, sql=_registry(tmp_path))
         assert vec.reads == 1, (
             f"available 을 {vec.reads}번 읽었다 — 호출당 정확히 1번이어야 한다"
         )
@@ -1290,13 +1326,13 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "vecreadfailresume-pack", ["n1"])
         vec1 = _FakeChromaVec({"n1": "vecreadfailresume-pack"})
-        pack_load.delete_pack("vecreadfailresume-pack", graph, docs, vec1)
+        _delete("vecreadfailresume-pack", graph, docs, vec1, sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "vecreadfailresume-pack")
         assert journal["axes"]["vectors"]["done"] is True
 
         vec2 = _AvailableRaisesAlways()
-        pack_load.delete_pack(
-            "vecreadfailresume-pack", graph, docs, vec2, resume=True)
+        _delete(
+            "vecreadfailresume-pack", graph, docs, vec2, resume=True, sql=_registry(tmp_path))
         assert vec2.reads == 1, (
             f"available 을 {vec2.reads}번 읽었다 — 호출당 정확히 1번이어야 한다"
         )
@@ -1330,13 +1366,13 @@ class TestDoneJournalDriftRecheck:
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "shapehostileresume-pack", ["o1"])
         vec1 = _FakeChromaVec({"o1": "shapehostileresume-pack"})
-        pack_load.delete_pack("shapehostileresume-pack", graph, docs, vec1)
+        _delete("shapehostileresume-pack", graph, docs, vec1, sql=_registry(tmp_path))
         journal = delete_journal.load_journal(tmp_path, "shapehostileresume-pack")
         assert journal["axes"]["vectors"]["done"] is True
 
         vec2 = _ShapeProbeHostile()
-        pack_load.delete_pack(
-            "shapehostileresume-pack", graph, docs, vec2, resume=True)
+        _delete(
+            "shapehostileresume-pack", graph, docs, vec2, resume=True, sql=_registry(tmp_path))
         journal2 = delete_journal.load_journal(tmp_path, "shapehostileresume-pack")
         assert journal2["axes"]["vectors"]["done"] is False, (
             "모양 판별 실패로 재확인이 필요한데 done=True 저널을 그대로 "
@@ -1363,7 +1399,7 @@ class TestDoneJournalDriftRecheck:
         """
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "graphdrift-pack", ["m1"])
-        n1, *_ = pack_load.delete_pack("graphdrift-pack", graph, docs, _NoVec())
+        n1, *_ = _delete("graphdrift-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
         assert n1 == 1
         journal = delete_journal.load_journal(tmp_path, "graphdrift-pack")
         assert journal["axes"]["node_twin_loop"]["done"] is True
@@ -1375,8 +1411,8 @@ class TestDoneJournalDriftRecheck:
         assert graph.get_node("Document", "m2") is not None
         assert docs.get_node_doc("resource", "m2") is not None
 
-        n2, *_ = pack_load.delete_pack(
-            "graphdrift-pack", graph, docs, _NoVec(), resume=True)
+        n2, *_ = _delete(
+            "graphdrift-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
         assert n2 == 1, (
             f"완료 이후 유입된 노드 하나만 이번 실행 확인 건수여야 한다(실제 {n2})"
         )
@@ -1424,7 +1460,7 @@ class TestDocAxisStickyFailureFlag:
 
         import unittest.mock as mock
         with mock.patch.object(docs, "delete_node_doc", side_effect=_fail_for_d2):
-            pack_load.delete_pack("docfail-pack", graph, docs, _NoVec())  # 예외 없이 정상 반환(기존 관용 계약)
+            _delete("docfail-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))  # 예외 없이 정상 반환(기존 관용 계약)
 
         journal = delete_journal.load_journal(tmp_path, "docfail-pack")
         axis = journal["axes"]["node_twin_loop"]
@@ -1436,7 +1472,7 @@ class TestDocAxisStickyFailureFlag:
         )
         assert journal["axes"]["graph_nodes"].get("done") is not True
 
-        pack_load.delete_pack("docfail-pack", graph, docs, _NoVec(), resume=True)
+        _delete("docfail-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
         journal2 = delete_journal.load_journal(tmp_path, "docfail-pack")
         assert journal2["axes"]["node_twin_loop"]["done"] is True
         assert journal2["axes"]["graph_nodes"]["done"] is True
@@ -1530,7 +1566,8 @@ class TestMultipleCrashPoints:
                 available = False
                 def delete(self, ids): pass
 
-            pack_load.delete_pack("crash-pack", graph, docs, _NoVec())
+            with principal_scope(principal):
+                pack_load.delete_pack("crash-pack", graph, docs, _NoVec(), sql=pack_sql)
         """)
         assert proc.returncode < 0, (
             f"doc 축 커밋 직후 죽지 않았다: rc={proc.returncode} stderr={proc.stderr[-2000:]}"
@@ -1548,7 +1585,7 @@ class TestMultipleCrashPoints:
 
             # 1단계: 플래그 없이 재실행 — 보고만 하고 멈춘다, 무쓰기.
             with pytest.raises(delete_journal.DeletePackJournalPending):
-                pack_load.delete_pack("crash-pack", graph, docs, _NoVec())
+                _delete("crash-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
             journal_still = delete_journal.load_journal(tmp_path, "crash-pack")
             assert journal_still == journal_before, (
                 "플래그 없는 재실행인데 저널이 바뀌었다 — 무쓰기 계약 위반"
@@ -1559,7 +1596,7 @@ class TestMultipleCrashPoints:
             assert graph.get_node("Document", "k2") is not None
 
             # 2단계: 명시 플래그로 완주.
-            _n, _c, _v = pack_load.delete_pack("crash-pack", graph, docs, _NoVec(), resume=True)
+            _n, _c, _v = _delete("crash-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
             journal_after = delete_journal.load_journal(tmp_path, "crash-pack")
             assert journal_after["axes"]["graph_nodes"]["done"] is True
             assert journal_after["axes"]["vectors"]["done"] is True
@@ -1630,7 +1667,8 @@ class TestMultipleCrashPoints:
                 available = False
                 def delete(self, ids): pass
 
-            pack_load.delete_pack("crash-pack-2", graph, docs, _NoVec())
+            with principal_scope(principal):
+                pack_load.delete_pack("crash-pack-2", graph, docs, _NoVec(), sql=pack_sql)
         """)
         assert proc.returncode < 0, (
             f"graph 축 커밋 직후 죽지 않았다: rc={proc.returncode} stderr={proc.stderr[-2000:]}"
@@ -1651,12 +1689,12 @@ class TestMultipleCrashPoints:
             # 1단계: 플래그 없이 재실행 — 보고만 하고 멈춘다, doc 축 재실행 없음.
             with mock.patch.object(docs, "delete_node_doc", side_effect=_counted):
                 with pytest.raises(delete_journal.DeletePackJournalPending):
-                    pack_load.delete_pack("crash-pack-2", graph, docs, _NoVec())
+                    _delete("crash-pack-2", graph, docs, _NoVec(), sql=_registry(tmp_path))
             assert doc_calls == [], f"플래그 없는 재실행인데 doc 축이 실행됐다: {doc_calls}"
 
             # 2단계: 명시 플래그로 완주 — 그래도 doc 축은 이미 done이라 재실행 안 됨.
             with mock.patch.object(docs, "delete_node_doc", side_effect=_counted):
-                pack_load.delete_pack("crash-pack-2", graph, docs, _NoVec(), resume=True)
+                _delete("crash-pack-2", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
 
             assert doc_calls == [], (
                 f"doc 축이 이미 done인데도 resume=True 재개가 다시 실행했다: {doc_calls}"
@@ -1697,10 +1735,10 @@ class TestResumeSummaryText:
 
         import unittest.mock as mock
         with mock.patch.object(graph, "delete_node", side_effect=_fail_for_s2):
-            pack_load.delete_pack("summary-pack", graph, docs, _NoVec())
+            _delete("summary-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
         capsys.readouterr()  # 1회차 출력은 버린다 — 이 테스트는 재개 호출의 출력만 본다
 
-        pack_load.delete_pack("summary-pack", graph, docs, _NoVec(), resume=True)
+        _delete("summary-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
         out = capsys.readouterr().out
 
         assert "재개" in out, f"재개 표시가 요약에 없다: {out!r}"
@@ -1735,15 +1773,15 @@ class TestResumeSkipDoesNotReuseCountInReturnValue:
         node_ids = ["g1", "g2", "g3"]
         _seed_pack(graph, docs, tmp_path, "graphskip-pack", node_ids)
 
-        node_del, _chunk_sql_del, _chunk_vec_del = pack_load.delete_pack(
-            "graphskip-pack", graph, docs, _NoVec()
+        node_del, _chunk_sql_del, _chunk_vec_del = _delete(
+            "graphskip-pack", graph, docs, _NoVec(), sql=_registry(tmp_path)
         )
         assert node_del == 3
         journal = delete_journal.load_journal(tmp_path, "graphskip-pack")
         assert journal["axes"]["graph_nodes"] == {"done": True, "count": 3}
 
-        node_del2, _chunk_sql_del2, _chunk_vec_del2 = pack_load.delete_pack(
-            "graphskip-pack", graph, docs, _NoVec(), resume=True
+        node_del2, _chunk_sql_del2, _chunk_vec_del2 = _delete(
+            "graphskip-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path)
         )
         assert node_del2 == 0, (
             f"과거 graph_nodes count(3)가 재개 반환값에 섞였다: node_del={node_del2!r}"
@@ -1775,14 +1813,14 @@ class TestResumeSkipDoesNotReuseCountInReturnValue:
         graph, docs = live
         vec = _FakeChromaVec({"v1": "vectorskip-pack", "v2": "vectorskip-pack"})
 
-        pack_load.delete_pack("vectorskip-pack", graph, docs, vec)
+        _delete("vectorskip-pack", graph, docs, vec, sql=_registry(tmp_path))
         capsys.readouterr()  # 1회차 출력은 버린다 — 2회차(재개) 출력만 본다
         journal = delete_journal.load_journal(tmp_path, "vectorskip-pack")
         assert journal["axes"]["vectors"] == {"done": True, "clean": True, "count": 2}
 
         vec2 = _FakeChromaVec({})  # available=True, 열거는 되지만 결과 0건(재유입 없음)
-        _node_del, _chunk_sql_del, chunk_vec_del = pack_load.delete_pack(
-            "vectorskip-pack", graph, docs, vec2, resume=True
+        _node_del, _chunk_sql_del, chunk_vec_del = _delete(
+            "vectorskip-pack", graph, docs, vec2, resume=True, sql=_registry(tmp_path)
         )
         out = capsys.readouterr().out
 
@@ -1874,7 +1912,7 @@ class TestLockContentionIsReallyObserved:
         try:
             assert holder_ready.wait(timeout=5), "holder가 락을 못 잡았다"
             with pytest.raises(TimeoutError):
-                pack_load.delete_pack("busy-pack", graph, docs, _NoVec(), lock_timeout=0.2)
+                _delete("busy-pack", graph, docs, _NoVec(), lock_timeout=0.2, sql=_registry(tmp_path))
         finally:
             release_holder.set()
             t.join(timeout=10)
@@ -1930,16 +1968,11 @@ class TestLockContentionIsReallyObserved:
 
 class TestBackwardCompatibilityWithoutSql:
     def test_sql_omitted_still_deletes_and_returns_the_same_tuple_shape(self, live, tmp_path):
-        """§3 "sql이 안 주어진 호출: 이 절 전체 스킵" — 기존 3만여 호출부
-        (`tests/test_pack_load.py` 등)가 `sql=` 을 안 준다. 이 파일이 `delete_pack`
-        의 시그니처를 넓혀도 그 호출부 전량이 그대로 통과해야 한다.
-
-        역변이: `sql` 을 선택적이 아니라 필수로 만들면(키워드 인자에 기본값을
-        안 주면), 이 테스트를 포함해 기존 호출부 전량이 `TypeError` 로 깨진다.
-        """
+        """#434 이후 `sql` 은 필수 키워드다. 소유자가 등록된 팩을 지우면 예전과
+        같은 3-튜플 모양을 돌려준다."""
         graph, docs = live
         _seed_pack(graph, docs, tmp_path, "compat-pack", ["c1"])
-        result = pack_load.delete_pack("compat-pack", graph, docs, _NoVec())
+        result = _delete("compat-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
         assert isinstance(result, tuple) and len(result) == 3
         node_del, chunk_sql_del, chunk_vec_del = result
         assert node_del == 1

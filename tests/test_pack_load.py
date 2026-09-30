@@ -818,14 +818,14 @@ class TestLoadEdges:
 class TestDeletePack:
     """`--fresh` 재적재의 삭제 경로. 여기가 새면 재적재가 중복을 쌓는다."""
 
-    def test_deletes_only_the_named_pack(self, live, tmp_path):
+    def test_deletes_only_the_named_pack(self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         _write_jsonl(tmp_path / "a.jsonl", [_node(id="a1"), _node(id="a2")])
         _write_jsonl(tmp_path / "b.jsonl", [_node(id="b1")])
         pack_load.load_nodes("pack-a", tmp_path / "a.jsonl", builder, {})
         pack_load.load_nodes("pack-b", tmp_path / "b.jsonl", builder, {})
 
-        node_del, _chunk_sql_del, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, _NoVec())
+        node_del, _chunk_sql_del, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, _NoVec(), sql=pack_sql)
 
         # 관측 가능한 상태가 판정의 본체다. 카운터는 그 다음이다.
         assert graph.get_node("Document", "a1") is None
@@ -863,24 +863,24 @@ class TestDeletePack:
             f"INSERT INTO doc_nodes ({','.join(vals)}) "
             f"VALUES ({','.join('?' * len(vals))})", tuple(vals.values()))
         docs._conn.commit()
-        n2, *_ = pack_load.delete_pack("pack-c", graph, docs, _NoVec())
+        n2, *_ = pack_load.delete_pack("pack-c", graph, docs, _NoVec(), sql=pack_sql)
         assert n2 == 1, (
             f"graph 트윈 없는 doc_nodes 앵커가 안 지워졌다 (실제 {n2}) — "
             "보강 경로가 죽었다. backfill 이 만든 앵커가 팩 삭제 후에도 남는다")
 
-    def test_deleted_pack_disappears_from_live_state(self, live, tmp_path):
+    def test_deleted_pack_disappears_from_live_state(self, live, pack_sql, tmp_path):
         """왕복: 적재 → 삭제 → 라이브 상태가 비어 있다."""
         builder, graph, docs = live
         _write_jsonl(tmp_path / "a.jsonl", [_node(id="a1")])
         pack_load.load_nodes("pack-a", tmp_path / "a.jsonl", builder, {})
         assert pack_load.live_pack_state("pack-a", graph, docs, _NoVec())["nodes"]
 
-        pack_load.delete_pack("pack-a", graph, docs, _NoVec())
+        pack_load.delete_pack("pack-a", graph, docs, _NoVec(), sql=pack_sql)
         assert pack_load.live_pack_state("pack-a", graph, docs, _NoVec())["nodes"] == {}
 
-    def test_deleting_an_absent_pack_is_a_noop_not_an_error(self, live):
+    def test_deleting_an_absent_pack_is_a_noop_not_an_error(self, live, pack_sql):
         builder, graph, docs = live
-        assert pack_load.delete_pack("없는-팩", graph, docs, _NoVec()) == (0, 0, 0)
+        assert pack_load.delete_pack("없는-팩", graph, docs, _NoVec(), sql=pack_sql) == (0, 0, 0)
 
 
 class _RecordingVec:
@@ -1113,7 +1113,7 @@ class TestIncrementalFinalizeSafetyPins:
     def _live(self, graph, docs, pack="pack-1"):
         return pack_load.live_pack_state(pack, graph, docs, _NoVec())
 
-    def test_zero_bypack_nodes_aborts_instead_of_deleting_everything(self, live, tmp_path):
+    def test_zero_bypack_nodes_aborts_instead_of_deleting_everything(self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         self._seed(builder, docs, tmp_path)
         state = self._live(graph, docs)
@@ -1121,7 +1121,7 @@ class TestIncrementalFinalizeSafetyPins:
         with pytest.raises(SystemExit) as ei:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                set(), set(), set(), False, 0, 0)
+                set(), set(), set(), False, 0, 0, sql=pack_sql)
         assert "by-pack 파일 누락 의심" in str(ei.value)
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
 
@@ -1141,11 +1141,11 @@ class TestIncrementalFinalizeSafetyPins:
         with pytest.raises(SystemExit) as ei:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                {f"n{i}" for i in range(10)}, set(), set(), False, 10, 0)
+                {f"n{i}" for i in range(10)}, set(), set(), False, 10, 0, sql=pack_sql)
         assert "by-pack 청크 0건" in str(ei.value), str(ei.value)
         assert self._live(graph, docs)["chunks"], "중단했는데 청크가 지워졌다"
 
-    def test_deletion_ratio_over_thirty_percent_aborts(self, live, tmp_path):
+    def test_deletion_ratio_over_thirty_percent_aborts(self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         self._seed(builder, docs, tmp_path)
         state = self._live(graph, docs)
@@ -1153,11 +1153,11 @@ class TestIncrementalFinalizeSafetyPins:
         with pytest.raises(SystemExit) as ei:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                keep, set(), set(), False, len(keep), 0)
+                keep, set(), set(), False, len(keep), 0, sql=pack_sql)
         assert str(ei.value) == _expect_node_chunk_ratio_msg("pack-1", 9, 10, 0, 0), str(ei.value)
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
 
-    def test_force_delete_bypasses_the_ratio_pin(self, live, tmp_path):
+    def test_force_delete_bypasses_the_ratio_pin(self, live, pack_sql, tmp_path):
         """핀은 **우회 가능해야** 한다 — 안 그러면 정당한 대량 정리가 막힌다.
 
         이게 없으면 `force_delete` 분기를 통째로 지우는 변이가 안 잡힌다.
@@ -1167,11 +1167,11 @@ class TestIncrementalFinalizeSafetyPins:
         state = self._live(graph, docs)
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n0"}, set(), set(), True, 1, 0)
+            {"n0"}, set(), set(), True, 1, 0, sql=pack_sql)
         assert res["node_del"] == 9, f"강행했는데 9건이 안 지워졌다: {res}"
         assert set(self._live(graph, docs)["nodes"]) == {"n0"}
 
-    def test_ratio_under_the_pin_deletes_normally(self, live, tmp_path):
+    def test_ratio_under_the_pin_deletes_normally(self, live, pack_sql, tmp_path):
         """정상 경로 — 핀이 항상 중단시키면 증분 정리가 통째로 죽는다."""
         builder, graph, docs = live
         self._seed(builder, docs, tmp_path)
@@ -1179,11 +1179,11 @@ class TestIncrementalFinalizeSafetyPins:
         keep = {f"n{i}" for i in range(8)}   # 2/10 = 20%
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            keep, set(), set(), False, len(keep), 0)
+            keep, set(), set(), False, len(keep), 0, sql=pack_sql)
         assert res["node_del"] == 2, res
         assert set(self._live(graph, docs)["nodes"]) == keep
 
-    def test_exactly_thirty_percent_is_allowed_not_aborted(self, live, tmp_path):
+    def test_exactly_thirty_percent_is_allowed_not_aborted(self, live, pack_sql, tmp_path):
         """**경계 자체**를 건다 — 위 셋은 값만 걸고 비교 방향을 안 건다.
 
         `node_ratio > 0.30` 을 `>=` 로 바꾸는 변이는 "초과 시 중단"(90%)·"force 우회"·
@@ -1200,11 +1200,11 @@ class TestIncrementalFinalizeSafetyPins:
         keep = {f"n{i}" for i in range(7)}   # 3/10 = 정확히 0.30
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            keep, set(), set(), False, len(keep), 0)
+            keep, set(), set(), False, len(keep), 0, sql=pack_sql)
         assert res["node_del"] == 3, f"정확히 30%는 핀에 걸리면 안 된다: {res}"
         assert set(self._live(graph, docs)["nodes"]) == keep
 
-    def test_just_over_thirty_percent_aborts(self, live, tmp_path):
+    def test_just_over_thirty_percent_aborts(self, live, pack_sql, tmp_path):
         """경계 바로 위 — 위 테스트와 짝이다.
 
         둘을 같이 걸어야 `>` 를 `>=` 로도, `0.30` 을 `0.31` 로도 못 바꾼다.
@@ -1217,7 +1217,7 @@ class TestIncrementalFinalizeSafetyPins:
         with pytest.raises(SystemExit) as ei:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                keep, set(), set(), False, len(keep), 0)
+                keep, set(), set(), False, len(keep), 0, sql=pack_sql)
         assert str(ei.value) == _expect_node_chunk_ratio_msg("pack-1", 4, 10, 0, 0), str(ei.value)
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
 
@@ -1255,7 +1255,7 @@ class TestIncrementalFinalize:
         with pytest.raises(SystemExit):
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                set(), set(), set(), False, 0, 0)
+                set(), set(), set(), False, 0, 0, sql=pack_sql)
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 노드가 지워졌다"
 
         cf = _write_jsonl(tmp_path / "c.jsonl", [_chunk(1)])
@@ -1264,7 +1264,7 @@ class TestIncrementalFinalize:
         with pytest.raises(SystemExit):
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state2,
-                {f"n{i}" for i in range(10)}, set(), set(), False, 10, 0)
+                {f"n{i}" for i in range(10)}, set(), set(), False, 10, 0, sql=pack_sql)
         assert self._live(graph, docs)["chunks"], "중단했는데 청크가 지워졌다"
 
     # ── 2. 30% 안전핀 — 값과 방향 + force_delete 우회 ──────────────────
@@ -1274,7 +1274,7 @@ class TestIncrementalFinalize:
         (6, True),    # 4/10 = 0.40 — 발동해야 한다
     ])
     def test_thirty_percent_pin_value_and_direction(
-            self, live, tmp_path, keep_n, expect_abort):
+            self, live, pack_sql, tmp_path, keep_n, expect_abort):
         builder, graph, docs = live
         self._seed(builder, docs, tmp_path)
         state = self._live(graph, docs)
@@ -1283,28 +1283,28 @@ class TestIncrementalFinalize:
             with pytest.raises(SystemExit) as ei:
                 pack_load.incremental_finalize(
                     "pack-1", graph, docs, _NoVec(), state,
-                    keep, set(), set(), False, len(keep), 0)
+                    keep, set(), set(), False, len(keep), 0, sql=pack_sql)
             assert str(ei.value) == _expect_node_chunk_ratio_msg(
                 "pack-1", 10 - keep_n, 10, 0, 0), str(ei.value)
         else:
             res = pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                keep, set(), set(), False, len(keep), 0)
+                keep, set(), set(), False, len(keep), 0, sql=pack_sql)
             assert res["node_del"] == 10 - keep_n, res
 
-    def test_force_delete_bypasses_thirty_percent_pin(self, live, tmp_path):
+    def test_force_delete_bypasses_thirty_percent_pin(self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         self._seed(builder, docs, tmp_path)
         state = self._live(graph, docs)
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n0"}, set(), set(), True, 1, 0)
+            {"n0"}, set(), set(), True, 1, 0, sql=pack_sql)
         assert res["node_del"] == 9, res
 
     # ── 3. 앵커 보호 — dataset: 접두사(근거: TestIncrementalFinalizeActuallyDeletes)
     #      + created_by=title-backfill(여기서 처음 건다) ────────────────
 
-    def test_title_backfill_anchor_is_protected_like_dataset_prefix(self, live, tmp_path):
+    def test_title_backfill_anchor_is_protected_like_dataset_prefix(self, live, pack_sql, tmp_path):
         """`_is_anchor` 의 두 조건 중 `dataset:` 접두사만 기존 커버리지가 있었다 —
         `created_by=title-backfill` 조건은 지금까지 무테스트였다."""
         builder, graph, docs = live
@@ -1319,7 +1319,7 @@ class TestIncrementalFinalize:
         # backfilled-1 은 by-pack 에 없다고 신고 — 앵커가 아니면 삭제 후보가 된다.
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1"}, set(), set(), True, 1, 0)
+            {"n1"}, set(), set(), True, 1, 0, sql=pack_sql)
 
         left = set(self._live(graph, docs)["nodes"])
         assert "backfilled-1" in left, (
@@ -1327,7 +1327,7 @@ class TestIncrementalFinalize:
 
     # ── 4. 삭제 카운터가 요청 수가 아니라 실제 성공 수를 반영하는가 ──────
 
-    def test_edge_del_reflects_actual_deletion_not_requested(self, live, tmp_path):
+    def test_edge_del_reflects_actual_deletion_not_requested(self, live, pack_sql, tmp_path):
         """`stale_edges` 후보에 있어도 `graph_edges` 에 실제로 없으면 `edge_del` 을 세면 안 된다.
 
         무조건 `edge_del += 1` 이던 판은 이런 "요청은 했지만 대상이 없던" 경우도 세서,
@@ -1346,7 +1346,7 @@ class TestIncrementalFinalize:
         # 여전히 stale 후보(=DELETE 대상)로 남게 한다.
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1", "n2"}, set(), {("무관", "무관계", "무관-y")}, True, 2, 0)
+            {"n1", "n2"}, set(), {("무관", "무관계", "무관-y")}, True, 2, 0, sql=pack_sql)
         assert res["edge_del"] == 0, (
             f"실제로 존재하지 않던 엣지인데 edge_del 을 세었다: {res}")
 
@@ -1374,7 +1374,7 @@ class TestIncrementalFinalize:
 
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, vec, state,
-            {"n0"}, {"c1"}, set(), True, 1, 1)
+            {"n0"}, {"c1"}, set(), True, 1, 1, sql=pack_sql)
         assert res["vec_orphan_del"] == 0, (
             f"벡터 삭제가 예외를 던졌는데 vec_orphan_del 을 세었다: {res}")
 
@@ -1387,7 +1387,7 @@ class TestIncrementalFinalize:
     # 가 노드·엣지·청크 세 sink 각각으로 건다.
 
     def test_positional_call_without_a_had_write_failures_kwarg_still_hits_the_zero_item_pin(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         """이름을 고쳤다 — 예전엔 `had_write_failures=False` 기본값이 종전 동작을
         지키는지를 걸었는데, 그 인자 자체가 지금은 없다(위 참고). 남은 것은
         시그니처가 여전히 위치인자 11개뿐이라는 것과, 순수 위치인자 호출도
@@ -1405,7 +1405,7 @@ class TestIncrementalFinalize:
         with pytest.raises(SystemExit):
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                set(), set(), set(), False, 0, 0)   # 순수 위치인자, kwarg 없음
+                set(), set(), set(), False, 0, 0, sql=pack_sql)   # 순수 위치인자, kwarg 없음
 
 
 class TestRatioPinAxisIsolation:
@@ -1430,7 +1430,7 @@ class TestRatioPinAxisIsolation:
 
     # ── 노드 축 격리 (청크 0 · doc 축 완전 비움) ────────────────────────
 
-    def test_node_only_exactly_thirty_percent_is_not_aborted(self, live, tmp_path):
+    def test_node_only_exactly_thirty_percent_is_not_aborted(self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         ids = [f"n{i}" for i in range(10)]
         self._seed_nodes(builder, tmp_path, ids)
@@ -1444,10 +1444,10 @@ class TestRatioPinAxisIsolation:
         keep = {f"n{i}" for i in range(7)}    # 3/10 = 정확히 0.30
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            keep, set(), set(), False, len(keep), 0)
+            keep, set(), set(), False, len(keep), 0, sql=pack_sql)
         assert res["node_del"] == 3, f"정확히 30%는 핀에 걸리면 안 된다: {res}"
 
-    def test_node_only_over_thirty_percent_aborts(self, live, tmp_path):
+    def test_node_only_over_thirty_percent_aborts(self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         ids = [f"n{i}" for i in range(10)]
         self._seed_nodes(builder, tmp_path, ids)
@@ -1462,7 +1462,7 @@ class TestRatioPinAxisIsolation:
         with pytest.raises(SystemExit) as ei:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                keep, set(), set(), False, len(keep), 0)
+                keep, set(), set(), False, len(keep), 0, sql=pack_sql)
         assert str(ei.value) == _expect_node_chunk_ratio_msg("pack-1", 9, 10, 0, 0), str(ei.value)
         assert len(self._live(graph, docs)["nodes"]) == 10, "중단했는데 뭔가 지워졌다"
 
@@ -1479,7 +1479,7 @@ class TestRatioPinAxisIsolation:
         keep_chunks = {f"c{i}" for i in range(7)}   # 3/10 = 정확히 0.30
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            set(), keep_chunks, set(), False, 0, len(keep_chunks))
+            set(), keep_chunks, set(), False, 0, len(keep_chunks), sql=pack_sql)
         assert res["chunk_del"] == 3, f"정확히 30%는 핀에 걸리면 안 된다: {res}"
 
     def test_chunk_only_over_thirty_percent_aborts(self, live, tmp_path, pack_sql):
@@ -1494,7 +1494,7 @@ class TestRatioPinAxisIsolation:
         with pytest.raises(SystemExit) as ei:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                set(), keep_chunks, set(), False, 0, len(keep_chunks))
+                set(), keep_chunks, set(), False, 0, len(keep_chunks), sql=pack_sql)
         assert str(ei.value) == _expect_node_chunk_ratio_msg("pack-1", 0, 0, 4, 10), str(ei.value)
         assert len(self._live(graph, docs)["chunks"]) == 10, "중단했는데 청크가 지워졌다"
 
@@ -1508,7 +1508,7 @@ class TestRatioPinAxisIsolation:
     # 33.3%/20% 조합으로 더 촘촘히 잡는다(G5).
 
     def test_doc_only_over_thirty_percent_aborts_node_and_chunk_stay_isolated(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         ids = [f"n{i}" for i in range(10)]
         self._seed_nodes(builder, tmp_path, ids)
@@ -1527,7 +1527,7 @@ class TestRatioPinAxisIsolation:
         with pytest.raises(SystemExit) as ei:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                keep, set(), set(), False, len(keep), 0)
+                keep, set(), set(), False, len(keep), 0, sql=pack_sql)
         assert str(ei.value) == _expect_doc_ratio_msg("pack-1", 1, 3), str(ei.value)
         left_spaces = {r[0] for r in docs._conn.execute(
             "SELECT space FROM doc_nodes WHERE node_id=?", ("n0",))}
@@ -1575,7 +1575,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
 
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            bypack_ids, set(), set(), True, 1, 0)
+            bypack_ids, set(), set(), True, 1, 0, sql=pack_sql)
         assert res["node_del"] == 1, (
             f"저장 실패가 있었다는 이유로 무관한 stale 노드(n2) 정리가 막혔다: {res}")
         left = set(pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"])
@@ -1584,7 +1584,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
             "저장 실패한 행(n1)이 지워졌다 — by-pack 보호 집합에 있어 안 지워져야 한다")
 
     def test_edge_write_failure_does_not_block_stale_edge_cleanup(
-            self, live, tmp_path, monkeypatch):
+            self, live, pack_sql, tmp_path, monkeypatch):
         builder, graph, docs = live
         nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2"), _node(id="n3")])
         id_map: dict = {}
@@ -1612,7 +1612,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
 
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1", "n2", "n3"}, set(), applied, True, 3, 0)
+            {"n1", "n2", "n3"}, set(), applied, True, 3, 0, sql=pack_sql)
         assert res["edge_del"] == 1, (
             f"저장 실패가 있었다는 이유로 무관한 stale 엣지(e2) 정리가 막혔다: {res}")
         left = {(r[0], r[1], r[2]) for r in graph._conn.execute(
@@ -1653,7 +1653,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
         state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"anchor-node"}, bypack_ids, set(), True, 1, 1)
+            {"anchor-node"}, bypack_ids, set(), True, 1, 1, sql=pack_sql)
         assert res["chunk_del"] == 1, (
             f"저장 실패가 있었다는 이유로 무관한 stale 청크(c2) 정리가 막혔다: {res}")
         left = {r[0] for r in docs._conn.execute("SELECT source_id FROM doc_sources")}
@@ -1758,21 +1758,21 @@ class _SqliteVecLike:
 
 
 class TestDeletePackVectorBranch:
-    def test_vectors_of_the_named_pack_are_deleted(self, live, tmp_path):
+    def test_vectors_of_the_named_pack_are_deleted(self, live, pack_sql, tmp_path):
         _b, graph, docs = live
         vec = _SqliteVecLike()
         vec.seed("pack-a", ["a1", "a2"])
         vec.seed("pack-b", ["b1"])
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 2, f"벡터 2건이 지워져야 한다 (실제 {chunk_vec_del})"
         assert vec.rows() == {("b1", "pack-b")}, (
             f"다른 팩의 벡터까지 지웠거나 대상이 남았다: {vec.rows()}")
 
-    def test_vector_branch_is_skipped_when_unavailable(self, live):
+    def test_vector_branch_is_skipped_when_unavailable(self, live, pack_sql):
         _b, graph, docs = live
-        assert pack_load.delete_pack("없는-팩", graph, docs, _NoVec()) == (0, 0, 0)
+        assert pack_load.delete_pack("없는-팩", graph, docs, _NoVec(), sql=pack_sql) == (0, 0, 0)
 
 
 class TestIncrementalFinalizeActuallyDeletes:
@@ -1813,7 +1813,7 @@ class TestIncrementalFinalizeActuallyDeletes:
         keep = {"c1", "c2", "c3"}
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1"}, keep, set(), False, 1, len(keep))
+            {"n1"}, keep, set(), False, 1, len(keep), sql=pack_sql)
 
         assert res["chunk_del"] == 1, res
         other = sqlite3.connect(f"file:{tmp_path / 'doc.db'}?mode=ro", uri=True)
@@ -1825,7 +1825,7 @@ class TestIncrementalFinalizeActuallyDeletes:
             f"별도 커넥션에서 본 청크가 {left} (기대 {keep}) — 삭제가 커밋되지 않았거나 "
             "지웠다고 보고만 하고 실제로는 안 지웠다")
 
-    def test_stale_edge_cleanup_only_touches_its_own_pack(self, live, tmp_path):
+    def test_stale_edge_cleanup_only_touches_its_own_pack(self, live, pack_sql, tmp_path):
         """stale 엣지 정리가 **자기 팩 엣지만** 지워야 한다."""
         builder, graph, docs = live
         # **순서가 계약이다.** `graph_edges` PK 는 `(from_type,from_id,relation,to_type,to_id)`
@@ -1859,7 +1859,7 @@ class TestIncrementalFinalizeActuallyDeletes:
         # ③ pack-1 이 낡은 상태로 정리 — 자기 것이 아닌 행을 지우면 안 된다
         pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1", "n2"}, set(), {("n1", "cites", "n9")}, True, 2, 0)
+            {"n1", "n2"}, set(), {("n1", "cites", "n9")}, True, 2, 0, sql=pack_sql)
 
         left = {json.loads(r[0]).get("pack_id") for r in graph._conn.execute(
             "SELECT properties FROM graph_edges")}
@@ -1867,7 +1867,7 @@ class TestIncrementalFinalizeActuallyDeletes:
             f"소유가 넘어간 엣지를 지웠다 — 남은 pack_id={left}. 삭제 SQL 의 pack_id "
             "필터가 없으면 낡은 상태로 남의 팩 행을 지운다")
 
-    def test_empty_applied_edges_skips_cleanup(self, live, tmp_path):
+    def test_empty_applied_edges_skips_cleanup(self, live, pack_sql, tmp_path):
         """`applied_edges` 가 비면 엣지 정리를 **건너뛰어야** 한다.
 
         edges.jsonl 누락 의심 상황이다 — 그대로 진행하면 라이브 엣지가 전량 삭제된다.
@@ -1885,20 +1885,20 @@ class TestIncrementalFinalizeActuallyDeletes:
         state = self._live(graph, docs)
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1", "n2"}, set(), set(), True, 2, 0)      # applied 가 비었다
+            {"n1", "n2"}, set(), set(), True, 2, 0, sql=pack_sql)      # applied 가 비었다
 
         after = graph._conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
         assert res["edge_del"] == 0 and after == 1, (
             f"반영 엣지 0건인데 정리를 진행했다 — edge_del={res['edge_del']}, 남은 {after}건")
 
-    def test_anchor_nodes_are_never_deletion_candidates(self, live, tmp_path):
+    def test_anchor_nodes_are_never_deletion_candidates(self, live, pack_sql, tmp_path):
         """`dataset:` 앵커는 by-pack 에 없어도 삭제 후보에서 빠져야 한다."""
         builder, graph, docs = live
         self._seed_nodes(builder, tmp_path, ["n1", "dataset:앵커"])
         state = self._live(graph, docs)
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1"}, set(), set(), True, 1, 0)            # 앵커는 by-pack 에 없다
+            {"n1"}, set(), set(), True, 1, 0, sql=pack_sql)            # 앵커는 by-pack 에 없다
         left = set(self._live(graph, docs)["nodes"])
         assert "dataset:앵커" in left, f"앵커를 지웠다 — 남은 노드 {left}, node_del={res['node_del']}"
 
@@ -1930,7 +1930,7 @@ class TestIncrementalFinalizeActuallyDeletes:
         state = pack_load.live_pack_state("pack-1", graph, docs, vec)
         pack_load.incremental_finalize(
             "pack-1", graph, docs, vec, state,
-            {"n1"}, {"c1"}, set(), True, 1, 1)
+            {"n1"}, {"c1"}, set(), True, 1, 1, sql=pack_sql)
         assert "n1" not in vec.deleted, f"살아있는 노드의 벡터를 지웠다: {vec.deleted}"
         assert "c1" not in vec.deleted, f"살아있는 청크의 벡터를 지웠다: {vec.deleted}"
 
@@ -1952,7 +1952,7 @@ class TestIncrementalFinalizeActuallyDeletes:
 
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1"}, {"없는-청크"}, set(), True, 1, 0)
+            {"n1"}, {"없는-청크"}, set(), True, 1, 0, sql=pack_sql)
 
         assert res["chunk_del"] == n, (
             f"배치 경계를 넘는 삭제가 전량 반영되지 않았다 (기대 {n}, 실제 {res['chunk_del']})")
@@ -2008,7 +2008,7 @@ class TestIncrementalFinalizePositiveDeletionAcrossAllFourAxes:
         #    (무관한 applied 항목으로 "반영 엣지 0건" 핀을 피한다) ──
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, vec, state,
-            {"n1", "n2"}, {"c1"}, {("무관", "무관계", "무관-y")}, True, 2, 1)
+            {"n1", "n2"}, {"c1"}, {("무관", "무관계", "무관-y")}, True, 2, 1, sql=pack_sql)
 
         assert res["node_del"] == 1, res
         assert res["chunk_del"] == 1, res
@@ -2048,7 +2048,7 @@ class TestDeletePackReclaimPredicateIsPackIdOnly:
     노드를 참조했던 흔적). 그 값으로 회수되면 남의 팩이 지워진다.
     """
 
-    def test_graph_nodes_reclaim_ignores_a_foreign_source_field(self, live, tmp_path):
+    def test_graph_nodes_reclaim_ignores_a_foreign_source_field(self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         # own-pack 소유 노드인데 properties.source 가 지우려는 팩명과 같다.
         f = _write_jsonl(tmp_path / "n.jsonl",
@@ -2056,11 +2056,11 @@ class TestDeletePackReclaimPredicateIsPackIdOnly:
         pack_load.load_nodes("own-pack", f, builder, {})
         assert graph.get_node("Document", "n1") is not None
 
-        pack_load.delete_pack("target", graph, docs, _NoVec())
+        pack_load.delete_pack("target", graph, docs, _NoVec(), sql=pack_sql)
         assert graph.get_node("Document", "n1") is not None, (
             "source 필드가 지우려는 팩명과 같다는 이유로 다른 팩 소유 노드가 지워졌다")
 
-    def test_graph_edges_reclaim_ignores_a_foreign_source_field(self, live, tmp_path):
+    def test_graph_edges_reclaim_ignores_a_foreign_source_field(self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
         id_map: dict = {}
@@ -2072,21 +2072,21 @@ class TestDeletePackReclaimPredicateIsPackIdOnly:
         before = graph._conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
         assert before == 1
 
-        pack_load.delete_pack("target", graph, docs, _NoVec())
+        pack_load.delete_pack("target", graph, docs, _NoVec(), sql=pack_sql)
         after = graph._conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
         assert after == 1, "source 필드가 지우려는 팩명과 같다는 이유로 다른 팩 엣지가 지워졌다"
 
-    def test_doc_nodes_reclaim_ignores_a_foreign_source_field(self, live, tmp_path):
+    def test_doc_nodes_reclaim_ignores_a_foreign_source_field(self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         docs.upsert_node_doc("resource", "Document", "orphan-1",
                               {"pack_id": "own-pack", "source": "target"})
-        pack_load.delete_pack("target", graph, docs, _NoVec())
+        pack_load.delete_pack("target", graph, docs, _NoVec(), sql=pack_sql)
         left = docs._conn.execute(
             "SELECT COUNT(*) FROM doc_nodes WHERE node_id=?", ("orphan-1",)).fetchone()[0]
         assert left == 1, "source 필드가 지우려는 팩명과 같다는 이유로 다른 팩 doc_nodes 행이 지워졌다"
 
     def test_doc_sources_reclaim_matches_pack_id_or_source_but_ignores_other_tags(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         """`doc_sources` 는 **유일하게** `source` 도 본다 — 그래서 `source=target` 은
         실제로 지워져야 하고(양성 절반), `pack_id` 도 `source` 도 아닌 다른 태그가
         같은 값이어도 지워지면 안 된다(음성 절반)."""
@@ -2095,7 +2095,7 @@ class TestDeletePackReclaimPredicateIsPackIdOnly:
         docs.upsert_source("c-by-unrelated-tag", "본문",
                            {"pack_id": "own-pack", "tag": "target"})
 
-        pack_load.delete_pack("target", _graph, docs, _NoVec())
+        pack_load.delete_pack("target", _graph, docs, _NoVec(), sql=pack_sql)
 
         left = {r[0] for r in docs._conn.execute("SELECT source_id FROM doc_sources")}
         assert "c-by-source" not in left, (
@@ -2116,7 +2116,7 @@ class TestDocSourcesReclaimBothDirectionsAndFTSShadowCleanup:
     """
 
     def test_source_only_and_pack_id_only_rows_are_both_reclaimed_unrelated_survives(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         """pack_id 만 태그된 행·source 만 태그된 행 둘 다 회수돼야 한다(양방향) —
         `doc_sources` 회수 술어가 `source` 단독으로 축소되면 pack_id-only 행이,
         `pack_id` 단독으로 축소되면 source-only 행이 각각 안 지워진다."""
@@ -2125,7 +2125,7 @@ class TestDocSourcesReclaimBothDirectionsAndFTSShadowCleanup:
         docs.upsert_source("c-pack-id-only", "본문B", {"pack_id": "pack-1"})
         docs.upsert_source("c-unrelated", "본문C", {"pack_id": "다른팩", "tag": "pack-1"})
 
-        pack_load.delete_pack("pack-1", _graph, docs, _NoVec())
+        pack_load.delete_pack("pack-1", _graph, docs, _NoVec(), sql=pack_sql)
 
         left = {r[0] for r in docs._conn.execute("SELECT source_id FROM doc_sources")}
         assert "c-source-only" not in left, "source 만 일치하는 행이 안 지워졌다"
@@ -2133,7 +2133,7 @@ class TestDocSourcesReclaimBothDirectionsAndFTSShadowCleanup:
         assert "c-unrelated" in left, "pack_id/source 가 아닌 무관 태그 행이 지워졌다"
 
     def test_delete_pack_removes_the_fts_shadow_row_and_leaves_unrelated_row(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         """`delete_pack` 경로의 FTS 삭제(load.py:314) — 행 단위 독립 readback."""
         _builder, _graph, docs = live
         if not docs._fts_ok:
@@ -2152,7 +2152,7 @@ class TestDocSourcesReclaimBothDirectionsAndFTSShadowCleanup:
         assert "c1" in before, "전제: 삭제 전 대상이 FTS 에 있어야 한다"
 
         node_del, chunk_sql_del, _chunk_vec_del = pack_load.delete_pack(
-            "pack-1", _graph, docs, _NoVec())
+            "pack-1", _graph, docs, _NoVec(), sql=pack_sql)
         assert chunk_sql_del == 1, (node_del, chunk_sql_del)
 
         after = {r[0] for r in docs._conn.execute(
@@ -2185,7 +2185,7 @@ class TestDocSourcesReclaimBothDirectionsAndFTSShadowCleanup:
         # 통과한 뒤의 FTS 삭제이므로 force_delete 로 강행한다(핀 자체는 G1 이 건다).
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1"}, keep_chunks, set(), True, 1, len(keep_chunks))
+            {"n1"}, keep_chunks, set(), True, 1, len(keep_chunks), sql=pack_sql)
         assert res["chunk_del"] == 1, res
 
         after = {r[0] for r in docs._conn.execute(
@@ -2488,7 +2488,7 @@ class TestFallbackTagWithoutPackIdCounts:
         assert got == {"graph_nodes": 0, "graph_edges": 0, "doc_nodes": 0}
 
     def test_after_delete_pack_and_live_pack_state_the_row_survives_and_is_still_counted(
-            self, live):
+            self, live, pack_sql):
         """회수(`delete_pack`)와 대사(`live_pack_state`)를 `source_id` 값으로 불러도
         행이 안 지워지고 대사 결과에도 안 잡혀야 한다 — 두 관측이 함께 있어야 "저장소엔
         남지만 대사엔 안 보인다"가 성립한다(한쪽만 있으면 삭제와 구분이 안 된다)."""
@@ -2496,7 +2496,7 @@ class TestFallbackTagWithoutPackIdCounts:
         self._seed_graph_node(graph, "n1", {"source_id": "target"})
         self._seed_doc_node(docs, "n1", {"source_id": "target"})
 
-        pack_load.delete_pack("target", graph, docs, _NoVec())
+        pack_load.delete_pack("target", graph, docs, _NoVec(), sql=pack_sql)
         state = pack_load.live_pack_state("target", graph, docs, _NoVec())
         assert "n1" not in state["nodes"], (
             "source_id 만으로 태그된 행이 대사(live_pack_state)에 target 소유로 잡혔다")
@@ -2514,7 +2514,7 @@ class TestFallbackTagWithoutPackIdCounts:
         assert got == {"graph_nodes": 1, "graph_edges": 0, "doc_nodes": 1}
 
     def test_edge_attached_to_a_deleted_packid_node_is_removed_by_cascade_not_by_a_predicate(
-            self, live):
+            self, live, pack_sql):
         """`graph_edges` 에 "독립 회수 경로가 없다"(함수 docstring)는 말은 "회수 술어가
         직접 안 걸린다"는 뜻이지 "행이 절대 안 지워진다"는 뜻이 아니다 — `source_id`
         만으로 태그된 엣지라도 **양 끝 노드가 `pack_id` 로 회수되면** `graph.delete_node()`
@@ -2527,7 +2527,7 @@ class TestFallbackTagWithoutPackIdCounts:
         self._seed_graph_node(graph, "owned2", {"pack_id": "target"})
         self._seed_graph_edge(graph, "owned1", "owned2", {"source_id": "target"})
 
-        pack_load.delete_pack("target", graph, docs, _NoVec())
+        pack_load.delete_pack("target", graph, docs, _NoVec(), sql=pack_sql)
 
         left_edge = graph._conn.execute(
             "SELECT COUNT(*) FROM graph_edges WHERE from_id=? AND to_id=?",
@@ -2541,7 +2541,7 @@ class TestFallbackTagWithoutPackIdCounts:
             "cascade 로 이미 지워진 엣지가 fallback 카운트에도 잡혔다 — 존재하지 않는 행을 셌다")
 
     def test_doc_node_twin_of_a_deleted_packid_node_is_removed_by_delete_pack_not_by_a_predicate(
-            self, live):
+            self, live, pack_sql):
         """`doc_nodes` 에도 `graph_edges` 와 같은 구멍이 있다(localcrab #164, PR #330
         코드 리뷰 지적) — `delete_pack` 은 `pack_id` 로 고른 각 graph 노드의 `node_id`
         로 `docs.delete_node_doc(space, node_id)` 를 그 doc_nodes 행 자신의 태그와
@@ -2559,7 +2559,7 @@ class TestFallbackTagWithoutPackIdCounts:
         assert before["doc_nodes"] == 1, (
             "source_id-only doc_nodes 트윈이 회수 전에는 사각지대로 잡혀야 한다")
 
-        pack_load.delete_pack("target", graph, docs, _NoVec())
+        pack_load.delete_pack("target", graph, docs, _NoVec(), sql=pack_sql)
 
         left_doc = docs._conn.execute(
             "SELECT COUNT(*) FROM doc_nodes WHERE node_id=?", ("n1",)).fetchone()[0]
@@ -2708,11 +2708,11 @@ class TestChromaBackendBranches:
     """`_vec_backend()` 가 `"chroma"` 로 인식하는 형태(F5-1) — 4자리 전부를 태운다."""
 
     def test_delete_pack_uses_single_pack_id_predicate_and_deletes_the_matched_rows(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         _builder, graph, docs = live
         vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a", "b1": "pack-b"})
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 2, f"벡터 2건이 지워져야 한다 (실제 {chunk_vec_del})"
         assert vec._collection.get_calls[-1] == {"pack_id": "pack-a"}, (
@@ -2965,47 +2965,47 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
     """
 
     # ── chroma: 재조회로 확인한다 ────────────────────────────────────────
-    def test_partial_delete_reports_the_confirmed_count_not_the_request_count(self, live):
+    def test_partial_delete_reports_the_confirmed_count_not_the_request_count(self, live, pack_sql):
         """G1 — delete 가 예외 없이 일부만 지우면 지워진 수만 센다."""
         _builder, graph, docs = live
         vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a", "a3": "pack-a"})
         vec._collection.lossy_delete_ids = {"a2", "a3"}      # 요청 3, 실제 삭제 1
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 1, (
             f"요청 3건 중 실제로 지워진 것은 1건인데 {chunk_vec_del} 로 보고했다 — "
             "요청 수를 삭제 수로 내면 이 단언이 깨진다")
 
-    def test_delete_failure_reports_unconfirmed_not_zero(self, live):
+    def test_delete_failure_reports_unconfirmed_not_zero(self, live, pack_sql):
         """G2 — delete 가 예외면 어디까지 지워졌는지 모른다."""
         _builder, graph, docs = live
         vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
         vec._collection.fail_delete_ids = {"a1"}
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None, (
             f"삭제가 예외로 끝났는데 {chunk_vec_del!r} 를 확정 카운트로 냈다")
 
-    def test_readback_failure_reports_unconfirmed(self, live):
+    def test_readback_failure_reports_unconfirmed(self, live, pack_sql):
         """G3 — 삭제는 됐는데 재조회가 예외면 확인 불가다."""
         _builder, graph, docs = live
         vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
         vec._collection.fail_get_wheres = {2}                # 2번째 where= 조회 = 재조회
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None, (
             f"재조회로 확인하지 못했는데 {chunk_vec_del!r} 를 냈다")
         assert vec._collection.delete_calls, "삭제 자체는 시도됐어야 한다"
 
-    def test_full_delete_still_reports_every_row_and_reads_back_ids_only(self, live):
+    def test_full_delete_still_reports_every_row_and_reads_back_ids_only(self, live, pack_sql):
         """G4(회귀) — 정상 경로는 여전히 전량을 세고, 재조회는 id 만 받는다."""
         _builder, graph, docs = live
         vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a", "b1": "pack-b"})
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 2, f"벡터 2건이 지워져야 한다 (실제 {chunk_vec_del})"
         assert set(vec._collection._rows) == {"b1"}
@@ -3015,7 +3015,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         assert where_calls[1] == ({"pack_id": "pack-a"}, []), (
             f"재조회는 id 만 받아야 한다(include=[]): {where_calls[1]}")
 
-    def test_failure_before_any_write_reports_zero_not_unconfirmed(self, live):
+    def test_failure_before_any_write_reports_zero_not_unconfirmed(self, live, pack_sql):
         """G5 — 삭제 시도 **전** 조회가 실패하면 0건 삭제가 확인된 사실이다.
 
         **회귀 게이트다**: 원 결함에서도 통과한다(base 도 이 경우 0을 낸다). 이
@@ -3025,13 +3025,13 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         vec = _FakeChromaVec({"a1": "pack-a"})
         vec._collection.fail_get_wheres = {1}                # 1번째 = 삭제 전 조회
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 0, (
             f"아직 아무것도 안 지웠는데 {chunk_vec_del!r} 를 냈다 — 미확인이 아니라 0이다")
         assert not vec._collection.delete_calls, "삭제를 시도하면 안 된다"
 
-    def test_concurrent_insert_of_a_new_id_is_not_counted_as_a_survivor(self, live):
+    def test_concurrent_insert_of_a_new_id_is_not_counted_as_a_survivor(self, live, pack_sql):
         """G12 — 재조회에 잡힌 **새** id 는 우리가 요청한 것이 아니다.
 
         카운트만 단언하면 이 게이트는 **원 결함(요청 수 보고)에서도 통과한다** —
@@ -3042,7 +3042,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
         vec._collection.insert_after_delete = {"a9": "pack-a"}   # 삭제 직후 유입
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 2, (
             f"요청 2건이 모두 지워졌는데 {chunk_vec_del} 로 보고했다 — 재조회 결과를 "
@@ -3061,7 +3061,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         {"ids": ["a1", "a1"]},               # 중복 id
         "그냥 문자열",                          # dict 도 아니다
     ])
-    def test_unreadable_readback_reports_unconfirmed(self, live, bad):
+    def test_unreadable_readback_reports_unconfirmed(self, live, pack_sql, bad):
         """G15 — 재조회 응답을 id 집합으로 못 읽으면 `None`.
 
         관대하게 읽으면(`got.get("ids", [])`) 생존자 0 = **전량 삭제**로 접힌다 —
@@ -3071,7 +3071,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         vec = _FakeChromaVec({"a1": "pack-a", "a2": "pack-a"})
         vec._collection.malformed_get_wheres = {2: bad}
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None, (
             f"재조회 응답 {bad!r} 를 믿고 {chunk_vec_del!r} 를 냈다")
@@ -3083,7 +3083,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         {"ids": ["a1", "a1"]},
     ])
     def test_unreadable_pre_delete_query_deletes_nothing_and_reports_zero(
-            self, live, bad, caplog):
+            self, live, pack_sql, bad, caplog):
         """G22 — 삭제 **전** 조회를 못 읽으면 지울 대상을 모른다: 삭제하지 않는다.
 
         문자열을 그대로 쓰면 `delete(ids="a1a2")` 는 chroma 계약상 **단일 id 삭제**인데
@@ -3094,7 +3094,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         vec._collection.malformed_get_wheres = {1: bad}
 
         with caplog.at_level(logging.WARNING):
-            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 0, f"안 지웠으면 0이다 (실제 {chunk_vec_del!r})"
         assert not vec._collection.delete_calls, (
@@ -3106,7 +3106,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         pytest.param("dict", id="dict-subclass-returns-ghost-ids"),
         pytest.param("str", id="str-subclass-lies-in-eq-and-hash"),
     ])
-    def test_subclassed_response_shapes_are_unconfirmed(self, live, hostile):
+    def test_subclassed_response_shapes_are_unconfirmed(self, live, pack_sql, hostile):
         """G27 — 응답이 **정확히 내장** dict/list/str 이 아니면 카운트를 안 낸다.
 
         `isinstance` 로 읽으면 서브클래스가 산술을 오염시킨다: 실제 내용과 다른
@@ -3134,7 +3134,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         vec = _FakeChromaVec({"a1": "pack-a"})
         vec._collection.malformed_get_wheres = {1: bad}
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 0, (
             f"삭제를 시도하지 않았는데 {chunk_vec_del!r} 를 냈다")
@@ -3142,7 +3142,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
             f"서브클래스 응답을 믿고 삭제를 날렸다: {vec._collection.delete_calls}")
 
     @pytest.mark.parametrize("position", ["pre", "readback"])
-    def test_a_hostile_key_cannot_redirect_the_ids_lookup(self, live, position):
+    def test_a_hostile_key_cannot_redirect_the_ids_lookup(self, live, pack_sql, position):
         """G28 — dict 가 정확한 내장형이어도 **키**가 적대적이면 조회가 리디렉션된다.
 
         dict 조회는 해시가 맞으면 저장된 키의 `__eq__` 를 부른다. 그래서
@@ -3168,7 +3168,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
             bad = {}
             bad[_EvilKey("zzz")] = ["ghost"]          # 삭제 대상을 고스트로 바꿔치기
             vec._collection.malformed_get_wheres = {1: bad}
-            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
             assert chunk_vec_del == 0, (
                 f"고스트 id 를 지운 척하고 {chunk_vec_del!r} 를 발행했다")
             assert not vec._collection.delete_calls, (
@@ -3178,11 +3178,11 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
             bad[_EvilKey("zzz")] = []                 # 생존 0으로 위장
             vec._collection.lossy_delete_ids = {"a1"}  # 실제로는 하나도 안 지워진다
             vec._collection.malformed_get_wheres = {2: bad}
-            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
             assert chunk_vec_del is None, (
                 f"생존자를 확인하지 못했는데 {chunk_vec_del!r} 를 발행했다")
 
-    def test_zero_target_reports_zero_without_calling_delete(self, live):
+    def test_zero_target_reports_zero_without_calling_delete(self, live, pack_sql):
         """G21 — 대상이 0건이면 0이고, 빈 목록으로 delete 를 부르지 않는다.
 
         **회귀 게이트다**: 원 결함(요청 수 보고)에서도 통과한다. "확인된 0" 이
@@ -3192,18 +3192,18 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         _builder, graph, docs = live
         vec = _FakeChromaVec({"b1": "pack-b"})
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 0, f"지울 것이 없었으니 0이다 (실제 {chunk_vec_del!r})"
         assert not vec._collection.delete_calls
 
     # ── chroma: 스토어 락 아래에서 한 덩어리로 돈다 ──────────────────────
-    def test_query_delete_readback_all_run_under_the_store_lock(self, live):
+    def test_query_delete_readback_all_run_under_the_store_lock(self, live, pack_sql):
         """G16 ⓐⓑ — 세 호출 전부 락 보유 중이고, 끝나면 풀린다."""
         _builder, graph, docs = live
         vec = _LockedChromaVec({"a1": "pack-a", "a2": "pack-a"})
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 2
         depths = vec._collection.lock_depth_log
@@ -3211,18 +3211,18 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
             f"조회·삭제·재조회가 락 밖에서 돌았다: {depths}")
         assert vec._lock.depth == 0, "정상 종료 후 락이 안 풀렸다"
 
-    def test_the_lock_is_released_when_the_delete_raises(self, live):
+    def test_the_lock_is_released_when_the_delete_raises(self, live, pack_sql):
         """G16 ⓑ — 예외 경로에서도 락이 풀린다(경고는 락 밖에서 찍힌다)."""
         _builder, graph, docs = live
         vec = _LockedChromaVec({"a1": "pack-a"})
         vec._collection.fail_delete_ids = {"a1"}
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None
         assert vec._lock.depth == 0, "예외로 빠져나오며 락을 쥔 채 남았다"
 
-    def test_the_collection_handle_is_re_read_after_taking_the_lock(self, live):
+    def test_the_collection_handle_is_re_read_after_taking_the_lock(self, live, pack_sql):
         """G16 ⓒ — 락 획득 뒤의 `_collection` 을 쓴다.
 
         `reset_collection()` 은 같은 락 아래에서 컬렉션을 교체한다. 락 전 스냅샷을
@@ -3233,7 +3233,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
                                swap_rows={"n1": "pack-a"})
         old = vec.pre_lock_collection
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 1, (
             "교체된 컬렉션(1건)이 아니라 옛 핸들(2건)을 봤다 — 락 안에서 핸들을 "
@@ -3242,7 +3242,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         assert vec._collection.delete_calls == [["n1"]]
 
     # ── sql / sqlalchemy: rowcount 를 곧이곧대로 믿지 않는다 ─────────────
-    def test_an_int_subclass_that_lies_in_comparisons_is_unconfirmed(self, live):
+    def test_an_int_subclass_that_lies_in_comparisons_is_unconfirmed(self, live, pack_sql):
         """G26 — `isinstance` 검사는 비교를 거짓말하는 `int` 서브클래스를 통과시켜
         **음수 카운트**를 발행한다. 카운트는 정확히 내장 `int` 일 때만 발행한다."""
 
@@ -3256,13 +3256,13 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         _builder, graph, docs = live
         vec = _StubSqlVec(rowcount=_LiarInt(-7))
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None, (
             f"거짓말하는 int 서브클래스가 카운트로 발행됐다: {chunk_vec_del!r}")
 
     @pytest.mark.parametrize("rowcount", [-1, None, True, False, Decimal("1")])
-    def test_sql_unreported_rowcount_is_unconfirmed(self, live, rowcount, caplog):
+    def test_sql_unreported_rowcount_is_unconfirmed(self, live, pack_sql, rowcount, caplog):
         """G8 — 드라이버가 안 세어준 값은 `0` 이 아니라 `None` 이다.
 
         `bool` 이 섞여 있는 이유: `isinstance(True, int)` 가 참이라 안 막으면
@@ -3272,7 +3272,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         vec = _StubSqlVec(rowcount=rowcount)
 
         with caplog.at_level(logging.WARNING):
-            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None, (
             f"rowcount={rowcount!r} 는 확인된 삭제 수가 아닌데 {chunk_vec_del!r} 를 냈다")
@@ -3280,12 +3280,12 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
             "미확인은 보이는 실패여야 한다 — 사유 로그가 없으면 요약의 '미확인'만 남는다")
 
     @pytest.mark.parametrize("rowcount", [-1, None, True, False, Decimal("1")])
-    def test_sqlalchemy_unreported_rowcount_is_unconfirmed(self, live, rowcount):
+    def test_sqlalchemy_unreported_rowcount_is_unconfirmed(self, live, pack_sql, rowcount):
         """G9 — 같은 계약. 종전엔 `r.rowcount or 0` 이라 `-1` 이 그대로 나갔다."""
         _builder, graph, docs = live
         vec = _StubSaVec(rowcount=rowcount)
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None, (
             f"rowcount={rowcount!r} 인데 {chunk_vec_del!r} 를 냈다")
@@ -3294,7 +3294,7 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         pytest.param(lambda: _StubSqlVec(rowcount=0), id="sql"),
         pytest.param(lambda: _StubSaVec(rowcount=0), id="sqlalchemy"),
     ])
-    def test_rowcount_zero_stays_zero(self, live, vec_factory):
+    def test_rowcount_zero_stays_zero(self, live, pack_sql, vec_factory):
         """G20 — "세어보니 0" 은 확인된 사실이다. 미확인으로 접지 않는다.
 
         **회귀 게이트다**: 원 결함에서도 통과한다. 목적은 `None`(미확인) 도입이
@@ -3302,49 +3302,49 @@ class TestDeletePackVectorCountIsConfirmedNotRequested:
         """
         _builder, graph, docs = live
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec_factory())
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec_factory(), sql=pack_sql)
 
         assert chunk_vec_del == 0, f"0건 삭제는 확인된 0이다 (실제 {chunk_vec_del!r})"
 
-    def test_sql_execute_failure_is_unconfirmed(self, live):
+    def test_sql_execute_failure_is_unconfirmed(self, live, pack_sql):
         """G17."""
         _builder, graph, docs = live
         _n, _c, chunk_vec_del = pack_load.delete_pack(
-            "pack-a", graph, docs, _StubSqlVec(fail_execute=True))
+            "pack-a", graph, docs, _StubSqlVec(fail_execute=True), sql=pack_sql)
         assert chunk_vec_del is None
 
-    def test_sql_commit_failure_is_unconfirmed(self, live):
+    def test_sql_commit_failure_is_unconfirmed(self, live, pack_sql):
         """G18 — 쓰기의 완결점은 execute 가 아니라 commit 이다."""
         _builder, graph, docs = live
         vec = _StubSqlVec(rowcount=7, fail_commit=True)
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None, (
             f"commit 이 실패했는데 {chunk_vec_del!r} 를 확정 카운트로 냈다")
 
-    def test_sqlalchemy_execute_failure_is_unconfirmed(self, live):
+    def test_sqlalchemy_execute_failure_is_unconfirmed(self, live, pack_sql):
         """G19."""
         _builder, graph, docs = live
         _n, _c, chunk_vec_del = pack_load.delete_pack(
-            "pack-a", graph, docs, _StubSaVec(fail_execute=True))
+            "pack-a", graph, docs, _StubSaVec(fail_execute=True), sql=pack_sql)
         assert chunk_vec_del is None
 
-    def test_sqlalchemy_commit_failure_is_unconfirmed(self, live):
+    def test_sqlalchemy_commit_failure_is_unconfirmed(self, live, pack_sql):
         """G13 — 숫자를 `with` 블록 **안**에서 발행하면 이 단언이 깨진다."""
         _builder, graph, docs = live
         vec = _StubSaVec(rowcount=7, fail_commit=True)
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None, (
             f"컨텍스트 종료(commit)가 실패했는데 {chunk_vec_del!r} 를 냈다")
 
-    def test_sqlalchemy_begin_failure_is_unconfirmed(self, live):
+    def test_sqlalchemy_begin_failure_is_unconfirmed(self, live, pack_sql):
         """G24 — 트랜잭션 진입 자체가 실패한 경우."""
         _builder, graph, docs = live
         _n, _c, chunk_vec_del = pack_load.delete_pack(
-            "pack-a", graph, docs, _StubSaVec(fail_begin=True))
+            "pack-a", graph, docs, _StubSaVec(fail_begin=True), sql=pack_sql)
         assert chunk_vec_del is None
 
 
@@ -3355,58 +3355,58 @@ class TestDeletePackSummaryNamesTheActualBackend:
     찍혔다. 카운트가 `None`(미확인)일 때 `None개` 로 찍히지도 않아야 한다.
     """
 
-    def test_chroma_is_named_chroma(self, live, capsys):
+    def test_chroma_is_named_chroma(self, live, pack_sql, capsys):
         """G6."""
         _builder, graph, docs = live
         pack_load.delete_pack("pack-a", graph, docs,
-                              _FakeChromaVec({"a1": "pack-a"}))
+                              _FakeChromaVec({"a1": "pack-a"}), sql=pack_sql)
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("chroma", "1"), f"{backend=} {count=}"
 
-    def test_sql_is_named_sql(self, live, capsys):
+    def test_sql_is_named_sql(self, live, pack_sql, capsys):
         """G6."""
         _builder, graph, docs = live
-        pack_load.delete_pack("pack-a", graph, docs, _StubSqlVec(rowcount=3))
+        pack_load.delete_pack("pack-a", graph, docs, _StubSqlVec(rowcount=3), sql=pack_sql)
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("sql", "3"), f"{backend=} {count=}"
 
-    def test_sqlalchemy_is_named_sqlalchemy(self, live, capsys):
+    def test_sqlalchemy_is_named_sqlalchemy(self, live, pack_sql, capsys):
         """G6."""
         _builder, graph, docs = live
-        pack_load.delete_pack("pack-a", graph, docs, _StubSaVec(rowcount=2))
+        pack_load.delete_pack("pack-a", graph, docs, _StubSaVec(rowcount=2), sql=pack_sql)
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("sqlalchemy", "2"), f"{backend=} {count=}"
 
-    def test_unsupported_backend_says_so(self, live, capsys):
+    def test_unsupported_backend_says_so(self, live, pack_sql, capsys):
         """G6 — kind 가 `None` 인데 가용한 형태."""
         _builder, graph, docs = live
 
         class _AvailableButUnknown:
             available = True
 
-        pack_load.delete_pack("pack-a", graph, docs, _AvailableButUnknown())
+        pack_load.delete_pack("pack-a", graph, docs, _AvailableButUnknown(), sql=pack_sql)
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("미지원", "0"), f"{backend=} {count=}"
 
-    def test_unavailable_backend_is_distinguished_from_unsupported(self, live, capsys):
+    def test_unavailable_backend_is_distinguished_from_unsupported(self, live, pack_sql, capsys):
         """G14 — 미가용과 미지원은 운영자에게 다른 사실이다."""
         _builder, graph, docs = live
-        pack_load.delete_pack("pack-a", graph, docs, _NoVec())
+        pack_load.delete_pack("pack-a", graph, docs, _NoVec(), sql=pack_sql)
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("미가용", "0"), f"{backend=} {count=}"
 
-    def test_unconfirmed_count_prints_as_unconfirmed(self, live, capsys):
+    def test_unconfirmed_count_prints_as_unconfirmed(self, live, pack_sql, capsys):
         """G7 — `None` 을 그대로 포맷하면 `None개` 가 된다."""
         _builder, graph, docs = live
         vec = _FakeChromaVec({"a1": "pack-a"})
         vec._collection.fail_delete_ids = {"a1"}
 
-        pack_load.delete_pack("pack-a", graph, docs, vec)
+        pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("chroma", "미확인"), f"{backend=} {count=}"
 
-    def test_summary_does_not_reread_available(self, live, capsys):
+    def test_summary_does_not_reread_available(self, live, pack_sql, capsys):
         """G25 — 요약이 `available` 을 다시 읽으면 그 접근은 `try` 밖이라, 나중
         접근에서 던지는 property 가 `delete_pack` 밖으로 샌다(종전엔 없던 경로).
 
@@ -3429,13 +3429,13 @@ class TestDeletePackSummaryNamesTheActualBackend:
 
         vec = _StatefulAvailable()
 
-        got = pack_load.delete_pack("pack-a", graph, docs, vec)
+        got = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert got == (0, 0, 0), f"흡수되고 0건이어야 한다 (실제 {got!r})"
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("미지원", "0"), f"{backend=} {count=}"
 
-    def test_a_hostile_class_name_does_not_escape_from_the_warning(self, live, capsys):
+    def test_a_hostile_class_name_does_not_escape_from_the_warning(self, live, pack_sql, capsys):
         """G29 — 경고의 인자 평가가 `try` 밖이면 적대적 메타클래스가 예외를 밖으로
         내보낸다. base 에는 없던 탈출 경로다."""
         class _EvilName(type):
@@ -3454,12 +3454,12 @@ class TestDeletePackSummaryNamesTheActualBackend:
         _builder, graph, docs = live
         vec = _EvilVec()
 
-        got = pack_load.delete_pack("pack-a", graph, docs, vec)   # 예외가 새면 여기서 터진다
+        got = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)   # 예외가 새면 여기서 터진다
 
         assert got == (0, 0, 0), f"삭제 미시도이므로 0이다 (실제 {got!r})"
         assert not vec._collection.delete_calls
 
-    def test_a_hostile_rowcount_does_not_mask_the_reason(self, live, caplog):
+    def test_a_hostile_rowcount_does_not_mask_the_reason(self, live, pack_sql, caplog):
         """G30 — 미확인 사유 로그가 적대적 rowcount 의 속성 접근에서 터지면, 바깥
         핸들러가 그것을 일반 벡터 오류로 다시 적어 **진짜 원인을 가린다**."""
         class _EvilName(type):
@@ -3475,14 +3475,14 @@ class TestDeletePackSummaryNamesTheActualBackend:
         vec = _StubSqlVec(rowcount=_EvilRowcount())
 
         with caplog.at_level(logging.WARNING):
-            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del is None
         msgs = [r.getMessage() for r in caplog.records]
         assert any("삭제 수 미확인" in m for m in msgs), (
             f"원인이 가려졌다 — 남은 로그: {msgs}")
 
-    def test_summary_survives_a_stateful_available(self, live, capsys):
+    def test_summary_survives_a_stateful_available(self, live, pack_sql, capsys):
         """G31 — `available` 을 정확한 `bool` 로 캐시하지 않으면 `if` 와 요약이 각각
         `__bool__` 을 불러, 두 번째 호출이 `try` 밖에서 터진다."""
         class _Flaky:
@@ -3501,14 +3501,14 @@ class TestDeletePackSummaryNamesTheActualBackend:
 
         _builder, graph, docs = live
 
-        got = pack_load.delete_pack("pack-a", graph, docs, _FlakyVec())
+        got = pack_load.delete_pack("pack-a", graph, docs, _FlakyVec(), sql=pack_sql)
 
         assert got == (0, 0, 0), f"흡수되고 0건이어야 한다 (실제 {got!r})"
         backend, count = _vec_line(capsys)
         assert (backend, count) == ("미지원", "0"), f"{backend=} {count=}"
 
     @pytest.mark.parametrize("path", ["chroma", "sql", "sqlalchemy"])
-    def test_the_reason_log_survives_a_hostile_object(self, live, caplog, path):
+    def test_the_reason_log_survives_a_hostile_object(self, live, pack_sql, caplog, path):
         """G32 — 사유 로그가 적대적 객체의 **포맷팅**에서 사라지면 안 된다.
 
         인자 평가가 안전해도(`type()` 은 타입 슬롯 읽기) 포맷 단계는 메타클래스
@@ -3544,7 +3544,7 @@ class TestDeletePackSummaryNamesTheActualBackend:
             vec, expected, needle = _StubSaVec(rowcount=_Hostile()), None, "삭제 수 미확인"
 
         with caplog.at_level(logging.WARNING):
-            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+            _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == expected, f"카운트가 틀렸다: {chunk_vec_del!r}"
         rendered = []
@@ -3553,7 +3553,7 @@ class TestDeletePackSummaryNamesTheActualBackend:
         assert any(needle in m for m in rendered), (
             f"사유 로그가 포맷 단계에서 사라졌다 — 남은 기록: {rendered}")
 
-    def test_unsupported_backend_name_access_raising_is_absorbed(self, live, caplog):
+    def test_unsupported_backend_name_access_raising_is_absorbed(self, live, pack_sql, caplog):
         """G33 — 미지원 백엔드(`available=True`, kind 판별 불가) + `__name__` 접근
         자체가 예외를 던지는 메타클래스. 수정 전: 그 예외가 바깥 `except`로 흘러가
         "미지원 백엔드" 경고 대신 "벡터 delete 오류"로 뒤바뀐다(G30과 같은 연쇄).
@@ -3571,14 +3571,14 @@ class TestDeletePackSummaryNamesTheActualBackend:
         _builder, graph, docs = live
         with caplog.at_level(logging.WARNING):
             _n, _c, chunk_vec_del = pack_load.delete_pack(
-                "pack-a", graph, docs, _UnsupportedVec())
+                "pack-a", graph, docs, _UnsupportedVec(), sql=pack_sql)
 
         assert chunk_vec_del == 0, "미지원 백엔드는 0건 삭제로 흡수된다"
         rendered = [r.getMessage() for r in caplog.records]
         assert any("미지원 백엔드" in m for m in rendered), (
             f"미지원 백엔드 경고가 다른 경고로 뒤바뀌었다 — 남은 기록: {rendered}")
 
-    def test_unsupported_backend_non_str_name_does_not_lose_the_record(self, live, caplog):
+    def test_unsupported_backend_non_str_name_does_not_lose_the_record(self, live, pack_sql, caplog):
         """G33b — 위와 같되 `__name__`이 예외 없이 **str 아닌 적대적 객체**(그 객체의
         `__str__`도 던짐)를 돌려주는 변형. 수정 전: `type(vec).__name__` 평가는
         성공하지만 그 반환값이 로그 인자로 들어가 포맷 단계(`msg % args`)에서 실패해
@@ -3600,7 +3600,7 @@ class TestDeletePackSummaryNamesTheActualBackend:
         _builder, graph, docs = live
         with caplog.at_level(logging.WARNING):
             _n, _c, chunk_vec_del = pack_load.delete_pack(
-                "pack-a", graph, docs, _UnsupportedVec())
+                "pack-a", graph, docs, _UnsupportedVec(), sql=pack_sql)
 
         assert chunk_vec_del == 0, "미지원 백엔드는 0건 삭제로 흡수된다"
         rendered = []
@@ -3610,7 +3610,7 @@ class TestDeletePackSummaryNamesTheActualBackend:
         assert any("미지원 백엔드" in m for m in rendered), (
             f"경고 레코드가 포맷 단계에서 사라졌다 — 남은 기록: {rendered}")
 
-    def test_outer_exception_hostile_str_does_not_lose_the_record(self, live, caplog):
+    def test_outer_exception_hostile_str_does_not_lose_the_record(self, live, pack_sql, caplog):
         """G34 — `_conn` 판별 프로퍼티가 `__str__`/`__repr__` 모두 던지는 예외
         인스턴스를 던지는 vec. 바깥 `except Exception as e:`가 그 예외를 원시로
         포맷하면(수정 전) 포맷 단계에서 실패해 "벡터 delete 오류" 경고 레코드
@@ -3633,19 +3633,19 @@ class TestDeletePackSummaryNamesTheActualBackend:
         _builder, graph, docs = live
         with caplog.at_level(logging.WARNING):
             _n, _c, chunk_vec_del = pack_load.delete_pack(
-                "pack-a", graph, docs, _ExplodingHostileVec())
+                "pack-a", graph, docs, _ExplodingHostileVec(), sql=pack_sql)
 
         assert chunk_vec_del == 0, "판별 실패는 현행대로 흡수 + 0건이다"
         rendered = [r.getMessage() for r in caplog.records]  # 실제 렌더링까지 해본다
         assert any("벡터 delete 오류" in m for m in rendered), (
             f"오류 경고 레코드가 포맷 단계에서 사라졌다 — 남은 기록: {rendered}")
 
-    def test_discrimination_failure_is_absorbed_and_labelled(self, live, capsys):
+    def test_discrimination_failure_is_absorbed_and_labelled(self, live, pack_sql, capsys):
         """G23 — 판별 자체가 예외여도 밖으로 안 새고, 표기는 판별 결과를 따른다."""
         _builder, graph, docs = live
 
         _n, _c, chunk_vec_del = pack_load.delete_pack(
-            "pack-a", graph, docs, _ExplodingVec())
+            "pack-a", graph, docs, _ExplodingVec(), sql=pack_sql)
 
         assert chunk_vec_del == 0, "판별 실패는 현행대로 흡수 + 0건이다"
         backend, count = _vec_line(capsys)
@@ -4094,13 +4094,13 @@ class _SqlAlchemyVecLike:
 class TestSqlAlchemyBackendBranches:
     """`_vec_backend()` 가 `"sqlalchemy"` 로 인식하는 형태(pgvector, F5-1)."""
 
-    def test_delete_pack_deletes_via_begin_and_reflects_real_rowcount(self, live, tmp_path):
+    def test_delete_pack_deletes_via_begin_and_reflects_real_rowcount(self, live, pack_sql, tmp_path):
         _builder, graph, docs = live
         vec = _SqlAlchemyVecLike()
         vec.seed("pack-a", ["a1", "a2"])
         vec.seed("pack-b", ["b1"])
 
-        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec)
+        _n, _c, chunk_vec_del = pack_load.delete_pack("pack-a", graph, docs, vec, sql=pack_sql)
 
         assert chunk_vec_del == 2, f"벡터 2건이 지워져야 한다 (실제 {chunk_vec_del})"
         assert vec.rows() == {("b1", "pack-b")}, (
@@ -4822,7 +4822,7 @@ class TestFailedEdgeWriteStaysInAppliedProtection:
     2026-08-11 적대 검증).
     """
 
-    def test_store_write_failure_does_not_orphan_the_live_edge(self, live, tmp_path, monkeypatch):
+    def test_store_write_failure_does_not_orphan_the_live_edge(self, live, pack_sql, tmp_path, monkeypatch):
         builder, graph, docs = live
         nf = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1"), _node(id="n2")])
         id_map: dict = {}
@@ -4852,7 +4852,7 @@ class TestFailedEdgeWriteStaysInAppliedProtection:
             bypack_node_ids={"n1", "n2"}, bypack_chunk_ids=set(),
             applied_edges=applied, force_delete=False,
             nodes_total=2, chunks_total=0,
-        )
+        sql=pack_sql)
         assert result["edge_del"] == 0, (
             "applied 에 남은 실패 엣지가 stale 로 오판돼 지워졌다")
         left = graph._conn.execute(
@@ -4924,7 +4924,7 @@ class TestDocSpaceResidueCleanup:
         assert left_spaces == {"concept"}, (
             f"same 경로에서 구 space(resource) doc 잔재가 안 지워졌다: {left_spaces}")
 
-    def test_orphan_doc_node_without_graph_twin_is_cleaned_by_finalize(self, live, tmp_path):
+    def test_orphan_doc_node_without_graph_twin_is_cleaned_by_finalize(self, live, pack_sql, tmp_path):
         """(b) graph 행 없음, doc 행만 남음. `incremental_finalize` 의 doc 축이 잡아야 한다."""
         builder, graph, docs = live
         nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
@@ -4937,7 +4937,7 @@ class TestDocSpaceResidueCleanup:
 
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1"}, set(), set(), True, 1, 0)
+            {"n1"}, set(), set(), True, 1, 0, sql=pack_sql)
 
         assert res["doc_orphan_del"] == 1, res
         left = docs._conn.execute(
@@ -4945,7 +4945,7 @@ class TestDocSpaceResidueCleanup:
         assert left == 0, "graph 트윈 없는 doc 고아가 안 지워졌다"
 
     def test_all_spaces_for_a_doc_candidate_are_removed_not_just_the_live_space(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         """(c) 삭제 후보 노드의 doc 행이 여러 space 에 걸쳐 있으면 **전부** 지워져야
         한다 — `live_nodes` 의 space 하나만 지우면 다른 space 잔재가 남는다."""
         builder, graph, docs = live
@@ -4959,7 +4959,7 @@ class TestDocSpaceResidueCleanup:
 
         res = pack_load.incremental_finalize(   # n1 이 by-pack 에서 사라졌다고 신고
             "pack-1", graph, docs, _NoVec(), state,
-            {"n2"}, set(), set(), True, 1, 0)
+            {"n2"}, set(), set(), True, 1, 0, sql=pack_sql)
 
         left_spaces = {r[0] for r in docs._conn.execute(
             "SELECT space FROM doc_nodes WHERE node_id=?", ("n1",))}
@@ -5114,7 +5114,7 @@ class _FalsyButNonEmptyDict(dict):
 
 class TestDocAxisSafetyPinEdgeCases:
     def test_empty_doc_node_spaces_denominator_does_not_raise_zero_division(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         """doc_node_spaces 가 비면 30% 핀을 건너뛰어야 한다 — 분모가 0인 나눗셈을
         시도하면 ZeroDivisionError 로 죽는다."""
         builder, graph, docs = live
@@ -5123,11 +5123,11 @@ class TestDocAxisSafetyPinEdgeCases:
 
         res = pack_load.incremental_finalize(   # 예외 없이 끝나야 한다
             "없는-팩", graph, docs, _NoVec(), state,
-            set(), set(), set(), False, 0, 0)
+            set(), set(), set(), False, 0, 0, sql=pack_sql)
         assert res["doc_orphan_del"] == 0
 
     def test_invariant_violation_pin_fires_when_candidates_outrun_the_denominator(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         """비었는데(bool 기준) 후보가 있으면(순회 기준) 불변식 위반으로 중단해야 한다.
 
         `doc_del_candidates` 가 `doc_node_spaces` 의 부분집합이라는 불변식은 정상
@@ -5144,7 +5144,7 @@ class TestDocAxisSafetyPinEdgeCases:
         with pytest.raises(SystemExit) as ei:
             pack_load.incremental_finalize(   # bypack 은 비지 않게(0-item 핀 회피), n1 은 안 담아 후보로 남긴다
                 "pack-1", graph, docs, _NoVec(), state,
-                {"다른-노드"}, set(), set(), False, 1, 0)
+                {"다른-노드"}, set(), set(), False, 1, 0, sql=pack_sql)
         assert "불변식 위반" in str(ei.value), str(ei.value)
 
 
@@ -5163,7 +5163,7 @@ class TestDocAxisDenominatorAndMutationGuards:
         pack_load.load_nodes(pack, f, builder, {})
 
     def test_doc_axis_denominator_is_node_count_and_fires_at_thirty_three_percent(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         builder, graph, docs = live
         ids = [f"n{i}" for i in range(10)]
         self._seed_nodes(builder, tmp_path, ids)
@@ -5189,11 +5189,11 @@ class TestDocAxisDenominatorAndMutationGuards:
         with pytest.raises(SystemExit) as ei:
             pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                keep, set(), set(), False, len(keep), 0)
+                keep, set(), set(), False, len(keep), 0, sql=pack_sql)
         assert str(ei.value) == _expect_doc_ratio_msg("pack-1", 1, 3), str(ei.value)
 
     def test_doc_axis_exactly_thirty_percent_with_asymmetric_denominator_is_not_aborted(
-            self, live, tmp_path):
+            self, live, pack_sql, tmp_path):
         """doc 축 분모(10)가 노드 축 분모(20)와 **다른 채로** 정확히 0.30 경계를
         걸어야, `>` 를 `>=` 로 바꾸는 변이와 분모를 다른 값으로 바꾸는 변이를
         동시에 잡는다. 타 축(<30%) 도 함께 자기 단언한다."""
@@ -5216,7 +5216,7 @@ class TestDocAxisDenominatorAndMutationGuards:
 
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            keep, set(), set(), False, len(keep), 0)
+            keep, set(), set(), False, len(keep), 0, sql=pack_sql)
         assert res["doc_orphan_del"] == 3, (
             f"doc 축 정확히 30%(분모 10)는 핀에 걸리면 안 된다: {res}")
 
@@ -5248,7 +5248,7 @@ class TestDocAxisDenominatorAndMutationGuards:
 
 class TestDocOrphanDeleteFalseIsNotCounted:
     def test_delete_node_doc_returning_false_does_not_increment_doc_orphan_del(
-            self, live, tmp_path, monkeypatch):
+            self, live, pack_sql, tmp_path, monkeypatch):
         """`delete_node_doc` 이 실제로는 못 지웠다는 뜻인 `False` 를 돌려주면
         `doc_orphan_del` 이 오르면 안 된다 — 그래프 축의 `delete_node`/`False` 계약
         (`TestDeleteNodeFalseIsNotCounted`)과 같은 요구를 doc 축에도 건다."""
@@ -5263,7 +5263,7 @@ class TestDocOrphanDeleteFalseIsNotCounted:
 
         res = pack_load.incremental_finalize(
             "pack-1", graph, docs, _NoVec(), state,
-            {"n1"}, set(), set(), True, 1, 0)
+            {"n1"}, set(), set(), True, 1, 0, sql=pack_sql)
         assert res["doc_orphan_del"] == 0, (
             "delete_node_doc 가 False 를 돌려줬는데 doc_orphan_del 을 세었다 — "
             f"실제로는 안 지워졌는데 지웠다고 보고한다 (res={res})")
@@ -5278,7 +5278,7 @@ class TestDeleteNodeFalseIsNotCounted:
     """
 
     def test_incremental_finalize_node_del_reflects_actual_deletion(
-            self, live, tmp_path, monkeypatch):
+            self, live, pack_sql, tmp_path, monkeypatch):
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
         pack_load.load_nodes("pack-1", f, builder, {})
@@ -5295,12 +5295,12 @@ class TestDeleteNodeFalseIsNotCounted:
             bypack_node_ids={"다른-노드"}, bypack_chunk_ids=set(),
             applied_edges=set(), force_delete=True,
             nodes_total=0, chunks_total=0,
-        )
+        sql=pack_sql)
         assert result["node_del"] == 0, (
             "delete_node 가 False 를 돌려줬는데 node_del 을 세었다 — "
             f"실제로는 안 지워졌는데 지웠다고 보고한다 (node_del={result['node_del']})")
 
-    def test_delete_pack_node_del_reflects_actual_deletion(self, live, tmp_path, monkeypatch):
+    def test_delete_pack_node_del_reflects_actual_deletion(self, live, pack_sql, tmp_path, monkeypatch):
         builder, graph, docs = live
         nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
         pack_load.load_nodes("pack-1", nf, builder, {})
@@ -5308,7 +5308,7 @@ class TestDeleteNodeFalseIsNotCounted:
 
         monkeypatch.setattr(graph, "delete_node", lambda *a, **kw: False)
         node_del, _chunk_sql_del, _chunk_vec_del = pack_load.delete_pack(
-            "pack-1", graph, docs, _NoVec())
+            "pack-1", graph, docs, _NoVec(), sql=pack_sql)
 
         assert node_del == 0, (
             "delete_node 가 False 를 돌려줬는데 delete_pack 의 node_del 을 세었다 "
@@ -5353,7 +5353,7 @@ class TestLoadLogsInsteadOfSwallowing:
             f"{[r.getMessage() for r in caplog.records]}")
 
     def test_node_deletion_failure_in_incremental_finalize_is_logged_and_continues(
-            self, live, tmp_path, monkeypatch, caplog):
+            self, live, pack_sql, tmp_path, monkeypatch, caplog):
         """`incremental_finalize` 의 노드 삭제 루프(load.py 약 1031행)가 예외를
         던지면 예전엔 `except Exception: deleted = False` 로 조용히 삼켰다 —
         이제 `log.warning` 을 남기고 다음 노드로 계속한다(삭제는 여전히 실패로
@@ -5370,7 +5370,7 @@ class TestLoadLogsInsteadOfSwallowing:
         with caplog.at_level("WARNING", logger="opencrab.pack.load"):
             res = pack_load.incremental_finalize(
                 "pack-1", graph, docs, _NoVec(), state,
-                {"무관-id"}, set(), set(), True, 0, 0)
+                {"무관-id"}, set(), set(), True, 0, 0, sql=pack_sql)
         assert res["node_del"] == 0, (
             "노드 삭제가 예외를 던졌는데 node_del 을 세었다 — "
             f"실제로는 안 지워졌는데 지웠다고 보고한다: {res}")

@@ -30,11 +30,13 @@ import sqlite3
 
 import pytest
 
+from opencrab.auth import Principal, principal_scope
 from opencrab.pack import load as pack_load
 from opencrab.stores._sql_dialect import POSTGRES, SQLITE
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, GraphTx, _SqlGraphStoreBase
 from tests.test_pack_load import (  # noqa: F401 — 기존 픽스처·더블 재사용(세 번째 사본 방지)
+    _LIVE_TEST_USER,
     _chunk,
     _node,
     _NoVec,
@@ -248,10 +250,11 @@ class TestNonSqlStoreRejection:
         with pytest.raises(NotImplementedError):
             pack_load.pack_live_counts("p", _NonSqlGraph(), _NonSqlDocs(), _NoVec())
 
-    def test_delete_pack_rejects(self, tmp_path, monkeypatch):
+    def test_delete_pack_rejects(self, tmp_path, monkeypatch, pack_sql):
         monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
-        with pytest.raises(NotImplementedError):
-            pack_load.delete_pack("p", _NonSqlGraph(), _NonSqlDocs(), _NoVec())
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal), pytest.raises(NotImplementedError):
+            pack_load.delete_pack("p", _NonSqlGraph(), _NonSqlDocs(), _NoVec(), sql=pack_sql)
 
     def test_live_pack_state_rejects(self):
         with pytest.raises(NotImplementedError):
@@ -646,7 +649,7 @@ class _NoVecFake:
 class TestPgShapedFakeStores:
     """게이트 ②·⑧(PG 축) — 3 시나리오 정상 동작 + 위반 raise + FTS 미실행."""
 
-    def test_delete_pack_scenario(self):
+    def test_delete_pack_scenario(self, pack_sql):
         graph, docs = _pg_fakes()
         graph.seed_node("Document", "n1", "pack-1")
         graph.seed_node("Document", "n2", "pack-1")
@@ -655,8 +658,10 @@ class TestPgShapedFakeStores:
         docs.seed_source("c1", "본문", pack_id="pack-1")
         docs.seed_source("c2", "본문2", pack_id="pack-2")
 
-        node_del, chunk_sql_del, _chunk_vec_del = pack_load.delete_pack(
-            "pack-1", graph, docs, _NoVecFake())
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            node_del, chunk_sql_del, _chunk_vec_del = pack_load.delete_pack(
+                "pack-1", graph, docs, _NoVecFake(), sql=pack_sql)
 
         assert node_del == 2, node_del
         assert chunk_sql_del == 1, chunk_sql_del
@@ -686,7 +691,7 @@ class TestPgShapedFakeStores:
         assert set(state["chunks"]) == {"c1"}
         assert "n1" in state["doc_node_spaces"]
 
-    def test_incremental_finalize_scenario(self):
+    def test_incremental_finalize_scenario(self, pack_sql):
         """doc 고아 청크 삭제(orphan)·엣지 정리 두 축 모두 PG fake 위에서 완주한다
         (게이트 ①의 21곳 전환 대상 중 :1111-1126·:1149-1161 커버)."""
         graph, docs = _pg_fakes()
@@ -698,9 +703,11 @@ class TestPgShapedFakeStores:
         docs.seed_source("c2", "본문2", pack_id="pack-1")  # 남을 청크
 
         state = pack_load.live_pack_state("pack-1", graph, docs, _NoVecFake())
-        res = pack_load.incremental_finalize(
-            "pack-1", graph, docs, _NoVecFake(), state,
-            {"n1"}, {"c2"}, {("n1", "rel", "n2")}, True, 1, 1)
+        principal = Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+        with principal_scope(principal):
+            res = pack_load.incremental_finalize(
+                "pack-1", graph, docs, _NoVecFake(), state,
+                {"n1"}, {"c2"}, {("n1", "rel", "n2")}, True, 1, 1, sql=pack_sql)
 
         assert res["node_del"] == 1, res
         assert res["chunk_del"] == 1, res
