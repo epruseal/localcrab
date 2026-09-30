@@ -15,7 +15,7 @@
 | `VECTOR_BACKEND` | 미설정(조건부) / `chroma` / `sqlite-vec` / `pgvector` | 벡터를 저장·검색하는 백엔드. 임베딩 축과 독립 |
 | `EMBEDDING_BACKEND` | `openai`(기본) / `local` | 텍스트를 벡터로 바꾸는 방식. 벡터 백엔드 축과 독립 |
 
-> **운영 권장**: `local`(SQLite 단일 규율)이 기본 권장이며, `docker`(Neo4j+MongoDB+PostgreSQL+Chroma 4종 혼합)는 다중 테넌트 등 SaaS 규모 전제가 아니면 4종 스토어 관리 비용이 개별 이점을 상회해 비권장이다. 실시간 동시 write(MCP 서빙 중 백그라운드 로더) 또는 벡터 수백만 스케일이 확정 요구이면 `pg`(PostgreSQL 단일 통합, MVCC 다중 라이터)로 이행한다 — §9 힌지 참고.
+> **운영 권장**: `local`(SQLite 단일 규율)이 기본 권장이며, `docker`(Neo4j+MongoDB+PostgreSQL+Chroma 4종 혼합)는 다중 테넌트 등 SaaS 규모 전제가 아니면 4종 스토어 관리 비용이 개별 이점을 상회해 비권장이다. 실시간 동시 write(MCP 서빙 중 백그라운드 로더) 또는 벡터 수백만 스케일이 확정 요구이면 `pg`(PostgreSQL 단일 통합, MVCC 다중 라이터)로 이행한다. 다중 라이터 운영 기준을 따른다.
 
 ---
 
@@ -66,7 +66,7 @@ sqlite-vec 표준 차원(KURE 1024d)과 맞지 않기 때문이다. sqlite-vec�
 | `docker` | 무관 | `sqlite-vec` | 사용(단, 로컬 파일 경로) | 코드상 `is_local` 체크 없이 backend 자체는 동작하나, docker 모드에서 vector만 SQLite로 로컬화하는 조합은 설계 의도 밖 — 권장하지 않음 |
 | `pg` | `openai` | _(미설정)_ | **`pgvector`** | `STORAGE_MODE=pg`이면 자동 선택(4스토어 전부 PG) |
 | `pg` | `local` | 무관 | **기동 실패** | **불가** — `ValueError`(minilm 384d는 pgvector 미지원, sqlite-vec와 동일 가드) |
-| `local`/`kuzu`/`docker` | `openai` | `pgvector` | 사용(벡터만 PG) | 가능 — `STORAGE_MODE!=pg`여도 명시하면 벡터만 PG로 보낼 수 있음(§6.3 (C) 단계) |
+| `local`/`kuzu`/`docker` | `openai` | `pgvector` | 사용(벡터만 PG) | 가능: `STORAGE_MODE!=pg`여도 명시하면 벡터만 PG로 보낼 수 있음 |
 
 ---
 
@@ -114,7 +114,7 @@ MATCH 스캔은 ~336ms(행당 vtab 오버헤드), 임의 point 접근은 ~0.76ms
 재빌드한다. 대량 적재 중 전역 ANN 쿼리는 배치마다 재빌드(~3s)를 유발할 수 있다.
 
 **pack-scoped 검색과 잔여 필터(where) 쿼리는 ANN을 타지 않는다** — pack 은
-partition key 사전필터로 이미 ~8ms라 exact 유지(§3.7의 안전 기본), 잔여 필터는
+partition key 사전필터로 이미 ~8ms라 exact 유지(위 §4.1의 안전 기본), 잔여 필터는
 post-filter 후보 풀을 보존하기 위해 exact 폴백. 따라서 pack isolation 특성은
 ANN on/off와 무관하게 동일하다.
 
@@ -219,7 +219,7 @@ opencrab serve
   이미 KURE 1024d이므로 벡터는 raw float 그대로 옮긴다).
 - 인프라 제약(`/dev/shm`, cgroup 메모리): 아래 §4.3.
 
-#### 4.2 Phase 2 통합 벤치 — sqlite-vec(A) vs pgvector(B) §11.1 게이트 실측
+#### 4.2 Phase 2 통합 벤치: sqlite-vec(A) vs pgvector(B) 벤치마크 성공 기준 실측
 
 실코드 경로(`PgVectorStore`/`PGGraphStore`/`PgDocStore`, factory가 만드는 것과 동일한
 클래스)로 **179,784건 실데이터 KURE 1024d 벡터 전량 + graph 154,561 노드/431,377
@@ -285,7 +285,7 @@ FIFO 특성상 항상 레벨(홉) 단위로 진행되므로, 한 홉의 프론�
 `unnest`+`JOIN` 쿼리 1회로 모은다. 원본의 "remaining slot" 순차 선택 로직(노드/방향/행
 순서, pack 필터 3규칙)은 메모리상에서 그대로 재현했다 — SQL은 후보 수집만 배치화했을 뿐
 선택 로직은 손대지 않아 파리티가 보존된다. 파리티 검증: `tests/test_pg_graph_doc_parity.py`
-36개 전부 통과(`OPENCRAB_PG_TEST_URL` 설정 시). 재귀 CTE(§6.4 canonical 경로)로의 전환은
+36개 전부 통과(`OPENCRAB_PG_TEST_URL` 설정 시). 재귀 CTE(canonical 경로)로의 전환은
 여전히 미착수 상태이나, 이번 홉 단위 배치화만으로 게이트를 9배 이상 여유 있게 통과했다.
 
 **doc 스팟체크** (`PgDocStore.keyword_search`, 실데이터 질의 3종):
@@ -334,7 +334,7 @@ FIFO 특성상 항상 레벨(홉) 단위로 진행되므로, 한 홉의 프론�
 | 디스크 사용량 | 2,474 MB(graph 299 + doc 970 + vector 1,205) | **3,584 MB**(graph 260 + doc 806 + vector 2,518) | **PG가 약 45% 큼** — HNSW 인덱스(벡터 테이블 2,518MB 중 상당 비중) + JSONB/TOAST + PG 튜플 오버헤드가 원인. VACUUM 미실행 상태 수치 |
 | 콜드 커넥션(최초 1회) | 0.4ms(파일 open) | 73.1ms(TCP 커넥션+ping) | 상시 서버 프로세스 특성상 1회성 비용, 커넥션 풀 재사용 후 steady-state 영향 없음 |
 
-**§11.1 게이트 종합 판정** (pgvector, 179,784×1024d 전량, ef_search=500 · find_neighbors
+**벤치마크 성공 기준 종합 판정** (pgvector, 179,784×1024d 전량, ef_search=500, find_neighbors
 홉 단위 배치화 적용 기준 — 수정 후 재측정):
 
 | 게이트 | 목표 | 실측 | 판정 |
@@ -353,14 +353,14 @@ FIFO 특성상 항상 레벨(홉) 단위로 진행되므로, 한 홉의 프론�
 곡선 실측으로 550 이상의 지연 급증 구간을 확인하고 그 직전 안전값을 채택), graph는
 `find_neighbors`를 홉 단위 배치 조회(unnest+LATERAL)로 재작성해 N+1 SQL 왕복을 제거했다
 (재귀 CTE 전환은 여전히 미착수 상태로 남아 있으나 이번 배치화만으로 게이트를 만족).
-재측정 결과 8개 게이트 전부 PASS. sqlite-vec(A) 쪽 §11.1 실측(pack-scoped p95 8.3ms
+재측정 결과 8개 게이트 전부 PASS. sqlite-vec(A) 쪽 §4.2 실측(pack-scoped p95 8.3ms
 exact / global p95 exact 593ms·binary 55ms recall 0.995)과 나란히 보면, pack-scoped
 지연은 pgvector가 근소 우위(2.93\~6.73ms vs 8.3ms)이나 절대 격차는 작고, global 검색은
 pgvector(HNSW, ef=500 기준 24.61ms)가 sqlite-vec의 binary 2단계(54.8ms)보다 빠르면서
 recall도 게이트를 만족한다(0.96). graph 3-hop 지연도 수정 후 11.02ms로 (A)의 인프로세스
 SQLite(LocalGraphStore, 4.75\~9.34ms)에 근접한다. graph/doc/backup 축은 pgvector 전용
 이점(단일 트랜잭션 백업, MVCC 다중 라이터)이 뚜렷하며, 두 FAIL이 해소됨에 따라 (B) 채택의
-성능 측 장애 요인은 남아 있지 않다. 최종 채택은 §9 힌지와 함께 확정한다.
+성능 측 장애 요인은 남아 있지 않다. 최종 채택은 다중 라이터 운영 기준에 따라 확정한다.
 
 #### 4.3 인프라 주의 (pgvector HNSW 빌드)
 

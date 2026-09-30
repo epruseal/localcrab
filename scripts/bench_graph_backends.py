@@ -7,16 +7,16 @@ bench_graph_backends.py — LocalGraphStore(SQLite) vs Neo4jStore 비교
 
 사용 예:
   # 임시 Neo4j 기동 후 (별도 포트 7688)
-  python scripts/bench_graph_backends.py
+  python scripts/bench_graph_backends.py --dump-dir <dump_dir>
 
   # 스케일 지정
-  python scripts/bench_graph_backends.py --scales 500,2000,10000
+  python scripts/bench_graph_backends.py --dump-dir <dump_dir> --scales 500,2000,10000
 
   # 정합성만
-  python scripts/bench_graph_backends.py --consistency-only
+  python scripts/bench_graph_backends.py --dump-dir <dump_dir> --consistency-only
 
   # 속도만
-  python scripts/bench_graph_backends.py --speed-only
+  python scripts/bench_graph_backends.py --dump-dir <dump_dir> --speed-only
 
   # 라이브 Neo4j 읽기 전용 쿼리 (쓰기 0)
   python scripts/bench_graph_backends.py --readonly-target live --neo4j-uri bolt://localhost:7687
@@ -824,8 +824,8 @@ def main():
                         help="읽기 전용 쿼리 대상 (쓰기 0). live=라이브 Neo4j, localdb=기존 graph.db")
     parser.add_argument("--seed-count", type=int, default=20,
                         help="시드 노드 수 (기본: 20)")
-    parser.add_argument("--dump-dir", required=True,
-                        help="nodes.jsonl/edges.jsonl 이 있는 덤프 디렉터리(필수, 머신마다 다름)")
+    parser.add_argument("--dump-dir",
+                        help="쓰기 벤치마크용 nodes.jsonl/edges.jsonl 덤프 디렉터리")
     parser.add_argument("--graph-db-path", default=None,
                         help="읽기 전용(--readonly-target localdb) 대상 graph.db 경로 "
                              "(기본: Settings().local_data_dir/graph.db)")
@@ -852,6 +852,8 @@ def main():
         run_readonly_target(args.readonly_target, uri, user, pwd, graph_db_path)
         return
 
+    if not args.dump_dir:
+        parser.error("--dump-dir is required for benchmark mode")
     scales = [int(s.strip()) for s in args.scales.split(",")]
     results = run_bench(
         scales=scales,

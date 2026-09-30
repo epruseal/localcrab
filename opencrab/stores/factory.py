@@ -122,7 +122,7 @@ def make_vector_store(settings: Settings) -> Any:
       "pgvector"   : pgvector(PostgreSQL 확장). STORAGE_MODE=pg 이면 sql/doc/graph
                      와 동일 공유 SQLAlchemy 엔진을 주입받는다. storage_mode!="pg"
                      여도 VECTOR_BACKEND=pgvector 를 명시하면 벡터만 PG 를 쓸 수
-                     있다(§6.3 (C) 단계 — 이 경우 postgres_url 로 자체 엔진 생성).
+                     있다(벡터만 PG로 보내는 조합. 이 경우 postgres_url 로 자체 엔진 생성).
 
     설계: docs/vector-backends.md §2. 임베딩은 백엔드와 무관하게 동일.
     한국어 검색 품질: minilm MRR 0.285 vs KURE-v1 1.000.
@@ -139,7 +139,7 @@ def make_vector_store(settings: Settings) -> Any:
                 f"현재 EMBEDDING_BACKEND={settings.embedding_backend!r}. "
                 "KURE EF 로 앱측 임베딩 후 vec0 에 INSERT 하므로 minilm(384d)은 미지원입니다."
             )
-        # VECTOR_ANN 유효성 검증: ""(off, 기본) / "binary"(2단계 양자화, §3.7)만 허용.
+        # VECTOR_ANN 유효성 검증: ""(off, 기본) / "binary"(2단계 양자화, docs/vector-backends.md §4.1)만 허용.
         # 잘못된 값은 막연한 런타임 오류 대신 기동 시 명확한 설정 오류로 안내.
         if settings.vector_ann not in ("", "binary"):
             raise ValueError(

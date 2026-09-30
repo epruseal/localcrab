@@ -108,7 +108,7 @@ class Settings(BaseSettings):
     #              capability-negative until Ladybug is qualified.
     #   "pg"     — PG-unified: 4스토어(graph/doc/sql/vector) 전부 PostgreSQL 한
     #              서버·SQLAlchemy 공유 엔진으로 통합. MVCC 다중 라이터가 필요한
-    #              운영(§9 힌지: MCP 서빙 중 동시 write, 벡터 수백만 스케일)에
+    #              운영(운영 기준: MCP 서빙 중 동시 write, 벡터 수백만 스케일)에
     #              권장. 설계/실측: docs/vector-backends.md pgvector 절.
     # ------------------------------------------------------------------
     storage_mode: Literal["local", "docker", "kuzu", "pg"] = Field(
@@ -263,7 +263,7 @@ class Settings(BaseSettings):
     #                        hnsw.ef_search=PG_EF_SEARCH(기본 500). STORAGE_MODE=pg
     #                        이면 자동 선택(vector_backend_resolved), local 모드에서
     #                        VECTOR_BACKEND=pgvector 명시 설정으로 벡터만 PG를 쓰는
-    #                        조합도 가능(§6.3 (C) 단계). 실측: docs/vector-backends.md.
+    #                        조합도 가능(벡터만 PG로 보내는 조합). 실측: docs/vector-backends.md.
     #
     # 설계: docs/vector-backends.md §2. embedding 은 백엔드와 무관하게
     #       동일(ResilientEmbeddingFunction, KURE). 바뀌는 것은 저장/검색 백엔드뿐.
@@ -289,7 +289,7 @@ class Settings(BaseSettings):
     #
     # 옵션:
     #   ""(미설정, 기본) : off. 기존 exact 브루트포스 경로 100% 불변.
-    #   "binary"         : binary 2단계 양자화(§3.7). 전역(pack 미지정) 검색을
+    #   "binary"         : binary 2단계 양자화(docs/vector-backends.md §4.1). 전역(pack 미지정) 검색을
     #                      ① bit 해밍 coarse(부호 1bit 사본, 후보 C개 추림) →
     #                      ② float cosine rerank 로 답해 179k×1024d 브루트포스
     #                      p95 ~868ms 를 ~30ms 대로 낮춘다. pack-scoped 검색은
@@ -309,7 +309,7 @@ class Settings(BaseSettings):
         # Literal["", "binary"] — pydantic-settings 호환을 위해 str 사용
     )
     # binary 2단계의 coarse 후보 수 C (recall 튜닝 노브). C↑ → exact 근접·느려짐.
-    # recall@10 ≥ 0.95 게이트를 통과하는 최소값을 벤치로 채택(§3.7). vec0 k 상한
+    # recall@10 ≥ 0.95 게이트를 통과하는 최소값을 벤치로 채택(docs/vector-backends.md §4.1). vec0 k 상한
     # (4096)으로 클램프됨.
     vector_ann_coarse_k: int = Field(default=512, alias="VECTOR_ANN_COARSE_K")
 

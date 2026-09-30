@@ -48,11 +48,6 @@ def _num_dotted(*parts: object) -> str:
     return ".".join(str(p) for p in parts)
 
 
-def _unexpected_and_missing(violations, deferred):
-    found_pairs = {(str(v.path), v.matched_text) for v in violations}
-    return found_pairs - deferred, deferred - found_pairs
-
-
 # ---------------------------------------------------------------------------
 # 기본 탐지
 # ---------------------------------------------------------------------------
@@ -202,7 +197,7 @@ def test_allowed_placeholder_users_actually_filters(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_scan_flags_new_violation_in_deferred_file(tmp_path):
+def test_scan_flags_new_violation_in_deferred_file(tmp_path, monkeypatch):
     """같은 파일 안이라도 보류된 matched_text 와 다른 신규 위반은 잡혀야 한다
     — 줄 번호가 아니라 (path, matched_text) 쌍이 보류 키라서 가능한 정밀도."""
     target = tmp_path / "owned.py"
@@ -212,27 +207,69 @@ def test_scan_flags_new_violation_in_deferred_file(tmp_path):
     deferred = frozenset({(str(target), _fake_home_path("owneruser", ""))})
 
     violations = mod.scan([target])
-    unexpected, missing = _unexpected_and_missing(violations, deferred)
+    unexpected, missing = mod.classify_violations(violations, deferred)
+    monkeypatch.setattr(mod, "enumerate_git_files", lambda: [target])
+    monkeypatch.setattr(sys, "argv", ["check_no_machine_paths.py"])
+    monkeypatch.setattr(mod, "DEFERRED_VIOLATIONS", deferred)
 
     assert unexpected == {(str(target), _fake_home_path("intruderuser", ""))}
     assert missing == set()
+    assert mod.main() == 1
 
 
-def test_scan_passes_with_only_recorded_violations(tmp_path):
+def test_scan_passes_with_only_recorded_violations(tmp_path, monkeypatch):
     target = tmp_path / "owned.py"
     recorded = _fake_home_path("owneruser", "old.py")
     target.write_text(f"{recorded}\n", encoding="utf-8")
     deferred = frozenset({(str(target), _fake_home_path("owneruser", ""))})
 
     violations = mod.scan([target])
-    unexpected, missing = _unexpected_and_missing(violations, deferred)
+    unexpected, missing = mod.classify_violations(violations, deferred)
+    monkeypatch.setattr(mod, "enumerate_git_files", lambda: [target])
+    monkeypatch.setattr(sys, "argv", ["check_no_machine_paths.py"])
+    monkeypatch.setattr(mod, "DEFERRED_VIOLATIONS", deferred)
 
     assert unexpected == set()
     assert missing == set()
+    assert mod.main() == 0
+
+
+def test_scan_rejects_missing_deferred_violation(tmp_path, monkeypatch):
+    target = tmp_path / "owned.py"
+    target.write_text("clean\n", encoding="utf-8")
+    deferred = frozenset({(str(target), _fake_home_path("owneruser", ""))})
+    monkeypatch.setattr(mod, "enumerate_git_files", lambda: [target])
+    monkeypatch.setattr(sys, "argv", ["check_no_machine_paths.py"])
+    monkeypatch.setattr(mod, "DEFERRED_VIOLATIONS", deferred)
+
+    assert mod.main() == 1
+
+
+def test_scan_rejects_unreadable_tracked_file(tmp_path, monkeypatch):
+    target = tmp_path / "owned.py"
+    target.write_text("clean\n", encoding="utf-8")
+    original_read = Path.read_bytes
+
+    def fail_read(path):
+        if path == target:
+            raise PermissionError("tracked file cannot be read")
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read)
+    monkeypatch.setattr(mod, "enumerate_git_files", lambda: [target])
+    monkeypatch.setattr(sys, "argv", ["check_no_machine_paths.py"])
+    monkeypatch.setattr(mod, "DEFERRED_VIOLATIONS", frozenset())
+
+    try:
+        mod.main()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("main accepted an unreadable tracked file")
 
 
 # ---------------------------------------------------------------------------
-# 역변이 — 두 탐지기가 서로 독립임을 확인(한쪽을 죽여도 다른 쪽은 산다)
+# 역변이: 두 탐지기가 서로 독립임을 확인한다.
 # ---------------------------------------------------------------------------
 
 _NEVER_MATCHES = re.compile(r"(?!)")

@@ -34,7 +34,7 @@ SCHEMA / INDEX (프리플라이트 실증 완료, 2026-07 — 이대로 구현):
     인덱스 생성 직전 ``maintenance_work_mem='512MB'``/``max_parallel_maintenance_workers=0``
     을 SET한 뒤 CREATE INDEX한다(ensure-schema에서 1회, 세션 단위이므로 부작용 없음).
 
-WHY NOT BINARY 2-STAGE (SqliteVecStore §3.7과 달리 여기서는 불필요):
+WHY NOT BINARY 2-STAGE (SqliteVecStore binary 2-stage ANN과 달리 여기서는 불필요):
     HNSW 인덱스가 이미 전역 검색을 실측 p95 6.44ms로 처리하므로(sqlite-vec의
     브루트포스 868ms 문제가 애초에 없음), 별도의 sign-bit 2단계 근사 경로를
     둘 이유가 없다 — HNSW 자체가 이미 서브선형 ANN이다.

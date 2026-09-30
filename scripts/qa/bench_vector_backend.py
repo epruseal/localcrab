@@ -11,7 +11,7 @@ then measures — isolating the *store index/search* behaviour from embedding:
   - pack leak   : partition-filtered results must all belong to the pack
   - disk/build  : vectors.db size and build time
 
-Gate targets (§11.1): recall@10 >= 0.95, single-pack p95 <= 100ms,
+Gate targets (docs/vector-backends.md §4.2): recall@10 >= 0.95, single-pack p95 <= 100ms,
 metadata-filtered p95 <= 200ms, pack leak = 0.
 
 Notes:
@@ -75,7 +75,7 @@ def pctl(xs: list[float], p: float) -> float:
 
 
 def bench_binary(args: argparse.Namespace) -> int:
-    """§3.7 gate: binary 2-stage (real SqliteVecStore path) vs exact float.
+    """docs/vector-backends.md §4.1 gate: binary 2-stage (real SqliteVecStore path) vs exact float.
 
     Protocol (kept cheap — the exact baseline is the expensive part):
       - exact global top-10 per query is computed ONCE and cached to a JSON
@@ -252,8 +252,8 @@ def bench_pg(args: argparse.Namespace) -> int:
       - recall@10 : HNSW vs exact(동일 데이터, 인덱스 강제 비활성 스캔) top-10 overlap
       - pack leak : pack-scoped 결과가 항상 지정 pack만 포함하는지(=0 이어야 함)
 
-    게이트 상수는 §11.1(recall>=0.95, pack p95<=200ms)을 재사용한다. 전역 p95는
-    HNSW가 서브선형이라 별도 게이트를 프리플라이트에서 신설하지 않았으므로(§3.7
+    게이트 상수는 docs/vector-backends.md §4.2(recall>=0.95, pack p95<=200ms)을 재사용한다. 전역 p95는
+    HNSW가 서브선형이라 별도 게이트를 프리플라이트에서 신설하지 않았으므로(docs/vector-backends.md §4.1
     binary 모드의 100ms 게이트와 달리 pgvector는 HNSW 자체가 답이라 참고치만 출력).
 
     NOTE: 이 함수는 --mode pg 를 동작 가능하게 구현한 것이며, 179k 라이브 데이터
@@ -438,7 +438,7 @@ def main() -> int:
     ap.add_argument("--mode", choices=["chroma-parity", "binary", "pg"],
                     default="chroma-parity",
                     help="chroma-parity: original chroma-vs-vec0 gate; "
-                         "binary: §3.7 2-stage ANN gate on a migrated DB copy; "
+                         "binary: docs/vector-backends.md §4.1 2-stage ANN gate on a migrated DB copy; "
                          "pg: PgVectorStore(HNSW) gate from an offline vec0 DB copy")
     ap.add_argument("--data-dir", default=Settings().local_data_dir)
     ap.add_argument("--work-dir", default=str(Path(Settings().local_data_dir).parent),

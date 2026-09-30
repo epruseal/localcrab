@@ -127,10 +127,7 @@ def scan(files: Iterable[Path]) -> list[Violation]:
     """
     violations: list[Violation] = []
     for path in files:
-        try:
-            data = path.read_bytes()
-        except OSError:
-            continue
+        data = path.read_bytes()
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -138,6 +135,13 @@ def scan(files: Iterable[Path]) -> list[Violation]:
         violations.extend(_scan_home_paths(path, text))
         violations.extend(_scan_private_ips(path, text))
     return violations
+
+
+def classify_violations(
+    violations: Iterable[Violation], deferred: frozenset[tuple[str, str]]
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    found_pairs = {(str(v.path), v.matched_text) for v in violations}
+    return found_pairs - deferred, deferred - found_pairs
 
 
 def enumerate_git_files() -> list[Path]:
@@ -154,8 +158,7 @@ def main() -> int:
 
     files = enumerate_git_files()
     violations = scan(files)
-    found_pairs = {(str(v.path), v.matched_text) for v in violations}
-    unexpected = found_pairs - DEFERRED_VIOLATIONS
+    unexpected, missing_deferred = classify_violations(violations, DEFERRED_VIOLATIONS)
 
     if unexpected:
         print("미회수 위반:")
@@ -163,7 +166,6 @@ def main() -> int:
             print(f"  {path}: {matched!r}")
         return 1
 
-    missing_deferred = DEFERRED_VIOLATIONS - found_pairs
     if missing_deferred:
         print(
             "기록된 보류 위반이 저장소에서 사라졌다 — #415가 머지됐으면 "
