@@ -44,6 +44,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -67,11 +68,85 @@ logger = logging.getLogger(__name__)
 # call sites and tests keep working.
 __all__ = [
     "create_app",
+    "AccessLogTokenRedactor",
+    "install_access_log_redaction",
     "install_mcp_no_store",
     "install_mcp_origin_guard",
     "mcp_router",
     "refuse_stale_shared_secret_env",
 ]
+
+# #427: the ?token= credential travels in the URL when allow_query_token is on,
+# and uvicorn logs the URL. Two uvicorn loggers carry the query string: the
+# access log (request line) and the TRACE-level ASGI message logger (scope
+# dump). The WebSocket handshake lines on uvicorn.error also carry it; that
+# channel is closed by ws="none" in ``opencrab serve``, not filtered here.
+# The mask is total (no prefix): a token prefix still shrinks the search space.
+_TOKEN_PARAM = "token"
+_TOKEN_MASK = "***"
+_REDACTED_LOGGERS = ("uvicorn.access", "uvicorn.asgi")
+
+
+def _redact_query(query: str) -> str:
+    """Mask the value of every ``token`` parameter in a raw query string.
+
+    The name is percent-decoded before comparison because Starlette decodes it
+    before lookup, so ``?%74oken=`` authenticates exactly like ``?token=``.
+    ``+`` decodes to a space there, so ``to+ken`` is not an alias.
+    """
+    parts = query.split("&")
+    for i, part in enumerate(parts):
+        name, sep, _value = part.partition("=")
+        if sep and unquote(name.replace("+", " ")) == _TOKEN_PARAM:
+            parts[i] = f"{name}={_TOKEN_MASK}"
+    return "&".join(parts)
+
+
+def _redact_target(target: str) -> str:
+    path, sep, query = target.partition("?")
+    return f"{path}?{_redact_query(query)}" if sep else target
+
+
+def _scrub_log_arg(arg: Any) -> Any:
+    if isinstance(arg, str):
+        return _redact_target(arg)
+    if isinstance(arg, dict) and isinstance(arg.get("query_string"), bytes):
+        # uvicorn.asgi logs a copy of the ASGI scope; copy again so the live
+        # scope the app reads is never touched.
+        scrubbed = dict(arg)
+        scrubbed["query_string"] = _redact_query(arg["query_string"].decode("latin-1")).encode("latin-1")
+        return scrubbed
+    return arg
+
+
+class AccessLogTokenRedactor(logging.Filter):
+    """Mask ``token`` query values in uvicorn access and TRACE log records.
+
+    Never drops a record and never raises: a record whose args have an
+    unexpected shape passes through unchanged.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.args, tuple):
+                record.args = tuple(_scrub_log_arg(a) for a in record.args)
+        except Exception:  # noqa: BLE001 - a logging filter must not break requests
+            pass
+        return True
+
+
+def install_access_log_redaction() -> None:
+    """Attach the redactor to the uvicorn loggers once (idempotent).
+
+    Logger filters, unlike handlers, survive uvicorn's ``dictConfig`` call in
+    ``uvicorn.run()``, so installing from ``create_app()`` (which runs before
+    it) is enough.
+    """
+    for name in _REDACTED_LOGGERS:
+        target = logging.getLogger(name)
+        if not any(isinstance(f, AccessLogTokenRedactor) for f in target.filters):
+            target.addFilter(AccessLogTokenRedactor())
+
 
 # Every /mcp response carries this. Not just the successful ones: when the
 # credential travels in the URL (allow_query_token), the 401/405/202/parse-error
@@ -594,11 +669,12 @@ async def _startup_registry_check(app: FastAPI) -> Any:
 def create_app(*, allow_query_token: bool = False) -> FastAPI:
     """Lightweight FastAPI app for ``serve --transport http`` — MCP router + healthz."""
     refuse_stale_shared_secret_env()
+    install_access_log_redaction()
     if allow_query_token:
         logger.warning(
             "?token= query-parameter auth is ENABLED. The credential will appear "
-            "in access logs, reverse-proxy logs, browser history and Referer "
-            "headers. Rotate these tokens more often than header-borne ones, and "
+            "in reverse-proxy logs, browser history and Referer headers "
+            "(this server masks it in its own logs). Rotate these tokens more often than header-borne ones, and "
             "issue a separate token per client so one leak revokes one client. "
             "See docs/mcp-client-auth.md."
         )

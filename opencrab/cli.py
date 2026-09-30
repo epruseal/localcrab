@@ -400,6 +400,9 @@ def serve(
         port=bind_port,
         workers=1,
         log_level=cfg.log_level.lower(),
+        # #427: MCP over HTTP never uses WebSocket, and uvicorn's WebSocket
+        # handshake lines log the full URL (including ?token=) on uvicorn.error.
+        ws="none",
     )
 
 
