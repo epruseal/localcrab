@@ -24,7 +24,7 @@ request so ``dispatch_tool`` and the handlers it calls can read it via
 CREDENTIAL SOURCES. ``Authorization: Bearer`` is the default and the only one
 enabled out of the box. ``?token=`` is available but **off unless explicitly
 enabled** (``allow_query_token``), because a URL-borne credential leaks into
-access logs, proxy logs, browser history and Referer headers. It exists
+access logs (this server masks ``token`` in its own uvicorn logs, #427), proxy logs, browser history and Referer headers. It exists
 because some clients cannot set custom headers at all -- claude.ai's web UI
 is the concrete case -- and deleting it would cut them off. See
 ``docs/mcp-client-auth.md`` for which client needs which, and read that table
