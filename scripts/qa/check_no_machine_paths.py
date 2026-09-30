@@ -11,11 +11,10 @@
 받아들임 기준은 "원시 매치 0건"이 아니라 "미회수 위반 0건"이다 — 중립
 placeholder 사용자명(ALLOWED_PLACEHOLDER_USERS)과 완전 검증된 IP 옥텟이
 아닌 문자열(예: package-lock.json의 3-part semver)은 애초에 위반이 아니다.
-그래도 남는 실위반 중 #415(다른 이슈)가 소유한 두 파일만 DEFERRED_VIOLATIONS로
-보류한다 — 보류는 (path, matched_text) 쌍 단위로 기록해, 같은 파일 안의 다른
-신규 위반은 보류 대상에 섞이지 않고 그대로 잡히게 한다(줄 번호를 키로 쓰면
-다른 커밋이 줄을 밀 때 거짓 실패/거짓 통과가 난다 — 실측: opencrab/pack/load.py의
-이 위반은 #421 머지 전후로 줄 번호가 2010→2136으로 이동했다).
+다른 이슈가 소유한 파일의 기존 위반을 잠시 넘겨야 하면 DEFERRED_VIOLATIONS에
+(path, matched_text) 쌍으로 기록한다. 쌍 단위로 기록하므로 같은 파일 안의 다른
+신규 위반은 그대로 잡힌다. 줄 번호는 다른 커밋이 줄을 밀면 거짓 판정을 내므로
+키로 쓰지 않는다. 현재 보류 목록은 비어 있다.
 """
 
 from __future__ import annotations
@@ -59,22 +58,9 @@ PRIVATE_IP_RE = re.compile(
 # 검사 전용).
 ALLOWLIST_IP_PATH_GLOBS: tuple[str, ...] = ()
 
-# 보류: #415가 아직 열려 있는 동안, 그 이슈가 소유한 두 파일의 기존 위반만
-# (path, matched_text) 쌍으로 기록한다. 줄 번호는 키에 넣지 않는다 — 다른
-# 커밋이 그 파일의 줄을 밀어도 이 보류 등록이 거짓으로 무효화되지 않는다.
-# #415가 먼저 머지되면 이 두 파일의 실제 위반이 사라지므로 이 frozenset을
-# 비우고 두 파일을 직접 고친다.
-# 이 파일도 게이트 대상이므로 보류 키의 경로 모양을 리터럴로 쓰지 않고 조립한다.
-_HOME_PREFIX = "/".join(["", "home", ""])
-_MAC_PREFIX = "/".join(["", "Users", ""])
-_DEFERRED_USER = "asd" + "f"
-DEFERRED_VIOLATIONS: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("opencrab/pack/load.py", _HOME_PREFIX + _DEFERRED_USER + "/"),
-        ("tests/test_pack_load_r11_pg_gates.py", _MAC_PREFIX + _DEFERRED_USER),
-        # 추적: #415 — 두 파일 모두 #415가 고치는 파일이다.
-    }
-)
+# 보류 목록. 다른 이슈가 소유한 파일의 기존 위반만 (path, matched_text) 쌍으로
+# 기록한다. 기록된 쌍이 저장소에서 사라지면 main()이 실패해 목록 갱신을 강제한다.
+DEFERRED_VIOLATIONS: frozenset[tuple[str, str]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -168,14 +154,14 @@ def main() -> int:
 
     if missing_deferred:
         print(
-            "기록된 보류 위반이 저장소에서 사라졌다 — #415가 머지됐으면 "
-            "DEFERRED_VIOLATIONS를 비우고 이 스크립트를 갱신할 시점이다:"
+            "기록된 보류 위반이 저장소에서 사라졌다. "
+            "DEFERRED_VIOLATIONS에서 해당 쌍을 지운다:"
         )
         for path, matched in sorted(missing_deferred):
             print(f"  {path}: {matched!r}")
         return 1
 
-    print(f"OK — 미회수 위반 0건 (보류 {len(DEFERRED_VIOLATIONS)}건, #415 추적)")
+    print(f"OK: 미회수 위반 0건 (보류 {len(DEFERRED_VIOLATIONS)}건)")
     return 0
 
 

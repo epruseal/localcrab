@@ -334,8 +334,7 @@ class TestRowAccessDiscipline:
 # ───────────────────────── 게이트 ⑪ 집합 DELETE 등가 ─────────────────────────
 
 class TestSetDeleteEquivalence:
-    """참고: `/Users/asdf/.claude/jobs/29401570/tmp/verify_r11v6/p1_setdelete.py`
-    와 동일한 9행 픽스처(문자열/정수/불리언/null/복합/부재 pack_id 혼재)."""
+    """참고: 게이트 ⑪ 검증 스크립트(p1_setdelete)와 동일한 9행 픽스처(문자열/정수/불리언/null/복합/부재 pack_id 혼재)."""
 
     @staticmethod
     def _mkdb() -> sqlite3.Connection:
