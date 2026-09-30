@@ -413,19 +413,24 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         absent from the returned dict. Empty ``pack_ids``, ``per_pack_limit
         <= 0`` or an unavailable index return ``{}`` without querying.
         """
-        if not self._available or not self._fts_ok or not self._conn:
+        if not self._available or not self._fts_ok:
             return {}
         if not pack_ids or per_pack_limit <= 0:
             return {}
         built = self._keyword_where(query, pack_ids, spaces)
         if built is None:
             return {}
+        # Connection access comes last: on a fresh thread it opens a connection
+        # and runs PRAGMAs, which the input guards above must not trigger.
+        if not self._conn:
+            return {}
         where_sql, params, pack_expr = built
         params.append(per_pack_limit)
         rows = self._conn.execute(
-            # bm25() is only legal in the MATCH query itself, not inside a window
-            # function, so the MATERIALIZED CTE ranks the match set once and the
-            # outer query numbers the rows per pack.
+            # A MATCH query that projects bm25() and also uses it in a window
+            # ORDER BY fails ("unable to use function bm25 in the requested
+            # context"). The MATERIALIZED CTE computes rank in the MATCH query;
+            # the window then runs over the CTE's rank column.
             "WITH m AS MATERIALIZED ("
             "SELECT f.source_id AS sid, s.text AS text, s.metadata AS meta, "
             f"bm25(doc_sources_fts) AS rank, {pack_expr} AS pid "
@@ -445,6 +450,6 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                 "node_id": meta.get("node_id") or r["sid"],
                 "text": r["text"],
                 "metadata": meta,
-                "score": -float(r["rank"] or 0.0),
+                "score": -float(r["rank"] or 0.0),  # bm25: lower is better, so flip the sign
             })
         return out

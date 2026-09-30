@@ -97,6 +97,35 @@ def test_per_pack_guards(store):
     assert f("!!! ???", pack_ids=["big"], per_pack_limit=5) == {}
 
 
+@pytest.mark.parametrize(
+    "query, pack_ids, limit",
+    [("common", [], 5), ("common", ["big"], 0), ("common", ["big"], -1), ("!!! ???", ["big"], 5)],
+)
+def test_guards_on_a_fresh_thread_never_create_a_connection(
+    store, monkeypatch, query, pack_ids, limit
+):
+    """Same pattern as keyword_search's fresh-thread guard tests: an input
+    that needs no query must not open a connection (PRAGMA side effects)."""
+    _seed(store)
+    new_conn_calls = []
+    real_new_conn = store._new_conn
+    monkeypatch.setattr(store, "_new_conn", lambda: (new_conn_calls.append(1), real_new_conn())[1])
+    store._local.conn = None
+    assert store.keyword_search_per_pack(query, pack_ids=pack_ids, per_pack_limit=limit) == {}
+    assert new_conn_calls == []
+
+
+def test_valid_call_on_a_fresh_thread_does_create_a_connection(store, monkeypatch):
+    """Negative control: the spy does fire for a real query."""
+    _seed(store)
+    new_conn_calls = []
+    real_new_conn = store._new_conn
+    monkeypatch.setattr(store, "_new_conn", lambda: (new_conn_calls.append(1), real_new_conn())[1])
+    store._local.conn = None
+    store.keyword_search_per_pack("common", pack_ids=["big"], per_pack_limit=3)
+    assert new_conn_calls == [1]
+
+
 def test_malformed_metadata_row_does_not_crash(store, tmp_path):
     _seed(store)
     con = sqlite3.connect(str(tmp_path / "doc.db"))

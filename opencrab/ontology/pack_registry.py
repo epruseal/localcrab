@@ -545,7 +545,7 @@ def _choose_by_content(
     fts_by_pack: dict[str, list[dict[str, Any]]] | None = None
     per_pack_fts = getattr(hybrid, "_fts_search_per_pack", None)
     if per_pack_fts is not None:
-        result = per_pack_fts(  # noqa: SLF001 — 내부 프로브 전용 호출
+        result = per_pack_fts(  # noqa: SLF001 (내부 프로브 전용 호출)
             question,
             spaces,
             PER_PACK_PROBE_LIMIT,
@@ -560,7 +560,7 @@ def _choose_by_content(
         if fts_by_pack is not None:
             fts_hits = fts_by_pack.get(pid, [])
         else:
-            fts_hits = hybrid._fts_search(  # noqa: SLF001 — 내부 프로브 전용 호출
+            fts_hits = hybrid._fts_search(  # noqa: SLF001 (내부 프로브 전용 호출)
                 question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
             )
         if len(bm25_hits) >= PER_PACK_PROBE_LIMIT or len(fts_hits) >= PER_PACK_PROBE_LIMIT:
