@@ -1,8 +1,10 @@
 """#428: MCP read tools must not disguise rows the store marked with
 ``property_decode_error`` as empty nodes or edges.
 
-Corruption is a duplicate-key JSON object: still valid JSON (so the pack
-scope predicate reaches the row) but rejected by ``decode_properties``.
+Node corruption is a duplicate-key JSON object: still valid JSON (so the
+pack scope predicate reaches the row) but rejected by ``decode_properties``.
+Malformed JSON cannot be written to a node here (the SQLite pack index
+refuses it), and the safe scope predicate would exclude it anyway.
 """
 
 from __future__ import annotations

@@ -24,10 +24,10 @@ from ._registry import AccessTier, safe_tool_error, tool
 logger = logging.getLogger(__name__)
 
 _DECODE_ERROR_NOTE = (
-    "Rows whose stored properties are corrupt (the store marks them "
-    "property_decode_error) are withheld, never returned as empty entries. "
-    "When any were withheld the response carries property_decode_error_count. "
-    "The key is absent otherwise. (#428)"
+    "The tool withholds every row the store marked property_decode_error "
+    "(for an edge: either endpoint or the edge itself). It never returns such "
+    "a row as an empty entry. When the tool withheld any row, the response "
+    "carries property_decode_error_count. The key is absent otherwise. (#428)"
 )
 
 
@@ -359,8 +359,8 @@ def ontology_add_edge(
             "Suppose the row is readable in scope but its stored properties fail to "
             "decode. Then found stays true and the response adds "
             "property_decode_error=true at the top level. Its properties are not "
-            "trustworthy. A row so broken that its ownership cannot be read "
-            "is answered found=false, like an absent node. (#428)"
+            "trustworthy. For a row so broken that its ownership cannot be read, "
+            "the tool answers found=false, as for an absent node. (#428)"
         ),
         "inputSchema": {
             "type": "object",
@@ -434,12 +434,12 @@ def ontology_get_node(node_id: str) -> dict[str, Any]:
             "ontology_get_node -- both now read the same store). `total` in the response is "
             "the TRUE count of all matching nodes -- it is NOT capped by `limit` and can be "
             "larger than the number of `nodes` actually returned. If `total` exceeds "
-            "len(nodes), some matching rows were not returned. The page may have been cut "
-            "by `limit`. A larger `limit` may then return more rows, but extra rows it "
-            "fetches can be corrupt too and are then withheld. Or rows were withheld as "
-            "corrupt (see `property_decode_error_count`). A larger `limit` never returns "
-            "those. COUNT and the page are separate queries, so concurrent writes can also "
-            "make them differ. Row order is not guaranteed. Useful for inspecting a pack's contents after ingest. "
+            "len(nodes), the response omits some matching rows. `limit` may have cut the "
+            "page. A larger `limit` may then return more rows, but extra rows it fetches "
+            "can be corrupt too, and the tool withholds those. Alternatively the tool "
+            "withheld corrupt rows (see `property_decode_error_count`). A larger `limit` "
+            "never returns those. COUNT and the page are separate queries, so concurrent "
+            "writes can also make them differ. Row order is not guaranteed. Useful for inspecting a pack's contents after ingest. "
         ) + _DECODE_ERROR_NOTE,
         "inputSchema": {
             "type": "object",
