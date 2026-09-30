@@ -13,6 +13,7 @@ from neo4j import GraphDatabase
 
 from opencrab.common.hashing import file_sha256
 from opencrab.common.neo4j_driver import make_driver
+from opencrab.config import Settings
 from opencrab.pack.neo4j_export import (
     _clean_props,
     _normalise_edge,
@@ -112,7 +113,10 @@ def export_edges(session, handle, fetch_size: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="/home/asdf/.openclaw/workspace/data/localcrab/packs/nvidia-nemotron-personas-korea/stage/neo4j/opencrab_ingest.neo4j.jsonl")
+    parser.add_argument(
+        "--output",
+        default=f"{Settings().local_data_dir}/packs/nvidia-nemotron-personas-korea/stage/neo4j/opencrab_ingest.neo4j.jsonl",
+    )
     parser.add_argument("--uri", default="bolt://localhost:7687")
     parser.add_argument("--user", default="neo4j")
     parser.add_argument("--password", default="opencrab")

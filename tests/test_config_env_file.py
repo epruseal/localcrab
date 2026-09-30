@@ -20,7 +20,7 @@ from pathlib import Path
 
 from opencrab.config import DEFAULT_ENV_FILE, Settings, _default_env_files
 
-REMOTE_GPUS = "http://100.77.10.49:1234/v1,http://100.89.143.59:1234/v1"
+REMOTE_GPUS = "http://192.0.2.10:1234/v1,http://192.0.2.20:1234/v1"
 
 
 def _write(path: Path, base: str) -> Path:

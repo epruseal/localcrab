@@ -17,6 +17,8 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
+from opencrab.config import Settings
+
 REPO_ID = "nvidia/Nemotron-Personas-Korea"
 REVISION = "d0a9272116a2ebf139b964ca72b8b8f604616689"
 PACK_ID = "nvidia-nemotron-personas-korea"
@@ -543,10 +545,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> int:
+    _base = Settings().local_data_dir
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-root", default="/home/asdf/.openclaw/workspace/data/localcrab/datasets/nvidia-nemotron-personas-korea")
-    parser.add_argument("--output-root", default="/home/asdf/.openclaw/workspace/data/localcrab/packs/nvidia-nemotron-personas-korea")
-    parser.add_argument("--local-data-dir", default="/home/asdf/.openclaw/workspace/data/localcrab")
+    parser.add_argument("--dataset-root", default=f"{_base}/datasets/nvidia-nemotron-personas-korea")
+    parser.add_argument("--output-root", default=f"{_base}/packs/nvidia-nemotron-personas-korea")
+    parser.add_argument("--local-data-dir", default=_base)
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--reset-ingest", action="store_true")
     parser.add_argument("--no-zip", action="store_true")

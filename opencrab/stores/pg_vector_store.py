@@ -4,7 +4,7 @@ pgvector store adapter (PostgreSQL-unified backend, (B) 경로).
 Drop-in replacement for :class:`ChromaStore` (and sibling to
 :class:`SqliteVecStore`, A 경로) that keeps the vector index in the same
 PostgreSQL instance as sql/doc/graph stores in PG-unified 모드. See
-``docs/pgvector-migration-plan.md`` §3.1-§3.5 / §4.1-B for the original design;
+``docs/vector-backends.md`` (pgvector section) for the design;
 스키마/인덱스 파라미터는 프리플라이트 실측(HNSW global p95 6.44ms)으로 아래와 같이
 확정했다.
 
@@ -34,7 +34,7 @@ SCHEMA / INDEX (프리플라이트 실증 완료, 2026-07 — 이대로 구현):
     인덱스 생성 직전 ``maintenance_work_mem='512MB'``/``max_parallel_maintenance_workers=0``
     을 SET한 뒤 CREATE INDEX한다(ensure-schema에서 1회, 세션 단위이므로 부작용 없음).
 
-WHY NOT BINARY 2-STAGE (SqliteVecStore §3.7과 달리 여기서는 불필요):
+WHY NOT BINARY 2-STAGE (SqliteVecStore binary 2-stage ANN과 달리 여기서는 불필요):
     HNSW 인덱스가 이미 전역 검색을 실측 p95 6.44ms로 처리하므로(sqlite-vec의
     브루트포스 868ms 문제가 애초에 없음), 별도의 sign-bit 2단계 근사 경로를
     둘 이유가 없다 — HNSW 자체가 이미 서브선형 ANN이다.
@@ -126,7 +126,7 @@ class PgVectorStore:
         dsn_or_engine:
             PostgreSQL DSN 문자열(``postgresql://user:pass@host:port/db``) 또는
             이미 생성된 SQLAlchemy ``Engine``. 후자는 factory가 sql/vector/doc
-            스토어에 동일 엔진(동일 커넥션 풀)을 공유 주입하는 경로(§3.5)를
+            스토어에 동일 엔진(동일 커넥션 풀)을 공유 주입하는 경로를
             지원하기 위함이다.
         embedding_function:
             앱측 임베딩 콜러블 ``(list[str]) -> list[list[float]]``
@@ -259,7 +259,7 @@ class PgVectorStore:
             return False
 
     def close(self) -> None:
-        # 공유 엔진(factory가 sql/vector/doc에 동일 엔진을 주입한 경우, §3.5)은
+        # 공유 엔진(factory가 sql/vector/doc에 동일 엔진을 주입한 경우)은
         # 이 스토어가 소유하지 않으므로 dispose하지 않는다 — 다른 스토어가 계속
         # 쓰는 풀을 여기서 끊으면 안 된다. 이 스토어가 직접 create_engine한
         # 경우(DSN 문자열 생성자 경로)에만 dispose한다.

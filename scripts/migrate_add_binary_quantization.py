@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backfill binary-quantized (sign-bit) vectors into an existing vec0 table.
 
-docs/pgvector-migration-plan.md §3.7 non-destructive extension: adds an
+docs/vector-backends.md section 4.1 non-destructive extension: adds an
 ``embedding_bit bit[dim]`` column next to the float embeddings so that
 VECTOR_ANN=binary can serve global searches via the 2-stage (hamming coarse +
 cosine rerank) path. NO re-embedding — bit vectors are derived from the sign

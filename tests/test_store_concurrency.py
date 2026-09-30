@@ -2,7 +2,7 @@
 스토어 in-process 동시성 테스트 — 멀티스레드 안전성 검증.
 
 작업 전 작성(정상/에러/엣지) → 작업 후 검증. 모든 테스트는 pytest tmp_path 만 사용하므로
-실데이터(/home/asdf/.openclaw/workspace/data/localcrab)는 절대 건드리지 않는다.
+실데이터($LOCAL_DATA_DIR)는 절대 건드리지 않는다.
 
 대상:
   - LocalGraphStore : 단일 sqlite3.Connection 공유 + threading.Lock(쓰기 직렬화)

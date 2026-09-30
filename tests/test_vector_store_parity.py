@@ -3,7 +3,7 @@
 green→green characterization: the same suite runs against both backends
 (parametrized) and asserts identical behaviour, plus a direct cross-backend
 equivalence test. Uses tmp_path only (no real data) and a deterministic MockEF
-(no network). See docs/pgvector-migration-plan.md §11.
+(no network). See docs/vector-backends.md section 8.
 """
 
 from __future__ import annotations

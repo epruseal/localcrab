@@ -830,7 +830,7 @@ class TestVerifyReleaseArchiveCorruption:
     def test_corrupted_archive_rejected_without_traceback(self, release, mutate):
         """절단(10바이트·50%) 및 gzip 자체는 유효하나 내용이 무작위인 아카이브 -- 전부
         아카이브 블록의 `except Exception` 에서 BuildError 로 수렴해야 한다(EOFError 는
-        절단, 3차 채널 B 실측: /home/asdf/orch-scratch/o247/p2b-repro/before-fix-eoferror.txt).
+        절단, PR #257 3차 이중검증 채널 B 실측(before-fix EOFError)).
         RELEASE.SHA256SUMS 를 손상된 아카이브의 새 해시로 재계산해, 앞선 RELEASE 해시
         비교 단계가 아니라 이 아카이브 파싱 블록에 실제로 도달함을 보장한다(재계산 없이는
         해시 불일치가 먼저 걸려 이 테스트가 무의미해진다).
@@ -1389,7 +1389,7 @@ class TestVerifyReleaseServedBytesInstrumentation:
     """PR #257 5차 이중검증 채널 B(MED) 대응 -- 유계 읽기 헬퍼(`_read_all_limited`/
     `_sha256_stream`/`_hash_chunked`)를 통째 읽기로 역변이해도 걸러지지 않던 검출력
     공백을 메운다(실측: 세 헬퍼를 전부 무제한 `read()` 로 바꿔도 기존 방호 테스트
-    10개가 `10 passed` 로 전부 통과했다 -- /home/asdf/orch-scratch/o247/adv-B5-output.txt).
+    10개가 `10 passed` 로 전부 통과했다 -- PR #257 채널 B5 실측).
 
     원인은 두 가지였다: (1) 역할별 과대 파일 테스트가 오류 문구만 단언하고 실제
     서빙 바이트를 재지 않았다. (2) "정상 멤버 해싱" 표본이 선언 크기만으로 [Z1]

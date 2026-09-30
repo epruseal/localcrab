@@ -55,7 +55,7 @@ def build_vector_store(
     """Construct a vector store for the given backend with the shared MockEF.
 
     Extra kwargs are forwarded to the store constructor (e.g. ``ann="binary"``,
-    ``ann_coarse_k=...`` for SqliteVecStore's §3.7 2-stage path).
+    ``ann_coarse_k=...`` for SqliteVecStore's docs/vector-backends.md §4.1 2-stage path).
 
     ``ef`` swaps in a different embedding function -- a counting wrapper, say,
     for tests that assert a path never embeds (issue #200). Keyword-only, and

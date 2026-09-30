@@ -2,7 +2,7 @@
 RED-phase contract tests for issue #251 -- legacy ``tools/call`` shape
 validation aligned with the modern validator.
 
-Design of record: /home/asdf/orch-scratch/o251/design-v7.md.
+Design of record: issue #251 design v7.
 
 Issue #136 (PR #243) deliberately left the legacy era's call-shape checks as
 a bare ``if not name`` truthiness test and an unconditional

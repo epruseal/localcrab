@@ -19,7 +19,7 @@ from tests.issue80_migration import FixtureHandle
 
 
 def test_t4_infer_pack_id_from_path_standard_layout() -> None:
-    path = "/home/asdf/.openclaw/workspace/data/localcrab/packs/test-pack/stage/README.md"
+    path = "/home/user/.openclaw/workspace/data/localcrab/packs/test-pack/stage/README.md"
     assert infer_pack_id_from_path(path) == "test-pack"
 
 

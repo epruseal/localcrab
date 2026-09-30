@@ -4,7 +4,7 @@ sqlite-vec vector store adapter (SQLite-unified backend).
 Drop-in replacement for :class:`ChromaStore` that keeps the vector index in the
 same SQLite WAL discipline as the graph/doc/sql stores, removing Chroma's
 "single-process writer" constraint (and the custom flock layer built around it).
-See ``docs/pgvector-migration-plan.md`` §3.6 / §4.1-A / §9 for the design.
+See ``docs/vector-backends.md`` sections 2 and 4 for the design.
 
 WHY A SEPARATE STORE (not an embedding-function swap):
     sqlite-vec is a *vector store backend*, not an embedding backend. Chroma
@@ -38,7 +38,7 @@ VEC0 NOTES (verified against sqlite-vec 0.1.9):
       Chroma ``where`` semantics ($in/$and/space) with a Python post-filter,
       pushing only single ``pack_id`` equality down to the partition key.
 
-BINARY 2-STAGE ANN (VECTOR_ANN=binary, docs/pgvector-migration-plan.md §3.7):
+BINARY 2-STAGE ANN (VECTOR_ANN=binary, docs/vector-backends.md section 4.1):
     Global (no filter) brute-force KNN over 179k×1024d floats is
     CPU/memory-bandwidth bound (~868ms p95). With ``ann="binary"`` the store
     answers GLOBAL (no ``where``) queries in two stages over an in-process
@@ -49,7 +49,7 @@ BINARY 2-STAGE ANN (VECTOR_ANN=binary, docs/pgvector-migration-plan.md §3.7):
          top ~3n are refined with EXACT float cosine (``vec_distance_cosine``
          point queries) — returned distances are exact, contract preserved.
     Pack-scoped queries stay on the exact float path (already ~8ms via the
-    partition key — §3.7 keeps exact as the safe default there); queries with
+    partition key; docs/vector-backends.md §4.1 keeps exact as the safe default there); queries with
     residual (non-pack) filters also fall back to exact so the post-filter
     keeps its full candidate pool.
 
@@ -77,7 +77,7 @@ BINARY 2-STAGE ANN (VECTOR_ANN=binary, docs/pgvector-migration-plan.md §3.7):
       every INSERT (no NULL allowed). Write-path gating is therefore driven by
       the ACTUAL schema (PRAGMA table_info), not by the config flag — a DB that
       was never migrated keeps the original 5-column INSERT byte-for-byte.
-    - the stored bit column is the durable §3.7 representation (kept in
+    - the stored bit column is the durable docs/vector-backends.md §4.1 representation (kept in
       lock-step with the floats on every write); the query path derives its RAM
       bit matrix from the floats directly, which is guaranteed identical.
 """
@@ -173,7 +173,7 @@ def _sign_bits(vec: list[float]) -> bytes:
 
 
 class _AnnCache:
-    """In-process 2-stage ANN cache (§3.7): ids + sign-bit matrix (coarse) +
+    """In-process 2-stage ANN cache (docs/vector-backends.md §4.1): ids + sign-bit matrix (coarse) +
     int8-quantized vectors with per-row scales (rerank). ``max_rowid`` anchors
     freshness against the ``{table}_rowids`` shadow table."""
 
@@ -218,7 +218,7 @@ class SqliteVecStore(_SqliteConnMixin):
         ann:
             ``""`` (default, off — exact brute-force only, 기존 동작 불변) or
             ``"binary"`` (2-stage bit-hamming coarse + float-cosine rerank for
-            GLOBAL queries; §3.7). ``"binary"`` requires the table to have the
+            GLOBAL queries; docs/vector-backends.md §4.1). ``"binary"`` requires the table to have the
             ``embedding_bit`` column (run scripts/migrate_add_binary_quantization.py
             on an existing DB; new/empty DBs get it at CREATE). Missing column →
             warning + silent fallback to the exact path.
@@ -241,7 +241,7 @@ class SqliteVecStore(_SqliteConnMixin):
         # _init_db from PRAGMA table_info. Drives the write path independently
         # of `ann` (vec0 requires a value for every vector column on INSERT).
         self._has_bit_column = False
-        # In-process ANN cache (§3.7). Built lazily on the first global ANN
+        # In-process ANN cache (docs/vector-backends.md §4.1). Built lazily on the first global ANN
         # query; invalidated by this store's writes and by freshness checks.
         self._ann_cache: _AnnCache | None = None
         self._ann_cache_lock = threading.Lock()
@@ -684,13 +684,13 @@ class SqliteVecStore(_SqliteConnMixin):
           (exact within each pack, so the global top-n across packs is exact).
           Pack-scoped search stays EXACT even under ``ann="binary"`` — the
           partition pre-filter already makes it fast (~8ms measured), so
-          §3.7 keeps exact as the safe default here.
+          docs/vector-backends.md §4.1 keeps exact as the safe default here.
         - no pack constraint, ``ann="binary"`` eligible (bit column present),
           and EITHER no residual filter at all OR the residual filter is
           exactly the large-scope pack fallback (``pack_scope`` set, issue
           #147 §3.4(c) — ``query()`` clears ``pack_values`` above
           ``_PACK_KNN_MAX`` but the caller is still, structurally, pack-only)
-          → binary 2-stage ANN (§3.7): in-RAM bit-hamming coarse → int8
+          binary 2-stage ANN (docs/vector-backends.md §4.1): in-RAM bit-hamming coarse, then int8
           rerank → exact float refinement of the top ~3n. ``pack_scope``, when
           given, is ALSO applied at the coarse-candidate stage (see
           ``_knn_bit_rerank``) — without that, every query above
@@ -721,7 +721,7 @@ class SqliteVecStore(_SqliteConnMixin):
         return self._knn(qvec, fetch_k, pack=None)
 
     # ------------------------------------------------------------------
-    # Binary 2-stage ANN (§3.7) — in-process cache path
+    # Binary 2-stage ANN (docs/vector-backends.md §4.1): in-process cache path
     # ------------------------------------------------------------------
 
     def _ann_cache_fresh(self, cache: _AnnCache) -> bool:
@@ -855,7 +855,7 @@ class SqliteVecStore(_SqliteConnMixin):
         *,
         pack_scope: frozenset[str] | None = None,
     ) -> list[dict[str, Any]] | None:
-        """Binary 2-stage global KNN (§3.7) over the in-process cache.
+        """Binary 2-stage global KNN (docs/vector-backends.md §4.1) over the in-process cache.
 
         1. coarse : hamming(sign(qvec), bit matrix) via numpy XOR+bitwise_count
            → top ``coarse_k`` candidates (~16ms at 179k).

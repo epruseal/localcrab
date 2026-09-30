@@ -188,7 +188,7 @@ def test_factory_pg_sql_store_uses_postgres_url(tmp_path) -> None:
 
 
 def test_factory_pg_graph_and_doc_share_engine(tmp_path) -> None:
-    """§3.5: graph/doc/vector share one SQLAlchemy engine (one connection pool)
+    """graph/doc/vector share one SQLAlchemy engine (one connection pool)
     per POSTGRES_URL via factory._get_pg_engine's lru_cache."""
     from opencrab.config import Settings
     from opencrab.stores.factory import make_doc_store, make_graph_store

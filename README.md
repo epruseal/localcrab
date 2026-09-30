@@ -69,8 +69,8 @@ Ladybug의 원자적 transaction/CAS 능력을 검증하기 전까지 optional �
 > 전부 SQLite 한 규율로 통일해 백업 디렉터리 1개·정합성 관리 대상 1개로 운영합니다.
 > 실시간 동시 write(MCP 서빙 중 백그라운드 로더)가 확정 요구이거나 벡터가 수백만
 > 스케일로 커지면 `STORAGE_MODE=pg`(PostgreSQL 단일 통합, 4스토어 전부 PG·MVCC 다중
-> 라이터, `pip install ".[pg]"` — [pgvector-migration-plan.md](./docs/pgvector-migration-plan.md)
-> (B) 경로)로 이행하세요. 기존 SQLite → PG 데이터 이관은
+> 라이터, `pip install ".[pg]"`, [벡터 백엔드 매트릭스](./docs/vector-backends.md)의
+> pgvector 절)로 이행하세요. 기존 SQLite에서 PG로 옮기는 데이터 이관은
 > `scripts/migrate_sqlite_to_pg.py`(1:1 복사, 재임베딩 불필요) 참고.
 > `docker` 모드(Neo4j+MongoDB+PostgreSQL+Chroma 4종 혼합)는 SaaS 규모가 아니면
 > 비권장입니다 — Neo4j/Mongo 각각의 이점이 4종 스토어를 따로 백업·버전관리·정합성
@@ -316,7 +316,7 @@ export EMBEDDING_BACKEND=openai
 **`sqlite-vec` (로컬 모드 기본)**: sqlite-vec(vec0) — 벡터를 graph/doc/sql 과 **같은 SQLite WAL 규율**에 편입해
 Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거합니다. 앱이 KURE EF로 직접 임베딩 후
 `vec0` 테이블에 INSERT하므로 `EMBEDDING_BACKEND=openai`(KURE 1024d)와 함께 씁니다. 벡터 DB는
-`LOCAL_DATA_DIR/vectors.db`. 설계·트레이드오프: `docs/pgvector-migration-plan.md` (A) 경로.
+`LOCAL_DATA_DIR/vectors.db`. 설계와 트레이드오프: `docs/vector-backends.md` sqlite-vec 절.
 
 > 특성: pack-scoped 검색은 매우 빠르나(수 ms), 전역(pack 미지정) 검색은 기본 브루트포스라 대규모에서 느립니다.
 > 전역 고속화는 `VECTOR_ANN=binary`(binary 2단계 양자화, 기본 off) 옵트인으로 제공 —
@@ -328,7 +328,7 @@ Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거
 (`m=16, ef_construction=64`, 쿼리 시 `hnsw.ef_search=PG_EF_SEARCH` 기본 500)로
 전역 검색도 179,784건 전량 실측 p95 24.61ms — sqlite-vec의 binary 2단계 같은 별도 가속이 불필요.
 `pip install ".[pg]"` 필요. `STORAGE_MODE!=pg`에서도 `VECTOR_BACKEND=pgvector`를
-명시하면 벡터만 PG로 보낼 수 있습니다. 설계·실측: `docs/pgvector-migration-plan.md` (B) 경로.
+명시하면 벡터만 PG로 보낼 수 있습니다. 설계와 실측: `docs/vector-backends.md` pgvector 절.
 
 | 환경변수 | 기본값 | 설명 |
 |----------|--------|------|

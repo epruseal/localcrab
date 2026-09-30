@@ -6,7 +6,7 @@
 
 범위 확정: `pack_purge`(삭제) · `pack_ingest_chunks`(청크 배치) **두 신규 MCP write 도구 신설 포함**. `--fresh`(purge-replace)까지 MCP 무중단으로 달성한다.
 
-관련 문서: `[[pgvector-migration-plan]]` (스토어 백엔드 교체·동시성 결정 힌지 — §9가 본 문서를 "실시간 동시 적재" 시나리오로 직접 인용), `[[vector-backends]]` (3-백엔드 매트릭스·기본값 해석 규칙)
+관련 문서: `[[vector-backends]]` (3-백엔드 매트릭스와 기본값 해석 규칙)
 
 ---
 
@@ -34,7 +34,7 @@ VECTOR_BACKEND 명시됨?
 | `sqlite-vec` | **가능** (무중단) | graph/doc/sql과 동일한 SQLite **WAL** 규율. 리더는 락 없이 동시 진행, 라이터는 `busy_timeout(5s)`로 직렬화(`sqlite_vec_store.py` `_new_conn`) | **로컬 모드 신규 기본값**. 라이터는 여전히 **직렬화**(동시에 하나) — MVCC 아님 |
 | `pgvector`(`STORAGE_MODE=pg`) | **가능** (진짜 다중 라이터) | PostgreSQL **MVCC** — 리더가 라이터를 막지 않고, 라이터끼리도 행 단위로만 경합 | `opencrab/stores/factory.py`가 graph/doc/sql/vector 4스토어 전부 `PGGraphStore`/`PgDocStore`/`SQLStore`/`PgVectorStore`로 PG에 통합 배치. `EMBEDDING_BACKEND=openai`(KURE) 필수 |
 
-`pgvector-migration-plan.md` §9(동시성 결론 — 의사결정 힌지)는 본 문서를 "실시간 동시 적재가 확정 요구인 시나리오"로 직접 인용하며, 그 경우 sqlite-vec의 라이터 직렬화로는 부족하고 **pg 모드의 MVCC만이 근본 해法**이라고 결론짓는다. 반대로 현행처럼 "로더가 적재 시 사실상 단독 라이터"인 워크로드라면 sqlite-vec 직렬화로 충분하다. 즉:
+`docs/vector-backends.md`의 동시성 판단은 다음과 같다. 실시간 동시 적재가 확정 요구이면 sqlite-vec의 라이터 직렬화로는 부족하고 **pg 모드의 MVCC만이 근본 해法**이다. 반대로 현행처럼 "로더가 적재 시 사실상 단독 라이터"인 워크로드라면 sqlite-vec 직렬화로 충분하다. 즉:
 
 - **가벼운 로컬 배포(현행 stop-to-load에 가까운 워크로드):** `sqlite-vec` 무중단 ingest로 충분 — 별도 인프라 없이 "MCP 중지" 절차만 제거.
 - **진짜 동시 다중 라이터가 확정 요구(예: 백그라운드 로더 + 다수 MCP 클라이언트가 상시 동시 write, 또는 수백만 벡터 스케일):** `STORAGE_MODE=pg`로 이행 — 이것이 현재 아키텍처의 프로덕션/SaaS-스케일 답이다.
@@ -78,7 +78,7 @@ VECTOR_BACKEND 명시됨?
 - 로더가 스토어를 직접 열지 않게 하여, 스토어 API 변경 시 손봐야 할 지점을 하나(MCP)로 좁힌다.
 
 **비목표**
-- 스토어 백엔드 교체 자체(Chroma → sqlite-vec/pgvector). → `[[pgvector-migration-plan]]`·`docs/vector-backends.md`에서 다룬다. 이미 마이그레이션 스크립트가 존재한다(§9).
+- 스토어 백엔드 교체 자체(Chroma에서 sqlite-vec/pgvector로). `docs/vector-backends.md`에서 다룬다. 이미 마이그레이션 스크립트가 존재한다(§9).
 - 임베딩 모델/청킹 전략 변경.
 - MCP 인증 체계 재설계 (기존 Bearer 토큰 재사용).
 - `write.lock`을 백엔드별로 조건부화(pg MVCC 활용)하는 것 — §1.3에서 향후 과제로만 기록.
@@ -164,7 +164,7 @@ VECTOR_BACKEND 명시됨?
 > 스토어를 만지는 작업이므로 **단계 0(백업)·단계 1(회귀 기준선 테스트)을 신규 코드 작성보다 먼저** 수행한다. 이는 선택이 아니라 필수 게이트다.
 
 0. **DB 백업** (작업 전 1회)
-   - `$LOCAL_DATA_DIR`(기본 `/home/asdf/.openclaw/workspace/data/localcrab`)를 `~/opencrab-dump/localcrab-backup/<YYYYMMDD-HHMMSS>/`로 스냅샷.
+   - `$LOCAL_DATA_DIR`(기본 `<LOCAL_DATA_DIR>`, 실행 사용자 HOME 파생)를 `~/opencrab-dump/localcrab-backup/<YYYYMMDD-HHMMSS>/`로 스냅샷.
    - 대상: `graph.db`(+`-wal`/`-shm`), `doc_store.db`, `opencrab.db`(+wal/shm), 그리고 사용 중인 벡터 백엔드에 따라 `chroma/` 디렉터리 또는 `vectors.db`(+wal/shm). `write.lock`/`chroma.lock`은 제외.
    - WAL 일관성: MCP write 유휴 시점에 복사하거나 sqlite `.backup` 명령으로 일관 스냅샷을 권장.
 1. **회귀 기준선 테스트** (신규 코드 작성 **전**)
@@ -242,7 +242,7 @@ VECTOR_BACKEND 명시됨?
 - `scripts/migrate_graph_to_ladybug.py` — 과거 그래프 스토어 kuzu → ladybug 이전 경로의
   read-only inspection 포인터. 현재 apply는 qualification 전까지 fixture-only이다.
 
-상세 설계·동시성 결정 힌지는 `docs/pgvector-migration-plan.md` §8-9, 백엔드 조합 매트릭스는 `docs/vector-backends.md` 참고.
+백엔드 조합 매트릭스와 동시성 판단은 `docs/vector-backends.md` 참고.
 
 ---
 
@@ -250,7 +250,7 @@ VECTOR_BACKEND 명시됨?
 
 이 절은 2026-06-18 최초 작성 당시의 배경을 압축 보존한다. 현재는 §1.2에 따라 chroma가 예외 경로이므로 아래는 **chroma 사용 시에만 유효**하다.
 
-- 현행 팩 로더 `/home/asdf/opencrab-dump/load_local_packs.py`는 로컬 스토어를 **직접 열어서** 적재했다. `make_graph_store`/`make_vector_store`/`make_doc_store`/`make_sql_store`로 스토어를 직접 생성하고 `OntologyBuilder(graph, docs, sql, vec=vec)`로 적재한다(라인 600-613). 임베딩은 **서버/빌더 측에서 계산된다**: `OntologyBuilder.add_node` 내부가 노드 텍스트를 추출해 `vec.upsert_texts(texts=[...])`로 넘기면 스토어가 임베딩한다(`opencrab/ontology/builder.py:148-166`).
+- 현행 팩 로더 `<소비 저장소>/load_local_packs.py`는 로컬 스토어를 **직접 열어서** 적재했다. `make_graph_store`/`make_vector_store`/`make_doc_store`/`make_sql_store`로 스토어를 직접 생성하고 `OntologyBuilder(graph, docs, sql, vec=vec)`로 적재한다(라인 600-613). 임베딩은 **서버/빌더 측에서 계산된다**: `OntologyBuilder.add_node` 내부가 노드 텍스트를 추출해 `vec.upsert_texts(texts=[...])`로 넘기면 스토어가 임베딩한다(`opencrab/ontology/builder.py:148-166`).
 - 적재 직전 `LOCAL_DATA_DIR/chroma.lock`에 `fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)`를 잡았다(라인 586-589). 선점 실패 시 즉시 종료하며, 안내 메시지가 **MCP 서버 중지를 요구**했다(라인 591-598): `systemctl --user stop localcrab-gateway` → 적재 → `systemctl --user start localcrab-gateway`.
 - 이 배타 락이 필요했던 이유는 ChromaDB 제약 때문이다: `PersistentClient`는 **동일 persist 경로에 대한 다중 프로세스 동시 쓰기를 지원하지 않는다**(출처: Chroma Cookbook — System Constraints, "Chroma is not process-safe for concurrent writers sharing the same local persistence path." <https://cookbook.chromadb.dev/core/system_constraints/>). 단, **프로세스 내부 멀티스레드는 안전하다**("Chroma is thread-safe").
 - MCP 서버 측은 이 제약을 락으로 방어했다(`opencrab/mcp/tools.py`): `_acquire_chroma_shared_lock()`가 서버 수명 동안 `chroma.lock`에 `LOCK_SH`를 보유 → 로더의 `LOCK_EX`와 상호 배제. uvicorn은 `workers=1`로 기동(`opencrab/cli.py`, 주석: 원래 "the chroma PersistentClient is single-process only") → chroma를 만지는 프로세스는 MCP 단일 인스턴스뿐. 여러 MCP 인스턴스(예: 인증/비인증 HTTP) 간 쓰기는 `_write_lock()`이 `write.lock`의 `LOCK_EX`로 직렬화. write 도구 집합은 `WRITE_TOOLS`: `ontology_add_node`, `ontology_add_edge`, `pack_create`, `pack_ingest`, `schema_pack_install`, `schema_pack_uninstall`, `harness_promotion_apply`.

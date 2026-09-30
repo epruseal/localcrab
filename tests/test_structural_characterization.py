@@ -799,27 +799,50 @@ def test_import_script_iter_jsonl_preserves_lone_cr(tmp_path):
 _bench_pkg = _load_module_from_path("bench_pkg_char", "scripts/bench_graph_backends.py")
 
 
-def test_bench_load_nodes_preserves_lone_cr(tmp_path, monkeypatch):
+def test_bench_load_nodes_preserves_lone_cr(tmp_path):
     """bench_graph_backends.load_nodes 는 구조적 CR 을 레코드 경계로 삼지
-    않는다(#382)."""
+    않는다(#382). #429 이후 nodes_path 는 명시 인자로 주입한다(모듈 상수
+    NODES_JSONL 폐지, 머신 고유 경로를 얼려두지 않기 위해)."""
     nodes_path = tmp_path / "nodes.jsonl"
     with nodes_path.open("w", encoding="utf-8", newline="") as f:
         f.write('{"id":\r"n1"}\n{"id":"n2"}\n')
-    monkeypatch.setattr(_bench_pkg, "NODES_JSONL", nodes_path)
 
-    nodes = _bench_pkg.load_nodes(10)
+    nodes = _bench_pkg.load_nodes(10, nodes_path)
 
     assert nodes == [{"id": "n1"}, {"id": "n2"}]
 
 
-def test_bench_load_edges_preserves_lone_cr(tmp_path, monkeypatch):
+def test_bench_load_edges_preserves_lone_cr(tmp_path):
     """bench_graph_backends.load_edges 는 구조적 CR 을 레코드 경계로 삼지
-    않는다(#382)."""
+    않는다(#382). #429 이후 edges_path 는 명시 인자로 주입한다."""
     edges_path = tmp_path / "edges.jsonl"
     with edges_path.open("w", encoding="utf-8", newline="") as f:
         f.write('{"from_id":\r"n1","to_id":"n2"}\n')
-    monkeypatch.setattr(_bench_pkg, "EDGES_JSONL", edges_path)
 
-    edges = _bench_pkg.load_edges({"n1", "n2"})
+    edges = _bench_pkg.load_edges({"n1", "n2"}, edges_path)
 
     assert edges == [{"from_id": "n1", "to_id": "n2"}]
+
+
+def test_load_nodes_edges_use_injected_dump_dir(tmp_path):
+    """run_bench 는 --dump-dir 인자로 받은 디렉터리 아래의 nodes.jsonl/
+    edges.jsonl 을 read 한다(#429: DUMP_DIR 모듈 상수 폐지, 머신 고유 경로를
+    얼려두지 않기 위해 호출자가 dump_dir 를 명시 주입). 두 함수 모두 같은
+    dump_dir 에서 읽어야 하므로 load_nodes 뿐 아니라 load_edges 호출도
+    함께 확인한다."""
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+    (dump_dir / "nodes.jsonl").write_text(
+        '{"id":"n1","node_type":"concept"}\n{"id":"n2","node_type":"concept"}\n',
+        encoding="utf-8",
+    )
+    (dump_dir / "edges.jsonl").write_text(
+        '{"from_id":"n1","to_id":"n2","relation":"related"}\n', encoding="utf-8"
+    )
+
+    nodes = _bench_pkg.load_nodes(10, dump_dir / "nodes.jsonl")
+    node_ids = {nd["id"] for nd in nodes}
+    edges = _bench_pkg.load_edges(node_ids, dump_dir / "edges.jsonl")
+
+    assert node_ids == {"n1", "n2"}
+    assert edges == [{"from_id": "n1", "to_id": "n2", "relation": "related"}]

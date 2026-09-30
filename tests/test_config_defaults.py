@@ -1,7 +1,7 @@
-"""config.py / llamacpp_embedding.py 의 기본 경로가 특정 사용자 홈("/home/asdf")에
+"""config.py / llamacpp_embedding.py 의 기본 경로가 특정 사용자 홈("/home/user")에
 하드코딩되지 않고 실행 사용자의 HOME 에서 파생되는지 검증한다.
 
-배경: CI(ubuntu 러너)에서 "/home/asdf" 로 고정된 기본값 때문에
+배경: CI(ubuntu 러너)에서 "/home/user" 로 고정된 기본값 때문에
 [Errno 13] Permission denied 가 발생했다 — 이 파일은 그 회귀 방지 테스트다.
 """
 
@@ -27,7 +27,7 @@ def test_local_data_dir_default_derives_from_home(monkeypatch, tmp_path):
 
     assert settings.local_data_dir.startswith(str(tmp_path))
     # 옛 하드코딩 기본값으로 고정되어 있지 않은지 확인.
-    assert settings.local_data_dir != "/home/asdf/.openclaw/workspace/data/localcrab"
+    assert settings.local_data_dir != "/home/user/.openclaw/workspace/data/localcrab"
 
 
 def test_local_data_dir_env_override_wins(monkeypatch, tmp_path):
@@ -138,7 +138,7 @@ def test_gguf_default_dir_derives_from_home(monkeypatch, tmp_path):
 
     assert result.startswith(str(tmp_path))
     # 옛 하드코딩 기본값으로 고정되어 있지 않은지 확인.
-    assert result != "/home/asdf/models"
+    assert result != "/home/user/models"
 
 
 def test_gguf_default_dir_reevaluates_per_call(monkeypatch, tmp_path):
@@ -161,7 +161,7 @@ def test_gguf_default_dir_reevaluates_per_call(monkeypatch, tmp_path):
 
 def test_ensure_local_gguf_uses_home_derived_default_when_no_override(monkeypatch, tmp_path):
     """requested_path 가 비어 있고 huggingface_hub 이 없을 때(에러 메시지 경로),
-    RuntimeError 메시지가 하드코딩된 "/home/asdf" 가 아니라 HOME 파생 경로를 담아야 한다."""
+    RuntimeError 메시지가 하드코딩된 "/home/user" 가 아니라 HOME 파생 경로를 담아야 한다."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setitem(
         __import__("sys").modules, "huggingface_hub", None
@@ -171,8 +171,8 @@ def test_ensure_local_gguf_uses_home_derived_default_when_no_override(monkeypatc
     with pytest.raises(RuntimeError) as exc_info:
         llamacpp_embedding._ensure_local_gguf("")
 
-    # 옛 하드코딩 기본 디렉터리("/home/asdf/models")가 아니라 HOME 파생 경로를 담아야 한다.
-    assert "/home/asdf/models" not in str(exc_info.value)
+    # 옛 하드코딩 기본 디렉터리("/home/user/models")가 아니라 HOME 파생 경로를 담아야 한다.
+    assert "/home/user/models" not in str(exc_info.value)
     assert str(tmp_path) in str(exc_info.value)
 
 

@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 @lru_cache(maxsize=8)
 def _get_pg_engine(url: str) -> Any:
     """PG-unified(storage_mode=="pg") 모드에서 4스토어(sql/vector/doc/graph)가
-    공유할 SQLAlchemy 엔진을 URL당 1회만 생성해 캐시한다(§3.5 단일 커넥션 풀).
+    공유할 SQLAlchemy 엔진을 URL당 1회만 생성해 캐시한다(단일 커넥션 풀).
 
     lru_cache 를 쓰는 이유: make_graph_store/make_vector_store/make_doc_store/
     make_sql_store 는 기존 시그니처(settings 단일 인자)를 그대로 유지해야 하므로
@@ -122,9 +122,9 @@ def make_vector_store(settings: Settings) -> Any:
       "pgvector"   : pgvector(PostgreSQL 확장). STORAGE_MODE=pg 이면 sql/doc/graph
                      와 동일 공유 SQLAlchemy 엔진을 주입받는다. storage_mode!="pg"
                      여도 VECTOR_BACKEND=pgvector 를 명시하면 벡터만 PG 를 쓸 수
-                     있다(§6.3 (C) 단계 — 이 경우 postgres_url 로 자체 엔진 생성).
+                     있다(벡터만 PG로 보내는 조합. 이 경우 postgres_url 로 자체 엔진 생성).
 
-    설계: docs/pgvector-migration-plan.md §3.6 / §9. 임베딩은 백엔드와 무관하게 동일.
+    설계: docs/vector-backends.md §2. 임베딩은 백엔드와 무관하게 동일.
     한국어 검색 품질: minilm MRR 0.285 vs KURE-v1 1.000.
     """
     backend = settings.vector_backend_resolved
@@ -139,7 +139,7 @@ def make_vector_store(settings: Settings) -> Any:
                 f"현재 EMBEDDING_BACKEND={settings.embedding_backend!r}. "
                 "KURE EF 로 앱측 임베딩 후 vec0 에 INSERT 하므로 minilm(384d)은 미지원입니다."
             )
-        # VECTOR_ANN 유효성 검증: ""(off, 기본) / "binary"(2단계 양자화, §3.7)만 허용.
+        # VECTOR_ANN 유효성 검증: ""(off, 기본) / "binary"(2단계 양자화, docs/vector-backends.md §4.1)만 허용.
         # 잘못된 값은 막연한 런타임 오류 대신 기동 시 명확한 설정 오류로 안내.
         if settings.vector_ann not in ("", "binary"):
             raise ValueError(
@@ -171,7 +171,7 @@ def make_vector_store(settings: Settings) -> Any:
                 f"현재 EMBEDDING_BACKEND={settings.embedding_backend!r}. "
                 "KURE EF 로 앱측 임베딩 후 pgvector 테이블에 INSERT 하므로 minilm(384d)은 미지원입니다."
             )
-        # storage_mode=="pg" 이면 sql/doc/graph 와 동일 공유 엔진(§3.5). 아니면
+        # storage_mode=="pg" 이면 sql/doc/graph 와 동일 공유 엔진. 아니면
         # (VECTOR_BACKEND=pgvector 명시 + local 모드 등) 벡터 전용 DSN 으로
         # PgVectorStore 가 자체 엔진을 생성한다(dsn_or_engine=str 경로).
         dsn_or_engine: Any = (
