@@ -11,10 +11,12 @@
      않고 `DeletePackJournalPending` 을 던진다(`opencrab.pack.load.delete_pack` 이
      축 상태·라이브 카운트·창 경고를 담아 던진다, 이 모듈은 예외 타입만 정의한다).
   2. 운영자가 그 보고를 보고 `resume=True` 를 명시해야만 완주한다.
-  3. `resume=True` 라도 팩 동일성 부정 신호(저널 생성 시점 대비 레지스트리 행 소멸
-     또는 `created_at` 불일치)가 있으면 `DeletePackJournalConflict` 로 거부한다 —
+  3. `resume=True` 라도 팩 동일성 부정 신호(저널 생성 시점 대비 `created_at`
+     불일치)가 있으면 `DeletePackJournalConflict` 로 거부한다 —
      일치는 증명이 아니므로 통과 증거로 쓰지 않고, 불일치만 확실한 부정 신호로
      차단에 쓴다(SQLite `datetime('now')` 초 단위 충돌 실측, 5라운드 codex).
+     레지스트리 행이 사라진 팩은 그 앞의 소유권 게이트가 `PackNotFoundError` 로
+     먼저 거부한다(#434).
   4. 저널이 찢어져 파싱할 수 없으면 "없음"으로 접지 않고 `DeletePackJournalCorrupt`
      를 던진다 — 소유 증거가 있는데 없는 것처럼 굴면 다른 실행이 같은 팩에 겹쳐
      쓴다.
