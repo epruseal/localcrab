@@ -56,7 +56,7 @@ SQLAlchemy 엔진**(`_get_pg_engine`, 단일 커넥션 풀)을 주입받는다. 
 
 ```
 _get_pg_engine(url)   # lru_cache(maxsize=8) — 1 Engine per POSTGRES_URL, shared by
-                       # graph/vector/doc below (single connection pool, §3.5)
+                       # graph/vector/doc below (single connection pool)
 
 make_graph_store(settings)
     STORAGE_MODE=pg   → PGGraphStore(_get_pg_engine(POSTGRES_URL))

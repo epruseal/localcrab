@@ -126,7 +126,7 @@ class PgVectorStore:
         dsn_or_engine:
             PostgreSQL DSN 문자열(``postgresql://user:pass@host:port/db``) 또는
             이미 생성된 SQLAlchemy ``Engine``. 후자는 factory가 sql/vector/doc
-            스토어에 동일 엔진(동일 커넥션 풀)을 공유 주입하는 경로(§3.5)를
+            스토어에 동일 엔진(동일 커넥션 풀)을 공유 주입하는 경로를
             지원하기 위함이다.
         embedding_function:
             앱측 임베딩 콜러블 ``(list[str]) -> list[list[float]]``
@@ -259,7 +259,7 @@ class PgVectorStore:
             return False
 
     def close(self) -> None:
-        # 공유 엔진(factory가 sql/vector/doc에 동일 엔진을 주입한 경우, §3.5)은
+        # 공유 엔진(factory가 sql/vector/doc에 동일 엔진을 주입한 경우)은
         # 이 스토어가 소유하지 않으므로 dispose하지 않는다 — 다른 스토어가 계속
         # 쓰는 풀을 여기서 끊으면 안 된다. 이 스토어가 직접 create_engine한
         # 경우(DSN 문자열 생성자 경로)에만 dispose한다.
