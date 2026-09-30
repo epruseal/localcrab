@@ -2589,6 +2589,121 @@ class TestFallbackTagPostgresDialect:
         assert "jsonb_typeof" not in sqlite_sql
 
 
+def test_json_string_present_case_guard_survives_malformed_row_in_select_list_position():
+    """issue #415 design.md §8: `_json_string_present`의 SQLite CASE 가드가
+    SELECT 리스트 위치에서도 안전한지 확인한다 — `_json_str_in`과 짝을 이루는
+    `_json_string_present` 쪽 재정 항목. RED: 가드 없는 바닥
+    `json_type(...) = 'text'`는 WHERE뿐 아니라 SELECT 리스트에 두어도 손상 행
+    에서 그대로 죽는다(json_type 자체가 평가 위치와 무관하게 던진다). GREEN:
+    가드 버전은 손상 행에 대해 0(거짓)을 내며 예외 없이 살아남는다."""
+    import sqlite3
+
+    from opencrab.stores._sql_dialect import SQLITE
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (id TEXT, properties TEXT)")
+    conn.execute("INSERT INTO t VALUES ('good', '{\"source_id\": \"S\"}')")
+    conn.execute("INSERT INTO t VALUES ('bad', 'not valid json {')")
+    conn.commit()
+
+    with pytest.raises(sqlite3.OperationalError, match="malformed JSON"):
+        conn.execute(
+            "SELECT id, json_type(properties, '$.source_id') = 'text' FROM t"
+        ).fetchall()
+
+    guarded = pack_load._json_string_present(SQLITE, "properties", "source_id")
+    rows = dict(conn.execute(f"SELECT id, {guarded} FROM t").fetchall())
+    assert rows == {"good": 1, "bad": 0}
+    conn.close()
+
+
+def test_json_string_present_json5_style_row_is_not_excluded_when_simulated_on(monkeypatch):
+    """JSON5 대조군(리드 재정 — 함수별 행동 시험 요구): `_json_string_present`가
+    JSON5 지원 시뮬레이션 하에서 트레일링 콤마 행을 비문자열/손상으로 오판
+    하지 않는지 이 함수 자체의 렌더링으로 직접 확인한다."""
+    import sqlite3
+
+    from opencrab.stores._sql_dialect import SQLITE, sqlite_json5_valid_supported
+
+    if not sqlite_json5_valid_supported():
+        pytest.skip("this SQLite build has no JSON5 support to simulate positively")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (id TEXT, properties TEXT)")
+    conn.execute("INSERT INTO t VALUES ('json5', '{\"source_id\": \"S\",}')")  # trailing comma
+    conn.execute("INSERT INTO t VALUES ('good', '{\"source_id\": \"T\"}')")
+    conn.execute("INSERT INTO t VALUES ('bad', 'not valid json {')")
+    conn.commit()
+
+    import opencrab.stores._sql_dialect as dialect_mod
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", True)
+    expr = pack_load._json_string_present(SQLITE, "properties", "source_id")
+    rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+    assert rows["json5"] == 1, "JSON5 행도 문자열 존재로 판정돼야 한다"
+    assert rows["good"] == 1
+    assert rows["bad"] == 0, "진짜 손상 행은 여전히 배제돼야 한다"
+    conn.close()
+
+
+def test_json_string_present_json5_style_row_is_a_known_limitation_when_simulated_off(monkeypatch):
+    """알려진 한계 대조군(`_json_string_present` 쪽): 1-인자 엄격 폴백에서는
+    JSON5 행도 진짜 손상과 구분되지 않고 배제된다."""
+    import sqlite3
+
+    from opencrab.stores._sql_dialect import SQLITE
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (id TEXT, properties TEXT)")
+    conn.execute("INSERT INTO t VALUES ('json5', '{\"source_id\": \"S\",}')")  # trailing comma
+    conn.execute("INSERT INTO t VALUES ('good', '{\"source_id\": \"T\"}')")
+    conn.commit()
+
+    import opencrab.stores._sql_dialect as dialect_mod
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", False)
+    expr = pack_load._json_string_present(SQLITE, "properties", "source_id")
+    rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+    assert rows["good"] == 1
+    assert rows["json5"] == 0, "알려진 한계: 폴백에서는 JSON5 행도 배제된다"
+    conn.close()
+
+
+def test_doc_owner_pred_where_clause_survives_malformed_metadata_row():
+    """issue #415 design.md §8 row 3: `_doc_owner_pred`(비-scoped, `delete_pack`/
+    `live_pack_state`/`fallback_tag_without_pack_id_counts` 공용 정본)이 깨진
+    `doc_sources.metadata` 행이 섞인 실쿼리에서 살아남는지 확인한다 —
+    `_doc_owner_pred_scoped`(array-bind)는 `TestListSourcesScopedSurvivesMalformedMetadata`
+    에서 이미 확인했고, 이 시험은 스칼라 비교 쪽(`_json_str_eq` 경유) 짝이다.
+    RED: 가드 없는 바닥 `json_extract`/`=` 비교는 손상 행에서 그대로 죽는다.
+    GREEN: `_doc_owner_pred`의 결합식은 손상 행을 결과에서 제외하고 정상
+    pack_id 매치는 그대로 살린다(비회귀)."""
+    import sqlite3
+
+    from opencrab.stores._sql_dialect import SQLITE
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE doc_sources (source_id TEXT, metadata TEXT)")
+    conn.execute(
+        "INSERT INTO doc_sources VALUES ('good', ?)",
+        (json.dumps({"pack_id": "P"}),),
+    )
+    conn.execute("INSERT INTO doc_sources VALUES ('bad', 'not valid json {')")
+    conn.commit()
+
+    with pytest.raises(sqlite3.OperationalError, match="malformed JSON"):
+        conn.execute(
+            "SELECT source_id FROM doc_sources"
+            " WHERE json_extract(metadata, '$.pack_id') = :pack",
+            {"pack": "P"},
+        ).fetchall()
+
+    pred = pack_load._doc_owner_pred(SQLITE)
+    rows = conn.execute(
+        f"SELECT source_id FROM doc_sources WHERE {pred}", {"pack": "P"}
+    ).fetchall()
+    assert {r[0] for r in rows} == {"good"}, "정상 pack_id 매치 결과가 손상 행 때문에 바뀌면 안 된다"
+    conn.close()
+
+
 class TestChromaBackendBranches:
     """`_vec_backend()` 가 `"chroma"` 로 인식하는 형태(F5-1) — 4자리 전부를 태운다."""
 

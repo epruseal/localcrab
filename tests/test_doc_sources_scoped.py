@@ -13,6 +13,7 @@ suite:
 
 from __future__ import annotations
 
+import sqlite3
 from unittest.mock import MagicMock
 
 import pytest
@@ -124,6 +125,56 @@ class TestListSourcesScopedSql:
         s._available = False
         with pytest.raises(RuntimeError, match="not available"):
             s.list_sources_scoped([], limit=0)
+
+
+class TestListSourcesScopedSurvivesMalformedMetadata:
+    """issue #415 design.md §8 row 3: `_doc_owner_pred_scoped` (via
+    `_json_str_in`'s CASE guard) used to die with `OperationalError:
+    malformed JSON` the moment ANY `doc_sources` row had syntactically
+    broken `metadata` text -- for every caller, not just the one touching
+    the bad row. The fix lives directly in `_json_str_in`/`_json_
+    string_present` (no `safe=`/retry toggle the way the graph store has),
+    so RED must be reproduced by hand-building the pre-#415 unguarded
+    fragment, not by flipping a kwarg."""
+
+    def _assert_unguarded_predicate_raises(self, store) -> None:
+        from opencrab.stores._sql_dialect import SQLITE
+
+        bare = (
+            f"json_type(metadata, '$.pack_id') = 'text'"
+            f" AND {SQLITE.json_get('metadata', 'pack_id')} = 'irrelevant'"
+        )
+        with pytest.raises(sqlite3.OperationalError, match="malformed JSON"):
+            store._conn.execute(
+                f"SELECT source_id FROM {store._table('doc_sources')} WHERE {bare}"
+            ).fetchall()
+
+    def test_list_sources_scoped_survives_one_malformed_metadata_row(self, store):
+        _source(store, "good", PACK_A)
+        store.upsert_source("bad", "bad text", {"pack_id": PACK_A})
+        store._exec_write(
+            f"UPDATE {store._table('doc_sources')} SET metadata=:metadata"
+            " WHERE source_id=:source_id",
+            {"metadata": "not valid json {", "source_id": "bad"},
+        )
+
+        self._assert_unguarded_predicate_raises(store)
+
+        got = {s["source_id"] for s in store.list_sources_scoped([PACK_A], limit=100)}
+        assert got == {"good"}, "malformed metadata row must be excluded, not raise"
+
+    def test_count_sources_scoped_survives_one_malformed_metadata_row(self, store):
+        _source(store, "good", PACK_A)
+        store.upsert_source("bad", "bad text", {"pack_id": PACK_A})
+        store._exec_write(
+            f"UPDATE {store._table('doc_sources')} SET metadata=:metadata"
+            " WHERE source_id=:source_id",
+            {"metadata": "not valid json {", "source_id": "bad"},
+        )
+
+        self._assert_unguarded_predicate_raises(store)
+
+        assert store.count_sources_scoped([PACK_A]) == 1
 
 
 class TestListSourcesScopedMongo:

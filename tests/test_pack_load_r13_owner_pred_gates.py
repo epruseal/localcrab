@@ -206,12 +206,39 @@ class TestDerivedExportInvariants:
 
     def test_nodes_and_edges_sql_untouched_by_docs_change(self):
         """`_json_str_eq` 기반 node/edge 술어는 `_doc_owner_pred` 도입과 무관
-        하다 — 여전히 단순 문자열 등가 하나뿐(OR/CASE 없음)."""
+        하다 — 소유권 판정은 여전히 `pack_id` 단순 등가 하나뿐이고 docs 축의
+        OR 폴백은 새어 들어오지 않는다.
+
+        `CASE`는 `#415`(손상 JSON 행 가드) 이후 두 술어 모두에 있다 — 이건
+        r13이 막던 것과 다른 성질(malformed-JSON 방어 전위조건절)이라 여기서
+        금지하지 않는다. 대신 등가절 리터럴이 `idx_nodes_pack`의 인덱스
+        표현식과 바이트 단위로 같은 채인지를 확인해 소유권 판정 자체는
+        여전히 단순 등가뿐임을 고정한다. 인덱스 탐색이 실제로 보존되는지는
+        `test_nodes_sql_still_uses_the_pack_id_index_after_the_json_safety_guard`
+        가 `EXPLAIN QUERY PLAN` 실측으로 별도 고정한다."""
         sqls = pack_load.build_count_sql(SQLITE)
         assert "OR" not in sqls["nodes"], sqls["nodes"]
         assert "OR" not in sqls["edges"], sqls["edges"]
-        assert "CASE" not in sqls["nodes"], sqls["nodes"]
-        assert "CASE" not in sqls["edges"], sqls["edges"]
+        assert "json_extract(properties, '$.pack_id') = :pack" in sqls["nodes"], sqls["nodes"]
+        assert "json_extract(properties, '$.pack_id') = :pack" in sqls["edges"], sqls["edges"]
+
+    def test_nodes_sql_still_uses_the_pack_id_index_after_the_json_safety_guard(self, live):
+        """#415의 CASE 가드가 `idx_nodes_pack` 인덱스 탐색을 깨지 않았는지
+        진짜 스토어(운영 스키마 그대로, 손으로 베낀 DDL 아님)로
+        `EXPLAIN QUERY PLAN` 실측 고정. `graph_edges`에는 애초에 `pack_id`
+        인덱스가 없어(전수 확인, `GRAPH_STORE_SCHEMA`) edges 쪽은 대응하는
+        고정 시험이 없다 — 늘 `SCAN`이라 고정할 성질 자체가 없다."""
+        _builder, graph, _docs = live
+        sqls = pack_load.build_count_sql(SQLITE)
+        plan = graph._conn.execute(
+            f"EXPLAIN QUERY PLAN {sqls['nodes']}", {"pack": "own-pack"}
+        ).fetchall()
+        plan_text = " ".join(str(cell) for row in plan for cell in row)
+        # `SEARCH ... USING INDEX idx_nodes_pack`를 요구한다 — 이 인덱스를
+        # 커버링 스캔(`SCAN ... USING INDEX`)하는 계획도 "idx_nodes_pack"
+        # 문자열은 포함하지만 그것은 탐색이 아니다. 지키려는 성질은 탐색이
+        # 유지되는 것이다.
+        assert "SEARCH graph_nodes USING INDEX idx_nodes_pack" in plan_text, plan_text
 
     def test_anchor_sql_untouched(self):
         assert pack_load.ANCHOR_SQL == pack_load.build_anchor_sql(SQLITE)

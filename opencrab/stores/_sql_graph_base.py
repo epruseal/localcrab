@@ -166,7 +166,14 @@ from opencrab.stores._graph_common import (
     decode_properties,
 )
 from opencrab.stores._json import dump_props
-from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
+from opencrab.stores._sql_dialect import (
+    Column,
+    IndexSpec,
+    SchemaSpec,
+    SqlDialect,
+    TableSpec,
+    json_valid_expr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -469,6 +476,60 @@ class _SqlGraphStoreBase(abc.ABC):
     @abc.abstractmethod
     def _require_available(self) -> None: ...
 
+    @abc.abstractmethod
+    def _is_malformed_json_error(self, exc: Exception) -> bool:
+        """issue #415: True iff ``exc`` is this dialect's exact "syntactically
+        malformed JSON" error -- used by ``_fetch_all_json_safe``/
+        ``_fetch_one_json_safe`` to tell a real bug apart from a broken data
+        row before retrying. SQLite: exact message match against a known
+        constant set (never a substring check -- a coincidental column name
+        must not be mistaken for this). PG: always False, since jsonb rejects
+        malformed JSON at write time (see module docs, issue #415 section 5)."""
+        ...
+
+    def _fetch_all_json_safe(
+        self, build: Callable[[bool], tuple[str, dict[str, Any]]]
+    ) -> list[tuple]:
+        """issue #415: run ``build(False)`` (the fast, index-preserving SQL)
+        first; if it raises this dialect's malformed-JSON error, rebuild and
+        retry exactly once via ``build(True)`` (the ``json_get_safe``-guarded
+        SQL). Any other exception, or a second failure, propagates as-is --
+        this never silently swallows a real error."""
+        sql, params = build(False)
+        try:
+            return self._fetch_all(sql, params)
+        except Exception as exc:
+            if not self._is_malformed_json_error(exc):
+                raise
+            logger.warning(
+                "graph scoped read hit malformed JSON on the indexed fast path; "
+                "retrying once via json_get_safe (rare: partial schema or "
+                "pre-index legacy data): %s",
+                exc,
+            )
+            sql, params = build(True)
+            return self._fetch_all(sql, params)
+
+    def _fetch_one_json_safe(
+        self, build: Callable[[bool], tuple[str, dict[str, Any]]]
+    ) -> tuple | None:
+        """Single-row counterpart of ``_fetch_all_json_safe`` -- see that
+        method's docstring for the retry-once contract."""
+        sql, params = build(False)
+        try:
+            return self._fetch_one(sql, params)
+        except Exception as exc:
+            if not self._is_malformed_json_error(exc):
+                raise
+            logger.warning(
+                "graph scoped read hit malformed JSON on the indexed fast path; "
+                "retrying once via json_get_safe (rare: partial schema or "
+                "pre-index legacy data): %s",
+                exc,
+            )
+            sql, params = build(True)
+            return self._fetch_one(sql, params)
+
     def _require_write_available(self) -> None:
         """Require a classified target schema for graph mutations.
 
@@ -480,6 +541,33 @@ class _SqlGraphStoreBase(abc.ABC):
         state = getattr(self, "_schema_state", "available")
         if state not in {"target", "available"}:
             raise GraphSchemaMigrationRequired("graph schema migration required")
+
+    def _json_columns(self) -> dict[str, str]:
+        """issue #415: table -> JSON column mapping for
+        ``count_malformed_properties()``. Both graph tables carry their JSON
+        payload in ``properties``."""
+        return {
+            self._table("graph_nodes"): "properties",
+            self._table("graph_edges"): "properties",
+        }
+
+    def count_malformed_properties(self) -> dict[str, int]:
+        """issue #415: on-demand diagnostic counting how many rows per table
+        carry syntactically malformed JSON in their JSON column -- SQLite
+        only (PG's jsonb structurally cannot hold malformed JSON, section 5
+        of the design). This is a full table scan with no supporting index;
+        it is never called from any hot read path, only by an operator who
+        needs to know whether the always-on guards (json_get_safe/guarded
+        json_truthy_text) are silently excluding any rows right now."""
+        if self._dialect.name != "sqlite":
+            return {t: 0 for t in self._json_columns()}
+        return {
+            table: self._fetch_one(
+                f"SELECT COUNT(*) FROM {table} WHERE NOT {json_valid_expr(col, conn=self._conn)}",
+                {},
+            )[0]
+            for table, col in self._json_columns().items()
+        }
 
     def _graph_tx_is_active(self) -> bool:
         """Return whether this thread owns a graph transaction callback.
@@ -3185,10 +3273,15 @@ class _SqlGraphStoreBase(abc.ABC):
         2 — see module docstring's "PACK_ID TYPE UNIFICATION")."""
         self._require_available()
         table = self._table("graph_nodes")
-        pid = self._dialect.json_get("properties", "pack_id")
-        title = self._dialect.json_get("properties", "title")
-        src_title = self._dialect.json_get("properties", "source_package_title")
-        desc = self._dialect.json_get("properties", "description")
+        # issue #415: json_get_safe (not the bare json_get) -- this aggregate
+        # query has no index-preserving fast path to protect (unlike
+        # _scoped_node_where's clause 1), so a direct guarded substitution is
+        # enough: one malformed properties row must not crash every caller's
+        # pack listing.
+        pid = self._dialect.json_get_safe("properties", "pack_id")
+        title = self._dialect.json_get_safe("properties", "title")
+        src_title = self._dialect.json_get_safe("properties", "source_package_title")
+        desc = self._dialect.json_get_safe("properties", "description")
         sql = f"""
             SELECT
                 {pid} AS pack_id,
@@ -3300,7 +3393,7 @@ class _SqlGraphStoreBase(abc.ABC):
         return f"{node_cond} AND {edge_cond}", params
 
     def _scoped_node_where(
-        self, col: str, bind_name: str
+        self, col: str, bind_name: str, *, safe: bool = False
     ) -> tuple[str, Callable[[list[str]], Any]]:
         """SINGLE SOURCE for the new pack_id-ONLY, index-friendly scope
         predicate the ``*_scoped`` methods below share (issue #147 §3.4(b)) --
@@ -3359,10 +3452,24 @@ class _SqlGraphStoreBase(abc.ABC):
         separately because it must also admit a NULL pack_id, which this
         two-clause node form does not. All the clauses still share ONE
         array bind, and the transform is applied to it exactly once).
+
+        ``safe`` (issue #415, default ``False``): when ``False`` clause 1
+        keeps the bare ``json_get`` extraction unchanged, byte-for-byte, from
+        before this parameter existed -- a syntactically malformed
+        ``properties``/``metadata`` value raises instead of silently
+        returning a wrong answer, and callers are expected to retry once with
+        ``safe=True`` (see ``_fetch_all_json_safe``/``_fetch_one_json_safe``)
+        rather than pay this method's index-matching literal (see
+        ``json_get_safe``'s own docstring) with every normal call. When
+        ``True`` clause 1 uses ``json_get_safe`` instead, which folds a
+        malformed row to SQL NULL -- excluded by the ``IN (...)`` test, same
+        "pack_id unresolved -> excluded" contract this method already applies
+        to every other unresolved-pack_id case.
         """
-        membership_expr = self._dialect.json_get(col, "pack_id")
+        getter = self._dialect.json_get_safe if safe else self._dialect.json_get
+        membership_expr = getter(col, "pack_id")
         frag, transform = self._dialect.in_string_array(membership_expr, f":{bind_name}")
-        truthy = self._dialect.json_truthy_text(col, "pack_id")
+        truthy = self._dialect.json_truthy_text(col, "pack_id")  # 4-A로 항상 안전
         return f"{frag} AND {truthy} IS NOT NULL", transform
 
     def export_nodes_scoped(
@@ -3392,18 +3499,27 @@ class _SqlGraphStoreBase(abc.ABC):
         if not pack_ids or limit <= 0:
             return []
         table = self._table("graph_nodes")
-        where_sql, transform = self._scoped_node_where("properties", "sc_packs")
-        where_parts = [where_sql]
-        params: dict[str, Any] = {"sc_packs": transform(sorted(set(pack_ids)))}
-        if space:
-            where_parts.append("space_id = :space")
-            params["space"] = space
-        params["lim"] = limit
-        sql = (
-            f"SELECT node_type, space_id, properties FROM {table} "
-            f"WHERE {' AND '.join(where_parts)} LIMIT :lim"
-        )
-        rows = self._fetch_all(sql, params)
+        packs_sorted = sorted(set(pack_ids))
+
+        # issue #415: build(safe) reruns only the WHERE-clause construction
+        # (via _scoped_node_where's own safe kwarg) -- JOIN/SELECT/LIMIT are
+        # untouched between the fast and safe attempts, so nothing here is
+        # reimplemented in Python.
+        def build(safe: bool) -> tuple[str, dict[str, Any]]:
+            where_sql, transform = self._scoped_node_where("properties", "sc_packs", safe=safe)
+            where_parts = [where_sql]
+            params: dict[str, Any] = {"sc_packs": transform(packs_sorted)}
+            if space:
+                where_parts.append("space_id = :space")
+                params["space"] = space
+            params["lim"] = limit
+            sql = (
+                f"SELECT node_type, space_id, properties FROM {table} "
+                f"WHERE {' AND '.join(where_parts)} LIMIT :lim"
+            )
+            return sql, params
+
+        rows = self._fetch_all_json_safe(build)
         results = []
         for node_type, space_id, properties in rows:
             props_raw, corrupted = decode_properties(properties)
@@ -3428,15 +3544,19 @@ class _SqlGraphStoreBase(abc.ABC):
         if not pack_ids:
             return 0
         table = self._table("graph_nodes")
-        where_sql, transform = self._scoped_node_where("properties", "sc_packs")
-        where_parts = [where_sql]
-        params: dict[str, Any] = {"sc_packs": transform(sorted(set(pack_ids)))}
-        if space:
-            where_parts.append("space_id = :space")
-            params["space"] = space
-        row = self._fetch_one(
-            f"SELECT COUNT(*) FROM {table} WHERE {' AND '.join(where_parts)}", params  # noqa: S608
-        )
+        packs_sorted = sorted(set(pack_ids))
+
+        def build(safe: bool) -> tuple[str, dict[str, Any]]:
+            where_sql, transform = self._scoped_node_where("properties", "sc_packs", safe=safe)
+            where_parts = [where_sql]
+            params: dict[str, Any] = {"sc_packs": transform(packs_sorted)}
+            if space:
+                where_parts.append("space_id = :space")
+                params["space"] = space
+            sql = f"SELECT COUNT(*) FROM {table} WHERE {' AND '.join(where_parts)}"  # noqa: S608
+            return sql, params
+
+        row = self._fetch_one_json_safe(build)
         return int(row[0]) if row else 0
 
     def export_edges_scoped(self, pack_ids: list[str], limit: int) -> list[dict[str, Any]]:
@@ -3467,27 +3587,35 @@ class _SqlGraphStoreBase(abc.ABC):
             return []
         nodes = self._table("graph_nodes")
         edges = self._table("graph_edges")
-        a_where, transform = self._scoped_node_where("a.properties", "sc_packs")
-        b_where, _ = self._scoped_node_where("b.properties", "sc_packs")
-        edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
-        e_membership, _ = self._dialect.in_string_array(
-            self._dialect.json_get("e.properties", "pack_id"), ":sc_packs"
-        )
-        edge_cond = f"({edge_truthy} IS NULL OR ({e_membership} AND {edge_truthy} IS NOT NULL))"
-        sql = f"""
-            SELECT
-                a.node_type AS from_type, a.properties AS source_props,
-                b.node_type AS to_type,   b.properties AS target_props,
-                e.properties AS rel_props, e.relation,
-                a.space_id AS from_space_id, b.space_id AS to_space_id
-            FROM {edges} e
-            JOIN {nodes} a ON e.from_type=a.node_type AND e.from_id=a.node_id
-            JOIN {nodes} b ON e.to_type=b.node_type   AND e.to_id=b.node_id
-            WHERE {a_where} AND {b_where} AND {edge_cond}
-            LIMIT :lim
-        """
-        params = {"sc_packs": transform(sorted(set(pack_ids))), "lim": limit}
-        rows = self._fetch_all(sql, params)
+        packs_sorted = sorted(set(pack_ids))
+
+        def build(safe: bool) -> tuple[str, dict[str, Any]]:
+            a_where, transform = self._scoped_node_where("a.properties", "sc_packs", safe=safe)
+            b_where, _ = self._scoped_node_where("b.properties", "sc_packs", safe=safe)
+            edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
+            edge_getter = self._dialect.json_get_safe if safe else self._dialect.json_get
+            e_membership, _ = self._dialect.in_string_array(
+                edge_getter("e.properties", "pack_id"), ":sc_packs"
+            )
+            edge_cond = (
+                f"({edge_truthy} IS NULL OR ({e_membership} AND {edge_truthy} IS NOT NULL))"
+            )
+            sql = f"""
+                SELECT
+                    a.node_type AS from_type, a.properties AS source_props,
+                    b.node_type AS to_type,   b.properties AS target_props,
+                    e.properties AS rel_props, e.relation,
+                    a.space_id AS from_space_id, b.space_id AS to_space_id
+                FROM {edges} e
+                JOIN {nodes} a ON e.from_type=a.node_type AND e.from_id=a.node_id
+                JOIN {nodes} b ON e.to_type=b.node_type   AND e.to_id=b.node_id
+                WHERE {a_where} AND {b_where} AND {edge_cond}
+                LIMIT :lim
+            """
+            params = {"sc_packs": transform(packs_sorted), "lim": limit}
+            return sql, params
+
+        rows = self._fetch_all_json_safe(build)
         results = []
         for r in rows:
             source_props, source_corrupted = decode_properties(r[1])
@@ -3515,22 +3643,30 @@ class _SqlGraphStoreBase(abc.ABC):
             return 0
         nodes = self._table("graph_nodes")
         edges = self._table("graph_edges")
-        a_where, transform = self._scoped_node_where("a.properties", "sc_packs")
-        b_where, _ = self._scoped_node_where("b.properties", "sc_packs")
-        edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
-        e_membership, _ = self._dialect.in_string_array(
-            self._dialect.json_get("e.properties", "pack_id"), ":sc_packs"
-        )
-        edge_cond = f"({edge_truthy} IS NULL OR ({e_membership} AND {edge_truthy} IS NOT NULL))"
-        sql = f"""
-            SELECT COUNT(*)
-            FROM {edges} e
-            JOIN {nodes} a ON e.from_type=a.node_type AND e.from_id=a.node_id
-            JOIN {nodes} b ON e.to_type=b.node_type   AND e.to_id=b.node_id
-            WHERE {a_where} AND {b_where} AND {edge_cond}
-        """  # noqa: S608
-        params = {"sc_packs": transform(sorted(set(pack_ids)))}
-        row = self._fetch_one(sql, params)
+        packs_sorted = sorted(set(pack_ids))
+
+        def build(safe: bool) -> tuple[str, dict[str, Any]]:
+            a_where, transform = self._scoped_node_where("a.properties", "sc_packs", safe=safe)
+            b_where, _ = self._scoped_node_where("b.properties", "sc_packs", safe=safe)
+            edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
+            edge_getter = self._dialect.json_get_safe if safe else self._dialect.json_get
+            e_membership, _ = self._dialect.in_string_array(
+                edge_getter("e.properties", "pack_id"), ":sc_packs"
+            )
+            edge_cond = (
+                f"({edge_truthy} IS NULL OR ({e_membership} AND {edge_truthy} IS NOT NULL))"
+            )
+            sql = f"""
+                SELECT COUNT(*)
+                FROM {edges} e
+                JOIN {nodes} a ON e.from_type=a.node_type AND e.from_id=a.node_id
+                JOIN {nodes} b ON e.to_type=b.node_type   AND e.to_id=b.node_id
+                WHERE {a_where} AND {b_where} AND {edge_cond}
+            """  # noqa: S608
+            params = {"sc_packs": transform(packs_sorted)}
+            return sql, params
+
+        row = self._fetch_one_json_safe(build)
         return int(row[0]) if row else 0
 
     def get_node_by_id_scoped(self, node_id: str, pack_ids: list[str]) -> dict[str, Any] | None:
@@ -3547,13 +3683,18 @@ class _SqlGraphStoreBase(abc.ABC):
         self._require_available()
         if not pack_ids:
             return None
-        where_sql, transform = self._scoped_node_where("properties", "sc_packs")
-        sql = (
-            f"SELECT node_type, properties, space_id FROM {self._table('graph_nodes')}"
-            f" WHERE node_id=:nid AND {where_sql} LIMIT 1"
-        )
-        params = {"nid": node_id, "sc_packs": transform(sorted(set(pack_ids)))}
-        row = self._fetch_one(sql, params)
+        packs_sorted = sorted(set(pack_ids))
+
+        def build(safe: bool) -> tuple[str, dict[str, Any]]:
+            where_sql, transform = self._scoped_node_where("properties", "sc_packs", safe=safe)
+            sql = (
+                f"SELECT node_type, properties, space_id FROM {self._table('graph_nodes')}"
+                f" WHERE node_id=:nid AND {where_sql} LIMIT 1"
+            )
+            params = {"nid": node_id, "sc_packs": transform(packs_sorted)}
+            return sql, params
+
+        row = self._fetch_one_json_safe(build)
         if not row:
             return None
         node_props, corrupted = decode_properties(row[1])
@@ -3597,31 +3738,42 @@ class _SqlGraphStoreBase(abc.ABC):
         edges = self._table("graph_edges")
         nodes = self._table("graph_nodes")
         placeholders, rel_params = self._in_placeholders(relations, "rel")
-        anchor_where, transform = self._scoped_node_where("anchor.properties", "sc_packs")
-        other_where, _ = self._scoped_node_where("other.properties", "sc_packs")
-        edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
-        edge_membership, _ = self._dialect.in_string_array(
-            self._dialect.json_get("e.properties", "pack_id"), ":sc_packs"
-        )
-        edge_cond = f"({edge_truthy} IS NULL OR ({edge_membership} AND {edge_truthy} IS NOT NULL))"
+        packs_sorted = sorted(set(pack_ids))
         results: list[dict[str, Any]] = []
 
         def leg(anchor_col: str, anchor_type: str, other_col: str, other_type: str, lim: int):
-            sql = (
-                f"SELECT other.node_type, other.node_id, e.relation, e.properties AS edge_props,"
-                f" anchor.properties AS anchor_props FROM {edges} e"
-                f" JOIN {nodes} anchor ON anchor.node_type=e.{anchor_type} AND anchor.node_id=e.{anchor_col}"
-                f" JOIN {nodes} other ON other.node_type=e.{other_type} AND other.node_id=e.{other_col}"
-                f" WHERE e.{anchor_col}=:nid AND e.relation IN ({placeholders})"
-                f" AND {anchor_where} AND {other_where} AND {edge_cond} LIMIT :lim"
-            )
-            params = {
-                "nid": node_id,
-                "lim": lim,
-                "sc_packs": transform(sorted(set(pack_ids))),
-                **rel_params,
-            }
-            for other_ntype, other_nid, relation, edge_props_raw, anchor_props_raw in self._fetch_all(sql, params):
+            def build(safe: bool) -> tuple[str, dict[str, Any]]:
+                anchor_where, transform = self._scoped_node_where(
+                    "anchor.properties", "sc_packs", safe=safe
+                )
+                other_where, _ = self._scoped_node_where(
+                    "other.properties", "sc_packs", safe=safe
+                )
+                edge_truthy = self._dialect.json_truthy_text("e.properties", "pack_id")
+                edge_getter = self._dialect.json_get_safe if safe else self._dialect.json_get
+                edge_membership, _ = self._dialect.in_string_array(
+                    edge_getter("e.properties", "pack_id"), ":sc_packs"
+                )
+                edge_cond = (
+                    f"({edge_truthy} IS NULL OR ({edge_membership} AND {edge_truthy} IS NOT NULL))"
+                )
+                sql = (
+                    f"SELECT other.node_type, other.node_id, e.relation, e.properties AS edge_props,"
+                    f" anchor.properties AS anchor_props FROM {edges} e"
+                    f" JOIN {nodes} anchor ON anchor.node_type=e.{anchor_type} AND anchor.node_id=e.{anchor_col}"
+                    f" JOIN {nodes} other ON other.node_type=e.{other_type} AND other.node_id=e.{other_col}"
+                    f" WHERE e.{anchor_col}=:nid AND e.relation IN ({placeholders})"
+                    f" AND {anchor_where} AND {other_where} AND {edge_cond} LIMIT :lim"
+                )
+                params = {
+                    "nid": node_id,
+                    "lim": lim,
+                    "sc_packs": transform(packs_sorted),
+                    **rel_params,
+                }
+                return sql, params
+
+            for other_ntype, other_nid, relation, edge_props_raw, anchor_props_raw in self._fetch_all_json_safe(build):
                 # #402 (round 6): the edge's own properties must be decode-
                 # checked here too, matching _expand()'s "must always be
                 # excluded" contract. Without this, a corrupted edge row
@@ -3840,9 +3992,12 @@ class _SqlGraphStoreBase(abc.ABC):
         where_parts: list[str] = []
         params: dict[str, Any] = {}
         if pack_id:
-            pid = self._dialect.json_get("properties", "pack_id")
-            src = self._dialect.json_get("properties", "source")
-            src_id = self._dialect.json_get("properties", "source_id")
+            # issue #415: no index-preserving fast path to protect here
+            # (unlike _scoped_node_where's clause 1) -- a direct json_get_safe
+            # substitution is enough.
+            pid = self._dialect.json_get_safe("properties", "pack_id")
+            src = self._dialect.json_get_safe("properties", "source")
+            src_id = self._dialect.json_get_safe("properties", "source_id")
             where_parts.append(f"({pid} = :pid OR {src} = :pid OR {src_id} = :pid)")
             params["pid"] = pack_id
         if space:
@@ -3983,28 +4138,34 @@ class _SqlGraphStoreBase(abc.ABC):
         _validate_search_fields(fields)
         table = self._table("graph_nodes")
         kw = keyword.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        where_parts = [
-            "(" + " OR ".join(
-                f"LOWER({self._dialect.json_get('properties', f)}) LIKE :kw ESCAPE '\\'"
-                for f in fields
-            ) + ")"
-        ]
-        pack_where, transform = self._scoped_node_where("properties", "sc_packs")
-        where_parts.append(pack_where)
-        params: dict[str, Any] = {
-            "kw": f"%{kw}%",
-            "sc_packs": transform(sorted(set(pack_ids))),
-        }
-        if spaces:
-            placeholders = ", ".join(f":space{i}" for i in range(len(spaces)))
-            where_parts.append(f"space_id IN ({placeholders})")
-            params.update({f"space{i}": s for i, s in enumerate(spaces)})
-        params["lim"] = limit
-        sql = (
-            f"SELECT node_type, space_id, properties FROM {table} "
-            f"WHERE {' AND '.join(where_parts)} LIMIT :lim"
-        )
-        rows = self._fetch_all(sql, params)  # noqa: S608
+        packs_sorted = sorted(set(pack_ids))
+
+        def build(safe: bool) -> tuple[str, dict[str, Any]]:
+            getter = self._dialect.json_get_safe if safe else self._dialect.json_get
+            where_parts = [
+                "(" + " OR ".join(
+                    f"LOWER({getter('properties', f)}) LIKE :kw ESCAPE '\\'"
+                    for f in fields
+                ) + ")"
+            ]
+            pack_where, transform = self._scoped_node_where("properties", "sc_packs", safe=safe)
+            where_parts.append(pack_where)
+            params: dict[str, Any] = {
+                "kw": f"%{kw}%",
+                "sc_packs": transform(packs_sorted),
+            }
+            if spaces:
+                placeholders = ", ".join(f":space{i}" for i in range(len(spaces)))
+                where_parts.append(f"space_id IN ({placeholders})")
+                params.update({f"space{i}": s for i, s in enumerate(spaces)})
+            params["lim"] = limit
+            sql = (
+                f"SELECT node_type, space_id, properties FROM {table} "
+                f"WHERE {' AND '.join(where_parts)} LIMIT :lim"
+            )
+            return sql, params
+
+        rows = self._fetch_all_json_safe(build)  # noqa: S608
         results = []
         for node_type, space_id, properties in rows:
             node_props, corrupted = decode_properties(properties)
@@ -4041,11 +4202,14 @@ class _SqlGraphStoreBase(abc.ABC):
             JOIN {nodes} b ON e.to_type=b.node_type   AND e.to_id=b.node_id
         """
         if pack_id:
-            pid_a = self._dialect.json_get("a.properties", "pack_id")
-            src_a = self._dialect.json_get("a.properties", "source")
-            pid_b = self._dialect.json_get("b.properties", "pack_id")
-            src_b = self._dialect.json_get("b.properties", "source")
-            pid_e = self._dialect.json_get("e.properties", "pack_id")
+            # issue #415: direct json_get_safe substitution -- this unscoped
+            # export has no index-preserving fast path to protect (not an
+            # authorization check), so no retry wrapper is needed here.
+            pid_a = self._dialect.json_get_safe("a.properties", "pack_id")
+            src_a = self._dialect.json_get_safe("a.properties", "source")
+            pid_b = self._dialect.json_get_safe("b.properties", "pack_id")
+            src_b = self._dialect.json_get_safe("b.properties", "source")
+            pid_e = self._dialect.json_get_safe("e.properties", "pack_id")
             sql = base_select + f"""
                 WHERE {pid_a} = :pid OR {src_a} = :pid
                    OR {pid_b} = :pid OR {src_b} = :pid

@@ -1012,3 +1012,48 @@ class TestUnavailableStore:
         # Should NOT raise — exception is swallowed silently.
         s.close()
         mock_conn.close.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# count_malformed_properties (issue #415 design.md §8 last row) -- on-demand
+# diagnostic, not on any hot read path.
+# ---------------------------------------------------------------------------
+
+
+class TestCountMalformedProperties:
+    def test_zero_on_a_clean_store(self, store):
+        store.upsert_node_doc("s1", "T", "n1", {"pack_id": "p1"})
+        store.upsert_source("src1", "hello", {"pack_id": "p1"})
+
+        assert store.count_malformed_properties() == {
+            store._table("doc_nodes"): 0,
+            store._table("doc_sources"): 0,
+        }
+
+    def test_counts_exactly_the_corrupted_rows_per_table(self, store):
+        store.upsert_node_doc("s1", "T", "good", {"pack_id": "p1"})
+        store.upsert_node_doc("s1", "T", "bad1", {"pack_id": "p1"})
+        store.upsert_node_doc("s1", "T", "bad2", {"pack_id": "p1"})
+        store.upsert_source("src_good", "hello", {"pack_id": "p1"})
+        store.upsert_source("src_bad", "hello", {"pack_id": "p1"})
+        store._exec_write(
+            f"UPDATE {store._table('doc_nodes')} SET properties=:p"
+            " WHERE space=:s AND node_id=:n",
+            {"p": "not valid json {", "s": "s1", "n": "bad1"},
+        )
+        store._exec_write(
+            f"UPDATE {store._table('doc_nodes')} SET properties=:p"
+            " WHERE space=:s AND node_id=:n",
+            {"p": "also not json [", "s": "s1", "n": "bad2"},
+        )
+        store._exec_write(
+            f"UPDATE {store._table('doc_sources')} SET metadata=:m"
+            " WHERE source_id=:id",
+            {"m": "{broken", "id": "src_bad"},
+        )
+
+        counts = store.count_malformed_properties()
+        assert counts == {
+            store._table("doc_nodes"): 2,
+            store._table("doc_sources"): 1,
+        }

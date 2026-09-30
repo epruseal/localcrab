@@ -72,7 +72,7 @@ from opencrab.pack.normalize import (
 )
 from opencrab.pack.ownership import get_pack
 from opencrab.pack.write_gate import authorize
-from opencrab.stores._sql_dialect import SQLITE, SqlDialect
+from opencrab.stores._sql_dialect import SQLITE, SqlDialect, json_valid_expr
 from opencrab.stores._vector_base import slot_owner
 
 # 로거 이름은 `__name__` 이다. 이관 전에는 호출자 스크립트 파일명으로 고정돼 있었는데
@@ -175,8 +175,12 @@ def _json_string_present(dialect: SqlDialect, col: str, key: str) -> str:
     비교하지 않으므로 `_json_str_eq` 의 `:param` 바인드가 필요 없다). `_json_str_eq` 는
     이 함수 위에 "존재 AND 값 일치"로 재구성돼 리터럴이 두 벌로 갈리지 않는다.
     """
+    # issue #415: CASE-guard the SQLite branch so a syntactically malformed
+    # `col` value folds to falsy (0) instead of raising -- json_type() itself
+    # throws before this ever reaches the WHERE-clause AND. Signature is
+    # unchanged (#377 조율 경계 유지).
     if dialect.name == "sqlite":
-        return f"json_type({col}, '$.{key}') = 'text'"
+        return f"(CASE WHEN {json_valid_expr(col)} THEN json_type({col}, '$.{key}') = 'text' ELSE 0 END)"
     return f"jsonb_typeof({col}->'{key}') = 'string'"
 
 
@@ -266,7 +270,9 @@ def build_anchor_sql(dialect: SqlDialect) -> str:
     을 쓴다. PG 의 `LIKE` 는 (sqlite 와 달리) 기본이 대소문자 구분이라 그대로
     Python 쪽과 일치한다(v6 검수 실증: `text()` 바인드 오인 없음·이스케이프 정확).
     """
-    created_by = dialect.json_get("properties", "created_by")
+    # issue #415: json_get_safe -- one syntactically malformed properties row
+    # must not crash this whole anchor-node scan.
+    created_by = dialect.json_get_safe("properties", "created_by")
     prefix_pred = "node_id GLOB 'dataset:*'" if dialect.name == "sqlite" else "node_id LIKE 'dataset:%'"
     return f"({prefix_pred} OR COALESCE({created_by},'') = 'title-backfill')"
 
@@ -1337,7 +1343,9 @@ def delete_pack(
         #
         # 매 호출마다 다시 조회한다(축이 이미 done 이라 안 쓰여도 무해한 읽기다) —
         # 재개 실행에서는 이전 실행이 이미 지운 행이 빠진 채로 돌아온다.
-        space_expr = graph._dialect.json_get("properties", "space")
+        # issue #415: json_get_safe -- one syntactically malformed properties
+        # row must not crash this whole delete_pack node scan.
+        space_expr = graph._dialect.json_get_safe("properties", "space")
         node_pack_pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
         rows = graph._fetch_all(
             f"""

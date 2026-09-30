@@ -394,4 +394,16 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
     def _fetch_one(self, sql: str, params: dict[str, Any]) -> tuple | None:
         return self._conn.execute(sql, params).fetchone()
 
+    # issue #415: exact message match, not a substring check -- a column
+    # name that happens to contain "malformed json" raises a DIFFERENT
+    # OperationalError ("no such column: ...") that must not be mistaken
+    # for this one and silently retried.
+    _SQLITE_MALFORMED_JSON_MESSAGES = frozenset({"malformed JSON"})
+
+    def _is_malformed_json_error(self, exc: Exception) -> bool:
+        return (
+            isinstance(exc, sqlite3.OperationalError)
+            and str(exc) in self._SQLITE_MALFORMED_JSON_MESSAGES
+        )
+
     # ``_require_available`` is inherited from ``_SqliteConnMixin``.

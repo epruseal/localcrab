@@ -11,6 +11,7 @@ connection" strategy for _sql_doc_base.py.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from typing import Any
 
@@ -70,6 +71,17 @@ class _SqliteGraphStoreDouble(_SqlGraphStoreBase):
     def _require_available(self) -> None:
         if not self._available:
             raise RuntimeError("not available")
+
+    _SQLITE_MALFORMED_JSON_MESSAGES = frozenset({"malformed JSON"})
+
+    def _is_malformed_json_error(self, exc: Exception) -> bool:
+        # issue #415: exact-message match, mirrors local_graph_store.py's
+        # real implementation -- must not swallow unrelated OperationalErrors
+        # (e.g. "no such column").
+        return (
+            isinstance(exc, sqlite3.OperationalError)
+            and str(exc) in self._SQLITE_MALFORMED_JSON_MESSAGES
+        )
 
 
 def _store() -> _SqliteGraphStoreDouble:
@@ -346,6 +358,33 @@ def test_list_packs_min_nodes_filter():
     store.upsert_node("Item", "i2b", {"pack_id": "big"})
     packs = store.list_packs(min_nodes=2)
     assert [p["pack_id"] for p in packs] == ["big"]
+
+
+def test_list_packs_survives_one_malformed_row_via_json_get_safe():
+    """issue #415 design.md §8 row 2: `list_packs()`'s aggregate query has no
+    index-preserving fast path to protect, so it uses `json_get_safe` (not the
+    retry mechanism) directly. RED: the pre-#415 bare `json_get`-built query
+    dies on a malformed row. GREEN: `list_packs()` survives the identical
+    data, silently excluding the malformed row (its `pack_id` resolves to SQL
+    NULL, tripping the query's own `WHERE pid IS NOT NULL`) while still
+    aggregating the well-formed pack normally."""
+    store = _store()
+    store.upsert_node("Item", "good1", {"pack_id": "p1"})
+    store.upsert_node("Item", "good2", {"pack_id": "p1"})
+    store.upsert_node("Item", "bad", {"pack_id": "p1"})
+    _corrupt_node_properties_malformed(store, "bad")
+
+    pid = store._dialect.json_get("properties", "pack_id")
+    with pytest.raises(sqlite3.OperationalError, match="malformed JSON"):
+        store._conn.execute(
+            f"SELECT {pid} AS pack_id, COUNT(*) FROM graph_nodes"
+            f" WHERE {pid} IS NOT NULL GROUP BY {pid}"
+        ).fetchall()
+
+    packs = store.list_packs()  # must not raise
+    assert len(packs) == 1
+    assert packs[0]["pack_id"] == "p1"
+    assert packs[0]["node_count"] == 2, "the malformed row must not be counted"
 
 
 # ---------------------------------------------------------------------------
@@ -1834,3 +1873,385 @@ def test_find_neighbors_corrupted_anchor_with_filter_still_returns_empty_control
 
     res = store.find_neighbors("hub", direction="out", pack_ids=["p1"])
     assert res == []
+
+
+# ---------------------------------------------------------------------------
+# issue #415: `_is_malformed_json_error` exact-match, `count_malformed_
+# properties()`, and the `_scoped_node_where(safe=)` / `_fetch_*_json_safe`
+# retry mechanism across its 7 consumers.
+# ---------------------------------------------------------------------------
+
+
+def test_is_malformed_json_error_matches_real_malformed_json():
+    store = _store()
+    store._conn.execute("CREATE TABLE _probe (properties TEXT)")
+    store._conn.execute("INSERT INTO _probe VALUES ('not valid json {')")
+    store._conn.commit()
+    try:
+        store._conn.execute("SELECT json_extract(properties, '$.k') FROM _probe").fetchall()
+        pytest.fail("expected malformed JSON to raise")
+    except sqlite3.OperationalError as exc:
+        assert store._is_malformed_json_error(exc) is True
+
+
+def test_is_malformed_json_error_does_not_match_unrelated_operational_error():
+    """Regression guard (rev.3): a coincidentally-similar OperationalError
+    (e.g. a bad column reference) must NOT be treated as malformed JSON --
+    exact string match only, never a substring/keyword check. This is the
+    exact shape codex round 2 used to demonstrate a substring check would
+    misfire."""
+    store = _store()
+    try:
+        store._conn.execute("SELECT malformed json FROM graph_nodes").fetchall()
+        pytest.fail("expected 'no such column' to raise")
+    except sqlite3.OperationalError as exc:
+        assert "malformed json" not in str(exc) or "no such column" in str(exc)
+        assert store._is_malformed_json_error(exc) is False
+
+
+def test_count_malformed_properties_zero_on_clean_store():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})
+    store.upsert_edge("Item", "a", "rel", "Item", "a", {"pack_id": "p1"})
+    counts = store.count_malformed_properties()
+    assert counts == {"graph_nodes": 0, "graph_edges": 0}
+
+
+def test_count_malformed_properties_counts_exactly_the_corrupted_rows():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})
+    store.upsert_node("Item", "b", {"pack_id": "p1"})
+    store.upsert_node("Item", "c", {"pack_id": "p1"})
+    store.upsert_edge("Item", "a", "rel", "Item", "b", {"pack_id": "p1"})
+    _corrupt_node_properties(store, "a", raw="not valid json {")
+    _corrupt_node_properties(store, "b", raw="also not json [")
+    _corrupt_edge_properties(store, "a", "b", raw="{broken")
+
+    counts = store.count_malformed_properties()
+    assert counts == {"graph_nodes": 2, "graph_edges": 1}
+
+
+def test_count_malformed_properties_json5_style_row_not_counted_when_simulated_on(monkeypatch):
+    """JSON5 대조군(리드 재정 — 함수별 행동 시험 요구): `count_malformed_properties`
+    가 JSON5 지원 시뮬레이션 하에서 트레일링 콤마 행을 손상으로 세지 않고,
+    진짜 손상 행은 여전히 세는지 이 함수 자체의 실행으로 직접 확인한다."""
+    from opencrab.stores._sql_dialect import sqlite_json5_valid_supported
+
+    if not sqlite_json5_valid_supported():
+        pytest.skip("this SQLite build has no JSON5 support to simulate positively")
+
+    store = _store()
+    store.upsert_node("Item", "good", {"pack_id": "p1"})
+    store.upsert_node("Item", "json5", {"pack_id": "p1"})
+    store.upsert_node("Item", "bad", {"pack_id": "p1"})
+    _corrupt_node_properties(store, "json5", raw='{"pack_id": "p1",}')  # trailing comma
+    _corrupt_node_properties(store, "bad", raw="not valid json {")
+
+    import opencrab.stores._sql_dialect as dialect_mod
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", True)
+    counts = store.count_malformed_properties()
+    assert counts["graph_nodes"] == 1, (
+        "JSON5 행은 손상으로 세면 안 되고, 진짜 손상 행 1개만 세어져야 한다"
+        f" -- got {counts}")
+
+
+def test_count_malformed_properties_json5_style_row_is_a_known_limitation_when_simulated_off(
+        monkeypatch):
+    """알려진 한계 대조군(`count_malformed_properties` 쪽): 1-인자 엄격
+    폴백에서는 JSON5 행도 진짜 손상과 구분되지 않고 세어진다."""
+    store = _store()
+    store.upsert_node("Item", "good", {"pack_id": "p1"})
+    store.upsert_node("Item", "json5", {"pack_id": "p1"})
+    _corrupt_node_properties(store, "json5", raw='{"pack_id": "p1",}')  # trailing comma
+
+    import opencrab.stores._sql_dialect as dialect_mod
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", False)
+    counts = store.count_malformed_properties()
+    assert counts["graph_nodes"] == 1, (
+        "알려진 한계: 폴백에서는 JSON5 행도 손상으로 세어져야 한다"
+        f" -- got {counts}")
+
+
+def _corrupt_node_properties_malformed(store, node_id: str) -> None:
+    """issue #415 variant of ``_corrupt_node_properties`` using genuinely
+    malformed (syntactically broken) JSON text, not a well-formed-but-wrong-
+    shape JSON array -- the exact row shape that used to crash the ENTIRE
+    query for every ``*_scoped``/``search_nodes`` consumer before the
+    ``safe=``/retry mechanism existed."""
+    _corrupt_node_properties(store, node_id, raw="not valid json {")
+
+
+def _assert_unguarded_where_raises_malformed_json(
+    store, col: str = "properties", pack_ids: list[str] | None = None
+) -> None:
+    """Proves the unguarded fast path (``safe=False``, byte-identical to
+    pre-#415 behavior) really does raise ``OperationalError: malformed
+    JSON`` against this store's seeded data -- so each GREEN assertion
+    below is provably the fix for a fixture that actually exercises the
+    bug, not one that happens to dodge it via query-plan shortcuts."""
+    where_sql, transform = store._scoped_node_where(col, "sc_packs", safe=False)
+    with pytest.raises(sqlite3.OperationalError, match="malformed JSON"):
+        store._conn.execute(
+            f"SELECT node_id FROM graph_nodes WHERE {where_sql}",
+            {"sc_packs": transform(pack_ids or ["p1"])},
+        ).fetchall()
+
+
+def _assert_exactly_one_retry_warning(caplog) -> None:
+    warnings = [
+        r for r in caplog.records if "retrying once via json_get_safe" in r.message
+    ]
+    assert len(warnings) == 1, f"expected exactly one retry warning, got {len(warnings)}"
+
+
+def test_export_nodes_scoped_survives_one_malformed_row_via_retry(caplog):
+    """issue #415 RED/GREEN for ``export_nodes_scoped``: a full pack-scoped
+    table scan touches every node row, including a malformed one -- GREEN
+    excludes that row (its pack_id can't be resolved) and returns the
+    well-formed one, with exactly one retry warning logged."""
+    store = _store()
+    store.upsert_node("Item", "good", {"pack_id": "p1", "id": "good"})
+    store.upsert_node("Item", "bad", {"pack_id": "p1", "id": "bad"})
+    _corrupt_node_properties_malformed(store, "bad")
+
+    _assert_unguarded_where_raises_malformed_json(store)
+
+    with caplog.at_level(logging.WARNING, logger="opencrab.stores._sql_graph_base"):
+        rows = store.export_nodes_scoped(["p1"], 20)  # must not raise
+    ids = {r["props"]["id"] for r in rows}
+    assert ids == {"good"}
+    _assert_exactly_one_retry_warning(caplog)
+
+
+def test_count_exported_nodes_scoped_survives_one_malformed_row_via_retry(caplog):
+    """issue #415 RED/GREEN for ``count_exported_nodes_scoped``: same full
+    table scan as export_nodes_scoped, COUNT(*) form."""
+    store = _store()
+    store.upsert_node("Item", "good", {"pack_id": "p1"})
+    store.upsert_node("Item", "bad", {"pack_id": "p1"})
+    _corrupt_node_properties_malformed(store, "bad")
+
+    _assert_unguarded_where_raises_malformed_json(store)
+
+    with caplog.at_level(logging.WARNING, logger="opencrab.stores._sql_graph_base"):
+        count = store.count_exported_nodes_scoped(["p1"])  # must not raise
+    assert count == 1
+    _assert_exactly_one_retry_warning(caplog)
+
+
+def test_search_nodes_survives_one_malformed_row_via_retry(caplog):
+    """issue #415 RED/GREEN for ``search_nodes``: the keyword predicate and
+    the pack-scope predicate share one WHERE clause over the whole table,
+    so a malformed row anywhere still used to kill the entire search."""
+    store = _store()
+    store.upsert_node("Item", "good", {"pack_id": "p1", "name": "alice"})
+    store.upsert_node("Item", "bad", {"pack_id": "p1", "name": "alice"})
+    _corrupt_node_properties_malformed(store, "bad")
+
+    _assert_unguarded_where_raises_malformed_json(store)
+
+    with caplog.at_level(logging.WARNING, logger="opencrab.stores._sql_graph_base"):
+        rows = store.search_nodes("alice", pack_ids=["p1"])  # must not raise
+    assert len(rows) == 1
+    assert rows[0]["props"]["name"] == "alice"
+    _assert_exactly_one_retry_warning(caplog)
+
+
+def _seed_edge_fixture_with_one_malformed_endpoint(store) -> None:
+    """Shared fixture for the three edge-JOIN consumers below: two clean
+    nodes joined by a clean edge (must survive), plus a third node whose
+    properties are malformed and which is itself an edge endpoint (so the
+    JOIN actually evaluates the scope predicate against it, unlike a
+    malformed node that is never an edge endpoint)."""
+    store.upsert_node("Item", "good1", {"pack_id": "p1", "id": "good1"})
+    store.upsert_node("Item", "good2", {"pack_id": "p1", "id": "good2"})
+    store.upsert_node("Item", "bad", {"pack_id": "p1", "id": "bad"})
+    store.upsert_edge("Item", "good1", "rel", "Item", "good2", {"pack_id": "p1"})
+    store.upsert_edge("Item", "good1", "rel", "Item", "bad", {"pack_id": "p1"})
+    _corrupt_node_properties_malformed(store, "bad")
+
+
+def test_export_edges_scoped_survives_one_malformed_endpoint_via_retry(caplog):
+    """issue #415 RED/GREEN for ``export_edges_scoped``: the edge whose
+    endpoint is malformed is correctly excluded (its endpoint's pack_id
+    can't be resolved, so the AND-scope predicate can't pass) -- that is
+    the pre-existing "unresolved pack_id -> excluded" contract, not a
+    regression. The OTHER edge, between two clean nodes, must still
+    survive, proving the retry reaches a real result rather than just
+    swallowing everything."""
+    store = _store()
+    _seed_edge_fixture_with_one_malformed_endpoint(store)
+
+    _assert_unguarded_where_raises_malformed_json(store)
+
+    with caplog.at_level(logging.WARNING, logger="opencrab.stores._sql_graph_base"):
+        rows = store.export_edges_scoped(["p1"], 20)  # must not raise
+    assert len(rows) == 1
+    assert rows[0]["source_props"]["id"] == "good1"
+    assert rows[0]["target_props"]["id"] == "good2"
+    _assert_exactly_one_retry_warning(caplog)
+
+
+def test_count_exported_edges_scoped_survives_one_malformed_endpoint_via_retry(caplog):
+    """issue #415 RED/GREEN for ``count_exported_edges_scoped``: same
+    endpoint-scope predicate as export_edges_scoped, COUNT(*) form -- only
+    the clean good1->good2 edge is counted."""
+    store = _store()
+    _seed_edge_fixture_with_one_malformed_endpoint(store)
+
+    _assert_unguarded_where_raises_malformed_json(store)
+
+    with caplog.at_level(logging.WARNING, logger="opencrab.stores._sql_graph_base"):
+        count = store.count_exported_edges_scoped(["p1"])  # must not raise
+    assert count == 1
+    _assert_exactly_one_retry_warning(caplog)
+
+
+def test_find_by_relations_scoped_survives_one_malformed_endpoint_via_retry(caplog):
+    """issue #415 RED/GREEN for ``find_by_relations_scoped``: querying the
+    CLEAN anchor's outgoing relations still touches the malformed "bad"
+    node as one candidate destination (same JOIN shape as
+    export_edges_scoped) -- GREEN skips that relation and returns only the
+    one to the other clean node."""
+    store = _store()
+    _seed_edge_fixture_with_one_malformed_endpoint(store)
+
+    _assert_unguarded_where_raises_malformed_json(store)
+
+    with caplog.at_level(logging.WARNING, logger="opencrab.stores._sql_graph_base"):
+        rows = store.find_by_relations_scoped("good1", ["rel"], ["p1"], "out", 20)
+    assert len(rows) == 1
+    assert rows[0]["properties"]["id"] == "good2"
+    _assert_exactly_one_retry_warning(caplog)
+
+
+def test_get_node_by_id_scoped_survives_lookup_of_the_malformed_row_itself_via_retry(caplog):
+    """issue #415 RED/GREEN for ``get_node_by_id_scoped``: ``node_id`` is
+    ``graph_nodes``'s primary key, so SQLite's planner seeks straight to
+    the requested row and never evaluates the scope predicate against any
+    OTHER row -- looking up a clean id therefore never reproduces the bug
+    for this method. Looking up the malformed row's OWN id does: the
+    predicate must still be evaluated against that exact (matching) row
+    before the query can decide whether to return it. GREEN: the malformed
+    row's pack_id can't be resolved, so it is correctly excluded from
+    scope and the lookup returns ``None`` (not the corrupted row, and not
+    a raised exception)."""
+    store = _store()
+    store.upsert_node("Item", "good", {"pack_id": "p1", "id": "good"})
+    store.upsert_node("Item", "bad", {"pack_id": "p1", "id": "bad"})
+    _corrupt_node_properties_malformed(store, "bad")
+
+    _assert_unguarded_where_raises_malformed_json(store)
+
+    with caplog.at_level(logging.WARNING, logger="opencrab.stores._sql_graph_base"):
+        result = store.get_node_by_id_scoped("bad", ["p1"])  # must not raise
+    assert result is None
+    _assert_exactly_one_retry_warning(caplog)
+
+    # no-regression companion: the clean row is unaffected and needs no
+    # retry at all (PK seek never touches the malformed row).
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="opencrab.stores._sql_graph_base"):
+        clean = store.get_node_by_id_scoped("good", ["p1"])
+    assert clean is not None and clean["id"] == "good"
+    assert not [r for r in caplog.records if "retrying once via json_get_safe" in r.message]
+
+
+def test_export_nodes_scoped_excludes_the_malformed_row_itself():
+    """Companion to the parametrized retry test above: confirms WHICH row
+    survives, not just that the call didn't raise -- the malformed node
+    itself must be excluded (its pack_id can't be resolved), same "unresolved
+    pack_id -> excluded" contract every other unresolved-pack_id case in
+    ``_scoped_node_where`` already applies."""
+    store = _store()
+    store.upsert_node("Item", "good", {"pack_id": "p1", "id": "good"})
+    store.upsert_node("Item", "bad", {"pack_id": "p1", "id": "bad"})
+    _corrupt_node_properties_malformed(store, "bad")
+
+    rows = store.export_nodes_scoped(["p1"], 20)
+    ids = {r["props"]["id"] for r in rows}
+    assert ids == {"good"}
+
+
+def test_count_exported_edges_scoped_counts_corrupted_edges_too_no_regression():
+    """rev.3: ``count_exported_edges_scoped`` does a raw ``COUNT(*)`` with no
+    decode step, so it counts a corrupted edge the same as a normal one --
+    an intentional asymmetry with ``export_edges_scoped`` (which decodes and
+    marks, never drops). This asserts the asymmetry is unchanged by the
+    #415 retry mechanism (the retry only concerns SQL-level malformed JSON
+    in NODE properties reachable via ``_scoped_node_where``, not the
+    Python-level ``decode_properties`` corruption this test seeds)."""
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})
+    store.upsert_node("Item", "b", {"pack_id": "p1"})
+    store.upsert_node("Item", "c", {"pack_id": "p1"})
+    store.upsert_edge("Item", "a", "rel", "Item", "b", {"pack_id": "p1"})
+    store.upsert_edge("Item", "a", "rel", "Item", "c", {"pack_id": "p1"})
+    _corrupt_edge_properties(store, "a", "c", raw="[1, 2, 3]")
+
+    assert store.count_exported_edges_scoped(["p1"]) == 2
+
+
+def test_scoped_node_where_safe_false_uses_idx_nodes_pack_on_clean_data_unaliased():
+    """Companion to ``test_count_exported_nodes_query_uses_space_index_not_
+    full_scan`` for the pack-scoped predicate: on a clean deployment (no
+    malformed rows), the default ``safe=False`` fast path must still use
+    ``idx_nodes_pack`` -- the whole point of keeping clause 1's literal text
+    byte-identical to pre-#415 (unaliased case: no table alias on `col`)."""
+    store = _store()
+    for i in range(20):
+        store.upsert_node("Item", f"n{i:02d}", {"pack_id": "p1"})
+
+    where_sql, transform = store._scoped_node_where("properties", "sc_packs", safe=False)
+    sql = f"SELECT node_id FROM graph_nodes WHERE {where_sql}"
+    plan = store._conn.execute(
+        "EXPLAIN QUERY PLAN " + sql, {"sc_packs": transform(["p1"])}
+    ).fetchall()
+    plan_text = " ".join(str(row) for row in plan)
+    assert "SCAN graph_nodes" not in plan_text
+    assert "idx_nodes_pack" in plan_text
+
+
+def test_scoped_node_where_safe_false_uses_idx_nodes_pack_on_clean_data_aliased():
+    """Aliased counterpart (``export_edges_scoped``/``find_by_relations_
+    scoped``'s ``a.properties``/``b.properties`` shape) -- rev.4's
+    correction: the literal text is not byte-identical to the DDL expression
+    once aliased, but the index still applies via structural column-
+    reference matching."""
+    store = _store()
+    for i in range(20):
+        store.upsert_node("Item", f"n{i:02d}", {"pack_id": "p1"})
+
+    where_sql, transform = store._scoped_node_where("a.properties", "sc_packs", safe=False)
+    sql = f"SELECT a.node_id FROM graph_nodes a WHERE {where_sql}"
+    plan = store._conn.execute(
+        "EXPLAIN QUERY PLAN " + sql, {"sc_packs": transform(["p1"])}
+    ).fetchall()
+    plan_text = " ".join(str(row) for row in plan)
+    assert "SCAN graph_nodes" not in plan_text
+    assert "idx_nodes_pack" in plan_text
+
+
+def test_clean_deployment_never_takes_the_retry_path(caplog):
+    """No-regression control (design.md table row, "정상 배포는 재시도 경로를
+    절대 타지 않음"): with no malformed rows at all, none of the 7 scoped
+    consumers should ever log the retry warning."""
+    store = _store()
+    store.upsert_node("Item", "good", {"pack_id": "p1", "name": "alice"})
+    store.upsert_node("Item", "other", {"pack_id": "p1", "name": "bob"})
+    store.upsert_edge("Item", "good", "rel", "Item", "other", {"pack_id": "p1"})
+
+    calls = [
+        lambda s: s.export_nodes_scoped(["p1"], 20),
+        lambda s: s.count_exported_nodes_scoped(["p1"]),
+        lambda s: s.export_edges_scoped(["p1"], 20),
+        lambda s: s.count_exported_edges_scoped(["p1"]),
+        lambda s: s.get_node_by_id_scoped("good", ["p1"]),
+        lambda s: s.find_by_relations_scoped("good", ["rel"], ["p1"], "out", 20),
+        lambda s: s.search_nodes("alice", pack_ids=["p1"]),
+    ]
+    with caplog.at_level(logging.WARNING, logger="opencrab.stores._sql_graph_base"):
+        for call in calls:
+            call(store)
+    warnings = [r for r in caplog.records if "retrying once via json_get_safe" in r.message]
+    assert warnings == [], f"clean deployment must never take the retry path: {warnings}"

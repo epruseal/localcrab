@@ -348,7 +348,9 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         where_sql = "WHERE doc_sources_fts MATCH ?"
         params: list[Any] = [match]
         if spaces:
-            space_expr = self._dialect.json_get("s.metadata", "space")
+            # issue #415: json_get_safe -- one syntactically malformed
+            # metadata row must not crash this whole keyword-search leg.
+            space_expr = self._dialect.json_get_safe("s.metadata", "space")
             placeholders = ",".join("?" for _ in spaces)
             where_sql += f" AND {space_expr} IN ({placeholders})"
             params.extend(spaces)
