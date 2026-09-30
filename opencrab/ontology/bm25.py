@@ -102,11 +102,11 @@ class BM25Index:
         index = BM25Index.build(doc_store.list_nodes(limit=10000))
         results = index.search("machine learning", pack_ids=["my-pack"], limit=10)
 
-    The index is a build-time snapshot. Token lists, IDF, average length and
-    pack membership (``_pack_buckets``) are all computed in ``build``. Do not
+    The index is a build-time snapshot. ``build`` computes token lists, IDF,
+    average length and pack membership (``_pack_buckets``) once. Do not
     mutate the input nodes afterwards. ``search`` re-checks each candidate's
-    pack against the requested scope, so a node moved out of a pack is never
-    returned for it. A node moved into a pack is not found until a rebuild.
+    pack against the requested scope, so a node moved out of a pack never
+    appears for it. A node moved into a pack stays invisible until a rebuild.
     """
 
     def __init__(self) -> None:
