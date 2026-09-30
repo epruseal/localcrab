@@ -52,6 +52,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from opencrab.common.graph_identity import (
     GraphMigrationConflict,
@@ -1775,8 +1776,11 @@ def _require_bound_principal():
     스크립트)의 책임이다.
 
     반환값은 청크 로더가 `write_gate.authorize` 에 넘길 principal 이다(#205).
-    노드·엣지 로더는 종전대로 문장으로만 부른다 — 그쪽 인가는 builder 안에서
-    일어난다.
+    엣지 로더는 종전대로 문장으로만 부른다. 그쪽 인가는 builder 안에서
+    일어난다. 노드 로더 가운데 `load_nodes_incremental`은 다르다(#377
+    2라운드): "same" 판정 행이 builder를 거치지 않고 벡터 백엔드에 직접
+    닿을 수 있어서, 이 반환값을 받아 벡터 접근 직전에 별도로
+    `write_gate.authorize`를 부른다(아래 해당 함수 본문 참고).
     """
     from opencrab.auth import current_principal
 
@@ -1869,11 +1873,36 @@ def load_nodes_incremental(
     graph,
     docs,
     doc_node_spaces: dict[str, set[str]],
-) -> tuple[int, int, int, int, int, set]:
+    *,
+    vec=None,
+    sql: Any = None,
+    recover_vectors: bool = False,
+) -> tuple[int, int, int, int, int, set, int]:
     """노드 증분 적재. 라이브와 동일한 행은 완전 스킵(어떤 스토어도 미접촉).
 
     graph/docs는 명시 파라미터 — OntologyBuilder는 스토어를 내부명(_neo4j/_mongo)으로
-    보관하므로 builder 속성 접근은 불가(vendor 실측, 2026-07-22).
+    보관하므로 builder 속성 접근은 불가(vendor 실측, 2026-07-22). `vec`도 같은
+    이유로 명시 파라미터다(#377) — 호출자는 `builder`를 구성할 때 쓴 것과
+    동일한 벡터 스토어 인스턴스를 넘겨야 한다. 기본값 `None`은 벡터 축 없는
+    배포에서 이 검사 전체를 안전하게 skip한다(아래 R1 설명).
+
+    `sql`(#377 2라운드, PR #421 codex 리뷰): `vec`가 주어질 때만 필수인
+    키워드 전용 인자다. "same" 판정 행은 `builder.add_node()`(팩 소유권
+    `authorize()`가 도는 자리)에 닿지 않고 벡터 백엔드를 직접 건드리므로,
+    이 함수 진입부에서 별도로 `authorize(sql, principal, pack_name)`을
+    부른다. 그래야 바인딩은 됐지만 이 팩을 소유하지 않은 principal이
+    타인의 비공개 팩 벡터 슬롯 존재 여부를 조회하는 경로가 막힌다.
+    `vec is None`(벡터 축 없는 배포)이면 이 인가 자체가 필요 없으므로
+    `sql`도 생략 가능하다. `vec`는 주어졌는데 `sql`이 없으면 `ValueError`로
+    즉시 실패한다(아래 본문). 호출자는 `builder`가 물린 것과 동일한
+    등록부 `SQLStore` 인스턴스를 넘겨야 한다(청크 축의 `sql` 계약과 같은
+    레지스트리 동일성 요구).
+
+    이 `authorize()`도 호출당 1회이고 대상은 `pack_name`이다. 행마다
+    인가하는 `builder.add_node()`와 달리, 벡터 접근이 걸리는 이 적재가
+    도는 동안 소유권이 바뀌는 창이 남는다. 청크 축
+    `load_chunks_incremental`과 같은 의도한 모서리다(그쪽 독스트링의
+    같은 설명 참고).
 
     `doc_node_spaces`는 F4-b `live_pack_state` 의 반환이다 — **필수 인자**다.
     노드가 이번 적재에서 space X 로 확인됐는데 doc_nodes 에 다른 space Y 의 행이
@@ -1886,21 +1915,65 @@ def load_nodes_incremental(
     빈 dict(`{}`)는 유효하다 — "대사할 doc 행이 없다"는 사실이고, 없는 것과는
     다르다.
 
-    반환: (n_new, n_chg, n_same, skip, err, bypack_ids)
+    반환: (n_new, n_chg, n_same, skip, err, bypack_ids, vec_unrecovered)
 
     #301: 이 함수는 doc 행 유실 회수(R2, 아래 `doc_row_missing`) 발동 횟수를
-    지역 카운터 `n_doc_recovered` 로 세지만 반환값에는 안 싣는다. 이 함수를
-    호출하는 프로덕션 코드가 없고(테스트만 이 6-tuple 을 언패킹한다) 반환
-    계약을 넓히면 그 콜사이트가 전부 바뀐다. 대신 진행 print 줄과 루프 종료
-    직후의 집계 `log.warning` 으로만 나간다. 이 카운터는 `add_node` 의
-    `res["stores"]["docs"]` 상태 문자열을 안 본다. 그 문자열은 #375(문서
-    upsert 성공 뒤 같은 try 블록의 audit_log 실패가 성공한 쓰기를 에러로
-    덮어쓴다)로 오염될 수 있다. `doc_row_missing` 은 이번 런 **시작 시점**의
-    `live_pack_state` 스냅샷에서 나온 사실이라 그 오염 경로에 안 걸린다.
+    지역 카운터 `n_doc_recovered` 로 세지만 반환값에는 안 싣는다. 대신 진행
+    print 줄과 루프 종료 직후의 집계 `log.warning` 으로만 나간다. 이 카운터는
+    `add_node` 의 `res["stores"]["docs"]` 상태 문자열을 안 본다. 그 문자열은
+    #375(문서 upsert 성공 뒤 같은 try 블록의 audit_log 실패가 성공한 쓰기를
+    에러로 덮어쓴다)로 오염될 수 있다. `doc_row_missing` 은 이번 런 **시작
+    시점**의 `live_pack_state` 스냅샷에서 나온 사실이라 그 오염 경로에 안
+    걸린다.
+
+    `vec_unrecovered`(#377, `load_chunks_incremental`의 `recover_vectors`(#332)와
+    같은 패턴): 그래프/문서가 라이브와 같아도 벡터 슬롯만 유실됐을 수 있다.
+    열거 가능한 백엔드(R1, `_live_vec_ids`가 이 팩의 벡터 id를 열거할 수 있는
+    경우)에서는 `recover_vectors` 값과 무관하게 **항상** 그 유실을 검사해
+    chg 경로로 재기록한다 — 팩당 열거 쿼리 1회로 저렴하기 때문에 opt-in으로
+    가두지 않는다(반환 튜플 확장과 별개로, 이 갈래는 노드 축의 기본 분류
+    자체를 바꾼다 — same이던 노드가 chg가 될 수 있다. 이것이 이 이슈가
+    고치는 유실 회수 그 자체다). 열거 불가 백엔드에서는 `recover_vectors=True`
+    이고 `vec.get_by_id(node_id) -> dict | None`이 콜러블일 때만 same-후보
+    입력 행마다 단건 조회로 존재를 확인한다(배치 열거보다 훨씬 비싸므로
+    opt-in). 열거 불가 + opt-out(또는 조회 수단 없음, 또는 조회 예외)이면
+    그 행은 기존과 같이 same으로 남되(분류를 바꾸지 않음), 판정 시점에
+    벡터 존재를 확인 못 했다는 사실을 `vec_unrecovered`로 세고 루프 종료 후
+    원인을 구분한 경고 로그를 남긴다 — 조용히 same으로 묻지 않는다. 이
+    카운터는 최종 same/chg 분류와 무관하게 "판정 시점에 미확인"이라는
+    사실만 정확히 반영한다(doc 유실로 이미 chg 낙하가 확정된 행도 포함).
+
+    **`vec is None`(벡터 축 자체가 없는 배포)은 위 opt-out 갈래와 다르다**
+    (#377 v3, 구현 보고 검토 뒤 리드 지시 반영). `vec is None`이면 이
+    배포에는 애초에 벡터 축이 없다는 뜻이지 유실이 아니다 — `vec_unrecovered`
+    를 전혀 올리지 않고(그 행은 0으로 남는다), 원인별 경고도 내지 않는다.
+    매 런 반복되는 opt-out 경고를 벡터 축 없는 배포에도 그대로 내면 그
+    경고가 영구 잡음이 되어, 정작 벡터 축이 있는데 미확인인 배포의 같은
+    경고까지 함께 무시된다. 대신 함수 진입 시 런당 정확히 1회
+    `log.debug`로 "벡터 축 없음"만 남긴다(반복 경고가 아니라 단발 관측
+    로그).
+
+    반환 튜플 6→7 확장은 파괴적 변경이다. 기존 6-값 위치 언패킹 호출부는
+    `ValueError: too many values to unpack (expected 6)`로 즉시 실패한다 —
+    조용한 오염보다 시끄러운 실패가 낫다는 `load_chunks_incremental`(#332)과
+    같은 설계 철학이다. 이 저장소 안 호출부(시험 전용, 프로덕션 호출 0건)는
+    전부 갱신했다. 저장소 밖 소비자(`opencrab-dump`)는 별도 업그레이드가
+    필요하다 — 이 소비자는 #332의 청크 축 확장에도 이미 같은 방식으로
+    맞춰 갱신한 전례가 있다.
+
+    성능 요구치(판정 비용, 코드가 바뀌어도 유지되는 상한): 열거 조회
+    (`_live_vec_ids`)는 실행당 정확히 1회. 단건 조회(opt-in, 열거 불가일
+    때만)는 판정 루프가 처리하는 입력 행당 최대 1회(파일에 같은 node_id가
+    중복되면 그 행 수만큼 반복 — 이 함수가 이미 갖고 있던 "행 단위, dedup
+    없음" 성질이며 #377이 새로 만드는 것이 아니다). 실제 회수 "쓰기"는
+    기존 `builder.add_node` 경로(`write_gate.node_identity_conflict`가
+    자신의 `get_by_id` 프로브를 이미 호출함, #377 이전부터 모든 chg 행에
+    있던 비용)를 그대로 타므로 이 요구치에 포함하지 않는다.
     """
     require_live_data("load_nodes_incremental")
     n_new = n_chg = n_same = skip = err = 0
     n_doc_recovered = 0
+    vec_unrecovered = 0  # #377: 판정 시점에 벡터 존재를 확인 못 한 same-후보 입력 행 수
     bypack_ids: set[str] = set()
     # R3(#142 재리뷰): 파일이 확정한 노드별 최종 타입 — 루프 말미의 구 타입
     # 행 스윕이 대조 기준으로 쓴다. same-continue **앞**에서 수집해야 same
@@ -1929,7 +2002,60 @@ def load_nodes_incremental(
             if not ok_del:
                 log.warning("doc 이종 space 정리 실패(반환 False) %s space=%s", node_id, other_space)
 
-    _require_bound_principal()
+    # PR #421 인라인 리뷰(codex, P2, 2026-09-28): 이 블록(벡터 접근)은
+    # 반드시 `_require_bound_principal()` 뒤에 와야 한다. 미바인딩
+    # principal 호출이 principal 오류보다 먼저 벡터 백엔드에 닿으면 안
+    # 된다(형제 축 load_chunks_incremental의 순서인 require_live_data,
+    # principal, authorize, 벡터 열거 순을 여기서도 지킨다).
+    # 정확한 보장은 "principal 오류가 항상 최초 오류"가 아니라 "미바인딩
+    # 호출은 벡터 접근에 도달하지 않는다"이다. require_live_data(위)가
+    # 먼저 실패하면 그 오류가 대신 난다(기존 동작, 이 수정이 바꾸지
+    # 않음). 게이트: tests/test_pack_load_r15_node_vec_gates.py::
+    # TestNodeVecAccessGatedByPrincipal.
+    principal = _require_bound_principal()
+
+    # PR #421 2라운드 리뷰(codex, P2, 2026-09-28): "same" 판정 행은
+    # builder.add_node()(팩 소유권 authorize()가 도는 자리)에 안 닿고
+    # 아래 _live_vec_ids로 벡터 백엔드를 직접 건드린다. 바인딩은 됐지만
+    # 이 팩을 소유하지 않은 principal이 타인의 비공개 팩 벡터 슬롯 존재를
+    # 조회할 수 있었다(#143 invariant 7 위반). vec 접근 직전에만 건다
+    # (vec is None 이면 벡터 축 자체가 없으므로 이 인가도 불필요, 범위
+    # 밖). 게이트: tests/test_pack_load_r15_node_vec_gates.py::
+    # TestNodeVecAccessGatedByPrincipal.
+    if vec is not None:
+        if sql is None:
+            raise ValueError(
+                "load_nodes_incremental: vec가 주어지면 sql도 필수다"
+                "(팩 소유권 인가, #377 2라운드)")
+        authorize(sql, principal, pack_name)
+
+    # R1(#377, load_chunks_incremental의 #142 재리뷰 패턴 이식): 그래프/문서가
+    # 라이브와 같아도 벡터만 유실됐을 수 있다. 열거 가능 백엔드에서는
+    # recover_vectors 값과 무관하게 항상 검사한다(§5: principal 검사를
+    # 통과한 실행당 1회, 저렴).
+    vec_set = _live_vec_ids(vec, pack_name)
+
+    # #377 v3(구현 보고 검토 뒤 리드 지시, 설계 v3 §4): `vec is None`은
+    # 이 배포에 벡터 축 자체가 없다는 뜻이지 유실이 아니다. 아래 opt-out
+    # 갈래(열거 불가 + 조회 수단 없음)와 같은 취급으로 매 런
+    # `vec_unrecovered`를 올리고 경고를 반복하면, 벡터 축 없는 배포에서 그
+    # 경고가 영구 잡음이 되어 실제 유실 경고의 신호까지 함께 죽인다(codex
+    # 좁은 검증 PASS, 2026-09-28). 이 배포에는 "확인 못 함"이 아니라 "확인할
+    # 대상 자체가 없다" — 카운터도 원인별 경고도 내지 않고, 런당 정확히
+    # 1회만 관측용 debug 로그를 남긴다.
+    vec_axis_absent = vec is None
+    if vec_axis_absent:
+        log.debug("%s 증분: 벡터 축 없음(vec=None) — 벡터 유실 판정을 skip한다", pack_name)
+
+    # #377: vec_set 이 None(열거 불가)이어도 백엔드가 단건 조회를 지원하면
+    # recover_vectors=True 로 그 수단을 켠다. `available` 을 확인 안 하면
+    # "확인 안 됨"(백엔드 비활성)을 "확인된 부재"로 격상시킬 위험이 있다.
+    vec_get_by_id = None
+    if recover_vectors and getattr(vec, "available", False):
+        _cand = getattr(vec, "get_by_id", None)
+        if callable(_cand):
+            vec_get_by_id = _cand
+
     for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림
         space, node_type, node_id, props = transform_node(pack_name, row)
         id_map[node_id] = (space, node_type)
@@ -2020,15 +2146,17 @@ def load_nodes_incremental(
                 # | docs.properties.<그 외 필드>      | **그렇다, 이 PR 은 안 잡는다** | 없음. 위 node_type 과 같은 기전(same 판정이 문서 sink 자신의 값을 안 본다)이라 #374 로 이관한다. codex 재리뷰(2026-09-14)가 지목한 부분 기록 잔존(원본이 properties.space 를 실은 채 다른 속성만 바뀌고 upsert_node_doc 실패)도 이 축이다. space 대칭 필터 이전에는 이 행들이 매 런 chg 로 강제돼 부분 기록 어긋남이 우연히 자가 치유됐다. 이 PR 이 그 우연한 치유를 없앤다 |
                 # | docs(audit_log, 별도 테이블)      | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. MongoDB.log_event 가 문서 upsert 와 같은 try 블록이라 그 실패만으로 stores.docs 상태가 에러로 찍힐 수 있다. #375 로 이관 |
                 # | sql(registry, (space,node_id)->node_type) | **그렇다, 이 PR 은 안 잡는다** | 없음. node_identity_conflict 도 이 registry 를 안 본다. #376 으로 이관 |
-                # | vector(노드 임베딩)               | **그렇다, 이 PR 은 안 잡는다** | 없음. load_chunks_incremental 의 R1/recover_vectors(#332) 와 같은 패턴이 청크에는 있지만 노드에는 아직 없다. #377 로 이관 |
+                # | vector(노드 임베딩)               | 그렇다(부분 복원·백엔드 삭제) | vec_row_missing(R1/opt-in, #377 로 해소 — load_chunks_incremental 의 R1/recover_vectors(#332) 와 같은 패턴을 아래 is_same 블록에 이식) |
                 #
                 # 표가 드러내는 것: docs.node_type 과 docs.properties.<그 외 필드>는
                 # #374(same 판정이 문서 sink 자신의 값을 보지 않는다), docs(audit_log)
-                # 는 #375, sql(registry)는 #376, vector(노드)는 #377, owner_id 는
-                # #378 로 각각 이관했다. "add_node 가 여러 저장소에 나눠 쓰고 부분
+                # 는 #375, sql(registry)는 #376, owner_id 는 #378 로 각각 이관했다.
+                # vector(노드)는 #377 이 이 함수 안에서 직접 해소했다(아래
+                # vec_row_missing). "add_node 가 여러 저장소에 나눠 쓰고 부분
                 # 실패가 가능하다"는 더 큰 부류의 남은 사각지대이며, #358(space 대칭
-                # 필터)의 범위를 넘는다. docs(행 존재/공간 잔재, 앵커)는 이 다섯 축과
-                # 성격이 다르다. 이번 라운드가 만든 gap 이 아니라 F4-b(`4d6878d`)와
+                # 필터)의 범위를 넘는다. docs(행 존재/공간 잔재, 앵커)는 이 네 축과
+                # 성격이 다르다(#377 해소로 다섯에서 넷으로 줄었다). 이번 라운드가
+                # 만든 gap 이 아니라 F4-b(`4d6878d`)와
                 # R2(`1f97bb3`)가 이미 받아들인 기존 설계 경계이므로 이슈로 묶지 않는다.
                 # docs(행 존재, 일반 노드) 행의 재발 여부는 이 함수의 `n_doc_recovered`
                 # 집계 경고로 관측한다(#301). doc 쓰기가 지속 실패 중이면 이 값이
@@ -2047,7 +2175,38 @@ def load_nodes_incremental(
                     not _is_anchor_node(node_id, props)
                     and space not in doc_node_spaces.get(node_id, set())
                 )
-                if not doc_row_missing:
+
+                # R1/opt-in(#377): doc 과 독립으로 벡터 유실을 판정한다. 하나의
+                # if/else 에 얹으면 ①벡터만 유실인데 doc 로그가 같이 찍히거나
+                # ②doc 유실로 chg 낙하가 이미 확정된 행에서 vec_unrecovered
+                # 증가가 누락되는 오류가 생긴다(설계 v2 §7, codex 1라운드
+                # 차단 사유 1) — 그래서 완전히 분리한다.
+                vec_row_missing = False
+                if vec_set is not None:
+                    vec_row_missing = node_id not in vec_set
+                elif vec_get_by_id is not None:
+                    try:
+                        hit = vec_get_by_id(node_id)
+                    except Exception as exc:
+                        vec_unrecovered += 1
+                        log.warning(
+                            "노드 단건 벡터 조회 오류(%s) %s: %s — 미확인으로 남긴다",
+                            pack_name, node_id, exc)
+                    else:
+                        owner = slot_owner(hit.get("metadata") if hit else None)
+                        if hit is None or owner != pack_name:
+                            vec_row_missing = True
+                elif not vec_axis_absent:
+                    # 열거 불가 + (opt-out 이거나 단건 조회 수단이 없다) — 판정
+                    # 시점에 존재를 확인 못 했다. doc_row_missing 때문에 이 행이
+                    # 뒤에서 chg 로 낙하해도 이 증가는 그대로 유효하다(§5/§7:
+                    # "판정 시점 미확인"이라는 사실만 반영, 최종 분류와 무관).
+                    vec_unrecovered += 1
+                # else(vec_axis_absent): 벡터 축 자체가 없는 배포 — 유실이
+                # 아니므로 vec_row_missing 은 False 로 남고 vec_unrecovered 도
+                # 안 오른다(#377 v3, 위 진입 전 설명 참고).
+
+                if not doc_row_missing and not vec_row_missing:
                     n_same += 1
                     # F4-c: 노드 자체는 안 바뀌었어도 doc 이 다른 space 를 가리키는
                     # 채로 남아 있을 수 있다(예: 지난 증분이 이 정리 전에 실패했다).
@@ -2055,12 +2214,17 @@ def load_nodes_incremental(
                     _cleanup_stale_doc_spaces(node_id, space)
                     done = n_new + n_chg + n_same + skip + err
                     if done % 500 == 0:
-                        print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err} doc_recovered={n_doc_recovered})", flush=True)
+                        print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err} doc_recovered={n_doc_recovered} vec_unrecovered={vec_unrecovered})", flush=True)
                     continue
-                log.warning("doc 행 유실 회수(%s) %s space=%s", pack_name, node_id, space)
-                n_doc_recovered += 1  # #301: 집계. 매 런 0 이 아니면 doc 쓰기가 지속 실패 중이란 신호
-                # same 으로 안 잡고 아래 chg 경로로 낙하한다 — live[0]==node_type
-                # 이므로 stale_typed 는 자연히 None(구 타입 삭제 로직 미개입).
+                if doc_row_missing:
+                    log.warning("doc 행 유실 회수(%s) %s space=%s", pack_name, node_id, space)
+                    n_doc_recovered += 1  # #301: 집계. 매 런 0 이 아니면 doc 쓰기가 지속 실패 중이란 신호
+                if vec_row_missing:
+                    log.warning("벡터 유실 회수(%s) %s", pack_name, node_id)
+                # doc, vec 둘 중 하나라도 missing 이면 same 으로 안 잡고 아래
+                # chg 낙하 경로로 흐른다 — live[0]==node_type 이므로 stale_typed
+                # 는 자연히 None(구 타입 삭제 로직 미개입, R2 와 동일한 안전성
+                # 근거).
 
         # 타입이 바뀐 구 행은 **새 노드가 실제로 저장된 뒤에** 지운다(아래).
         #
@@ -2149,7 +2313,7 @@ def load_nodes_incremental(
 
         done = n_new + n_chg + n_same + skip + err
         if done % 500 == 0:
-            print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err} doc_recovered={n_doc_recovered})", flush=True)
+            print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err} doc_recovered={n_doc_recovered} vec_unrecovered={vec_unrecovered})", flush=True)
 
     # #301: doc 행 유실 회수(R2) 누적 집계. 매 런 0 이 아니면 doc 쓰기가
     # 지속 실패 중이라는 신호다. R3 구 타입 스윕(아래)은 별개 축이라 이
@@ -2159,6 +2323,25 @@ def load_nodes_incremental(
             "%s 증분 doc 행 유실 회수 누적 %d건(전체 chg=%d), 매 런 "
             "반복되면 doc 쓰기가 지속 실패 중이라는 뜻이다(#301)",
             pack_name, n_doc_recovered, n_chg)
+
+    # #377: 벡터 유실 회수 미확인 누적 집계. load_chunks_incremental(#332)의
+    # 종료 후 경고와 같은 패턴 — 실행당 1회, 세 원인 중 무엇으로 미확인이
+    # 남았는지 정확히 구분한다(원인이 실제와 어긋나면 소비자가 잘못된 조치를
+    # 취한다).
+    if vec_unrecovered:
+        if not recover_vectors:
+            log.warning(
+                "벡터 유실 회수 미확인(%s): 열거 불가 백엔드에서 %d건 확인 못 함 — "
+                "recover_vectors=True 로 단건 조회 회수를 켤 수 있다",
+                pack_name, vec_unrecovered)
+        elif vec_get_by_id is None:
+            log.warning(
+                "벡터 유실 회수 미확인(%s): %d건 — 단건 조회를 지원하지 않거나 "
+                "백엔드가 비활성이다", pack_name, vec_unrecovered)
+        else:
+            log.warning(
+                "벡터 유실 회수 미확인(%s): %d건 — 단건 조회 오류로 확인하지 못했다",
+                pack_name, vec_unrecovered)
 
     # ── R3(#142 재리뷰): 구 타입 행 구조적 회수(매 런) ──────────────────────
     # 위 저장-후-삭제 순서 안에서 `graph.delete_node` 가 실패하면(경합·스토어
@@ -2191,7 +2374,7 @@ def load_nodes_incremental(
             else:
                 log.warning("구 타입 행 스윕 삭제(%s) %s(%s)", pack_name, node_id, stale_type)
 
-    return n_new, n_chg, n_same, skip, err, bypack_ids
+    return n_new, n_chg, n_same, skip, err, bypack_ids, vec_unrecovered
 
 
 def load_edges(

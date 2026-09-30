@@ -387,7 +387,7 @@ class TestLoadNodesIncremental:
         # 재리뷰) — 손으로 `{}` 를 지어내면 실제로 존재하는 doc 행을 "없다"로
         # 오판하게 만들어 same 이 chg 로 흘러 이 테스트 자체가 R2 검사를
         # 못 지나간다(위 docstring 의 "라이브를 실제로 읽는다" 원칙과 같은 이유).
-        n_new, n_chg, n_same, skip, err, ids = pack_load.load_nodes_incremental(
+        n_new, n_chg, n_same, skip, err, ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", f, builder, {}, live_nodes, graph, docs, state["doc_node_spaces"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 0, 1, 0, 0), (
             "라이브와 동일한 행이 same 으로 판정되지 않았다 — 매 증분마다 전량 재적재된다")
@@ -397,7 +397,7 @@ class TestLoadNodesIncremental:
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1", 발행연도="2027")])
         live_nodes = {"n1": ("Document", "resource", {"발행연도": "2026", "pack_id": "pack-1"})}
-        n_new, n_chg, n_same, skip, err, _ = pack_load.load_nodes_incremental(
+        n_new, n_chg, n_same, skip, err, _, _vu = pack_load.load_nodes_incremental(
             "pack-1", f, builder, {}, live_nodes, graph, docs, {})
         assert (n_new, n_chg, n_same) == (0, 1, 0)
 
@@ -420,7 +420,7 @@ class TestLoadNodesIncremental:
         live_nodes = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())["nodes"]
         f_new = _write_jsonl(tmp_path / "new.jsonl",
                              [_node(id="n1", node_type="Concept", space="concept")])
-        _n, n_chg, _s, _sk, _e, _ids = pack_load.load_nodes_incremental(
+        _n, n_chg, _s, _sk, _e, _ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", f_new, builder, {}, live_nodes, graph, docs, {})
 
         assert n_chg == 1, "타입 변경이 chg 로 세어지지 않았다"
@@ -431,7 +431,7 @@ class TestLoadNodesIncremental:
     def test_unknown_row_is_counted_as_new(self, live, tmp_path):
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1")])
-        n_new, n_chg, n_same, _, _, _ = pack_load.load_nodes_incremental(
+        n_new, n_chg, n_same, _, _, _, _vu = pack_load.load_nodes_incremental(
             "pack-1", f, builder, {}, {}, graph, docs, {})
         assert (n_new, n_chg, n_same) == (1, 0, 0)
 
@@ -742,7 +742,7 @@ class TestLoadNodesIncremental:
                            [_node(id="n1", node_type="Concept", space=None,
                                   properties={"space": "concept"})])
         with caplog.at_level(logging.WARNING):
-            n_new, n_chg, n_same, skip, err, _bypack_ids = _run(f2)
+            n_new, n_chg, n_same, skip, err, _bypack_ids, _vu = _run(f2)
         assert (n_new, n_chg, skip, err) == (0, 0, 0, 0), (
             "정규화 후 같은 노드는 same 이어야 한다"
             f"(n_new={n_new} n_chg={n_chg} skip={skip} err={err})")
@@ -1568,7 +1568,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
         # 이번 증분: n1 은 값이 바뀌어 재저장을 시도하지만 실패한다. n2 는 파일에서
         # 아예 빠졌다 — n1 의 실패와 무관한 stale 후보다.
         f2 = _write_jsonl(tmp_path / "n2.jsonl", [_node(id="n1", 발행연도="2027")])
-        n_new, n_chg, n_same, skip, err, bypack_ids = pack_load.load_nodes_incremental(
+        n_new, n_chg, n_same, skip, err, bypack_ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", f2, builder, {}, state["nodes"], graph, docs, {})
         assert err == 1, f"저장 실패가 err 로 안 잡혔다: n_new={n_new} n_chg={n_chg} err={err}"
         assert bypack_ids == {"n1"}, "저장 실패와 무관하게 bypack_ids 는 채워져야 한다"
@@ -4767,7 +4767,7 @@ class TestFailedAddNodeLeavesOldTypedRowIntact:
 
         f_new = _write_jsonl(tmp_path / "new.jsonl",
                              [_node(id="n1", node_type="Concept", space="concept")])
-        n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+        n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", f_new, builder, {}, live_nodes, graph, docs, {})
 
         assert err == 1, (
@@ -4799,7 +4799,7 @@ class TestDocSpaceResidueCleanup:
             "전제: doc_node_spaces 가 두 space 를 다 모아야 한다")
 
         # 같은 파일을 다시 적재 — 노드 자체는 안 바뀌었으므로 same 경로를 타야 한다.
-        n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+        n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", nf, builder, {}, state["nodes"], graph, docs,
             state["doc_node_spaces"])
         assert n_same == 1, f"전제 위반 — same 경로가 아니다: new={n_new} chg={n_chg} same={n_same}"
@@ -4877,7 +4877,7 @@ class TestDocSpaceResidueCleanup:
 
         nf2 = _write_jsonl(tmp_path / "n2.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
-        n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+        n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", nf2, builder, {}, state["nodes"], graph, docs,
             state["doc_node_spaces"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
@@ -4912,7 +4912,7 @@ class TestDocSpaceResidueCleanup:
         nf2 = _write_jsonl(tmp_path / "n2.jsonl",
                            [_node(id="n1", node_type="File", space="resource",
                                   properties={"버전": "2"})])
-        n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+        n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", nf2, builder, {}, state["nodes"], graph, docs,
             state["doc_node_spaces"])
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
@@ -5229,7 +5229,7 @@ class TestLoadLogsInsteadOfSwallowing:
         nf2 = _write_jsonl(tmp_path / "n2.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
         with caplog.at_level("WARNING", logger="opencrab.pack.load"):
-            n_new, n_chg, n_same, skip, err, _ids = pack_load.load_nodes_incremental(
+            n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
                 "pack-1", nf2, builder, {}, state["nodes"], graph, docs, {})
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             n_new, n_chg, n_same, skip, err)
