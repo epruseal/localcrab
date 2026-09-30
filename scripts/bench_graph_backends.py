@@ -47,7 +47,7 @@ from opencrab.stores.neo4j_store import Neo4jStore
 
 # ─── 상수 ────────────────────────────────────────────────────────────────────
 # 덤프 위치(nodes.jsonl/edges.jsonl)와 라이브 graph.db 경로는 머신마다 다르므로
-# 모듈 상수로 얼리지 않는다 — main()이 --dump-dir/--graph-db-path 인자로 받아
+# 모듈 상수로 얼리지 않는다. main()이 --dump-dir/--graph-db-path 인자로 받아
 # 함수 지역 변수로 전달한다(아래 load_nodes/load_edges/run_bench/
 # run_readonly_target 참고).
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs"

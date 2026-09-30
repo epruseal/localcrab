@@ -1,9 +1,9 @@
-"""#154 재발 방지 게이트 회귀 테스트 — scripts/qa/check_no_machine_paths.py.
+"""#154 재발 방지 게이트 회귀 테스트: scripts/qa/check_no_machine_paths.py.
 
 설계: 이슈 #429(스캐너 검증, 보류 로직 테스트, 경계 변이 테스트).
 
 이 파일 자체가 저장소 게이트 대상이므로, 계획된 머신 고유 경로/사설망 IP
-리터럴은 소스에 그대로 쓰지 않고 런타임에 조립한다(_fake_home_path 등) —
+리터럴은 소스에 그대로 쓰지 않고 런타임에 조립한다(_fake_home_path 등).
 그렇지 않으면 이 테스트 파일 자신이 test_repo_has_no_new_machine_paths 를
 깨뜨린다.
 """
@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def _load_module_from_path(name: str, relpath: str):
     """scripts/ 처럼 패키지가 아닌 모듈을 파일 경로로 직접 로드한다.
 
-    exec_module 전에 sys.modules 에 등록해야 한다 — 로드 대상이 dataclass 를
+    exec_module 전에 sys.modules 에 등록해야 한다. 로드 대상이 dataclass 를
     쓰면 dataclasses 내부가 cls.__module__ 로 sys.modules 를 되찾아 조회하는데,
     등록 전이면 그 조회가 None 이 되어 AttributeError 가 난다.
     """
@@ -90,7 +90,7 @@ def test_scanner_detects_planted_private_ip(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 경계값 — CIDR 범위와 리딩/트레일링 가드
+# 경계값: CIDR 범위와 리딩/트레일링 가드
 # ---------------------------------------------------------------------------
 
 _CIDR_CASES = [
@@ -127,7 +127,7 @@ def test_scanner_ip_cidr_boundaries(tmp_path):
 
 
 def test_scanner_rejects_ip_with_extra_leading_digit_token(tmp_path):
-    """반례: "1.10.1.2.3" — 트레일링 가드만 있으면 앞의 "1." 때문에
+    """반례: "1.10.1.2.3". 트레일링 가드만 있으면 앞의 "1." 때문에
     뒤 4토큰이 사설 IP로 오탐된다. 리딩 가드가 이를 막는다."""
     target = tmp_path / "note.txt"
     target.write_text(f"token={_num_dotted(1, 10, 1, 2, 3)} end\n", encoding="utf-8")
@@ -198,8 +198,8 @@ def test_allowed_placeholder_users_actually_filters(tmp_path):
 
 
 def test_scan_flags_new_violation_in_deferred_file(tmp_path, monkeypatch):
-    """같은 파일 안이라도 보류된 matched_text 와 다른 신규 위반은 잡혀야 한다
-    — 줄 번호가 아니라 (path, matched_text) 쌍이 보류 키라서 가능한 정밀도."""
+    """같은 파일 안이라도 보류된 matched_text 와 다른 신규 위반은 잡혀야 한다.
+    줄 번호가 아니라 (path, matched_text) 쌍이 보류 키라서 이 정밀도가 나온다."""
     target = tmp_path / "owned.py"
     recorded = _fake_home_path("owneruser", "old.py")
     new_violation = _fake_home_path("intruderuser", "new.py")
@@ -297,7 +297,7 @@ def test_disabling_ip_detector_leaves_home_path_detector_working(monkeypatch, tm
 
 
 # ---------------------------------------------------------------------------
-# 실제 저장소 게이트 — "미회수 위반 0건"
+# 실제 저장소 게이트: "미회수 위반 0건"
 # ---------------------------------------------------------------------------
 
 

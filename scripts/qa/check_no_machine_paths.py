@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""#154 재발 방지 게이트 — 머신 고유 절대경로/사설망 IP를 저장소에서 검출한다.
+"""#154 재발 방지 게이트: 머신 고유 절대경로/사설망 IP를 저장소에서 검출한다.
 
 배경(AGENTS.md "#154 재발 방지 규율"):
     머신 고유 절대경로(`/home/<사용자명>/...`, `/Users/<사용자명>/...`)와 사설망
@@ -8,7 +8,7 @@
 
 설계: 이슈 #429.
 
-받아들임 기준은 "원시 매치 0건"이 아니라 "미회수 위반 0건"이다 — 중립
+받아들임 기준은 "원시 매치 0건"이 아니라 "미회수 위반 0건"이다. 중립
 placeholder 사용자명(ALLOWED_PLACEHOLDER_USERS)과 완전 검증된 IP 옥텟이
 아닌 문자열(예: package-lock.json의 3-part semver)은 애초에 위반이 아니다.
 다른 이슈가 소유한 파일의 기존 위반을 잠시 넘겨야 하면 DEFERRED_VIOLATIONS에
@@ -26,7 +26,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-# 중립 placeholder 사용자명 — 테스트 픽스처가 쓰는 가짜 홈 경로는 실제 머신을
+# 중립 placeholder 사용자명. 테스트 픽스처가 쓰는 가짜 홈 경로는 실제 머신을
 # 가리키지 않으므로 위반이 아니다.
 ALLOWED_PLACEHOLDER_USERS = {"user", "someone", "alice"}
 
@@ -39,7 +39,7 @@ HOME_PATH_RE = re.compile(
 # 이슈 #429의 재현 명령(CMD2)은 3개 숫자 그룹만 요구하는 느슨한 정규식이라
 # package-lock.json류의 3-part semver 버전 문자열("10.4.27" 등)을 사설망 IP로
 # 오탐한다. 실제 IPv4는 언제나 옥텟 4개이므로, 이 스캐너는 4개 옥텟이 전부
-# 0-255 범위인 완전한 점 표기만 매치한다 — 그래서 3-part 문자열은 애초에 걸리지
+# 0-255 범위인 완전한 점 표기만 매치한다. 그래서 3-part 문자열은 애초에 걸리지
 # 않는다(파일 예외가 필요 없다). 리딩/트레일링 가드(둘 다 필수.
 # 반례 "1.10.1.2.3": 트레일링 가드만 있으면 앞에 더 붙은 "1." 때문에
 # 뒤 4토큰이 사설 IP로 오탐된다)로 더 긴 숫자열의 부분 문자열 매치도 막는다.
@@ -106,7 +106,7 @@ def _scan_private_ips(path: Path, text: str) -> list[Violation]:
 
 def scan(files: Iterable[Path]) -> list[Violation]:
     """전달받은 파일 목록만 검사한다. 파일 열거(git ls-files 등)는 호출자의
-    책임이다 — scan()은 자기 안에서 대상 파일을 찾지 않는다. 전달받은 파일
+    책임이다. scan()은 자기 안에서 대상 파일을 찾지 않는다. 전달받은 파일
     집합과 그 시점의 내용에만 의존하고 숨은 전역 상태(git 인덱스, cwd)를
     참조하지 않는다는 뜻에서 결정적이다. 디코드 실패(바이너리) 파일은 두
     검사 모두 건너뛴다.
