@@ -4,7 +4,7 @@ pgvector store adapter (PostgreSQL-unified backend, (B) 경로).
 Drop-in replacement for :class:`ChromaStore` (and sibling to
 :class:`SqliteVecStore`, A 경로) that keeps the vector index in the same
 PostgreSQL instance as sql/doc/graph stores in PG-unified 모드. See
-``docs/pgvector-migration-plan.md`` §3.1-§3.5 / §4.1-B for the original design;
+``docs/vector-backends.md`` (pgvector section) for the design;
 스키마/인덱스 파라미터는 프리플라이트 실측(HNSW global p95 6.44ms)으로 아래와 같이
 확정했다.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Migrate the live Chroma KURE collection into a sqlite-vec (vec0) store.
 
-Phase-5 cutover for docs/pgvector-migration-plan.md (A) path. Instead of
+Phase-5 cutover for the sqlite-vec (A) path (docs/vector-backends.md). Instead of
 re-embedding (slow, and risks Q8 drift), this copies the EXACT KURE 1024d
 vectors already stored in Chroma into a vec0 table with byte-identical
 document/metadata — a perfect 1:1 migration in minutes.

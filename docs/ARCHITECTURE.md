@@ -37,8 +37,8 @@ LocalCrab은 `STORAGE_MODE` 환경변수로 네 가지 백엔드를 선택한다
 graph/vector/doc 3스토어는 factory가 `POSTGRES_URL`당 1회 생성해 캐시하는 **공유
 SQLAlchemy 엔진**(`_get_pg_engine`, 단일 커넥션 풀)을 주입받는다. `SQLStore`만
 기존 시그니처(`url` 인자)를 유지하기 위해 자체 엔진을 연다(같은 DB를 향하지만
-별도 풀). 설치: `pip install ".[pg]"`. 설계·프리플라이트 실측:
-`docs/pgvector-migration-plan.md` (B) 경로.
+별도 풀). 설치: `pip install ".[pg]"`. 설계·실측:
+`docs/vector-backends.md` pgvector 절.
 
 **운영 권장 구성**: 기본은 `local` — 4스토어(graph/doc/sql/vector)를 SQLite 단일
 규율로 통일해 백업(디렉터리 1개 파일 복사)·정합성 관리 대상을 1개로 줄인다.
@@ -151,7 +151,7 @@ ctx["hybrid"].invalidate_bm25_cache()  # → epoch를 올려 재빌드 후 atomi
 > `supports_keyword` capability를 노출할 때만 `keyword_search(...)`를 호출(미지원 시 폴백).
 > `LocalSQLDocStore`는 `doc_sources` 본문을 SQLite **FTS5**(`doc_sources_fts`,
 > `unicode61` 한+영)로 색인한다. 다른 백엔드(Mongo/pgvector)는 동일 capability로 구현.
-> 자세한 내용·한계는 `docs/pgvector-migration-plan.md` §7.1.
+> 구현은 `opencrab/stores/local_sql_doc_store.py`와 `opencrab/stores/pg_doc_store.py`를 참고한다.
 
 이 경로에서 JSON 파일 백엔드는 매 쿼리마다 `nodes.json` 전체를 파싱한다. 데이터가
 늘어날수록 지연이 선형으로 증가한다.
@@ -714,14 +714,13 @@ make_vector_store(settings)
   `VECTOR_ANN_COARSE_K`개 → float cosine rerank)으로 가속(기본 off, 기존 경로 불변; 기존 DB 는
   `scripts/migrate_add_binary_quantization.py` 로 bit 컬럼 backfill).
   전환: `scripts/migrate_chroma_to_sqlite_vec.py`, 설계·성능(전역 브루트포스·binary 2단계):
-  `docs/pgvector-migration-plan.md` (A) §3.6/§3.7, `docs/vector-backends.md` §4.1.
+  `docs/vector-backends.md` §4.1.
 - `chroma`(docker 모드 기본 / local+minilm 조합 기본): `ChromaStore` (위 그림 그대로).
 - `pgvector`(`STORAGE_MODE=pg` 기본): `PgVectorStore`(HNSW `m=16,ef_construction=64`,
   쿼리 세션 `hnsw.ef_search=PG_EF_SEARCH` 기본 500 — §4.2 Phase 2 게이트 재측정으로
   150→500 상향). `EMBEDDING_BACKEND=local`과 조합 시 ValueError(sqlite-vec와 동일 가드).
   전역 검색도 HNSW로 179,784건 전량 실측 p95 24.61ms라 sqlite-vec의 binary 2단계 같은
-  별도 가속 불필요. 설계·실측: `docs/pgvector-migration-plan.md` (B) 경로,
-  `docs/vector-backends.md` §4.2.
+  별도 가속 불필요. 설계·실측: `docs/vector-backends.md` §4.2.
 
 모드×옵션 전체 매트릭스는 `docs/vector-backends.md` 참고.
 

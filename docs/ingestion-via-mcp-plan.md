@@ -6,7 +6,7 @@
 
 범위 확정: `pack_purge`(삭제) · `pack_ingest_chunks`(청크 배치) **두 신규 MCP write 도구 신설 포함**. `--fresh`(purge-replace)까지 MCP 무중단으로 달성한다.
 
-관련 문서: `[[pgvector-migration-plan]]` (스토어 백엔드 교체·동시성 결정 힌지 — §9가 본 문서를 "실시간 동시 적재" 시나리오로 직접 인용), `[[vector-backends]]` (3-백엔드 매트릭스·기본값 해석 규칙)
+관련 문서: `[[vector-backends]]` (3-백엔드 매트릭스·기본값 해석 규칙)
 
 ---
 
@@ -34,7 +34,7 @@ VECTOR_BACKEND 명시됨?
 | `sqlite-vec` | **가능** (무중단) | graph/doc/sql과 동일한 SQLite **WAL** 규율. 리더는 락 없이 동시 진행, 라이터는 `busy_timeout(5s)`로 직렬화(`sqlite_vec_store.py` `_new_conn`) | **로컬 모드 신규 기본값**. 라이터는 여전히 **직렬화**(동시에 하나) — MVCC 아님 |
 | `pgvector`(`STORAGE_MODE=pg`) | **가능** (진짜 다중 라이터) | PostgreSQL **MVCC** — 리더가 라이터를 막지 않고, 라이터끼리도 행 단위로만 경합 | `opencrab/stores/factory.py`가 graph/doc/sql/vector 4스토어 전부 `PGGraphStore`/`PgDocStore`/`SQLStore`/`PgVectorStore`로 PG에 통합 배치. `EMBEDDING_BACKEND=openai`(KURE) 필수 |
 
-`pgvector-migration-plan.md` §9(동시성 결론 — 의사결정 힌지)는 본 문서를 "실시간 동시 적재가 확정 요구인 시나리오"로 직접 인용하며, 그 경우 sqlite-vec의 라이터 직렬화로는 부족하고 **pg 모드의 MVCC만이 근본 해法**이라고 결론짓는다. 반대로 현행처럼 "로더가 적재 시 사실상 단독 라이터"인 워크로드라면 sqlite-vec 직렬화로 충분하다. 즉:
+`docs/vector-backends.md`의 동시성 판단은 다음과 같다. 실시간 동시 적재가 확정 요구이면 sqlite-vec의 라이터 직렬화로는 부족하고 **pg 모드의 MVCC만이 근본 해法**이다. 반대로 현행처럼 "로더가 적재 시 사실상 단독 라이터"인 워크로드라면 sqlite-vec 직렬화로 충분하다. 즉:
 
 - **가벼운 로컬 배포(현행 stop-to-load에 가까운 워크로드):** `sqlite-vec` 무중단 ingest로 충분 — 별도 인프라 없이 "MCP 중지" 절차만 제거.
 - **진짜 동시 다중 라이터가 확정 요구(예: 백그라운드 로더 + 다수 MCP 클라이언트가 상시 동시 write, 또는 수백만 벡터 스케일):** `STORAGE_MODE=pg`로 이행 — 이것이 현재 아키텍처의 프로덕션/SaaS-스케일 답이다.
@@ -78,7 +78,7 @@ VECTOR_BACKEND 명시됨?
 - 로더가 스토어를 직접 열지 않게 하여, 스토어 API 변경 시 손봐야 할 지점을 하나(MCP)로 좁힌다.
 
 **비목표**
-- 스토어 백엔드 교체 자체(Chroma → sqlite-vec/pgvector). → `[[pgvector-migration-plan]]`·`docs/vector-backends.md`에서 다룬다. 이미 마이그레이션 스크립트가 존재한다(§9).
+- 스토어 백엔드 교체 자체(Chroma → sqlite-vec/pgvector). → `docs/vector-backends.md`에서 다룬다. 이미 마이그레이션 스크립트가 존재한다(§9).
 - 임베딩 모델/청킹 전략 변경.
 - MCP 인증 체계 재설계 (기존 Bearer 토큰 재사용).
 - `write.lock`을 백엔드별로 조건부화(pg MVCC 활용)하는 것 — §1.3에서 향후 과제로만 기록.
@@ -242,7 +242,7 @@ VECTOR_BACKEND 명시됨?
 - `scripts/migrate_graph_to_ladybug.py` — 과거 그래프 스토어 kuzu → ladybug 이전 경로의
   read-only inspection 포인터. 현재 apply는 qualification 전까지 fixture-only이다.
 
-상세 설계·동시성 결정 힌지는 `docs/pgvector-migration-plan.md` §8-9, 백엔드 조합 매트릭스는 `docs/vector-backends.md` 참고.
+백엔드 조합 매트릭스와 동시성 판단은 `docs/vector-backends.md` 참고.
 
 ---
 

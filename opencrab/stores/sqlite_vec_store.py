@@ -4,7 +4,7 @@ sqlite-vec vector store adapter (SQLite-unified backend).
 Drop-in replacement for :class:`ChromaStore` that keeps the vector index in the
 same SQLite WAL discipline as the graph/doc/sql stores, removing Chroma's
 "single-process writer" constraint (and the custom flock layer built around it).
-See ``docs/pgvector-migration-plan.md`` §3.6 / §4.1-A / §9 for the design.
+See ``docs/vector-backends.md`` sections 2 and 4 for the design.
 
 WHY A SEPARATE STORE (not an embedding-function swap):
     sqlite-vec is a *vector store backend*, not an embedding backend. Chroma
@@ -38,7 +38,7 @@ VEC0 NOTES (verified against sqlite-vec 0.1.9):
       Chroma ``where`` semantics ($in/$and/space) with a Python post-filter,
       pushing only single ``pack_id`` equality down to the partition key.
 
-BINARY 2-STAGE ANN (VECTOR_ANN=binary, docs/pgvector-migration-plan.md §3.7):
+BINARY 2-STAGE ANN (VECTOR_ANN=binary, docs/vector-backends.md section 4.1):
     Global (no filter) brute-force KNN over 179k×1024d floats is
     CPU/memory-bandwidth bound (~868ms p95). With ``ann="binary"`` the store
     answers GLOBAL (no ``where``) queries in two stages over an in-process

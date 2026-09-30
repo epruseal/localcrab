@@ -124,7 +124,7 @@ def make_vector_store(settings: Settings) -> Any:
                      여도 VECTOR_BACKEND=pgvector 를 명시하면 벡터만 PG 를 쓸 수
                      있다(§6.3 (C) 단계 — 이 경우 postgres_url 로 자체 엔진 생성).
 
-    설계: docs/pgvector-migration-plan.md §3.6 / §9. 임베딩은 백엔드와 무관하게 동일.
+    설계: docs/vector-backends.md §2. 임베딩은 백엔드와 무관하게 동일.
     한국어 검색 품질: minilm MRR 0.285 vs KURE-v1 1.000.
     """
     backend = settings.vector_backend_resolved

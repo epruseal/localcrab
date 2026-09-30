@@ -3,7 +3,7 @@
 Verifies the backend option is wired correctly, and that the conditional
 smart default (vector_backend_resolved) picks sqlite-vec only for local
 storage + openai embedding, falling back to chroma otherwise. See
-docs/pgvector-migration-plan.md §3.6 and config.py (vector_backend /
+docs/vector-backends.md section 2 and config.py (vector_backend /
 vector_backend_resolved).
 """
 

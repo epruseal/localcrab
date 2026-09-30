@@ -1,6 +1,6 @@
 """Binary 2-stage quantization tests for SqliteVecStore (VECTOR_ANN=binary).
 
-docs/pgvector-migration-plan.md §3.7. Covers:
+docs/vector-backends.md section 4.1. Covers:
   - _sign_bits packing correctness (vs hand-computed bytes and SQL
     vec_quantize_binary)
   - 2-stage result == exact result when C >= corpus size (synthetic data)

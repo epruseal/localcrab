@@ -16,7 +16,7 @@ directly as a ``vector`` literal). If the source vec0 table has an
 ``embedding_bit`` column (VECTOR_ANN=binary backfill,
 scripts/migrate_add_binary_quantization.py), it is IGNORED — PgVectorStore
 has no binary 2-stage path (its HNSW index already serves global search at
-p95 6.44ms, see docs/pgvector-migration-plan.md "WHY NOT BINARY 2-STAGE").
+p95 6.44ms, see docs/vector-backends.md, pgvector section).
 
 SOURCE SAFETY: unlike migrate_add_binary_quantization.py (which rebuilds the
 source table in place and therefore REQUIRES --backup-to), this script only

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark sqlite-vec (vec0) vs the live Chroma KURE collection.
 
-Phase-3 gate for docs/pgvector-migration-plan.md (A) path. Copies the live
+Phase-3 gate for the sqlite-vec (A) path (docs/vector-backends.md). Copies the live
 Chroma dir to a temp location on disk (read-only; never touches live data),
 streams the real KURE 1024d vectors into a temp vec0 table (same vectors, raw),
 then measures — isolating the *store index/search* behaviour from embedding:
@@ -16,12 +16,11 @@ metadata-filtered p95 <= 200ms, pack leak = 0.
 
 Notes:
   - The live Chroma dir (~2GB) is copied to --work-dir (default: the parent of
-    Settings().local_data_dir; override if that resolves to a tmpfs mount,
-    since the copy is sized to the live Chroma dir) so the running gateway is
-    never touched.
+    Settings().local_data_dir; override with --work-dir) so the running
+    gateway is never touched.
   - Vectors are streamed in batches; only a small query reservoir is held in RAM.
 
-BINARY MODE (--mode binary, docs/pgvector-migration-plan.md §3.7 gate):
+BINARY MODE (--mode binary, docs/vector-backends.md section 4.1 gate):
   Measures the binary 2-stage ANN path against exact float brute-force on an
   ALREADY-MIGRATED vec0 DB (run scripts/migrate_add_binary_quantization.py on a
   COPY first — this bench is read-only and never migrates/mutates the target;

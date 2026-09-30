@@ -109,7 +109,7 @@ class Settings(BaseSettings):
     #   "pg"     — PG-unified: 4스토어(graph/doc/sql/vector) 전부 PostgreSQL 한
     #              서버·SQLAlchemy 공유 엔진으로 통합. MVCC 다중 라이터가 필요한
     #              운영(§9 힌지: MCP 서빙 중 동시 write, 벡터 수백만 스케일)에
-    #              권장. 설계/실측: docs/pgvector-migration-plan.md (B) 경로.
+    #              권장. 설계/실측: docs/vector-backends.md pgvector 절.
     # ------------------------------------------------------------------
     storage_mode: Literal["local", "docker", "kuzu", "pg"] = Field(
         default="local", alias="STORAGE_MODE"
@@ -263,9 +263,9 @@ class Settings(BaseSettings):
     #                        hnsw.ef_search=PG_EF_SEARCH(기본 500). STORAGE_MODE=pg
     #                        이면 자동 선택(vector_backend_resolved), local 모드에서
     #                        VECTOR_BACKEND=pgvector 명시 설정으로 벡터만 PG를 쓰는
-    #                        조합도 가능(§6.3 (C) 단계). 실측: pgvector-migration-plan.md.
+    #                        조합도 가능(§6.3 (C) 단계). 실측: docs/vector-backends.md.
     #
-    # 설계: docs/pgvector-migration-plan.md §3.6 / §9. embedding 은 백엔드와 무관하게
+    # 설계: docs/vector-backends.md §2. embedding 은 백엔드와 무관하게
     #       동일(ResilientEmbeddingFunction, KURE). 바뀌는 것은 저장/검색 백엔드뿐.
     # 롤백: VECTOR_BACKEND=chroma 로 명시하면 조건부 기본값과 무관하게 기존 Chroma
     #       스택 그대로 사용(항상 명시 설정이 최우선).
@@ -299,7 +299,7 @@ class Settings(BaseSettings):
     #       기존 DB 는 scripts/migrate_add_binary_quantization.py 로 비파괴 backfill
     #       (재임베딩 없음 — float 원본의 부호 비트만 파생). 컬럼이 없으면 경고 후
     #       exact 경로로 자동 폴백(동작은 안전, 가속만 없음).
-    # 설계: docs/pgvector-migration-plan.md §3.7, docs/vector-backends.md.
+    # 설계: docs/vector-backends.md §4.1.
     # 롤백: VECTOR_ANN 미설정으로 되돌리면 즉시 exact 경로로 복귀(스키마 원복 불필요
     #       — bit 컬럼은 남아 있어도 미사용일 뿐이며 쓰기 시 계속 동기 유지됨).
     # ------------------------------------------------------------------

@@ -3,8 +3,7 @@
 `STORAGE_MODE` × `VECTOR_BACKEND` × `EMBEDDING_BACKEND` 세 축의 조합과 각 백엔드의
 장단점을 정리한다. 개별 축의 설정법은 [README](../README.md#임베딩-백엔드),
 [README 벡터 스토어 섹션](../README.md#벡터-스토어-백엔드-vector_backend),
-[ARCHITECTURE.md §8](./ARCHITECTURE.md), 설계 배경은
-[pgvector-migration-plan.md](./pgvector-migration-plan.md) 참고.
+[ARCHITECTURE.md §8](./ARCHITECTURE.md) 참고.
 
 ---
 
@@ -86,7 +85,7 @@ sqlite-vec 표준 차원(KURE 1024d)과 맞지 않기 때문이다. sqlite-vec�
 - **단점**
   - **전역(pack 미지정) 브루트포스 검색이 느리다** — 실측 p95 약 868ms(179k×1024d,
     CPU/메모리대역폭 바운드). 전역 고속화는 **binary 2단계 양자화(`VECTOR_ANN=binary`,
-    아래 §4.1)로 해결** — 구현 완료([pgvector-migration-plan.md §3.7](./pgvector-migration-plan.md)).
+    아래 §4.1)로 해결** — 구현 완료.
   - **KURE(1024d) 전용** — minilm(384d)과 조합 불가(위 §2 참고).
   - pre-v1(v0.1.x) 라이브러리 — 파괴적 변경 가능성.
   - metadata 필터는 vec0 제약(컬럼 최대 16개, `= != < <= > >=` 6연산자, partition key
@@ -94,7 +93,6 @@ sqlite-vec 표준 차원(KURE 1024d)과 맞지 않기 때문이다. sqlite-vec�
 
 #### 4.1 binary 2단계 양자화 (`VECTOR_ANN=binary`) — 전역 검색 가속
 
-설계 원문·실측 근거: [pgvector-migration-plan.md §3.7](./pgvector-migration-plan.md).
 sqlite-vec 백엔드 전용 옵트인 기능이며 **기본 off**(미설정 시 기존 exact 경로 100% 불변).
 
 **동작 원리.** float 임베딩(1024×4B)의 **부호 1bit 사본**(`embedding_bit bit[1024]`,
@@ -207,7 +205,7 @@ opencrab serve
 - **단점**
   - 상시 서버 프로세스(RPi5에서 SQLite/Chroma 인프로세스 대비 자원 점유 증가),
     HNSW 빌드 시 CPU/메모리 스파이크(`maintenance_work_mem`/`max_parallel_maintenance_workers`
-    튜닝 필요 — 아래 인프라 주의 참고).
+    튜닝 필요 — 아래 §4.3 인프라 주의 참고).
   - `EMBEDDING_BACKEND=local`(minilm)과 조합 불가(sqlite-vec와 동일 가드, `ValueError`).
 - **pack_id 전용 컬럼(JSONB GIN 미채택)**: `pack_id`를 `metadata` JSONB에 묻지 않고
   전용 컬럼 + btree 인덱스로 분리했다 — 프리플라이트 실증상 JSONB GIN 대비 이점이 없었고,
@@ -219,7 +217,7 @@ opencrab serve
 - **이관**: 기존 SQLite(graph.db/doc_store.db/opencrab.db/vectors.db) → PG는
   `scripts/migrate_sqlite_to_pg.py`로 1:1 복사(재임베딩 불필요 — sqlite-vec 표준이
   이미 KURE 1024d이므로 벡터는 raw float 그대로 옮긴다).
-- 상세 설계·프리플라이트 실측·트레이드오프: [pgvector-migration-plan.md](./pgvector-migration-plan.md) (B) 경로.
+- 인프라 제약(`/dev/shm`, cgroup 메모리): 아래 §4.3.
 
 #### 4.2 Phase 2 통합 벤치 — sqlite-vec(A) vs pgvector(B) §11.1 게이트 실측
 
@@ -364,6 +362,23 @@ SQLite(LocalGraphStore, 4.75\~9.34ms)에 근접한다. graph/doc/backup 축은 p
 이점(단일 트랜잭션 백업, MVCC 다중 라이터)이 뚜렷하며, 두 FAIL이 해소됨에 따라 (B) 채택의
 성능 측 장애 요인은 남아 있지 않다. 최종 채택은 §9 힌지와 함께 확정한다.
 
+#### 4.3 인프라 주의 (pgvector HNSW 빌드)
+
+Raspberry Pi 5급 자원 제한 환경에서 확인된 제약이다. 값은 그 환경의 관측이므로
+재현할 때 다시 확인한다.
+
+1. **`/dev/shm` 용량.** 컨테이너 기본 `/dev/shm`은 작다. 이 환경에서 HNSW
+   `CREATE INDEX`의 병렬 빌드가 공유 메모리 부족으로 실패했다. 스토어는 인덱스 생성
+   직전에 세션 파라미터 `max_parallel_maintenance_workers=0`으로 병렬 빌드를 끄고
+   `maintenance_work_mem=512MB`로 단일 워커에 메모리를 준다. 컨테이너 설정을
+   바꿀 수 있으면 `docker run --shm-size=...`로 `/dev/shm`을 늘리는 대안도 있다.
+   현재 값은 컨테이너 안에서 `df -h /dev/shm`으로 확인한다.
+2. **cgroup 메모리 상한.** 컨테이너나 cgroup이 Postgres 프로세스 메모리를 제한하면
+   `maintenance_work_mem=512MB`가 그 상한을 압박한다. HNSW 빌드 중 컨테이너가 비정상
+   종료하는 OOM kill 징후가 보이면 먼저 컨테이너 메모리 한도를 확인한다(운영 배포는
+   빌드 여유 메모리를 따로 둘 것). 한도는 `docker inspect <컨테이너> --format
+   '{{.HostConfig.Memory}}'`로 읽는다.
+
 ---
 
 ## 5. 임베딩 축 (`EMBEDDING_BACKEND`)
@@ -409,8 +424,7 @@ opencrab serve
 ```
 
 - **재임베딩 불필요** — sqlite-vec 표준이 이미 KURE(1024d)이므로 `vectors.db`의 raw
-  float 벡터를 `vec_to_json`으로 읽어 그대로 pgvector에 복사한다(§3.2/§4.3 정정 —
-  아래 pgvector-migration-plan.md §3.2 참고).
+  float 벡터를 `vec_to_json`으로 읽어 그대로 pgvector에 복사한다.
 - 원본 SQLite 파일은 **읽기 전용으로만 접근**(마이그레이션 스크립트가 절대 쓰지 않음) —
   `--backup-to` 없이도 원본 무변경이 보장된다. `--verify`로 이관 후 행수 대조.
 - 멱등 — 이미 이관된 테이블(행수 일치)은 재실행 시 스킵.
