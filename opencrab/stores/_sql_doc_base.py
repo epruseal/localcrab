@@ -61,7 +61,7 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from opencrab.stores._graph_common import _as_dict
+from opencrab.stores._graph_common import decode_properties
 from opencrab.stores._json import dump_props
 from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
 
@@ -302,12 +302,12 @@ class _SqlDocStoreBase(abc.ABC):
         재사용하지 않는다). 0건/1건/다건 모두 있는 그대로(빈 리스트 포함)
         반환하고 예외로 신호하지 않는다.
 
-        ``_row_to_node()``(따라서 ``_as_dict()``)를 재사용하지 않는다.
-        ``_as_dict()``는 비딕셔너리/파싱 실패 JSON을 조용히 ``{}``로
-        치환하는데, 그 치환이 이 호출자(``_promote_one()``)가 값을 보기
-        전에 일어나면 원본이 오염된 경우를 빈 속성 승격으로 위장시킨다
-        (issue #402, 이 헬퍼 자체는 범위 밖). 대신 ``_decode_properties_raw()``
-        로 이 메서드 전용의 좁은 계약을 쓴다.
+        ``_row_to_node()``(따라서 ``decode_properties()``)를 재사용하지
+        않는다. #402에서 공유 헬퍼(``decode_properties()``)는 이미 해소됐다
+        (더 이상 비딕셔너리/파싱 실패 JSON을 조용히 ``{}``로 치환하지
+        않는다). 이 메서드는 그와 별개로, PG의 이미 디코드된 JSONB를
+        재파싱하지 않기 위해 여전히 dialect-aware 좁은 계약
+        (``_decode_properties_raw()``)을 유지한다.
         """
         self._require_available()
         sql = (
@@ -788,35 +788,51 @@ class _SqlDocStoreBase(abc.ABC):
     # ------------------------------------------------------------------
     # Row -> dict shaping
     #
-    # _as_dict() (opencrab.stores._graph_common) tolerates both a raw JSON
-    # TEXT string (what sqlite3 returns for the JSON-typed columns here) and
-    # an already-decoded dict/None (what psycopg2 returns for JSONB) — so
-    # this shaping code needs no per-dialect branch, unlike
-    # LocalSQLDocStore (json.loads) vs PgDocStore (_as_dict) today.
+    # decode_properties() (opencrab.stores._graph_common) tolerates both a
+    # raw JSON TEXT string (what sqlite3 returns for the JSON-typed columns
+    # here) and an already-decoded dict/None (what psycopg2 returns for
+    # JSONB) — so this shaping code needs no per-dialect branch, unlike
+    # LocalSQLDocStore (json.loads) vs PgDocStore (_as_dict, pre-#402) today.
+    # #402: unlike _as_dict(), a non-dict/malformed value no longer silently
+    # collapses to {} — the row is still returned (multi-row/export shape,
+    # Cluster C), only marked with property_decode_error so a caller can
+    # tell a corrupted row from a legitimately empty one.
     # ------------------------------------------------------------------
 
     def _row_to_node(self, row: Any) -> dict[str, Any]:
-        return {
+        properties, corrupted = decode_properties(self._row_get(row, "properties"))
+        entry = {
             "space": self._row_get(row, "space"),
             "node_id": self._row_get(row, "node_id"),
             "node_type": self._row_get(row, "node_type"),
-            "properties": _as_dict(self._row_get(row, "properties")),
+            "properties": properties,
             "updated_at": _ts_str(self._row_get(row, "updated_at")),
         }
+        if corrupted:
+            entry["property_decode_error"] = True
+        return entry
 
     def _row_to_source(self, row: Any) -> dict[str, Any]:
-        return {
+        metadata, corrupted = decode_properties(self._row_get(row, "metadata"))
+        entry = {
             "source_id": self._row_get(row, "source_id"),
             "text": self._row_get(row, "text"),
-            "metadata": _as_dict(self._row_get(row, "metadata")),
+            "metadata": metadata,
             "ingested_at": _ts_str(self._row_get(row, "ingested_at")),
         }
+        if corrupted:
+            entry["property_decode_error"] = True
+        return entry
 
     def _row_to_audit(self, row: Any) -> dict[str, Any]:
-        return {
+        details, corrupted = decode_properties(self._row_get(row, "details"))
+        entry = {
             "event_id": self._row_get(row, "event_id"),
             "event_type": self._row_get(row, "event_type"),
             "subject_id": self._row_get(row, "subject_id"),
-            "details": _as_dict(self._row_get(row, "details")),
+            "details": details,
             "timestamp": _ts_str(self._row_get(row, "timestamp")),
         }
+        if corrupted:
+            entry["property_decode_error"] = True
+        return entry

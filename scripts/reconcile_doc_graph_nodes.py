@@ -327,13 +327,15 @@ def _classify_doc_only(
         report.doc_only.append(DocOnlyRow(node_id, node_type, space, False, REASON_NODE_TYPE_MISSING))
         return
 
-    # get_node_doc() 이 아니라 get_node_docs_by_id() 를 쓴다: 전자는
-    # _row_to_node()/_as_dict() 를 거쳐 비딕셔너리/파싱 실패 properties 를
-    # 조용히 {} 로 치환하므로, properties 컬럼이 오염된 경우 진단이 빈
-    # 속성 승격 가능(healable=True)으로 잘못 보고한다. get_node_docs_by_id()
-    # 는 이미 적용 시점 재확인(_promote_one())이 같은 이유로 쓰는 헬퍼이며
-    # 원본 값을 그대로 반환한다(#402, 대체 리뷰 BLOCKING). 진단과 적용이
-    # 같은 조회를 쓰게 맞춰 조회 경로 불일치를 없앤다.
+    # get_node_doc() 이 아니라 get_node_docs_by_id() 를 쓴다. #402에서
+    # 공유 헬퍼(decode_properties())는 이미 해소돼 _row_to_node()도 더는
+    # 비딕셔너리/파싱 실패 properties 를 조용히 {} 로 치환하지 않는다(대신
+    # property_decode_error 로 손상 여부를 드러낸다). 그와 별개로 이
+    # 진단은 여전히 get_node_docs_by_id() 를 쓴다: 적용 시점 재확인
+    # (_promote_one())이 같은 헬퍼를 쓰며, 두 곳 다 한 node_id 의 모든
+    # space 행을 한 조회로 봐야 중복 space 를 놓치지 않는다(_row_to_node()
+    # 은 space 하나만 보는 get_node_doc() 전용이라 이 목적에 맞지 않는다).
+    # 진단과 적용이 같은 조회를 쓰게 맞춰 조회 경로 불일치를 없앤다.
     current_rows = [row for row in doc_store.get_node_docs_by_id(node_id) if row["space"] == space]
     properties = current_rows[0]["properties"] if len(current_rows) == 1 else {}
     pack_id = properties.get("pack_id") if isinstance(properties, dict) else None

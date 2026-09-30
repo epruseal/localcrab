@@ -18,6 +18,8 @@ import pytest
 
 from opencrab.common.graph_identity import (
     EdgeIdentityConflict,
+    GraphPropertyCorruptionError,
+    GraphPropertyValidationError,
     GraphReadCapabilityUnavailable,
     NodeIdentityConflict,
 )
@@ -235,6 +237,30 @@ def test_delete_node_also_removes_incident_edges():
     store.upsert_edge("Person", "a", "knows", "Person", "b")
     assert store.delete_node("Person", "a") is True
     assert store.find_by_relations("b", ["knows"], direction="in") == []
+
+
+def test_delete_edge_duplicate_key_row_is_corrupted_not_silently_deleted():
+    """#402 rev.6: delete_edge decodes its ownership check with _as_dict
+    (plain json.loads, no object_pairs_hook), which collapses a duplicate-key
+    `properties` value to its LAST key -- direct-SQL corruption only, a
+    normal upsert can never serialize duplicate keys. Pre-fix: an
+    owner_pack_id matching the last-written key deletes the row even though
+    parse_properties_object/decode_properties -- the shared decode contract
+    every other pack-ownership write path already uses (upsert_edge,
+    update_edge, upsert_node, update_node) -- would reject the row outright.
+    Post-fix: decode_properties rejects the duplicate key and delete_edge
+    raises fail-closed instead, matching update_edge's sibling pattern."""
+    store = _store()
+    store.upsert_node("Person", "a", {"pack_id": "victim-pack"})
+    store.upsert_node("Person", "b", {"pack_id": "victim-pack"})
+    store.upsert_edge("Person", "a", "knows", "Person", "b", {"pack_id": "victim-pack"})
+    _corrupt_edge_properties(
+        store, "a", "b",
+        raw='{"pack_id": "victim-pack", "pack_id": "attacker-pack"}',
+    )
+
+    with pytest.raises(GraphPropertyCorruptionError):
+        store.delete_edge("a", "knows", "b", owner_pack_id="attacker-pack")
 
 
 def test_upsert_edge_conflict_is_rejected_without_mutation():
@@ -478,6 +504,381 @@ def test_find_by_relations_empty_relations_returns_empty():
     store = _store()
     store.upsert_node("Item", "a", {})
     assert store.find_by_relations("a", []) == []
+
+
+# --- #402 round 6: find_by_relations() never fetched or decode-checked the
+# EDGE's own properties column at all (unlike _expand(), which always has).
+# A corrupted edge row -- e.g. a duplicate-key `properties` JSON object,
+# reachable only via direct-SQL writes since a normal upsert_edge/
+# update_edge call can never serialize one -- was returned as an ordinary
+# relationship as long as the far-side node itself decoded fine. These
+# tests reproduce that gap on each leg find_by_relations builds its own SQL
+# for (out, in), plus a "both" combination, each with a healthy-edge
+# control so the fix cannot be over-broad and start dropping normal edges.
+
+
+def test_find_by_relations_out_excludes_corrupted_edge():
+    store = _store()
+    store.upsert_node("Item", "a", {})
+    store.upsert_node("Item", "b", {})
+    store.upsert_node("Item", "c", {})
+    store.upsert_edge("Item", "a", "next", "Item", "b")  # corrupted below
+    store.upsert_edge("Item", "a", "next", "Item", "c")  # control: stays healthy
+    _corrupt_edge_properties(store, "a", "b")
+
+    res = store.find_by_relations("a", ["next"], direction="out")
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c"]
+
+
+def test_find_by_relations_in_excludes_corrupted_edge():
+    store = _store()
+    store.upsert_node("Item", "a", {})
+    store.upsert_node("Item", "b", {})
+    store.upsert_node("Item", "c", {})
+    store.upsert_edge("Item", "b", "next", "Item", "a")  # corrupted below
+    store.upsert_edge("Item", "c", "next", "Item", "a")  # control: stays healthy
+    _corrupt_edge_properties(store, "b", "a")
+
+    res = store.find_by_relations("a", ["next"], direction="in")
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c"]
+
+
+def test_find_by_relations_both_excludes_corrupted_edge_on_either_leg():
+    store = _store()
+    store.upsert_node("Item", "a", {})
+    store.upsert_node("Item", "b", {})  # out target, corrupted
+    store.upsert_node("Item", "c", {})  # out control
+    store.upsert_node("Item", "d", {})  # in source, corrupted
+    store.upsert_node("Item", "e", {})  # in control
+    store.upsert_edge("Item", "a", "next", "Item", "b")
+    store.upsert_edge("Item", "a", "next", "Item", "c")
+    store.upsert_edge("Item", "d", "next", "Item", "a")
+    store.upsert_edge("Item", "e", "next", "Item", "a")
+    _corrupt_edge_properties(store, "a", "b")
+    _corrupt_edge_properties(store, "d", "a")
+
+    res = store.find_by_relations("a", ["next"], direction="both")
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c", "e"]
+
+
+# --- #402 round 6, scoped counterpart: find_by_relations_scoped()'s `leg()`
+# only decode-checked the far-side NODE (via get_node's own
+# GraphPropertyCorruptionError), never the EDGE row its own SQL selects --
+# even though that SQL already fetches e.properties for the pack-membership
+# predicate (edge_cond). A corrupted edge that both endpoints and the pack
+# scope would otherwise authorize was returned as an ordinary relationship.
+# The authorization-control-group test (an edge genuinely out of scope,
+# unrelated to corruption) lives in test_read_scope_isolation.py; this pair
+# isolates the corruption axis on its own with a single-pack scope so a
+# regression cannot hide behind an authorization-filter coincidence.
+
+
+def test_find_by_relations_scoped_excludes_corrupted_edge_out():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})
+    store.upsert_node("Item", "b", {"pack_id": "p1"})  # corrupted edge target
+    store.upsert_node("Item", "c", {"pack_id": "p1"})  # control: healthy edge
+    store.upsert_edge("Item", "a", "next", "Item", "b", {"pack_id": "p1"})
+    store.upsert_edge("Item", "a", "next", "Item", "c", {"pack_id": "p1"})
+    _corrupt_edge_properties(store, "a", "b", raw='{"pack_id": "p1", "pack_id": "p1"}')
+
+    res = store.find_by_relations_scoped("a", ["next"], ["p1"], "out", 20)
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c"]
+
+
+def test_find_by_relations_scoped_excludes_corrupted_edge_in():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})
+    store.upsert_node("Item", "b", {"pack_id": "p1"})  # corrupted edge source
+    store.upsert_node("Item", "c", {"pack_id": "p1"})  # control: healthy edge
+    store.upsert_edge("Item", "b", "next", "Item", "a", {"pack_id": "p1"})
+    store.upsert_edge("Item", "c", "next", "Item", "a", {"pack_id": "p1"})
+    _corrupt_edge_properties(store, "b", "a", raw='{"pack_id": "p1", "pack_id": "p1"}')
+
+    res = store.find_by_relations_scoped("a", ["next"], ["p1"], "in", 20)
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["c"]
+
+
+# --- #402 round 7: find_by_relations()/find_by_relations_scoped() decode-
+# checked the EDGE (round 6, above) and the far-side node (via get_node,
+# pre-existing) but never the ANCHOR itself -- the node_id the caller
+# passed in. A corrupted anchor's relationships were returned as if the
+# anchor were healthy, unlike find_neighbors() (which already checks the
+# BFS anchor, round 4 gap 2) and get_node() (which raises for the same
+# node). Found by codex CLI during round 6's dual verification, then
+# design-verified over two rounds before this fix (design.md's round 7
+# sections). Each test pairs the corrupted anchor with a distinct healthy
+# anchor of the same shape so the fix cannot be over-broad and start
+# blocking every anchor.
+
+
+def test_find_by_relations_out_excludes_corrupted_anchor():
+    store = _store()
+    store.upsert_node("Item", "a", {})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {})
+    store.upsert_edge("Item", "a", "next", "Item", "b")
+    _corrupt_node_properties(store, "a")
+
+    store.upsert_node("Item", "x", {})  # control: healthy anchor
+    store.upsert_node("Item", "y", {})
+    store.upsert_edge("Item", "x", "next", "Item", "y")
+
+    assert store.find_by_relations("a", ["next"], direction="out") == []
+    res = store.find_by_relations("x", ["next"], direction="out")
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+def test_find_by_relations_in_excludes_corrupted_anchor():
+    store = _store()
+    store.upsert_node("Item", "a", {})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {})
+    store.upsert_edge("Item", "b", "next", "Item", "a")
+    _corrupt_node_properties(store, "a")
+
+    store.upsert_node("Item", "x", {})  # control: healthy anchor
+    store.upsert_node("Item", "y", {})
+    store.upsert_edge("Item", "y", "next", "Item", "x")
+
+    assert store.find_by_relations("a", ["next"], direction="in") == []
+    res = store.find_by_relations("x", ["next"], direction="in")
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+def test_find_by_relations_both_excludes_corrupted_anchor():
+    store = _store()
+    store.upsert_node("Item", "a", {})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {})
+    store.upsert_node("Item", "c", {})
+    store.upsert_edge("Item", "a", "next", "Item", "b")
+    store.upsert_edge("Item", "c", "next", "Item", "a")
+    _corrupt_node_properties(store, "a")
+
+    store.upsert_node("Item", "x", {})  # control: healthy anchor
+    store.upsert_node("Item", "y", {})
+    store.upsert_node("Item", "z", {})
+    store.upsert_edge("Item", "x", "next", "Item", "y")
+    store.upsert_edge("Item", "z", "next", "Item", "x")
+
+    assert store.find_by_relations("a", ["next"], direction="both") == []
+    res = store.find_by_relations("x", ["next"], direction="both")
+    ids = sorted(r["properties"]["id"] for r in res)
+    assert ids == ["y", "z"]
+
+
+def test_find_by_relations_orphan_anchor_still_returns_relations():
+    """Regression control for the fix's LEFT JOIN choice (design.md round
+    7): an edge whose anchor has no matching graph_nodes row at all (never
+    upserted, or removed independently of its edges) must still return
+    normally -- only an anchor row that EXISTS but fails decode_properties
+    is newly excluded. An INNER JOIN here would silently start dropping
+    orphan-anchor edges too, a referential-integrity behavior change
+    outside this fix's scope."""
+    store = _store()
+    store.upsert_node("Item", "y", {})
+    store._conn.execute(
+        "INSERT INTO graph_edges (from_type, from_id, relation, to_type, to_id, properties)"
+        " VALUES ('Ghost', 'ghost-1', 'next', 'Item', 'y', '{}')"
+    )
+    store._conn.commit()
+
+    res = store.find_by_relations("ghost-1", ["next"], direction="out")
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+def test_find_by_relations_scoped_excludes_corrupted_anchor_out():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {"pack_id": "p1"})
+    store.upsert_edge("Item", "a", "next", "Item", "b", {"pack_id": "p1"})
+    _corrupt_node_properties(store, "a", raw='{"pack_id": "p1", "pack_id": "p1"}')
+
+    store.upsert_node("Item", "x", {"pack_id": "p1"})  # control: healthy anchor
+    store.upsert_node("Item", "y", {"pack_id": "p1"})
+    store.upsert_edge("Item", "x", "next", "Item", "y", {"pack_id": "p1"})
+
+    assert store.find_by_relations_scoped("a", ["next"], ["p1"], "out", 20) == []
+    res = store.find_by_relations_scoped("x", ["next"], ["p1"], "out", 20)
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+def test_find_by_relations_scoped_excludes_corrupted_anchor_in():
+    store = _store()
+    store.upsert_node("Item", "a", {"pack_id": "p1"})  # anchor, corrupted below
+    store.upsert_node("Item", "b", {"pack_id": "p1"})
+    store.upsert_edge("Item", "b", "next", "Item", "a", {"pack_id": "p1"})
+    _corrupt_node_properties(store, "a", raw='{"pack_id": "p1", "pack_id": "p1"}')
+
+    store.upsert_node("Item", "x", {"pack_id": "p1"})  # control: healthy anchor
+    store.upsert_node("Item", "y", {"pack_id": "p1"})
+    store.upsert_edge("Item", "y", "next", "Item", "x", {"pack_id": "p1"})
+
+    assert store.find_by_relations_scoped("a", ["next"], ["p1"], "in", 20) == []
+    res = store.find_by_relations_scoped("x", ["next"], ["p1"], "in", 20)
+    assert [r["properties"]["id"] for r in res] == ["y"]
+
+
+# --- #402 round 7, legacy composite-key homonym cross-check (codex CLI
+# BLOCKING 1 in round 7's first design-verification pass): under the
+# pre-issue80 schema, graph_nodes' PK was (node_type, node_id), so the same
+# node_id could be claimed by two different node_types at once. A
+# type-agnostic single-row anchor lookup (LIMIT 1, no ORDER BY -- like
+# _fetch_node_props_by_id(), already used elsewhere for a type-agnostic
+# anchor check) could arbitrarily pick either row, so it was rejected for
+# this fix. Both methods instead resolve each edge's anchor by the exact
+# (node_type, node_id) that specific edge itself recorded, so a healthy
+# TypeA/a and a corrupted TypeB/a are judged independently and correctly
+# even though they share the id "a". LocalGraphStore's read path remains
+# reachable against a legacy-schema database (_require_available() checks
+# only self._available, not schema state -- only the write-path guard
+# checks schema state), so this scenario is reachable in production, not
+# just in this synthetic fixture.
+#
+# The double below is intentionally NOT _SqliteGraphStoreDouble/_store():
+# that class is built from the CURRENT schema (GRAPH_STORE_SCHEMA), whose
+# graph_nodes PK is node_id alone -- a true homonym cannot exist there (see
+# test_get_nodes_by_id_returns_the_single_global_identity_row(), which
+# documents and relies on that global uniqueness). Rows are seeded with raw
+# INSERTs, not upsert_node/upsert_edge -- those assume the current
+# single-column PK's ON CONFLICT target and would not apply cleanly to the
+# composite-key table.
+
+
+def _legacy_double() -> _SqliteGraphStoreDouble:
+    store = _SqliteGraphStoreDouble.__new__(_SqliteGraphStoreDouble)
+    store._conn = sqlite3.connect(":memory:")
+    store._available = True
+    store._conn.executescript(
+        """
+        CREATE TABLE graph_nodes (
+            node_type TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            space_id TEXT,
+            properties TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (node_type, node_id)
+        );
+        CREATE TABLE graph_edges (
+            from_type TEXT NOT NULL,
+            from_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            to_type TEXT NOT NULL,
+            to_id TEXT NOT NULL,
+            properties TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (from_type, from_id, relation, to_type, to_id)
+        );
+        """
+    )
+    store._conn.commit()
+    return store
+
+
+def _legacy_insert_node(store, node_type: str, node_id: str, raw_properties: str) -> None:
+    store._conn.execute(
+        "INSERT INTO graph_nodes (node_type, node_id, properties) VALUES (:t, :i, :p)",
+        {"t": node_type, "i": node_id, "p": raw_properties},
+    )
+    store._conn.commit()
+
+
+def _legacy_insert_edge(
+    store,
+    from_type: str,
+    from_id: str,
+    relation: str,
+    to_type: str,
+    to_id: str,
+    raw_properties: str = "{}",
+) -> None:
+    store._conn.execute(
+        "INSERT INTO graph_edges"
+        " (from_type, from_id, relation, to_type, to_id, properties)"
+        " VALUES (:ft, :fi, :r, :tt, :ti, :p)",
+        {"ft": from_type, "fi": from_id, "r": relation, "tt": to_type, "ti": to_id, "p": raw_properties},
+    )
+    store._conn.commit()
+
+
+def test_find_by_relations_legacy_homonym_anchor_checked_by_the_edges_own_type():
+    store = _legacy_double()
+    _legacy_insert_node(store, "TypeA", "a", '{"k": "healthy"}')
+    _legacy_insert_node(store, "TypeB", "a", "[1, 2, 3]")  # corrupted, unrelated homonym
+    _legacy_insert_node(store, "Item", "b", '{"id": "b"}')
+    _legacy_insert_edge(store, "TypeA", "a", "next", "Item", "b")
+
+    res = store.find_by_relations("a", ["next"], direction="out")
+    assert [r["properties"]["id"] for r in res] == ["b"]
+
+
+def test_find_by_relations_scoped_legacy_homonym_out_leg_anchor_corrupted():
+    """Scoped 'both': the out leg's anchor (TypeA/a) is corrupted while the
+    in leg's anchor (TypeB/a) stays healthy -- only reachable under the
+    legacy schema, where the two legs' anchor JOINs can resolve to
+    different physical rows sharing one node_id. The out-leg relation must
+    be dropped and the in-leg relation must survive."""
+    store = _legacy_double()
+    _legacy_insert_node(store, "TypeA", "a", '{"pack_id": "p1", "pack_id": "p1"}')  # corrupted
+    _legacy_insert_node(store, "TypeB", "a", '{"pack_id": "p1"}')  # healthy
+    _legacy_insert_node(store, "Item", "out-target", '{"pack_id": "p1", "id": "out-target"}')
+    _legacy_insert_node(store, "Item", "in-source", '{"pack_id": "p1", "id": "in-source"}')
+    _legacy_insert_edge(store, "TypeA", "a", "next", "Item", "out-target", '{"pack_id": "p1"}')
+    _legacy_insert_edge(store, "Item", "in-source", "next", "TypeB", "a", '{"pack_id": "p1"}')
+
+    res = store.find_by_relations_scoped("a", ["next"], ["p1"], "both", 20)
+    assert [r["properties"]["id"] for r in res] == ["in-source"]
+
+
+def test_find_by_relations_scoped_legacy_homonym_in_leg_anchor_corrupted():
+    """Mirror of the above with the roles reversed: the in leg's anchor
+    (TypeB/a) is corrupted while the out leg's anchor (TypeA/a) stays
+    healthy. The in-leg relation must be dropped and the out-leg relation
+    must survive."""
+    store = _legacy_double()
+    _legacy_insert_node(store, "TypeA", "a", '{"pack_id": "p1"}')  # healthy
+    _legacy_insert_node(store, "TypeB", "a", '{"pack_id": "p1", "pack_id": "p1"}')  # corrupted
+    _legacy_insert_node(store, "Item", "out-target", '{"pack_id": "p1", "id": "out-target"}')
+    _legacy_insert_node(store, "Item", "in-source", '{"pack_id": "p1", "id": "in-source"}')
+    _legacy_insert_edge(store, "TypeA", "a", "next", "Item", "out-target", '{"pack_id": "p1"}')
+    _legacy_insert_edge(store, "Item", "in-source", "next", "TypeB", "a", '{"pack_id": "p1"}')
+
+    res = store.find_by_relations_scoped("a", ["next"], ["p1"], "both", 20)
+    assert [r["properties"]["id"] for r in res] == ["out-target"]
+
+
+# #402 round 8 (design discarded, see design.md -- lead arbitration: the
+# legacy-homonym read-path bug this round found in find_neighbors()/
+# find_path() is real but out of this PR's current-schema scope, tracked as
+# issue #426). This test pins the CURRENT-schema counterpart of the round-7
+# legacy-homonym tests above: on GRAPH_STORE_SCHEMA (node_id alone is the
+# primary key), a second node_type can never claim an id already in use --
+# upsert_node() rejects it via NodeIdentityConflict before any row is
+# written (see also test_get_nodes_by_id_returns_the_single_global_identity_row).
+# So _fetch_node_props_by_id()'s type-agnostic `WHERE node_id=:nid` --
+# find_neighbors()/find_path()'s start-anchor check -- can never match more
+# than one row on this schema, and is therefore exactly as precise as a
+# type-checked lookup would be. Only a legacy (pre-issue80, composite-key)
+# database can create the homonym ambiguity round 8 found.
+def test_start_anchor_lookup_cannot_see_a_type_homonym_on_current_schema():
+    store = _store()
+    store.upsert_node("TypeA", "shared", {"pack_id": "p1"})
+    with pytest.raises(NodeIdentityConflict):
+        store.upsert_node("TypeB", "shared", {"pack_id": "p1"})
+
+    rows = store._fetch_all(
+        f"SELECT node_type FROM {store._table('graph_nodes')} WHERE node_id=:nid",
+        {"nid": "shared"},
+    )
+    assert [r[0] for r in rows] == ["TypeA"]
+
+    store.upsert_node("Item", "leaf", {"pack_id": "p1"})
+    store.upsert_edge("TypeA", "shared", "next", "Item", "leaf", {"pack_id": "p1"})
+
+    _corrupt_node_properties(store, "shared")
+    assert store.find_neighbors("shared", direction="out") == []
+    assert store.find_path("shared", "leaf") == []
 
 
 # ---------------------------------------------------------------------------
@@ -933,6 +1334,135 @@ def test_get_node_identity_by_id_missing_returns_none():
     assert store.get_node_identity_by_id("nope") is None
 
 
+def _corrupt_node_properties(store, node_id: str, raw: str = "[1, 2, 3]") -> None:
+    """Directly writes a corrupted ``properties`` value for ``node_id``,
+    bypassing ``upsert_node``'s validation (the only way to reach the
+    corrupted-row paths this file's #402 tests exercise). The default is a
+    JSON ARRAY, not truly malformed text: SQLite's own ``json_extract``
+    raises ``OperationalError: malformed JSON`` for syntactically-broken
+    text (e.g. ``"not json"``), so that shape can never reach the BFS SQL
+    pushdown path at all -- it fails before Python ever sees the row. A JSON
+    array is syntactically valid (``json_extract('[1,2,3]', '$.pack_id')``
+    resolves to NULL, same as "key absent"), so SQL happily treats it as
+    "no pack_id" while ``decode_properties``/``parse_properties_object``
+    still correctly reject it (top-level value is not an object) -- this is
+    exactly the shape the BFS leak (§10 item 6) is about. ``idx_nodes_pack``
+    is an expression index over ``json_extract(properties, ...)`` -- SQLite
+    recomputes it on every UPDATE and refuses non-JSON text outright, so it
+    must be dropped first (same trick ``test_get_node_identity_by_id_reports
+    _property_error_unlike_get_node`` already uses)."""
+    store._conn.execute("DROP INDEX IF EXISTS idx_nodes_pack")
+    store._conn.execute(
+        "UPDATE graph_nodes SET properties = :raw WHERE node_id = :id", {"raw": raw, "id": node_id}
+    )
+    store._conn.commit()
+
+
+def _corrupt_edge_properties(store, from_id: str, to_id: str, raw: str = "[1, 2, 3]") -> None:
+    """Edge counterpart of ``_corrupt_node_properties`` (see its docstring
+    for why the default is a JSON array, not malformed text). No expression
+    index exists over ``graph_edges.properties`` (only ``idx_edges_from``/
+    ``idx_edges_to``, both plain column indexes), so no DROP INDEX is
+    needed here."""
+    store._conn.execute(
+        "UPDATE graph_edges SET properties = :raw WHERE from_id = :fid AND to_id = :tid",
+        {"raw": raw, "fid": from_id, "tid": to_id},
+    )
+    store._conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Cluster B BFS corruption leak (#402, lead's critical correction, §10 item 6)
+#
+# Mechanism (see design.md §4.2): a corrupted node's `properties` column
+# decodes to `{}`. Pre-fix, `_batch_node_props` merged that `{}` with the
+# node's own (independently valid) `space_id` COLUMN via `_merge_space`,
+# producing a truthy `{"space": ...}` dict that survived `_expand`'s
+# `if not other_props: continue` skip. `_node_passes` then saw no `pack_id`
+# key and returned `include_unpackaged` -- i.e. corruption disguised itself
+# as "unpackaged" and leaked through whenever `include_unpackaged=True`.
+# The analogous edge-side leak: a corrupted edge's properties also decode to
+# `{}`, which has no `pack_id` key, so `_edge_passes` falls through to
+# `src_passes and dst_passes` -- exposing the edge whenever both endpoints
+# already pass, with no `include_unpackaged`-style opt-out.
+#
+# 6a/6c were run against the pre-#402-fix `_sql_graph_base.py` (git show
+# 6e1fd76:opencrab/stores/_sql_graph_base.py, the commit immediately
+# preceding this fix) to confirm RED before the fix restored them to GREEN;
+# see the PR description for the exact commands and captured output.
+# ---------------------------------------------------------------------------
+
+
+def test_find_neighbors_corrupted_node_excluded_when_include_unpackaged_true():
+    """6a: RED pre-fix (the corrupted node WAS reachable here whenever its
+    space_id column was set -- see mechanism note above) -> GREEN post-fix
+    (always excluded)."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "corrupt", {}, space_id="s1")
+    store.upsert_edge("Hub", "hub", "touches", "Item", "corrupt")
+    _corrupt_node_properties(store, "corrupt")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"], include_unpackaged=True)
+    # `to_id` (not `properties["id"]`) is the detector: the corrupted node's
+    # leaked entry has properties `{"space": "s1"}` with NO "id" key at all
+    # (the corruption wiped out the id `upsert_node` normally stamps), so a
+    # `properties.get("id")`-based check would silently pass either way --
+    # `to_id` is set by `_expand` from the raw node_id independent of
+    # whatever the (possibly corrupted) properties decoded to.
+    to_ids = {r["to_id"] for r in res}
+    assert "corrupt" not in to_ids
+
+
+def test_find_neighbors_corrupted_node_excluded_when_include_unpackaged_false():
+    """6b control: include_unpackaged=False already excluded the corrupted
+    node before this fix (no include_unpackaged escape hatch to leak
+    through) and still does after -- unchanged behavior, no RED needed."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "corrupt", {}, space_id="s1")
+    store.upsert_edge("Hub", "hub", "touches", "Item", "corrupt")
+    _corrupt_node_properties(store, "corrupt")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"], include_unpackaged=False)
+    to_ids = {r["to_id"] for r in res}
+    assert "corrupt" not in to_ids
+
+
+def test_find_neighbors_corrupted_edge_always_excluded():
+    """6c: RED pre-fix (a corrupted edge whose both endpoints already pass
+    the pack filter WAS exposed -- _edge_passes saw no pack_id key on the
+    decoded-to-{} edge and fell through to `src_passes and dst_passes`) ->
+    GREEN post-fix (unconditionally excluded; no control group exists for
+    this path, there is no include_unpackaged-style switch for edges)."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "leaf", {"pack_id": "p1"})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "leaf", {})
+    _corrupt_edge_properties(store, "hub", "leaf")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"], include_unpackaged=False)
+    to_ids = {r["to_id"] for r in res}
+    assert "leaf" not in to_ids
+
+
+def test_find_neighbors_normal_node_and_edge_unaffected_control():
+    """6d control: a normal, uncorrupted node/edge pair -- one packed, one
+    unpackaged -- must surface in BFS results exactly the same whether or
+    not the #402 fix is present, since decode_properties(valid_dict) is a
+    passthrough with corrupted=False."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "packed", {"pack_id": "p1"})
+    store.upsert_node("Item", "unpackaged", {})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "packed")
+    store.upsert_edge("Hub", "hub", "touches", "Item", "unpackaged")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"], include_unpackaged=True)
+    ids = {r["properties"]["id"] for r in res}
+    assert ids == {"packed", "unpackaged"}
+
+
 def test_get_node_identity_by_id_matches_normal_row_shape():
     store = _store()
     store.upsert_node("Person", "p1", {"name": "Alice", "pack_id": "pack-x"}, space_id="space-a")
@@ -948,10 +1478,8 @@ def test_get_node_identity_by_id_matches_normal_row_shape():
 
 
 def test_get_node_identity_by_id_reports_property_error_unlike_get_node():
-    # get_node()/get_node_by_id() go through _as_dict() and silently coerce
-    # malformed properties to {} (#402-class bug). get_node_identity_by_id()
-    # must not: it reuses _node_inventory_row(), the same decode path
-    # diagnose() relies on to reject a node as healable.
+    # get_node_identity_by_id() reuses _node_inventory_row(), the same decode
+    # path diagnose() relies on to reject a node as healable.
     store = _store()
     store.upsert_node("Person", "p1", {"name": "Alice"})
     # idx_nodes_pack is a json_extract() expression index: SQLite recomputes
@@ -967,7 +1495,342 @@ def test_get_node_identity_by_id_reports_property_error_unlike_get_node():
     row = store.get_node_identity_by_id("p1")
     assert row.property_error == "malformed_json"
 
-    # Contrast: the pre-existing accessors coerce silently instead of
-    # surfacing the corruption.
-    assert store.get_node("Person", "p1") == {}
-    assert store.get_node_by_id("p1")["node_type"] == "Person"
+    # Contrast (#402): the single-identity accessor now fails loud instead of
+    # silently coercing to {} -- while the bulk/export-style accessor keeps
+    # returning the row, only marked with property_decode_error.
+    with pytest.raises(GraphPropertyCorruptionError):
+        store.get_node("Person", "p1")
+    node = store.get_node_by_id("p1")
+    assert node["node_type"] == "Person"
+    assert node["property_decode_error"] is True
+
+
+# ---------------------------------------------------------------------------
+# #402 alternative-review findings 1-4 (PR #420): design-verification rounds
+# 1-3 plus lead arbitration (see design.md) landed on the following fixes.
+# Findings 2-4 are proven against pre-fix code in the PR description's RED
+# capture; finding 1's individual funnel tests below are the RED/GREEN
+# evidence themselves (each raised nothing pre-fix, GraphPropertyValidation
+# Error post-fix).
+# ---------------------------------------------------------------------------
+
+
+# --- finding 1: a fresh write must never define the property_decode_error
+# marker key (a synthetic flag only a bulk/multi-row read path ever
+# synthesizes for an already-corrupted row -- see decode_properties /
+# get_nodes_by_id -- never a value a normal write stores). A write that let a
+# caller set it would collide with that marker on the next bulk read.
+#
+# Scope note: the migration write paths (explicit-merge apply, migration-plan
+# apply in update_node/update_nodes_batch's incident-edge handling and the
+# dedicated migration-apply bodies) share the exact same
+# normalize_node_properties()/normalize_edge_properties() guard exercised by
+# the funnels below. They get no separate fixtures here: this file has no
+# pre-existing migration-path test infrastructure to extend (that lives in
+# tests/test_issue80_sql_graph.py, tests/test_issue80_migration.py, and
+# tests/test_migrate_graph_identity_cli.py), and a second fixture would only
+# re-exercise the identical shared branch at disproportionate setup cost.
+
+
+def test_upsert_node_rejects_property_decode_error_marker():
+    store = _store()
+    with pytest.raises(GraphPropertyValidationError):
+        store.upsert_node("Person", "p1", {"property_decode_error": True})
+
+
+def test_update_node_rejects_property_decode_error_marker():
+    store = _store()
+    receipt = store.upsert_node("Person", "p1", {}, return_receipt=True)
+    with pytest.raises(GraphPropertyValidationError):
+        store.update_node("p1", receipt.digest, "Person", {"property_decode_error": True})
+
+
+def test_upsert_nodes_batch_rejects_property_decode_error_marker():
+    store = _store()
+    with pytest.raises(GraphPropertyValidationError):
+        store.upsert_nodes_batch([
+            {"node_type": "Item", "node_id": "a", "properties": {"property_decode_error": True}},
+        ])
+
+
+def test_update_nodes_batch_rejects_property_decode_error_marker():
+    store = _store()
+    receipt = store.upsert_node("Item", "a", {}, return_receipt=True)
+    with pytest.raises(GraphPropertyValidationError):
+        store.update_nodes_batch([
+            {
+                "node_id": "a", "expected_current_digest": receipt.digest,
+                "new_type": "Item", "new_properties": {"property_decode_error": True},
+            },
+        ])
+
+
+def test_upsert_edge_rejects_property_decode_error_marker():
+    store = _store()
+    store.upsert_node("Person", "a", {})
+    store.upsert_node("Person", "b", {})
+    with pytest.raises(GraphPropertyValidationError):
+        store.upsert_edge("Person", "a", "knows", "Person", "b", {"property_decode_error": True})
+
+
+def test_update_edge_rejects_property_decode_error_marker():
+    store = _store()
+    store.upsert_node("Person", "a", {"pack_id": "p1"})
+    store.upsert_node("Person", "b", {"pack_id": "p1"})
+    receipt = store.upsert_edge(
+        "Person", "a", "knows", "Person", "b", {"pack_id": "p1"}, return_receipt=True
+    )
+    with pytest.raises(GraphPropertyValidationError):
+        store.update_edge(
+            "Person", "a", "knows", "Person", "b",
+            {"pack_id": "p1", "property_decode_error": True},
+            expected_current_digest=receipt.digest, owner_pack_id="p1",
+        )
+
+
+def test_upsert_edges_batch_rejects_property_decode_error_marker():
+    store = _store()
+    store.upsert_node("Person", "a", {})
+    store.upsert_node("Person", "b", {})
+    with pytest.raises(GraphPropertyValidationError):
+        store.upsert_edges_batch([
+            {
+                "from_type": "Person", "from_id": "a", "relation": "knows",
+                "to_type": "Person", "to_id": "b",
+                "properties": {"property_decode_error": True},
+            },
+        ])
+
+
+def test_update_edges_batch_rejects_property_decode_error_marker():
+    store = _store()
+    store.upsert_node("Person", "a", {"pack_id": "p1"})
+    store.upsert_node("Person", "b", {"pack_id": "p1"})
+    receipt = store.upsert_edge(
+        "Person", "a", "knows", "Person", "b", {"pack_id": "p1"}, return_receipt=True
+    )
+    with pytest.raises(GraphPropertyValidationError):
+        store.update_edges_batch([
+            {
+                "from_type": "Person", "from_id": "a", "relation": "knows",
+                "to_type": "Person", "to_id": "b",
+                "properties": {"pack_id": "p1", "property_decode_error": True},
+                "expected_current_digest": receipt.digest, "owner_pack_id": "p1",
+            },
+        ])
+
+
+def test_get_edge_read_path_unaffected_by_marker_guard():
+    """#402 finding 1, arbitration condition 2 (known limitation): a row that
+    stored this key as a plain property before this fix shipped -- written
+    here by direct SQL since no write path can produce it anymore -- must
+    still be readable exactly as before. get_edge()'s own re-validation call
+    to normalize_edge_properties() stays at the default
+    reject_reserved_marker=False, so it is provably unaffected by the new
+    opt-in check added only to the genuine write call sites above."""
+    store = _store()
+    store.upsert_node("Person", "a", {})
+    store.upsert_node("Person", "b", {})
+    store.upsert_edge("Person", "a", "knows", "Person", "b", {"pack_id": "p1"})
+    store._conn.execute(
+        "UPDATE graph_edges SET properties = :raw WHERE from_id='a' AND to_id='b'",
+        {"raw": '{"pack_id": "p1", "property_decode_error": true}'},
+    )
+    store._conn.commit()
+
+    props = store.get_edge("Person", "a", "knows", "Person", "b")
+    assert props["property_decode_error"] is True
+
+
+def test_backfill_pack_provenance_preserves_marker_key_documented_limitation():
+    """#402 arbitration ruling (design-verification round 3 -> lead decision,
+    option 2): backfill_pack_provenance() re-persists a node/edge's EXISTING
+    properties unchanged except for ownership (pack_id/pack) -- its node
+    branch never calls prepare_node()/normalize_node_properties(), and its
+    edge branch rebuilds the persisted after_props from a plain
+    dict(raw_current) copy rather than the normalized `current` value, so
+    neither branch passes through the finding-1 guard. This is an accepted,
+    documented exception, not a new collision vector: it takes no fresh
+    `properties` payload from its caller, only an ownership assignment. A
+    marker key already present on a row -- written here by direct SQL to
+    stand in for a pre-fix row -- therefore survives a backfill call
+    unchanged instead of being stripped or rejected; recovery of such a row
+    stays manual and out of this fix's scope (see issue #416)."""
+    import hashlib
+
+    store = _store()
+    store.upsert_node("Person", "p1", {})
+    store._conn.execute(
+        "UPDATE graph_nodes SET properties = :raw WHERE node_id='p1'",
+        {"raw": '{"id": "p1", "property_decode_error": true}'},
+    )
+    store._conn.commit()
+    target = store.graph_fingerprint()
+    current_digest = store.get_node_digest("p1", node_type="Person")
+    record = {
+        "kind": "node", "target_fingerprint": target,
+        "expected_current_digest": current_digest, "proposed_pack_id": "pack-x",
+        "node_id": "p1", "node_type": "Person", "reason": "inferred",
+        "dry_run_evidence_digest": hashlib.sha256(b"evidence").hexdigest(),
+        "allowed_properties_delta": {"set": {"pack_id": "pack-x"}, "remove": []},
+    }
+    store.backfill_pack_provenance([record])
+
+    row = store._conn.execute("SELECT properties FROM graph_nodes WHERE node_id='p1'").fetchone()
+    assert '"property_decode_error": true' in row[0]
+    assert '"pack_id": "pack-x"' in row[0]
+
+
+# --- finding 2: delete_node() previously selected only node_type before
+# deleting -- neither the node's own properties nor any incident edge's
+# properties were ever inspected, so a corrupted row (or an edge alongside
+# it) could be silently destroyed with no verification at all.
+
+
+def test_delete_node_raises_on_corrupted_node_properties():
+    store = _store()
+    store.upsert_node("Person", "p1", {})
+    _corrupt_node_properties(store, "p1")
+
+    with pytest.raises(GraphPropertyCorruptionError):
+        store.delete_node("Person", "p1")
+    assert store._conn.execute("SELECT 1 FROM graph_nodes WHERE node_id='p1'").fetchone() is not None
+
+
+def test_delete_node_raises_on_corrupted_incident_edge_properties():
+    store = _store()
+    store.upsert_node("Person", "a", {})
+    store.upsert_node("Person", "b", {})
+    store.upsert_edge("Person", "a", "knows", "Person", "b")
+    _corrupt_edge_properties(store, "a", "b")
+
+    with pytest.raises(GraphPropertyCorruptionError):
+        store.delete_node("Person", "a")
+    assert store._conn.execute("SELECT 1 FROM graph_nodes WHERE node_id='a'").fetchone() is not None
+    assert store._conn.execute("SELECT 1 FROM graph_edges WHERE from_id='a'").fetchone() is not None
+
+
+# --- finding 3: find_path() never selected/decoded the start node's, an
+# intermediate node's, or an edge's properties at all -- a corrupted start
+# node was invisible to it, a corrupted intermediate node was substituted
+# with a bare {"id": nid} placeholder and the search kept going through it,
+# and a corrupted edge was traversed exactly like a normal one.
+
+
+def test_find_path_corrupted_start_node_returns_empty():
+    store = _store()
+    _make_chain(store, 2)
+    _corrupt_node_properties(store, "n0")
+    assert store.find_path("n0", "n2", max_depth=4) == []
+
+
+def test_find_path_skips_corrupted_intermediate_node():
+    store = _store()
+    _make_chain(store, 3)  # n0 -> n1 -> n2 -> n3, single path through n1
+    _corrupt_node_properties(store, "n1")
+    assert store.find_path("n0", "n3", max_depth=4) == []
+
+
+def test_find_path_skips_corrupted_edge():
+    store = _store()
+    _make_chain(store, 2)  # n0 -> n1 -> n2
+    _corrupt_edge_properties(store, "n0", "n1")
+    assert store.find_path("n0", "n2", max_depth=4) == []
+
+
+# --- finding 4: _expand()'s corrupted-edge check used to live INSIDE the
+# `if pack_set is not None:` branch, so the default
+# find_neighbors(..., pack_ids=None) call path returned a corrupted edge as
+# if it were a normal relationship. test_find_neighbors_corrupted_edge_
+# always_excluded (6c, above) only exercises the pack_ids=["p1"] path, which
+# this specific bug did NOT affect.
+
+
+def test_find_neighbors_corrupted_edge_excluded_on_default_pack_ids_none_path():
+    store = _store()
+    store.upsert_node("Hub", "hub", {})
+    store.upsert_node("Item", "leaf", {})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "leaf", {})
+    _corrupt_edge_properties(store, "hub", "leaf")
+
+    res = store.find_neighbors("hub", direction="out")  # pack_ids=None default
+    to_ids = {r["to_id"] for r in res}
+    assert "leaf" not in to_ids
+
+
+# --- post-PR#420-dual-verification gap: find_neighbors() only checked the
+# BFS anchor node's own properties for corruption when a pack_ids or spaces
+# filter was active (see the `if pack_set is not None or space_set is not
+# None:` guard around the _fetch_node_props_by_id() call). The unfiltered,
+# default-args call path -- pack_ids=None, spaces=None -- never looked at
+# the anchor's own row at all, so a corrupted anchor's neighbours were
+# returned as if the anchor were healthy. Reproduced by execution (codex,
+# read-only) against pre-fix code before this test was written.
+
+
+def test_find_neighbors_corrupted_anchor_returns_empty_on_default_unfiltered_path():
+    store = _store()
+    store.upsert_node("Hub", "hub", {})
+    store.upsert_node("Item", "leaf", {})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "leaf", {})
+    _corrupt_node_properties(store, "hub")
+
+    res = store.find_neighbors("hub", direction="out")  # pack_ids=None, spaces=None
+    assert res == []
+
+
+def test_find_neighbors_unfiltered_limit_zero_skips_anchor_corruption_query(monkeypatch):
+    """Control for the fix's own regression concern: the pre-existing
+    "limit<=0 -> [] with zero queries" behavior for the unfiltered path
+    (see _graph_protocol.py's find_neighbors docstring, issue #347) must
+    survive this fix unchanged. The new anchor-corruption check must not
+    fire an avoidable query when the BFS loop would return [] regardless.
+    Asserted directly by spying on _fetch_node_props_by_id, not just by
+    checking the return value, since a naive always-check fix would also
+    return [] here and pass a return-value-only assertion."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {})
+    calls: list[str] = []
+    original = store._fetch_node_props_by_id
+
+    def _spy(node_id):
+        calls.append(node_id)
+        return original(node_id)
+
+    monkeypatch.setattr(store, "_fetch_node_props_by_id", _spy)
+
+    assert store.find_neighbors("hub", direction="out", limit=0) == []
+    assert calls == []
+
+
+def test_find_neighbors_unfiltered_depth_zero_skips_anchor_corruption_query(monkeypatch):
+    """Same zero-query contract for depth<=0: the BFS loop already
+    short-circuits to [] via `expandable = [nid for nid, d in level if d <
+    depth]`, so the new anchor-corruption check should not add an avoidable
+    query in this case either (round-4 design-review refinement)."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {})
+    calls: list[str] = []
+    original = store._fetch_node_props_by_id
+
+    def _spy(node_id):
+        calls.append(node_id)
+        return original(node_id)
+
+    monkeypatch.setattr(store, "_fetch_node_props_by_id", _spy)
+
+    assert store.find_neighbors("hub", direction="out", depth=0) == []
+    assert calls == []
+
+
+def test_find_neighbors_corrupted_anchor_with_filter_still_returns_empty_control():
+    """Control: the already-existing, already-verified filtered-path anchor
+    check (pack_ids or spaces set) must be unaffected by this fix."""
+    store = _store()
+    store.upsert_node("Hub", "hub", {"pack_id": "p1"})
+    store.upsert_node("Item", "leaf", {"pack_id": "p1"})
+    store.upsert_edge("Hub", "hub", "touches", "Item", "leaf", {"pack_id": "p1"})
+    _corrupt_node_properties(store, "hub")
+
+    res = store.find_neighbors("hub", direction="out", pack_ids=["p1"])
+    assert res == []

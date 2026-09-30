@@ -12,6 +12,7 @@ from opencrab.stores._graph_common import (
     _node_pack_id,
     _node_passes,
     _normalize_space,
+    decode_properties,
 )
 
 # ---------------------------------------------------------------------------
@@ -126,6 +127,71 @@ class TestAsDict:
     def test_other_types_return_empty_dict(self):
         assert _as_dict(42) == {}
         assert _as_dict([1, 2]) == {}
+
+
+# ---------------------------------------------------------------------------
+# decode_properties (#402 — explicit-return corruption signal)
+# ---------------------------------------------------------------------------
+
+
+class TestDecodeProperties:
+    def test_dict_passthrough_not_corrupted(self):
+        d = {"a": 1}
+        props, corrupted = decode_properties(d)
+        assert props is d
+        assert corrupted is False
+
+    def test_none_is_legitimate_absence_not_corrupted(self):
+        props, corrupted = decode_properties(None)
+        assert props == {}
+        assert corrupted is False
+
+    def test_valid_json_string_decodes_not_corrupted(self):
+        props, corrupted = decode_properties('{"a": 1}')
+        assert props == {"a": 1}
+        assert corrupted is False
+
+    def test_malformed_json_string_is_corrupted(self):
+        props, corrupted = decode_properties("not json")
+        assert props == {}
+        assert corrupted is True
+
+    def test_json_array_string_is_corrupted(self):
+        # A JSON array is valid JSON but not an object -- #402's whole point
+        # is that this must be distinguishable from "no properties", unlike
+        # _as_dict's silent {} collapse.
+        props, corrupted = decode_properties("[1, 2, 3]")
+        assert props == {}
+        assert corrupted is True
+
+    def test_empty_string_is_corrupted(self):
+        # Reclassification vs _as_dict (design.md §1.2): _as_dict("") also
+        # collapsed to {} via the broad except, indistinguishable from a
+        # real empty object -- decode_properties makes it explicit.
+        props, corrupted = decode_properties("")
+        assert props == {}
+        assert corrupted is True
+
+    def test_duplicate_json_keys_is_corrupted(self):
+        props, corrupted = decode_properties('{"a": 1, "a": 2}')
+        assert props == {}
+        assert corrupted is True
+
+    def test_nan_literal_is_corrupted(self):
+        # Reclassification vs _as_dict (design.md §1.2): plain json.loads
+        # accepts the NaN literal by default, so _as_dict("...NaN...")
+        # previously returned a "normal" dict containing a NaN float.
+        props, corrupted = decode_properties('{"a": NaN}')
+        assert props == {}
+        assert corrupted is True
+
+    def test_other_types_are_corrupted(self):
+        props, corrupted = decode_properties(42)
+        assert props == {}
+        assert corrupted is True
+        props, corrupted = decode_properties([1, 2])
+        assert props == {}
+        assert corrupted is True
 
 
 # ---------------------------------------------------------------------------

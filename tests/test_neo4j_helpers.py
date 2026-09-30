@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from opencrab.common.graph_identity import (
+    GraphPropertyValidationError,
     GraphReadCapabilityUnavailable,
     canonical_edge_digest,
     canonical_node_digest,
@@ -324,6 +325,50 @@ class TestNeo4jStoreNormal:
         mock_session.run.return_value.single.return_value = None
 
         assert store.upsert_edge("User", "u1", "OWNS", "Project", "p1") is False
+
+    # --- post-PR#420-dual-verification gap 1: Neo4jStore never synthesizes
+    # the SQL-store-only "property_decode_error" marker itself, but its
+    # upsert_edge()/update_edge() write paths did not reject a caller who
+    # supplies that key as a literal property value either. write_gate.py's
+    # backend-agnostic _check_probes() treats any edge carrying that key as
+    # unverifiable regardless of backend, so a Neo4j edge written with the
+    # key would later be misclassified as corrupted on read-back even though
+    # Neo4j has no genuine corruption-synthesis mechanism of its own. Fixed
+    # by passing reject_reserved_marker=True at both call sites, matching
+    # the SQL stores' already-fixed write paths. No query is mocked below
+    # because normalize_edge_properties() raises before either method's
+    # write() callback ever runs a query.
+
+    def test_upsert_edge_rejects_property_decode_error_marker(self):
+        store, _driver, _mock_session = _make_connected_store()
+
+        with pytest.raises(GraphPropertyValidationError):
+            store.upsert_edge(
+                "User", "u1", "OWNS", "Project", "p1",
+                {"property_decode_error": True},
+            )
+
+    def test_update_edge_rejects_property_decode_error_marker(self):
+        store, _driver, mock_session = _make_connected_store()
+        # Set up a stored record that matches the call's owner/digest exactly,
+        # so pre-fix code would sail through every identity check and
+        # actually perform the update (returning True) instead of merely
+        # tripping over an unrelated, incidentally-failing mock default. That
+        # would make a bare pytest.raises(...) failure ambiguous between
+        # "marker accepted" and "mock plumbing raised something else first".
+        current_props = {"from_id": "u1", "relation": "OWNS", "to_id": "p1", "pack_id": "p1"}
+        current_digest = canonical_edge_digest("u1", "OWNS", "p1", "User", "Project", current_props)
+        mock_session.run.return_value.single.return_value = {
+            "props": current_props, "from_type": "User", "to_type": "Project", "digest": current_digest,
+        }
+
+        with pytest.raises(GraphPropertyValidationError):
+            store.update_edge(
+                "User", "u1", "OWNS", "Project", "p1",
+                {"pack_id": "p1", "property_decode_error": True},
+                expected_current_digest=current_digest,
+                owner_pack_id="p1",
+            )
 
     def test_find_path_maps_nodes_and_relations(self):
         store, _driver, mock_session = _make_connected_store()

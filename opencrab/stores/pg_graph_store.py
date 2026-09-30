@@ -73,7 +73,7 @@ from typing import Any
 
 from opencrab.common.graph_identity import GraphSchemaMigrationRequired
 from opencrab.stores._graph_common import IDENT_RE as _SCHEMA_IDENT_RE
-from opencrab.stores._graph_common import _as_dict, _merge_space
+from opencrab.stores._graph_common import _merge_space, decode_properties
 from opencrab.stores._sql_dialect import POSTGRES
 from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, GraphTx, _SqlGraphStoreBase
 
@@ -474,7 +474,24 @@ class PGGraphStore(_SqlGraphStoreBase):
             ),
             {"types": types, "ids": ids},
         ).fetchall()
-        return {(r[0], r[1]): _merge_space(_as_dict(r[2]), r[3]) for r in rows}
+        result: dict[tuple[str, str], dict[str, Any]] = {}
+        for node_type, node_id, raw_properties, space_id in rows:
+            props, corrupted = decode_properties(raw_properties)
+            if corrupted:
+                # #402: never let a corrupted node's row leak into props_cache
+                # disguised as an "unpackaged" node (see _expand's `if not
+                # other_props: continue`) -- omitting it here makes that
+                # branch exclude it, same as a missing pair. Mirrors the
+                # base's get_node-backed _batch_node_props (its
+                # GraphPropertyCorruptionError catch, _sql_graph_base.py).
+                logger.warning(
+                    "skipping corrupted graph node during BFS expansion (pg batch): "
+                    "node_type=%s node_id=%s",
+                    node_type, node_id,
+                )
+                continue
+            result[(node_type, node_id)] = _merge_space(props, space_id)
+        return result
 
     def _prefetch_frontier(
         self,

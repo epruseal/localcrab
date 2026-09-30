@@ -707,6 +707,49 @@ class TestScopedStorePredicates:
         got = graph.find_by_relations_scoped("twin", ["raises"], bob_scope, "out", 20)
         assert [r["properties"]["node_id"] for r in got] == ["twin-target"]
 
+    def test_find_by_relations_scoped_excludes_corrupted_edge_even_when_fully_in_scope(
+        self, graph, docs, seeded
+    ):
+        """#402 round 6: corruption, isolated from authorization.
+
+        `leg()`'s SQL already fetches ``e.properties`` for the pack-
+        membership predicate (``edge_cond``), but the row loop only ever
+        decode-checked the far-side NODE (via ``get_node``'s own
+        ``GraphPropertyCorruptionError``) -- never the edge itself. An edge
+        row that both endpoints AND the pack scope would otherwise
+        authorize is precisely the case an authorization-only test cannot
+        distinguish from a healthy in-scope edge, so this seeds one edge of
+        each kind, both anchored on the same node and both fully within
+        alice's own scope, and asserts only the corrupted one is dropped
+        while the healthy sibling edge still comes back (round 6 dual-
+        verification non-blocking item: this test previously had no
+        healthy-edge control, so an over-broad fix dropping every edge
+        regardless of corruption could have passed it unnoticed).
+        """
+        _node(graph, docs, PACK_A, "a-other")
+        _node(graph, docs, PACK_A, "a-other-healthy")
+        graph.upsert_edge(
+            "Document", "a-secret", "relates_to", "Document", "a-other", {"pack_id": PACK_A}
+        )
+        graph.upsert_edge(
+            "Document", "a-secret", "relates_to", "Document", "a-other-healthy",
+            {"pack_id": PACK_A},
+        )
+        graph._conn.execute(
+            "UPDATE graph_edges SET properties = :raw"
+            " WHERE from_id = :fid AND to_id = :tid",
+            {
+                "raw": '{"pack_id": "pack-a", "pack_id": "pack-a"}',
+                "fid": "a-secret",
+                "tid": "a-other",
+            },
+        )
+        graph._conn.commit()
+
+        alice_scope = sorted({PACK_A, PACK_PUBLIC})
+        got = graph.find_by_relations_scoped("a-secret", ["relates_to"], alice_scope, "out", 20)
+        assert [r["properties"]["node_id"] for r in got] == ["a-other-healthy"]
+
     def test_edge_spanning_two_readable_packs_is_returned(self, graph, docs, seeded):
         """A cross-pack edge inside one scope must survive.
 
