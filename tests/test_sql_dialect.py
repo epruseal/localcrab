@@ -659,4 +659,28 @@ def test_json_str_in_raw_extraction_survives_malformed_row_in_select_list_positi
         f"SELECT id FROM t WHERE {frag}", {"packs": transform(["P"])}
     ).fetchall()
     assert {r[0] for r in where_rows} == {"good"}
+
+    # GREEN (SELECT-list position, this test's actual claim -- codex 3라운드
+    # P2 지적 수정): unlike the block above, which only proves
+    # the underlying building block json_get_safe survives there, this
+    # executes _json_str_in's OWN returned fragment in a SELECT list.
+    # A mutation reverting _json_str_in's internal json_get_safe back to
+    # bare json_get previously kept this test green because nothing here
+    # ran _json_str_in's real frag outside a WHERE clause. Checked against
+    # both selectivity values so a mutation that flips the membership test
+    # itself (not just the malformed-row guard) is also caught.
+    select_rows_match = dict(
+        conn.execute(
+            f"SELECT id, {frag} FROM t", {"packs": transform(["P"])}
+        ).fetchall()
+    )
+    assert select_rows_match == {"good": 1, "bad": 0}
+
+    select_rows_no_match = dict(
+        conn.execute(
+            f"SELECT id, {frag} FROM t", {"packs": transform(["Q"])}
+        ).fetchall()
+    )
+    assert select_rows_no_match == {"good": 0, "bad": 0}
+
     conn.close()
