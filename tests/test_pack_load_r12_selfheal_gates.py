@@ -200,7 +200,7 @@ class TestDocRowLossRecovery:
     """R2 — n_same 경로가 현재 space 의 doc 행 유실을 회수해야 한다."""
 
     def test_doc_row_only_loss_is_recovered_as_chg_then_converges_to_same(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1")])
         pack_load.load_nodes("pack-1", f, builder, {})
@@ -218,7 +218,7 @@ class TestDocRowLossRecovery:
         assert "n1" not in state["doc_node_spaces"], "전제: doc 행이 사라져야 한다"
 
         n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"], sql=pack_sql)
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             f"doc 행 유실이 same 으로 방치됐다: new={n_new} chg={n_chg} same={n_same}")
         assert docs._conn.execute(
@@ -228,11 +228,11 @@ class TestDocRowLossRecovery:
         # 2회차: doc 행이 이제 존재하니 same 으로 수렴한다.
         state2 = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
         n_new2, n_chg2, n_same2, skip2, err2, _ids2, _vu2 = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"])
+            "pack-1", f, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"], sql=pack_sql)
         assert (n_new2, n_chg2, n_same2, skip2, err2) == (0, 0, 1, 0, 0), (
             f"2회차가 same 으로 수렴하지 않았다: {(n_new2, n_chg2, n_same2, skip2, err2)}")
 
-    def test_doc_recovery_emits_an_aggregate_warning_once(self, live, tmp_path, caplog):
+    def test_doc_recovery_emits_an_aggregate_warning_once(self, live, tmp_path, caplog, pack_sql):
         """#301: doc 행 유실 회수가 발동하면 집계 경고가 뜨고, 다음 런이
         same 으로 수렴하면 그 경고가 사라진다(1회성 유실, #279 형과 대조).
         경고는 정확히 1번 뜨고, 그 안의 건수 필드는 실제 발동 횟수(1)와
@@ -248,7 +248,7 @@ class TestDocRowLossRecovery:
         state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
         with caplog.at_level(logging.WARNING):
             pack_load.load_nodes_incremental(
-                "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+                "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"], sql=pack_sql)
         aggregate = [r for r in caplog.records if "유실 회수 누적" in r.getMessage()]
         assert len(aggregate) == 1, (
             "1회차는 유실 회수 누적 경고가 정확히 1번 떠야 한다")
@@ -259,13 +259,13 @@ class TestDocRowLossRecovery:
         state2 = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
         with caplog.at_level(logging.WARNING):
             pack_load.load_nodes_incremental(
-                "pack-1", f, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"])
+                "pack-1", f, builder, {}, state2["nodes"], graph, docs, state2["doc_node_spaces"], sql=pack_sql)
         assert not any("유실 회수 누적" in r.getMessage() for r in caplog.records), (
             "2회차는 same 으로 수렴했으니 유실 회수 누적 경고가 없어야 한다"
         )
 
     def test_persistent_doc_write_failure_keeps_the_warning_recurring(
-            self, live, tmp_path, caplog):
+            self, live, tmp_path, caplog, pack_sql):
         """#301 본 시나리오: doc 쓰기가 매 런 계속 실패하면(행이 매번 없다)
         회수 경로가 매 런 재발동하고, 집계 경고도 매 런 다시 떠야 한다
         (#279 류 1회성 전이라면 2회차에 사라져야 하는데 여기서는 안
@@ -288,7 +288,7 @@ class TestDocRowLossRecovery:
             with caplog.at_level(logging.WARNING):
                 n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
                     "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                    state["doc_node_spaces"])
+                    state["doc_node_spaces"], sql=pack_sql)
             assert (n_new, n_chg, n_same, skip, err) == (0, 2, 0, 0, 0), (
                 f"매 회차 doc 행 유실 둘 다 chg 로 회수돼야 한다: {(n_new, n_chg, n_same, skip, err)}")
             aggregate = [r for r in caplog.records if "유실 회수 누적" in r.getMessage()]
@@ -300,7 +300,7 @@ class TestDocRowLossRecovery:
                 f"{aggregate[0].getMessage()}")
 
     def test_anchor_node_is_not_reloaded_when_doc_node_spaces_lacks_it(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         """F4-b 는 앵커를 `doc_node_spaces` 에서 아예 뺀다 — R2 검사가 앵커를
         예외하지 않으면 앵커마다 매 런 "doc 행 없음"으로 오판해 재적재
         루프가 열린다(설계 권고 #2)."""
@@ -314,13 +314,13 @@ class TestDocRowLossRecovery:
             "전제: F4-b 가 앵커를 doc_node_spaces 에서 뺀다")
 
         n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"], sql=pack_sql)
         assert (n_new, n_chg, n_same, skip, err) == (0, 0, 1, 0, 0), (
             f"앵커 노드가 doc_node_spaces 부재로 오탐 재적재됐다: "
             f"new={n_new} chg={n_chg} same={n_same}")
 
     def test_removing_the_check_would_leave_the_doc_row_loss_forever(
-            self, live, tmp_path, monkeypatch):
+            self, live, tmp_path, monkeypatch, pack_sql):
         """변형(검사 제거) red 확인 — `doc_node_spaces` 를 항상 실측대로
         보이게 강제하는 대신, 검사 조건 자체를 무력화(F4-c 정리 함수처럼
         "항상 존재"로 보이게)하면 doc 행 유실이 same 으로 영구 방치돼야
@@ -339,7 +339,7 @@ class TestDocRowLossRecovery:
         # (실코드 조건 `not _is_anchor_node(...) and ...` 의 첫 항을 죽인다).
         monkeypatch.setattr(pack_load, "_is_anchor_node", lambda *a, **kw: True)
         n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"])
+            "pack-1", f, builder, {}, state["nodes"], graph, docs, state["doc_node_spaces"], sql=pack_sql)
         monkeypatch.setattr(pack_load, "_is_anchor_node", orig)
 
         assert (n_chg, n_same) == (0, 1), (
@@ -384,7 +384,7 @@ class TestDupTypeNodeRowsHelper:
 class TestTypeReclassification:
     """A node type change uses the global-id CAS update path."""
 
-    def test_reclassification_replaces_the_single_global_row(self, live, tmp_path):
+    def test_reclassification_replaces_the_single_global_row(self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         old_file = _write_jsonl(
             tmp_path / "old.jsonl",
@@ -399,8 +399,7 @@ class TestTypeReclassification:
         )
         result = pack_load.load_nodes_incremental(
             "pack-1", new_file, builder, {}, state["nodes"], graph, docs,
-            state["doc_node_spaces"],
-        )
+            state["doc_node_spaces"], sql=pack_sql)
 
         assert result[:5] == (0, 1, 0, 0, 0)
         assert graph.get_node("Document", "n1") is None

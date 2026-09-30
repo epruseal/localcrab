@@ -246,7 +246,7 @@ class TestNodeVectorAxisAbsentIsNotLoss:
     """`vec=None` — 유실이 아니라 부재. 카운터도 경고도 없다(대조군은 ㉵b)."""
 
     def test_vec_none_yields_zero_unrecovered_and_no_warning(
-            self, live, tmp_path, caplog):
+            self, live, tmp_path, caplog, pack_sql):
         builder, graph, docs = live
         # 최초 적재 자체는 벡터 스토어가 있는 상태로 해야 same 판정까지
         # 도달한다(벡터 없이 최초 적재하면 graph/doc 자체가 live 아님).
@@ -266,7 +266,7 @@ class TestNodeVectorAxisAbsentIsNotLoss:
         with caplog.at_level(logging.DEBUG, logger="opencrab.pack.load"):
             n_new, n_chg, n_same, skip2, err2, _ids, vu = pack_load.load_nodes_incremental(
                 "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-                state["doc_node_spaces"])  # vec 생략(None) — 벡터 축 없는 배포
+                state["doc_node_spaces"], sql=pack_sql)  # vec 생략(None) — 벡터 축 없는 배포
         assert (n_new, n_chg, n_same, skip2, err2) == (0, 0, 1, 0, 0), (
             "vec=None 인 배포도 분류(same/chg)는 종전과 같이 보존돼야 한다: "
             f"{(n_new, n_chg, n_same, skip2, err2)}")
@@ -279,7 +279,7 @@ class TestNodeVectorAxisAbsentIsNotLoss:
             f"{[r.getMessage() for r in warnings]}")
 
     def test_vec_none_logs_at_most_one_debug_line_per_run(
-            self, live, tmp_path, caplog):
+            self, live, tmp_path, caplog, pack_sql):
         builder, graph, docs = live
         vec0 = _UnenumerableVecWithLookup()
         builder._vec = vec0
@@ -292,7 +292,7 @@ class TestNodeVectorAxisAbsentIsNotLoss:
         with caplog.at_level(logging.DEBUG, logger="opencrab.pack.load"):
             pack_load.load_nodes_incremental(
                 "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-                state["doc_node_spaces"])  # vec 생략(None)
+                state["doc_node_spaces"], sql=pack_sql)  # vec 생략(None)
         axis_absent_lines = [
             r for r in caplog.records if "벡터 축 없음" in r.getMessage()]
         assert len(axis_absent_lines) == 1, (
@@ -433,7 +433,7 @@ class TestNodeVecAccessGatedByPrincipal:
             with pytest.raises(RuntimeError, match="principal_scope"):
                 pack_load.load_nodes_incremental(
                     "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-                    state["doc_node_spaces"], vec=vec1)
+                    state["doc_node_spaces"], vec=vec1, sql=pack_sql)
 
             assert enum_calls["n"] == 0, (
                 "미바인딩 principal 인데 벡터 열거(_live_vec_ids)가 실행됐다. "
@@ -527,7 +527,7 @@ class TestNodeVecAccessGatedByPrincipal:
 
     def test_owner_principal_without_sql_raises_value_error(
             self, live, tmp_path, monkeypatch):
-        """`vec`을 넘기면서 `sql`을 생략하면(#377 2라운드 신규 가드) 소유
+        """`sql`을 생략하면(#377 2라운드 가드, #424에서 vec 유무와 무관해졌다) 소유
         principal이라도 `ValueError`로 막힌다. `_require_bound_principal()`
         은 이미 통과한 뒤이므로, 환경이나 바인딩 오류가 먼저 나서 이 가드를
         못 본다는 우려를 직접 반증한다."""
@@ -588,7 +588,7 @@ class TestNodeVecAccessGatedByPrincipal:
             with pytest.raises(RuntimeError, match="principal_scope"):
                 pack_load.load_nodes_incremental(
                     "pack-1", f, builder, id_map, state["nodes"], graph, docs,
-                    state["doc_node_spaces"], vec=vec0, recover_vectors=True)
+                    state["doc_node_spaces"], vec=vec0, recover_vectors=True, sql=pack_sql)
             assert vec0.get_by_id_calls == [], (
                 "미바인딩 principal 인데 opt-in 단건 조회(get_by_id)가 실행됐다")
         finally:
