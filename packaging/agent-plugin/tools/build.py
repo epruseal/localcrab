@@ -759,7 +759,7 @@ def verify_release(out_dir) -> None:
             archive_file.seek(0)
             # 신뢰 경계(파서 경계): 이 try 는 gzip 해제 + tarfile 스트림 순회(검사·읽기·
             # 해시 수집)까지만 감싼다 -- 손상된 tar.gz 는 tarfile 이 TarError 외에도
-            # EOFError(절단, /home/asdf/orch-scratch/o247/p2b-repro 실측)·ValueError(손상
+            # EOFError(절단, PR #257 3차 이중검증 채널 B 실측)·ValueError(손상
             # PAX/sparse 헤더, 3차 채널 B 실측)·zlib.error 등을 던질 수 있고 그 전수 열거는
             # CPython tarfile 파서 버전에 종속돼 유지 불가능하므로 `except Exception` 으로
             # 광역 수렴한다. `_BudgetExceededError` 는 그보다 먼저 잡아 별도 위반으로 구분한다.

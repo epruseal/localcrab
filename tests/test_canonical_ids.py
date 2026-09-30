@@ -106,7 +106,7 @@ def test_document_id_comes_from_props_only():
 
 
 def test_file_path_source_is_not_promoted_to_document_id():
-    node = {**TEXT_UNIT, "source": "/home/asdf/docs/x.md"}
+    node = {**TEXT_UNIT, "source": "/home/user/docs/x.md"}
     graph = FakeGraph({"claude/tdm/abc": node})
     results = [{"node_id": "claude/tdm/abc"}]
     enrich(graph, results, pack_ids=PACK_IDS)

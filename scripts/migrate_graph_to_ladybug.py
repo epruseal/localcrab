@@ -14,8 +14,10 @@ graph.db (SQLite) → KùzuDB (.kuzu) 마이그레이션 스크립트
     python scripts/migrate_graph_to_ladybug.py [--src SRC] [--dst DST] [--dry-run]
 
 기본값:
-    SRC = /home/asdf/.openclaw/workspace/data/localcrab/graph.db
-    DST = /home/asdf/.openclaw/workspace/data/localcrab/graph.kuzu
+    SRC = <LOCAL_DATA_DIR>/graph.db
+    DST = <LOCAL_DATA_DIR>/graph.kuzu
+    (LOCAL_DATA_DIR 은 opencrab.config.Settings().local_data_dir 이 실행 사용자
+    HOME 에서 파생한다.)
 """
 
 from __future__ import annotations
@@ -25,9 +27,7 @@ import os
 import sqlite3
 
 from opencrab.common.graph_identity import GraphMigrationFixtureOnlyError
-
-DEFAULT_SRC = "/home/asdf/.openclaw/workspace/data/localcrab/graph.db"
-DEFAULT_DST = "/home/asdf/.openclaw/workspace/data/localcrab/graph.kuzu"
+from opencrab.config import Settings
 
 
 def _create_schema(conn) -> None:
@@ -86,9 +86,10 @@ def inspect_graph_source(src_path: str) -> dict[str, object]:
 
 
 def main() -> None:
+    _base = Settings().local_data_dir
     parser = argparse.ArgumentParser(description="graph.db → KùzuDB 마이그레이션")
-    parser.add_argument("--src", default=DEFAULT_SRC)
-    parser.add_argument("--dst", default=DEFAULT_DST)
+    parser.add_argument("--src", default=f"{_base}/graph.db")
+    parser.add_argument("--dst", default=f"{_base}/graph.kuzu")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     run(args.src, args.dst, args.dry_run)

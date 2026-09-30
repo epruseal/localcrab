@@ -2,7 +2,7 @@
 Contract tests for the 2026-07-28 "modern" Streamable HTTP transport layer in
 opencrab/mcp/http_app.py -- issue #136.
 
-Design of record: /home/asdf/orch-scratch/o136/design-v4.md §4.3. This is the
+Design of record: issue #136 design v4 §4.3. This is the
 TDD RED file: none of protocol.py, the header-validation branch, the batch
 boundary guard, the Origin-guard middleware, or the MCP_ALLOWED_ORIGINS /
 MCP_PROTOCOL_VERSIONS settings exist yet, so every test below is expected to

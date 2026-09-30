@@ -164,7 +164,7 @@ VECTOR_BACKEND 명시됨?
 > 스토어를 만지는 작업이므로 **단계 0(백업)·단계 1(회귀 기준선 테스트)을 신규 코드 작성보다 먼저** 수행한다. 이는 선택이 아니라 필수 게이트다.
 
 0. **DB 백업** (작업 전 1회)
-   - `$LOCAL_DATA_DIR`(기본 `/home/asdf/.openclaw/workspace/data/localcrab`)를 `~/opencrab-dump/localcrab-backup/<YYYYMMDD-HHMMSS>/`로 스냅샷.
+   - `$LOCAL_DATA_DIR`(기본 `<LOCAL_DATA_DIR>`, 실행 사용자 HOME 파생)를 `~/opencrab-dump/localcrab-backup/<YYYYMMDD-HHMMSS>/`로 스냅샷.
    - 대상: `graph.db`(+`-wal`/`-shm`), `doc_store.db`, `opencrab.db`(+wal/shm), 그리고 사용 중인 벡터 백엔드에 따라 `chroma/` 디렉터리 또는 `vectors.db`(+wal/shm). `write.lock`/`chroma.lock`은 제외.
    - WAL 일관성: MCP write 유휴 시점에 복사하거나 sqlite `.backup` 명령으로 일관 스냅샷을 권장.
 1. **회귀 기준선 테스트** (신규 코드 작성 **전**)
@@ -250,7 +250,7 @@ VECTOR_BACKEND 명시됨?
 
 이 절은 2026-06-18 최초 작성 당시의 배경을 압축 보존한다. 현재는 §1.2에 따라 chroma가 예외 경로이므로 아래는 **chroma 사용 시에만 유효**하다.
 
-- 현행 팩 로더 `/home/asdf/opencrab-dump/load_local_packs.py`는 로컬 스토어를 **직접 열어서** 적재했다. `make_graph_store`/`make_vector_store`/`make_doc_store`/`make_sql_store`로 스토어를 직접 생성하고 `OntologyBuilder(graph, docs, sql, vec=vec)`로 적재한다(라인 600-613). 임베딩은 **서버/빌더 측에서 계산된다**: `OntologyBuilder.add_node` 내부가 노드 텍스트를 추출해 `vec.upsert_texts(texts=[...])`로 넘기면 스토어가 임베딩한다(`opencrab/ontology/builder.py:148-166`).
+- 현행 팩 로더 `<소비 저장소>/load_local_packs.py`는 로컬 스토어를 **직접 열어서** 적재했다. `make_graph_store`/`make_vector_store`/`make_doc_store`/`make_sql_store`로 스토어를 직접 생성하고 `OntologyBuilder(graph, docs, sql, vec=vec)`로 적재한다(라인 600-613). 임베딩은 **서버/빌더 측에서 계산된다**: `OntologyBuilder.add_node` 내부가 노드 텍스트를 추출해 `vec.upsert_texts(texts=[...])`로 넘기면 스토어가 임베딩한다(`opencrab/ontology/builder.py:148-166`).
 - 적재 직전 `LOCAL_DATA_DIR/chroma.lock`에 `fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)`를 잡았다(라인 586-589). 선점 실패 시 즉시 종료하며, 안내 메시지가 **MCP 서버 중지를 요구**했다(라인 591-598): `systemctl --user stop localcrab-gateway` → 적재 → `systemctl --user start localcrab-gateway`.
 - 이 배타 락이 필요했던 이유는 ChromaDB 제약 때문이다: `PersistentClient`는 **동일 persist 경로에 대한 다중 프로세스 동시 쓰기를 지원하지 않는다**(출처: Chroma Cookbook — System Constraints, "Chroma is not process-safe for concurrent writers sharing the same local persistence path." <https://cookbook.chromadb.dev/core/system_constraints/>). 단, **프로세스 내부 멀티스레드는 안전하다**("Chroma is thread-safe").
 - MCP 서버 측은 이 제약을 락으로 방어했다(`opencrab/mcp/tools.py`): `_acquire_chroma_shared_lock()`가 서버 수명 동안 `chroma.lock`에 `LOCK_SH`를 보유 → 로더의 `LOCK_EX`와 상호 배제. uvicorn은 `workers=1`로 기동(`opencrab/cli.py`, 주석: 원래 "the chroma PersistentClient is single-process only") → chroma를 만지는 프로세스는 MCP 단일 인스턴스뿐. 여러 MCP 인스턴스(예: 인증/비인증 HTTP) 간 쓰기는 `_write_lock()`이 `write.lock`의 `LOCK_EX`로 직렬화. write 도구 집합은 `WRITE_TOOLS`: `ontology_add_node`, `ontology_add_edge`, `pack_create`, `pack_ingest`, `schema_pack_install`, `schema_pack_uninstall`, `harness_promotion_apply`.

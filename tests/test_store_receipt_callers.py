@@ -14,7 +14,7 @@
    ``REQUIRED_STORES``)가 없던 결함. 신규 API의 계약(양성 확인, fail-closed,
    미등록 kind 는 ValueError, 기존 병렬 billing 판정과의 동치)을 못박는다.
 
-설계: ``/home/asdf/.claude/plans/localcrab-158-163-design.md`` C 절 "판정 게이트"
+설계: 이슈 #158/#163 결합 설계, C 절 "판정 게이트"
 RED 표의 #1~#10 을 전량 구현한다.
 
 **신규 API(``store_write_succeeded_for``/``is_not_applicable_status``/

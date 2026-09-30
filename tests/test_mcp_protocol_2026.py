@@ -1,7 +1,7 @@
 """
 RED-phase contract tests for issue #136 (MCP 2026-07-28 dual-era server).
 
-Design of record: /home/asdf/orch-scratch/o136/design-v4.md.
+Design of record: issue #136 design v4.
 
 These tests exercise ``MCPServer.handle_request`` directly (no HTTP, no
 stdio) against the modern (2026-07-28) era added by #136 alongside the

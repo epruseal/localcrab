@@ -26,6 +26,7 @@ from opencrab.common.graph_identity import (
     prepare_node as prepare_graph_node,
 )
 from opencrab.common.pack_tags import apply_pack_tag
+from opencrab.config import Settings
 from opencrab.stores.neo4j_store import Neo4jStore
 
 PACK_ID = "nvidia-nemotron-personas-korea"
@@ -204,7 +205,10 @@ def validate(store: Neo4jStore) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", default="/home/asdf/.openclaw/workspace/data/localcrab/packs/nvidia-nemotron-personas-korea/stage")
+    parser.add_argument(
+        "--stage",
+        default=f"{Settings().local_data_dir}/packs/nvidia-nemotron-personas-korea/stage",
+    )
     parser.add_argument("--uri", default="bolt://localhost:7687")
     parser.add_argument("--user", default="neo4j")
     parser.add_argument("--password", default="opencrab")

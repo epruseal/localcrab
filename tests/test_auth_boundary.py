@@ -667,7 +667,7 @@ class TestReservedIdentityKeysInPayloads:
 
 # ---------------------------------------------------------------------------
 # Issue #245 -- automatic stdio bootstrap on an empty, explicit LOCAL_DATA_DIR
-# (design v13, /home/asdf/orch-scratch/o245/design-v13.md).
+# (설계 v13, 이슈 #245).
 #
 # TDD RED: opencrab.auth.maybe_bootstrap_on_empty, bootstrap_on_empty_requested,
 # bootstrap_local_user_idempotent, and bootstrap_local_user(issue_token=...) do

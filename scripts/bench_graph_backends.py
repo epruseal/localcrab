@@ -41,26 +41,25 @@ from typing import Any
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
+from opencrab.config import Settings
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.neo4j_store import Neo4jStore
 
 # ─── 상수 ────────────────────────────────────────────────────────────────────
-DUMP_DIR = Path("/home/asdf/opencrab-dump")
-NODES_JSONL = DUMP_DIR / "nodes.jsonl"
-EDGES_JSONL = DUMP_DIR / "edges.jsonl"
-LIVE_GRAPH_DB = Path("/home/asdf/.openclaw/workspace/data/localcrab/graph.db")
-LIVE_CHROMA_PATH = "/home/asdf/.openclaw/workspace/data/localcrab/chroma"
-LIVE_DOCSTORE_PATH = "/home/asdf/.openclaw/workspace/data/localcrab/docs"
+# 덤프 위치(nodes.jsonl/edges.jsonl)와 라이브 graph.db 경로는 머신마다 다르므로
+# 모듈 상수로 얼리지 않는다 — main()이 --dump-dir/--graph-db-path 인자로 받아
+# 함수 지역 변수로 전달한다(아래 load_nodes/load_edges/run_bench/
+# run_readonly_target 참고).
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs"
 
 
 # ─── 데이터 로딩 헬퍼 ────────────────────────────────────────────────────────
 
-def load_nodes(n: int) -> list[dict]:
-    """nodes.jsonl 에서 앞 n 개를 읽어 반환."""
+def load_nodes(n: int, nodes_path: Path) -> list[dict]:
+    """nodes_path 에서 앞 n 개를 읽어 반환."""
     nodes = []
     # newline="\n": 레코드 경계를 LF 하나로 고정한다(#382, import_pack_graph_to_neo4j.py 참고).
-    with open(NODES_JSONL, encoding="utf-8", newline="\n") as f:
+    with open(nodes_path, encoding="utf-8", newline="\n") as f:
         for i, line in enumerate(f):
             if i >= n:
                 break
@@ -68,10 +67,10 @@ def load_nodes(n: int) -> list[dict]:
     return nodes
 
 
-def load_edges(node_ids: set[str]) -> list[dict]:
-    """양 끝점이 node_ids 에 속하는 엣지만 반환."""
+def load_edges(node_ids: set[str], edges_path: Path) -> list[dict]:
+    """양 끝점이 node_ids 에 속하는 엣지만 edges_path 에서 반환."""
     edges = []
-    with open(EDGES_JSONL, encoding="utf-8", newline="\n") as f:
+    with open(edges_path, encoding="utf-8", newline="\n") as f:
         for line in f:
             e = json.loads(line)
             if e.get("from_id") in node_ids and e.get("to_id") in node_ids:
@@ -446,16 +445,18 @@ def print_consistency_table(scale: int, report: dict):
 
 # ─── 읽기 전용 쿼리 측정 ─────────────────────────────────────────────────────
 
-def run_readonly_target(target: str, neo4j_uri: str, neo4j_user: str, neo4j_pass: str):
+def run_readonly_target(
+    target: str, neo4j_uri: str, neo4j_user: str, neo4j_pass: str, graph_db_path: Path
+):
     hline("═")
     print(f"[읽기 전용] 대상: {target}")
     hline("═")
 
     if target == "localdb":
-        if not LIVE_GRAPH_DB.exists():
-            print(f"  [오류] {LIVE_GRAPH_DB} 없음")
+        if not graph_db_path.exists():
+            print(f"  [오류] {graph_db_path} 없음")
             return
-        store = LocalGraphStore(db_path=str(LIVE_GRAPH_DB))
+        store = LocalGraphStore(db_path=str(graph_db_path))
         cnt_before = _safe_count(store)
         print(f"  SQLite 노드 수(사전): {cnt_before}")
 
@@ -517,10 +518,13 @@ def run_bench(
     neo4j_pass: str,
     consistency_only: bool,
     speed_only: bool,
+    dump_dir: Path,
     seed_count: int = 20,
 ):
     all_results: dict[str, Any] = {"scales": {}}
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    nodes_path = dump_dir / "nodes.jsonl"
+    edges_path = dump_dir / "edges.jsonl"
 
     # Neo4j 연결 확인
     neo4j_available = False
@@ -539,10 +543,10 @@ def run_bench(
 
         # ── 데이터 준비 ──
         print(f"  데이터 로딩 중 (nodes.jsonl {scale:,}개)…")
-        nodes = load_nodes(scale)
+        nodes = load_nodes(scale, nodes_path)
         node_ids = {nd["id"] for nd in nodes}
         node_type_map = {nd["id"]: nd.get("node_type", "concept") for nd in nodes}
-        edges = load_edges(node_ids)
+        edges = load_edges(node_ids, edges_path)
         print(f"  노드={len(nodes):,}  엣지={len(edges):,}")
 
         # 시드 노드 선택 (degree 높은 순)
@@ -820,7 +824,18 @@ def main():
                         help="읽기 전용 쿼리 대상 (쓰기 0). live=라이브 Neo4j, localdb=기존 graph.db")
     parser.add_argument("--seed-count", type=int, default=20,
                         help="시드 노드 수 (기본: 20)")
+    parser.add_argument("--dump-dir", required=True,
+                        help="nodes.jsonl/edges.jsonl 이 있는 덤프 디렉터리(필수, 머신마다 다름)")
+    parser.add_argument("--graph-db-path", default=None,
+                        help="읽기 전용(--readonly-target localdb) 대상 graph.db 경로 "
+                             "(기본: Settings().local_data_dir/graph.db)")
     args = parser.parse_args()
+
+    graph_db_path = (
+        Path(args.graph_db_path)
+        if args.graph_db_path
+        else Path(Settings().local_data_dir) / "graph.db"
+    )
 
     if args.readonly_target:
         uri = args.neo4j_uri if args.readonly_target == "live" else "bolt://localhost:7687"
@@ -834,7 +849,7 @@ def main():
             uri = args.neo4j_uri
             user = args.neo4j_user
             pwd = args.neo4j_pass
-        run_readonly_target(args.readonly_target, uri, user, pwd)
+        run_readonly_target(args.readonly_target, uri, user, pwd, graph_db_path)
         return
 
     scales = [int(s.strip()) for s in args.scales.split(",")]
@@ -845,6 +860,7 @@ def main():
         neo4j_pass=args.neo4j_pass,
         consistency_only=args.consistency_only,
         speed_only=args.speed_only,
+        dump_dir=Path(args.dump_dir),
         seed_count=args.seed_count,
     )
     print_recommendation(results)

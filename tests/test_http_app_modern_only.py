@@ -4,7 +4,7 @@ when the legacy era is DISABLED (``MCP_PROTOCOL_VERSIONS=2026-07-28``,
 "modern-only"), plus explicit pins separating the expected surfaces of the
 modern-only, dual (default), and legacy-only configurations.
 
-Design of record: /home/asdf/orch-scratch/o250/design-v2.md. TDD RED file:
+Design of record: issue #250 design v2. TDD RED file:
 at commit time the ``TestModernOnlyTransportErrors`` group below is expected
 to FAIL against main (errors come back 200/202/500); the normal-path and
 configuration-pin groups pass before and after the fix and are regression

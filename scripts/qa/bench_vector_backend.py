@@ -15,8 +15,10 @@ Gate targets (§11.1): recall@10 >= 0.95, single-pack p95 <= 100ms,
 metadata-filtered p95 <= 200ms, pack leak = 0.
 
 Notes:
-  - The live Chroma dir (~2GB) is copied to --work-dir (default on nvme disk,
-    NOT /tmp which is tmpfs) so the running gateway is never touched.
+  - The live Chroma dir (~2GB) is copied to --work-dir (default: the parent of
+    Settings().local_data_dir; override if that resolves to a tmpfs mount,
+    since the copy is sized to the live Chroma dir) so the running gateway is
+    never touched.
   - Vectors are streamed in batches; only a small query reservoir is held in RAM.
 
 BINARY MODE (--mode binary, docs/pgvector-migration-plan.md §3.7 gate):
@@ -46,6 +48,9 @@ import shutil
 import statistics
 import tempfile
 import time
+from pathlib import Path
+
+from opencrab.config import Settings
 
 CHROMA_COLLECTION = "opencrab_vectors_kure"
 DIM = 1024
@@ -436,9 +441,11 @@ def main() -> int:
                     help="chroma-parity: original chroma-vs-vec0 gate; "
                          "binary: §3.7 2-stage ANN gate on a migrated DB copy; "
                          "pg: PgVectorStore(HNSW) gate from an offline vec0 DB copy")
-    ap.add_argument("--data-dir", default="/home/asdf/.openclaw/workspace/data/localcrab")
-    ap.add_argument("--work-dir", default="/home/asdf/.openclaw/workspace",
-                    help="disk-backed dir for temp copy+db (NOT tmpfs /tmp)")
+    ap.add_argument("--data-dir", default=Settings().local_data_dir)
+    ap.add_argument("--work-dir", default=str(Path(Settings().local_data_dir).parent),
+                    help="disk-backed dir for temp copy+db (override if this "
+                         "default resolves to a tmpfs mount; the copy is "
+                         "sized to the live Chroma dir)")
     ap.add_argument("--collection", default=CHROMA_COLLECTION)
     ap.add_argument("--queries", type=int, default=200,
                     help="(binary/pg modes use --queries too; 100 is enough)")
