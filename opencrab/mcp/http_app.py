@@ -90,9 +90,9 @@ _REDACTED_LOGGERS = ("uvicorn.access", "uvicorn.asgi")
 def _redact_query(query: str) -> str:
     """Mask the value of every ``token`` parameter in a raw query string.
 
-    The name is percent-decoded before comparison because Starlette decodes it
-    before lookup, so ``?%74oken=`` authenticates exactly like ``?token=``.
-    ``+`` decodes to a space there, so ``to+ken`` is not an alias.
+    This function decodes the name before it compares, because Starlette
+    decodes the name before lookup. ``?%74oken=`` authenticates like
+    ``?token=``. Starlette decodes ``+`` to a space, so ``to+ken`` is not an alias.
     """
     parts = query.split("&")
     for i, part in enumerate(parts):
@@ -122,8 +122,8 @@ def _scrub_log_arg(arg: Any) -> Any:
 class AccessLogTokenRedactor(logging.Filter):
     """Mask ``token`` query values in uvicorn access and TRACE log records.
 
-    Never drops a record and never raises: a record whose args have an
-    unexpected shape passes through unchanged.
+    The filter never drops a record and never raises. A record with an
+    unexpected args shape passes through unchanged.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -138,9 +138,9 @@ class AccessLogTokenRedactor(logging.Filter):
 def install_access_log_redaction() -> None:
     """Attach the redactor to the uvicorn loggers once (idempotent).
 
-    Logger filters, unlike handlers, survive uvicorn's ``dictConfig`` call in
-    ``uvicorn.run()``, so installing from ``create_app()`` (which runs before
-    it) is enough.
+    Logger filters survive the ``dictConfig`` call in ``uvicorn.run()``, but
+    handlers do not. ``create_app()`` runs before that call, so one install
+    from ``create_app()`` is enough.
     """
     for name in _REDACTED_LOGGERS:
         target = logging.getLogger(name)
