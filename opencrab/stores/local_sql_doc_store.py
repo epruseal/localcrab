@@ -405,8 +405,9 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         """#437: top ``per_pack_limit`` FTS hits of EACH pack in ONE MATCH.
 
         Equivalent to calling ``keyword_search(query, pack_ids=[pid],
-        limit=per_pack_limit, spaces=spaces)`` once per pack: the same WHERE
-        clause, the same ``bm25`` rank, the same order, equal ranks included (FTS scan order, see the tie test).
+        limit=per_pack_limit, spaces=spaces)`` once per pack. The WHERE
+        clause, the ``bm25`` rank and the order are the same. Equal ranks
+        keep FTS scan order, as the tie tests check.
         The MATCH result set is ranked once and cut per pack with
         ``ROW_NUMBER() OVER (PARTITION BY pack)``, so a small pack's hits
         never compete with a large pack's hits. Packs without a hit are
