@@ -1027,6 +1027,51 @@ class HybridQuery:
             })
         return out
 
+    def _fts_search_per_pack(
+        self,
+        question: str,
+        spaces: list[str] | None,
+        limit: int,
+        *,
+        pack_ids: list[str],
+    ) -> dict[str, list[dict[str, Any]]] | None:
+        """#437: per-pack top-``limit`` FTS hits in one doc-store call.
+
+        Returns ``{pack_id: hits}`` shaped like ``_fts_search`` hits (packs
+        without a hit are absent), or ``None`` when the caller must loop over
+        ``_fts_search`` instead: the doc store has no
+        ``keyword_search_per_pack`` or the call raised. ``None`` keeps the
+        per-pack loop's own error handling (one bad pack probe becomes ``[]``).
+        """
+        ds = self._doc_store
+        per_pack = getattr(ds, "keyword_search_per_pack", None)
+        if ds is None or per_pack is None or not getattr(ds, "supports_keyword", False):
+            return None
+        if not pack_ids:
+            return {}
+        try:
+            raw = per_pack(
+                question, pack_ids=pack_ids, per_pack_limit=limit, spaces=spaces
+            )
+        except Exception as exc:
+            logger.warning("FTS per-pack keyword search error: %s", exc)
+            return None
+        if not isinstance(raw, dict):
+            return None
+        return {
+            pid: [
+                {
+                    "source": "keyword",
+                    "node_id": h.get("node_id"),
+                    "score": h.get("score", 0.0),
+                    "text": h.get("text"),
+                    "metadata": h.get("metadata") or {},
+                }
+                for h in hits
+            ]
+            for pid, hits in raw.items()
+        }
+
     def _policy_filter(
         self,
         results: list[dict[str, Any]],

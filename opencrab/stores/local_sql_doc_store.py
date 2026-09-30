@@ -339,26 +339,13 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             return []
         if not self._conn:
             return []
-        import re
-
-        toks = re.findall(r"\w+", query or "", flags=re.UNICODE)
-        if not toks:
+        built = self._keyword_where(query, pack_ids, spaces)
+        if built is None:
             return []
-        match = " OR ".join(f'"{t}"' for t in toks)
-        where_sql = "WHERE doc_sources_fts MATCH ?"
-        params: list[Any] = [match]
-        if spaces:
-            # issue #415: json_get_safe -- one syntactically malformed
-            # metadata row must not crash this whole keyword-search leg.
-            space_expr = self._dialect.json_get_safe("s.metadata", "space")
-            placeholders = ",".join("?" for _ in spaces)
-            where_sql += f" AND {space_expr} IN ({placeholders})"
-            params.extend(spaces)
-        pack_expr = self._dialect.json_truthy_text("s.metadata", "pack_id")
-        pack_frag, transform = self._dialect.in_string_array(pack_expr, "?")
-        where_sql += f" AND {pack_frag}"
-        params.append(transform(sorted(set(pack_ids))))
+        where_sql, params, _pack_expr = built
         params.append(limit)  # limit<=0 already guarded above; always positive here
+        # Equal ranks keep FTS scan order (SQLite leaves it unspecified, but it is
+        # stable; keyword_search_per_pack relies on the same order, see its tests).
         rows = self._conn.execute(
             "SELECT f.source_id AS sid, s.text AS text, s.metadata AS meta, "
             "bm25(doc_sources_fts) AS rank "
@@ -378,4 +365,86 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             })
             if len(out) >= limit:
                 break
+        return out
+
+    def _keyword_where(
+        self, query: str, pack_ids: list[str], spaces: list[str] | None
+    ) -> tuple[str, list[Any], str] | None:
+        """Shared WHERE clause of the FTS keyword queries, or ``None`` when
+        the query has no ``\\w+`` token. Returns ``(where_sql, params,
+        pack_expr)``; the caller appends its own trailing params."""
+        import re
+
+        toks = re.findall(r"\w+", query or "", flags=re.UNICODE)
+        if not toks:
+            return None
+        match = " OR ".join(f'"{t}"' for t in toks)
+        where_sql = "WHERE doc_sources_fts MATCH ?"
+        params: list[Any] = [match]
+        if spaces:
+            # issue #415: json_get_safe -- one syntactically malformed
+            # metadata row must not crash this whole keyword-search leg.
+            space_expr = self._dialect.json_get_safe("s.metadata", "space")
+            placeholders = ",".join("?" for _ in spaces)
+            where_sql += f" AND {space_expr} IN ({placeholders})"
+            params.extend(spaces)
+        pack_expr = self._dialect.json_truthy_text("s.metadata", "pack_id")
+        pack_frag, transform = self._dialect.in_string_array(pack_expr, "?")
+        where_sql += f" AND {pack_frag}"
+        params.append(transform(sorted(set(pack_ids))))
+        return where_sql, params, pack_expr
+
+    def keyword_search_per_pack(
+        self,
+        query: str,
+        *,
+        pack_ids: list[str],
+        per_pack_limit: int,
+        spaces: list[str] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """#437: top ``per_pack_limit`` FTS hits of EACH pack in ONE MATCH.
+
+        Equivalent to calling ``keyword_search(query, pack_ids=[pid],
+        limit=per_pack_limit, spaces=spaces)`` once per pack: the same WHERE
+        clause, the same ``bm25`` rank, the same order, equal ranks included (FTS scan order, see the tie test).
+        The MATCH result set is ranked once and cut per pack with
+        ``ROW_NUMBER() OVER (PARTITION BY pack)``, so a small pack's hits
+        never compete with a large pack's hits. Packs without a hit are
+        absent from the returned dict. Empty ``pack_ids``, ``per_pack_limit
+        <= 0`` or an unavailable index return ``{}`` without querying.
+        """
+        if not self._available or not self._fts_ok or not self._conn:
+            return {}
+        if not pack_ids or per_pack_limit <= 0:
+            return {}
+        built = self._keyword_where(query, pack_ids, spaces)
+        if built is None:
+            return {}
+        where_sql, params, pack_expr = built
+        params.append(per_pack_limit)
+        rows = self._conn.execute(
+            # bm25() is only legal in the MATCH query itself, not inside a window
+            # function, so the MATERIALIZED CTE ranks the match set once and the
+            # outer query numbers the rows per pack.
+            "WITH m AS MATERIALIZED ("
+            "SELECT f.source_id AS sid, s.text AS text, s.metadata AS meta, "
+            f"bm25(doc_sources_fts) AS rank, {pack_expr} AS pid "
+            "FROM doc_sources_fts f JOIN doc_sources s ON s.source_id = f.source_id "
+            f"{where_sql}) "
+            "SELECT sid, text, meta, rank, pid FROM ("
+            "SELECT sid, text, meta, rank, pid, "
+            "ROW_NUMBER() OVER (PARTITION BY pid ORDER BY rank) AS rn FROM m"
+            ") WHERE rn <= ? ORDER BY pid, rn",
+            params,
+        ).fetchall()
+        out: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+            out.setdefault(r["pid"], []).append({
+                "source_id": r["sid"],
+                "node_id": meta.get("node_id") or r["sid"],
+                "text": r["text"],
+                "metadata": meta,
+                "score": -float(r["rank"] or 0.0),
+            })
         return out

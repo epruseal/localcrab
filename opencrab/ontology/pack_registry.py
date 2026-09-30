@@ -518,7 +518,9 @@ def _choose_by_content(
     """``choose_packs``가 빈 리스트를 낸 뒤에만 호출되는 콘텐츠 폴백.
 
     팩별로 개별 조회한다(§4.2) -- 전역 한 번 조회는 작은 팩의 히트가 큰
-    팩에 밀려 사라지는 문제(§7 항목6)가 있다. 반환값은
+    팩에 밀려 사라지는 문제(§7 항목6)가 있다. FTS 는 문서 저장소가
+    ``keyword_search_per_pack`` 을 지원하면(#437) 한 번의 MATCH 를 팩별로 나눠
+    자른 같은 결과를 받고, 지원하지 않으면 팩별 호출 루프로 돌아간다. 반환값은
     ``(candidates, truncated_packs)``: ``truncated_packs``는 히트 수가
     ``PER_PACK_PROBE_LIMIT``에 닿아 그 팩의 실제 매치가 더 있을 수 있음을
     관측용으로 알리는 목록이다(§7 항목9, 선택 결과 자체에는 영향 없음).
@@ -537,13 +539,30 @@ def _choose_by_content(
     pack_hits: dict[str, set[str]] = {}
     pack_hit_scores: dict[str, float] = {}
     truncated_packs: list[str] = []
+    # #437: FTS 는 가능하면 한 번의 MATCH 로 팩별 상위 N 을 받는다. 지원하지
+    # 않는 백엔드나 호출 실패(None)는 종전 팩별 루프로 돌아간다. BM25 탐침은
+    # 이 경로와 무관하게 팩마다 돈다.
+    fts_by_pack: dict[str, list[dict[str, Any]]] | None = None
+    per_pack_fts = getattr(hybrid, "_fts_search_per_pack", None)
+    if per_pack_fts is not None:
+        result = per_pack_fts(  # noqa: SLF001 — 내부 프로브 전용 호출
+            question,
+            spaces,
+            PER_PACK_PROBE_LIMIT,
+            pack_ids=[p.pack_id for p in registry],
+        )
+        if isinstance(result, dict):
+            fts_by_pack = result
     for pid in (p.pack_id for p in registry):
         bm25_hits = hybrid._bm25_search(  # noqa: SLF001 — 내부 프로브 전용 호출
             question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
         )
-        fts_hits = hybrid._fts_search(  # noqa: SLF001 — 내부 프로브 전용 호출
-            question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
-        )
+        if fts_by_pack is not None:
+            fts_hits = fts_by_pack.get(pid, [])
+        else:
+            fts_hits = hybrid._fts_search(  # noqa: SLF001 — 내부 프로브 전용 호출
+                question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
+            )
         if len(bm25_hits) >= PER_PACK_PROBE_LIMIT or len(fts_hits) >= PER_PACK_PROBE_LIMIT:
             truncated_packs.append(pid)
         _accumulate(question, pid, bm25_hits, fts_hits, pack_hits, pack_hit_scores)
