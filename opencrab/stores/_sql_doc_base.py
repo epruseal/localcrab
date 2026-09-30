@@ -63,7 +63,14 @@ from typing import Any, Literal
 
 from opencrab.stores._graph_common import decode_properties
 from opencrab.stores._json import dump_props
-from opencrab.stores._sql_dialect import Column, IndexSpec, SchemaSpec, SqlDialect, TableSpec
+from opencrab.stores._sql_dialect import (
+    Column,
+    IndexSpec,
+    SchemaSpec,
+    SqlDialect,
+    TableSpec,
+    json_valid_expr,
+)
 
 # ---------------------------------------------------------------------------
 # One dialect-neutral schema spec for the three doc-store tables. Column-by-
@@ -172,14 +179,18 @@ def _json_str_in(
     ``list_nodes_scoped`` was built for) applied to the same typed JSON
     extraction ``_json_str_eq`` uses.
     """
-    raw = dialect.json_get(col, key)
+    # issue #415: json_get_safe (not the bare json_get) -- a syntactically
+    # malformed properties/metadata value must fold to SQL NULL here instead
+    # of raising, whether this fragment lands in a WHERE clause or (as codex
+    # 2라운드 지적 3 reproduced) a SELECT-list position.
+    raw = dialect.json_get_safe(col, key)
     frag, transform = dialect.in_string_array(raw, placeholder)
     type_check = (
-        f"json_type({col}, '$.{key}') = 'text'"
+        f"(CASE WHEN {json_valid_expr(col)} THEN json_type({col}, '$.{key}') = 'text' ELSE 0 END)"
         if dialect.name == "sqlite"
         else f"jsonb_typeof({col}->'{key}') = 'string'"
     )
-    return f"({type_check} AND {frag})", transform
+    return f"{type_check} AND {frag}", transform
 
 
 def _doc_owner_pred_scoped(
@@ -252,6 +263,33 @@ class _SqlDocStoreBase(abc.ABC):
 
     @abc.abstractmethod
     def _require_available(self) -> None: ...
+
+    def _json_columns(self) -> dict[str, str]:
+        """issue #415: table -> JSON column mapping for
+        ``count_malformed_properties()``."""
+        return {
+            self._table("doc_sources"): "metadata",
+            self._table("doc_nodes"): "properties",
+        }
+
+    def count_malformed_properties(self) -> dict[str, int]:
+        """issue #415: on-demand diagnostic counting how many rows per table
+        carry syntactically malformed JSON in their JSON column -- SQLite
+        only (PG's jsonb structurally cannot hold malformed JSON, section 5
+        of the design). Full table scan, no supporting index; never called
+        from any hot read path, only by an operator who needs to know
+        whether the always-on guards (json_get_safe/guarded json_truthy_text/
+        the CASE-guarded type checks in ``_json_str_in``) are silently
+        excluding any rows right now."""
+        if self._dialect.name != "sqlite":
+            return {t: 0 for t in self._json_columns()}
+        return {
+            table: self._fetch_one(
+                f"SELECT COUNT(*) FROM {table} WHERE NOT {json_valid_expr(col, conn=self._conn)}",
+                {},
+            )[0]
+            for table, col in self._json_columns().items()
+        }
 
     # ------------------------------------------------------------------
     # Node document operations

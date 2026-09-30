@@ -21,6 +21,9 @@ from opencrab.stores._sql_dialect import (
     IndexSpec,
     SchemaSpec,
     TableSpec,
+    json_valid_expr,
+    reset_json5_valid_cache_for_testing,
+    sqlite_json5_valid_supported,
 )
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA
 
@@ -96,6 +99,11 @@ def test_list_packs_pg_json_get_is_parenthesized_in_concat():
 
         def _require_available(self) -> None:
             pass
+
+        def _is_malformed_json_error(self, exc: Exception) -> bool:
+            # issue #415: PG's jsonb rejects malformed JSON at write time --
+            # structurally unreachable on PG, mirrors pg_graph_store.py.
+            return False
 
     store = _CapturingPgDouble()
     store.list_packs()
@@ -356,3 +364,278 @@ def test_render_ddl_json_key_index():
     pg_stmts = POSTGRES.render_ddl(spec, schema_name="s1")
     idx_pg = next(s for s in pg_stmts if "idx_t_pack" in s)
     assert idx_pg == 'CREATE INDEX IF NOT EXISTS idx_t_pack ON "s1".t((properties->>\'pack_id\'))'
+
+
+# ---------------------------------------------------------------------------
+# issue #415: json_valid_expr / json_get_safe / json_truthy_text malformed-row
+# guards, and the JSON5 (json_valid(x,3)) feature-detection cache.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_json5_cache():
+    """The JSON5 support flag is a process-wide cache (SQLite capability is a
+    property of the linked libsqlite3, not of any one connection). Reset it
+    around every test in this module so tests that force a simulated
+    on/off state never leak into an unrelated test's result."""
+    reset_json5_valid_cache_for_testing()
+    yield
+    reset_json5_valid_cache_for_testing()
+
+
+def _malformed_properties_db() -> sqlite3.Connection:
+    """A minimal in-memory table seeded with one well-formed row and one
+    syntactically malformed JSON row -- the exact issue #415 shape."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (id TEXT, properties TEXT)")
+    conn.execute("INSERT INTO t VALUES ('good', '{\"pack_id\": \"P\"}')")
+    conn.execute("INSERT INTO t VALUES ('bad', 'not valid json {')")
+    conn.commit()
+    return conn
+
+
+def test_sqlite_json5_valid_supported_returns_a_real_bool_and_caches():
+    """RED/GREEN is meaningless here (no prior behavior to break) -- this
+    pins the actual detection result against a real in-memory connection and
+    confirms the process-wide cache does not re-probe on a second call.
+    ``sqlite3.Connection`` is a C extension type whose methods cannot be
+    monkeypatched on the instance, so a thin wrapper counts calls instead."""
+
+    class _CountingConn:
+        def __init__(self, real: sqlite3.Connection) -> None:
+            self._real = real
+            self.calls: list[str] = []
+
+        def execute(self, sql, *a, **kw):
+            self.calls.append(sql)
+            return self._real.execute(sql, *a, **kw)
+
+    conn = _CountingConn(sqlite3.connect(":memory:"))
+    first = sqlite_json5_valid_supported(conn)
+    assert isinstance(first, bool)
+    second = sqlite_json5_valid_supported(conn)
+    assert second == first
+    assert len(conn.calls) == 1, f"probe must run at most once per process: {conn.calls}"
+
+
+def test_json_valid_expr_uses_json_valid_3_when_supported(monkeypatch):
+    """Simulated support branch (rev.4, 4-0): forces the cache to report
+    support without depending on this machine's actual SQLite build."""
+    import opencrab.stores._sql_dialect as dialect_mod
+
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", True)
+    assert json_valid_expr("properties") == "json_valid(properties, 3)"
+
+
+def test_json_valid_expr_falls_back_to_json_valid_1_when_unsupported(monkeypatch):
+    """Simulated unsupported branch: forces the probe itself to raise
+    OperationalError (as it would on SQLite < 3.45), independent of whether
+    this CI's actual SQLite build supports JSON5 or not."""
+    import opencrab.stores._sql_dialect as dialect_mod
+
+    reset_json5_valid_cache_for_testing()
+
+    class _RaisingConn:
+        def execute(self, sql):
+            raise sqlite3.OperationalError("unrecognized token")
+
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", None)
+    assert sqlite_json5_valid_supported(_RaisingConn()) is False
+    assert json_valid_expr("properties") == "json_valid(properties)"
+
+
+def test_json_get_safe_postgres_is_identical_to_json_get():
+    assert POSTGRES.json_get_safe("properties", "pack_id") == POSTGRES.json_get(
+        "properties", "pack_id"
+    )
+
+
+def test_json_get_safe_real_connection_null_for_malformed_row_not_exception():
+    """RED: the bare json_extract this replaces raises OperationalError for
+    the ENTIRE query the instant it touches the malformed row (issue #415's
+    core symptom) -- reproduced first so the GREEN assertion below is
+    provably a fix, not a no-op."""
+    conn = _malformed_properties_db()
+    with pytest.raises(sqlite3.OperationalError, match="malformed JSON"):
+        conn.execute(f"SELECT id, {SQLITE.json_get('properties', 'pack_id')} FROM t").fetchall()
+
+    # GREEN: json_get_safe survives the same query and NULLs out only the
+    # malformed row.
+    expr = SQLITE.json_get_safe("properties", "pack_id")
+    rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+    assert rows == {"good": "P", "bad": None}
+    conn.close()
+
+
+def test_json_truthy_text_guard_excludes_malformed_row_real_connection():
+    """RED/GREEN pair for the ``json_truthy_text`` SQLite branch's new outer
+    ``json_valid`` guard (4-A)."""
+    conn = _malformed_properties_db()
+    inner_only = (
+        "CASE json_type(properties, '$.pack_id')"
+        " WHEN 'text' THEN NULLIF(json_extract(properties, '$.pack_id'), '')"
+        " ELSE NULL END"
+    )
+    with pytest.raises(sqlite3.OperationalError, match="malformed JSON"):
+        conn.execute(f"SELECT id, {inner_only} FROM t").fetchall()
+
+    guarded = SQLITE.json_truthy_text("properties", "pack_id")
+    rows = dict(conn.execute(f"SELECT id, {guarded} FROM t").fetchall())
+    assert rows == {"good": "P", "bad": None}
+    conn.close()
+
+
+def test_json_truthy_text_json5_style_row_is_not_excluded_when_simulated_on(monkeypatch):
+    """JSON5 대조군(리드 재정 — 함수별 행동 시험 요구): `json_truthy_text`가
+    JSON5 지원 시뮬레이션 하에서 트레일링 콤마 행을 진짜 손상과 혼동하지
+    않는지 이 함수 자체의 렌더링으로 직접 확인한다. `json_valid_expr` 단위
+    시험만으로는 이 함수가 나중에 `json_valid_expr(col)` 대신 `json_valid(col)`
+    을 직접 박는 식으로 바뀌어도 잡지 못한다 — 이 시험은 그 회귀를 이 함수의
+    실제 SQL 렌더링으로 잡는다."""
+    if not sqlite_json5_valid_supported():
+        pytest.skip("this SQLite build has no JSON5 support to simulate positively")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (id TEXT, properties TEXT)")
+    conn.execute("INSERT INTO t VALUES ('json5', '{\"pack_id\": \"P\",}')")  # trailing comma
+    conn.execute("INSERT INTO t VALUES ('good', '{\"pack_id\": \"Q\"}')")
+    conn.execute("INSERT INTO t VALUES ('bad', 'not valid json {')")
+    conn.commit()
+
+    import opencrab.stores._sql_dialect as dialect_mod
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", True)
+    expr = SQLITE.json_truthy_text("properties", "pack_id")
+    rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+    assert rows["json5"] == "P", "JSON5 행은 정상 행처럼 값이 나와야 한다"
+    assert rows["good"] == "Q"
+    assert rows["bad"] is None, "진짜 손상 행은 여전히 배제돼야 한다"
+    conn.close()
+
+
+def test_json_truthy_text_json5_style_row_is_a_known_limitation_when_simulated_off(monkeypatch):
+    """알려진 한계 대조군(`json_truthy_text` 쪽): 1-인자 엄격 폴백에서는
+    JSON5 행도 진짜 손상과 구분되지 않고 배제된다 -- 4-0 문서화 내용과
+    일치하는지 이 함수 자체로 재확인한다."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (id TEXT, properties TEXT)")
+    conn.execute("INSERT INTO t VALUES ('json5', '{\"pack_id\": \"P\",}')")  # trailing comma
+    conn.execute("INSERT INTO t VALUES ('good', '{\"pack_id\": \"Q\"}')")
+    conn.commit()
+
+    import opencrab.stores._sql_dialect as dialect_mod
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", False)
+    expr = SQLITE.json_truthy_text("properties", "pack_id")
+    rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+    assert rows["good"] == "Q"
+    assert rows["json5"] is None, "알려진 한계: 폴백에서는 JSON5 행도 배제된다"
+    conn.close()
+
+
+def test_genuinely_malformed_row_excluded_regardless_of_json5_support(monkeypatch):
+    """No-regression check (rev.4, 4-0 introduction): a truly broken row must
+    be NULLed out by json_get_safe whether or not this run simulates JSON5
+    support -- 4-0 changes which json_valid() arity is used, never whether a
+    genuinely malformed row is judged invalid."""
+    import opencrab.stores._sql_dialect as dialect_mod
+
+    conn = _malformed_properties_db()
+    for supported in (True, False):
+        monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", supported)
+        expr = SQLITE.json_get_safe("properties", "pack_id")
+        rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+        assert rows["bad"] is None, f"genuinely malformed row leaked through (supported={supported})"
+        assert rows["good"] == "P"
+    conn.close()
+
+
+def test_json5_style_row_is_not_excluded_when_json5_support_is_simulated_on(monkeypatch):
+    """Positive control group (rev.4, 4-0/1): a JSON5-flavored-but-parseable
+    row (trailing comma) must NOT be treated as malformed when json_valid's
+    2-arg JSON5 mode is in effect -- distinguishing "SQLite's json_extract
+    can parse it" (true) from "strict RFC8259 json_valid(x) says invalid"
+    (also true, and would be a false positive if used alone)."""
+    import opencrab.stores._sql_dialect as dialect_mod
+
+    # This machine's actual json_valid(x, 3) support decides whether the
+    # trailing-comma probe row below is even parseable by json_extract in
+    # the first place (SQLite's own JSON5 lenience, independent of our
+    # json_valid_expr helper) -- skip the positive branch if this build
+    # can't parse JSON5 text at all, since then there is nothing to admit.
+    if not sqlite_json5_valid_supported():
+        pytest.skip("this SQLite build has no JSON5 support to simulate positively")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (id TEXT, properties TEXT)")
+    conn.execute("INSERT INTO t VALUES ('json5', '{\"pack_id\": \"P\",}')")  # trailing comma
+    conn.execute("INSERT INTO t VALUES ('good', '{\"pack_id\": \"Q\"}')")
+    conn.execute("INSERT INTO t VALUES ('bad', 'not valid json {')")
+    conn.commit()
+
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", True)
+    expr = SQLITE.json_get_safe("properties", "pack_id")
+    rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+    assert rows["json5"] == "P", "JSON5-style row must be admitted like a normal row, not excluded"
+    assert rows["good"] == "Q"
+    assert rows["bad"] is None, "a genuinely malformed row must still be excluded"
+    conn.close()
+
+
+def test_json5_style_row_is_a_known_limitation_when_json5_support_is_simulated_off(monkeypatch):
+    """Documented fallback limitation (4-0): with the 1-arg strict
+    ``json_valid(x)`` fallback, a JSON5-style row is indistinguishable from
+    a genuinely malformed one and gets excluded too -- confirmed here as an
+    intentional, documented gap, not silently discovered later."""
+    import opencrab.stores._sql_dialect as dialect_mod
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (id TEXT, properties TEXT)")
+    conn.execute("INSERT INTO t VALUES ('json5', '{\"pack_id\": \"P\",}')")  # trailing comma
+    conn.execute("INSERT INTO t VALUES ('good', '{\"pack_id\": \"Q\"}')")
+    conn.commit()
+
+    monkeypatch.setattr(dialect_mod, "_JSON5_VALID_SUPPORTED", False)
+    expr = SQLITE.json_get_safe("properties", "pack_id")
+    rows = dict(conn.execute(f"SELECT id, {expr} FROM t").fetchall())
+    assert rows["good"] == "Q"
+    assert rows["json5"] is None, (
+        "known limitation: strict-mode fallback cannot tell JSON5 apart from"
+        " genuinely malformed JSON -- if this now passes, the fallback"
+        " behavior changed and 4-0's documented gap needs updating too"
+    )
+    conn.close()
+
+
+def test_json_str_in_raw_extraction_survives_malformed_row_in_select_list_position():
+    """issue #415 design.md §8 row 4 (rev.4 정정, 리드 재정 3번): codex 2라운드가
+    재현한 대로, ``_json_str_in``의 ``raw`` 값 추출은 WHERE-불리언 위치뿐 아니라
+    SELECT 리스트 위치에서도 안전해야 한다. RED: 가드 없는 바닥 추출을 SELECT
+    리스트에 두면 손상 행에서 그대로 죽는다. GREEN 판정은 정확한 반환값이 아니라
+    **그 행이 결과 집합에서 빠지는지**로 한다 -- 실측(SQLite 3진 논리)상 손상
+    행은 ``type_check=0``, ``raw=NULL``이라 ``0 AND NULL = 0``(falsy지만 NULL은
+    아니다)이기 때문이다."""
+    from opencrab.stores._sql_doc_base import _json_str_in
+
+    conn = _malformed_properties_db()
+
+    # RED: bare unguarded extraction (pre-#415 shape) in a SELECT-list
+    # position -- codex 2라운드가 실측으로 재현한 정확한 실패 위치.
+    with pytest.raises(sqlite3.OperationalError, match="malformed JSON"):
+        conn.execute(
+            f"SELECT id, {SQLITE.json_get('properties', 'pack_id')} FROM t"
+        ).fetchall()
+
+    # GREEN (SELECT-list position): _json_str_in's own raw extraction
+    # (json_get_safe internally) survives the identical position/data.
+    safe_extract = SQLITE.json_get_safe("properties", "pack_id")
+    rows = dict(conn.execute(f"SELECT id, {safe_extract} FROM t").fetchall())
+    assert rows == {"good": "P", "bad": None}
+
+    # GREEN (WHERE-boolean position, rev.4 GREEN criterion): the malformed
+    # row is excluded from the result set -- not asserted via its combined
+    # expression's truth value, but via row presence/absence.
+    frag, transform = _json_str_in(SQLITE, "properties", "pack_id", ":packs")
+    where_rows = conn.execute(
+        f"SELECT id FROM t WHERE {frag}", {"packs": transform(["P"])}
+    ).fetchall()
+    assert {r[0] for r in where_rows} == {"good"}
+    conn.close()

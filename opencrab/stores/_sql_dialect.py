@@ -64,12 +64,60 @@ of the unification.
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
 ColumnKind = Literal["text", "json", "timestamp"]
+
+# issue #415: process-wide cache for whether this SQLite build's json_valid()
+# accepts the 2-arg (flag) form. See json_valid_expr() below for why this is
+# feature-detected by executing a probe query rather than compared against
+# sqlite3.sqlite_version -- the capability is a property of the linked SQLite
+# library, identical for every connection in this process.
+_JSON5_VALID_SUPPORTED: bool | None = None
+
+
+def sqlite_json5_valid_supported(conn: sqlite3.Connection | None = None) -> bool:
+    """SQLite `json_valid(x, Y)`의 두 번째 인자(플래그) 지원 여부. 이
+    능력은 연결이 바인딩된 SQLite 라이브러리 빌드 자체의 속성이라 같은
+    프로세스의 어느 연결로 검출해도 같은 값이 나온다 -- 버전 문자열
+    비교 대신 `SELECT json_valid('{}', 3)`를 실제로 실행해 검출하고,
+    한 번 검출한 결과는 프로세스 수명 동안 캐시한다(연결마다 다시
+    검출하지 않음 -- 다시 검출해도 같은 프로세스 안에서는 항상 같은
+    값이 나오므로 과잉 작업일 뿐이다)."""
+    global _JSON5_VALID_SUPPORTED
+    if _JSON5_VALID_SUPPORTED is not None:
+        return _JSON5_VALID_SUPPORTED
+    probe = conn or sqlite3.connect(":memory:")
+    try:
+        probe.execute("SELECT json_valid('{}', 3)")
+        _JSON5_VALID_SUPPORTED = True
+    except sqlite3.OperationalError:
+        _JSON5_VALID_SUPPORTED = False
+    finally:
+        if conn is None:
+            probe.close()
+    return _JSON5_VALID_SUPPORTED
+
+
+def reset_json5_valid_cache_for_testing() -> None:
+    """시험 전용. 캐시를 지워 두 분기(지원/미지원)를 강제로 재검출하게
+    한다 -- 실제 SQLite 버전과 무관하게 두 렌더링 경로를 각각 시험하는
+    유일한 방법."""
+    global _JSON5_VALID_SUPPORTED
+    _JSON5_VALID_SUPPORTED = None
+
+
+def json_valid_expr(col: str, *, conn: sqlite3.Connection | None = None) -> str:
+    """`json_valid(col)` 자리를 전부 대신하는 단일 합류점. 검출 결과에
+    따라 `json_valid(col, 3)`(JSON5 허용) 또는 `json_valid(col)`(엄격
+    RFC8259, SQLite < 3.45의 알려진 한계)을 낸다."""
+    if sqlite_json5_valid_supported(conn):
+        return f"json_valid({col}, 3)"
+    return f"json_valid({col})"
 
 
 @dataclass(frozen=True)
@@ -155,6 +203,19 @@ class SqlDialect:
             return f"json_extract({col}, '$.{key}')"
         return f"{col}->>'{key}'"
 
+    def json_get_safe(self, col: str, key: str) -> str:
+        """issue #415: same value as ``json_get()``, but SQL NULL instead of
+        an exception when ``col`` is syntactically malformed JSON. The
+        rendered text differs from ``json_get()`` and therefore from
+        ``idx_nodes_pack``'s DDL expression -- callers that need the DDL's
+        exact index-matching literal (``_scoped_node_where``'s clause 1) must
+        keep using ``json_get()`` and handle malformed rows some other way
+        (see that method's ``safe`` kwarg)."""
+        raw = self.json_get(col, key)
+        if self.name == "sqlite":
+            return f"(CASE WHEN {json_valid_expr(col)} THEN {raw} ELSE NULL END)"
+        return raw
+
     def json_truthy_text(self, col: str, key: str) -> str:
         """Canonical TEXT form of a JSON field, or SQL NULL — mirroring
         Python's truthiness test in ``opencrab/stores/_graph_common.py``'s
@@ -208,7 +269,13 @@ class SqlDialect:
         raw = self.json_get(col, key)
         if self.name == "sqlite":
             typ = f"json_type({col}, '$.{key}')"
-            return (
+            # issue #415: json_type() itself (the CASE selector) throws on a
+            # syntactically malformed properties/metadata value, before any
+            # WHEN branch runs -- wrap the whole CASE in an outer guard so
+            # one broken row can't take down the entire query. A broken row
+            # folds to NULL, i.e. "pack_id absent", matching this method's
+            # existing falsy-exclusion contract rather than adding a new one.
+            inner = (
                 f"(CASE {typ}"
                 f" WHEN 'null' THEN NULL"
                 f" WHEN 'false' THEN NULL"
@@ -219,6 +286,7 @@ class SqlDialect:
                 f" ELSE CAST({raw} AS TEXT)"  # missing key, object, array
                 f" END)"
             )
+            return f"(CASE WHEN NOT {json_valid_expr(col)} THEN NULL ELSE {inner} END)"
         node = f"{col}->'{key}'"
         typ = f"jsonb_typeof({node})"
         return (

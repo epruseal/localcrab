@@ -156,6 +156,12 @@ class PGGraphStore(_SqlGraphStoreBase):
         with self._conn() as conn:
             return conn.execute(self._text(sql), params).fetchone()
 
+    def _is_malformed_json_error(self, exc: Exception) -> bool:
+        # issue #415 section 5: jsonb rejects syntactically malformed JSON at
+        # write time, so this error class is structurally unreachable on the
+        # PG path -- placeholder only, never triggers a retry here.
+        return False
+
     GRAPH_WRITE_NAMESPACE = 80480
     GRAPH_WRITE_KEY = 1
 

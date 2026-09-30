@@ -80,13 +80,26 @@ class TestAnchorSqlDialectShape:
     )
 
     def test_sqlite_builder_matches_the_historical_literal_modulo_whitespace(self):
-        """유일한 차이는 `_dialect.json_get` 이 내는 쉼표 뒤 공백 하나뿐이다
-        (`json_extract(properties,'$.k')` vs `json_extract(properties, '$.k')`)
-        — 토큰 사이 공백 유무는 SQL 의미에 영향이 없으므로 **전체 공백 제거**
-        비교로 정규화한다(단순 런-압축은 무공백↔유공백 차이를 못 잡는다)."""
+        """이슈 #415 이후 `created_by` 추출은 `json_get`이 아니라
+        `json_get_safe`를 쓴다 — 깨진 JSON 행이 이 COALESCE 비교에서 예외
+        대신 NULL로 빠지게 하는 가드다. 그래서 옛 리터럴(`_OLD_SQLITE_LITERAL`)
+        그대로는 더 이상 일치하지 않는다. 이 테스트는 옛 리터럴에서
+        `json_extract(...)` 자리만 `SQLITE.json_get_safe(...)`의 실제 출력으로
+        치환한 기대값과 비교한다 — 하드코딩한 `json_valid` 변형 형태(1-인자 vs
+        2-인자) 대신 실제 방언 헬퍼를 호출해, 이 환경의 SQLite가 JSON5
+        `json_valid(x,3)`을 지원하든 안 하든(4-0 기능 검출) 이 테스트가 그
+        차이로 깨지지 않게 한다. 그 외 유일한 차이는 `_dialect.json_get`이
+        내는 쉼표 뒤 공백 하나뿐이므로(`json_extract(properties,'$.k')` vs
+        `json_extract(properties, '$.k')`) **전체 공백 제거** 비교로
+        정규화한다(단순 런-압축은 무공백↔유공백 차이를 못 잡는다)."""
         built = pack_load.build_anchor_sql(SQLITE)
         norm = lambda s: re.sub(r"\s+", "", s)  # noqa: E731
-        assert norm(built) == norm(self._OLD_SQLITE_LITERAL), (
+        guarded_created_by = SQLITE.json_get_safe("properties", "created_by")
+        expected = (
+            "(node_id GLOB 'dataset:*'"
+            f" OR COALESCE({guarded_created_by},'') = 'title-backfill')"
+        )
+        assert norm(built) == norm(expected), (
             f"공백 제거 후에도 다르다 — 의미가 바뀌었을 수 있다: {built!r}")
 
     def test_module_constant_anchor_sql_is_the_sqlite_builder_output(self):
@@ -526,6 +539,12 @@ class _PgFakeGraphStore(_SqlGraphStoreBase):
         if not self._available:
             raise RuntimeError("not available")
 
+    def _is_malformed_json_error(self, exc: Exception) -> bool:
+        # issue #415: PG's jsonb rejects malformed JSON at write time, so
+        # this path is structurally unreachable on PG -- mirrors
+        # pg_graph_store.py's real implementation.
+        return False
+
 
 class _PgFakeDocStore(_SqlDocStoreBase):
     _dialect = POSTGRES
@@ -711,3 +730,42 @@ class TestPgShapedFakeStores:
         with pytest.raises(_PgShapeViolationError):
             docs._exec_write(
                 'DELETE FROM "pgfake".doc_sources_fts WHERE source_id IN (:a)', {"a": "x"})
+
+
+class TestCountMalformedPropertiesPgConstantZero:
+    """issue #415 design.md §8 last row: on PG, ``count_malformed_properties()``
+    must return an all-zero constant WITHOUT actually scanning any table --
+    PG's jsonb column type structurally cannot hold malformed JSON (design
+    §5), so there is nothing to count, and the method must not even try."""
+
+    def test_graph_store_returns_all_zero_without_a_fetch(self, monkeypatch):
+        graph, _docs = _pg_fakes()
+        graph.seed_node("Document", "n1", "pack-1")
+        calls = []
+        monkeypatch.setattr(
+            graph, "_fetch_one", lambda sql, params: calls.append(sql) or (0,)
+        )
+
+        counts = graph.count_malformed_properties()
+
+        assert counts == {
+            graph._table("graph_nodes"): 0,
+            graph._table("graph_edges"): 0,
+        }
+        assert calls == [], "PG branch must not scan any table"
+
+    def test_doc_store_returns_all_zero_without_a_fetch(self, monkeypatch):
+        _graph, docs = _pg_fakes()
+        docs.seed_source("s1", "본문", pack_id="pack-1")
+        calls = []
+        monkeypatch.setattr(
+            docs, "_fetch_one", lambda sql, params: calls.append(sql) or (0,)
+        )
+
+        counts = docs.count_malformed_properties()
+
+        assert counts == {
+            docs._table("doc_sources"): 0,
+            docs._table("doc_nodes"): 0,
+        }
+        assert calls == [], "PG branch must not scan any table"
