@@ -561,8 +561,9 @@ def repair_incomplete_packs(
     ``delete_pack`` (frees the copied content) followed by the caller
     re-forking. Two limits on that procedure, precisely:
 
-    - ``delete_pack`` (``opencrab/pack/load.py``) takes no ``sql`` handle,
-      so it does not touch the registry -- the stranded ``partial`` row
+    - ``delete_pack`` (``opencrab/pack/load.py``) takes a required ``sql``
+      handle only to check that the caller owns the pack (#434), so it
+      does not modify the registry -- the stranded ``partial`` row
       stays, and it keeps occupying the fork's preferred slug (``{src}-fork``
       by default). A re-fork requesting that same slug does not fail on
       this; it relies on ``begin_pack_creation``'s existing collision
