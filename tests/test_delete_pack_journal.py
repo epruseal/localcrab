@@ -183,12 +183,24 @@ def _registry(tmp_path):
     return SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
 
 
-def _delete(pack_name, graph, docs, vec, **kwargs):
-    """`delete_pack` 을 `_OWNER` 주체에 묶어 부른다(#434 소유권 게이트).
+def _register(tmp_path, pack_name: str, owner: str = _OWNER):
+    """내용 없이 등록부 행만 만든다(삭제 게이트는 소유 행을 요구한다)."""
+    from opencrab.pack.ownership import create_pack as _create_pack
+    from opencrab.pack.ownership import get_pack as _get_pack
+
+    sql = _registry(tmp_path)
+    ensure_test_user(sql, owner)
+    if _get_pack(sql, pack_name) is None:
+        _create_pack(sql, owner, pack_name)
+    return sql
+
+
+def _delete(pack_name, graph, docs, vec, *, user: str = _OWNER, **kwargs):
+    """`delete_pack` 을 `user`(기본 `_OWNER`) 주체에 묶어 부른다(#434 소유권 게이트).
     `sql=` 은 호출부가 반드시 넘긴다(필수 키워드)."""
     from opencrab.auth import Principal, principal_scope
 
-    principal = Principal(user_id=_OWNER, is_local=True, disabled=False)
+    principal = Principal(user_id=user, is_local=True, disabled=False)
     with principal_scope(principal):
         return pack_load.delete_pack(pack_name, graph, docs, vec, **kwargs)
 
@@ -841,6 +853,7 @@ class TestVectorUnconfirmedNeverBecomesDone:
         vec = _FakeChromaVec({"a1": "vecpack", "a2": "vecpack"})
         vec._collection.malformed_get_wheres = {1: {"no_ids_key": []}}
 
+        _register(tmp_path, "vecpack")
         _n, _c, chunk_vec_del = _delete("vecpack", graph, docs, vec, sql=_registry(tmp_path))
         assert chunk_vec_del == 0
         assert not vec._collection.delete_calls
@@ -854,6 +867,7 @@ class TestVectorUnconfirmedNeverBecomesDone:
 
         # 복구된 뒤(malformed 없이) resume=True로 재실행하면 실제로 지워지고 done=True로 수렴한다.
         vec2 = _FakeChromaVec({"a1": "vecpack", "a2": "vecpack"})
+        _register(tmp_path, "vecpack")
         _delete("vecpack", graph, docs, vec2, resume=True, sql=_registry(tmp_path))
         journal2 = delete_journal.load_journal(tmp_path, "vecpack")
         assert journal2["axes"]["vectors"]["done"] is True
@@ -1585,7 +1599,7 @@ class TestMultipleCrashPoints:
 
             # 1단계: 플래그 없이 재실행 — 보고만 하고 멈춘다, 무쓰기.
             with pytest.raises(delete_journal.DeletePackJournalPending):
-                _delete("crash-pack", graph, docs, _NoVec(), sql=_registry(tmp_path))
+                _delete("crash-pack", graph, docs, _NoVec(), user="crash-user", sql=_registry(tmp_path))
             journal_still = delete_journal.load_journal(tmp_path, "crash-pack")
             assert journal_still == journal_before, (
                 "플래그 없는 재실행인데 저널이 바뀌었다 — 무쓰기 계약 위반"
@@ -1596,7 +1610,7 @@ class TestMultipleCrashPoints:
             assert graph.get_node("Document", "k2") is not None
 
             # 2단계: 명시 플래그로 완주.
-            _n, _c, _v = _delete("crash-pack", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
+            _n, _c, _v = _delete("crash-pack", graph, docs, _NoVec(), user="crash-user", resume=True, sql=_registry(tmp_path))
             journal_after = delete_journal.load_journal(tmp_path, "crash-pack")
             assert journal_after["axes"]["graph_nodes"]["done"] is True
             assert journal_after["axes"]["vectors"]["done"] is True
@@ -1689,12 +1703,12 @@ class TestMultipleCrashPoints:
             # 1단계: 플래그 없이 재실행 — 보고만 하고 멈춘다, doc 축 재실행 없음.
             with mock.patch.object(docs, "delete_node_doc", side_effect=_counted):
                 with pytest.raises(delete_journal.DeletePackJournalPending):
-                    _delete("crash-pack-2", graph, docs, _NoVec(), sql=_registry(tmp_path))
+                    _delete("crash-pack-2", graph, docs, _NoVec(), user="crash-user", sql=_registry(tmp_path))
             assert doc_calls == [], f"플래그 없는 재실행인데 doc 축이 실행됐다: {doc_calls}"
 
             # 2단계: 명시 플래그로 완주 — 그래도 doc 축은 이미 done이라 재실행 안 됨.
             with mock.patch.object(docs, "delete_node_doc", side_effect=_counted):
-                _delete("crash-pack-2", graph, docs, _NoVec(), resume=True, sql=_registry(tmp_path))
+                _delete("crash-pack-2", graph, docs, _NoVec(), user="crash-user", resume=True, sql=_registry(tmp_path))
 
             assert doc_calls == [], (
                 f"doc 축이 이미 done인데도 resume=True 재개가 다시 실행했다: {doc_calls}"
@@ -1813,6 +1827,7 @@ class TestResumeSkipDoesNotReuseCountInReturnValue:
         graph, docs = live
         vec = _FakeChromaVec({"v1": "vectorskip-pack", "v2": "vectorskip-pack"})
 
+        _register(tmp_path, "vectorskip-pack")
         _delete("vectorskip-pack", graph, docs, vec, sql=_registry(tmp_path))
         capsys.readouterr()  # 1회차 출력은 버린다 — 2회차(재개) 출력만 본다
         journal = delete_journal.load_journal(tmp_path, "vectorskip-pack")
@@ -1911,6 +1926,7 @@ class TestLockContentionIsReallyObserved:
         t.start()
         try:
             assert holder_ready.wait(timeout=5), "holder가 락을 못 잡았다"
+            _register(tmp_path, "busy-pack")
             with pytest.raises(TimeoutError):
                 _delete("busy-pack", graph, docs, _NoVec(), lock_timeout=0.2, sql=_registry(tmp_path))
         finally:

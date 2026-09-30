@@ -70,8 +70,7 @@ from opencrab.pack.normalize import (
     transform_chunk_meta,
     transform_node,
 )
-from opencrab.pack.ownership import get_pack
-from opencrab.pack.write_gate import authorize
+from opencrab.pack.write_gate import authorize, authorize_delete
 from opencrab.stores._sql_dialect import SQLITE, SqlDialect, json_valid_expr
 from opencrab.stores._vector_base import slot_owner
 
@@ -1305,24 +1304,35 @@ def delete_pack(
     삭제 계약을 깨뜨린다는 것이 이후 리뷰에서 드러났다.
 
     저널이 있으면 기본은 **탐지·보고뿐**이다(`DeletePackJournalPending`, 무쓰기).
-    `resume=True` 를 명시해야 완주한다. `sql` 이 주어졌고 저널 생성 시점에 팩 동일성
-    스냅샷(레지스트리 행의 `created_at`)을 남겼다면, 재개 시점에 그 행이 사라졌거나
-    `created_at` 이 다르면(부정 신호) `resume=True` 라도 `DeletePackJournalConflict`
-    로 거부한다. 자동 재개는 없다 — 모든 재개는 운영자의 명시 확인을 요구한다.
+    `resume=True` 를 명시해야 완주한다. 저널 생성 시점에 팩 동일성 스냅샷(레지스트리
+    행의 `created_at`)을 남겼다면, 재개 시점에 `created_at` 이 다르면(부정 신호)
+    `resume=True` 라도 `DeletePackJournalConflict` 로 거부한다. 자동 재개는 없다 —
+    모든 재개는 운영자의 명시 확인을 요구한다.
+
+    **소유권 인가(#434).** `sql` 은 키워드 전용 필수 인자다(등록부 `SQLStore`).
+    진입에서 `require_live_data`, principal 확인, `write_gate.authorize_delete` 순으로
+    건 뒤에야 잠금 파일, 저널, 스토어에 닿는다. 잠금을 잡은 뒤 저널을 읽기 전에 한 번
+    더 건다. 소유자는 팩 상태와 무관하게 지울 수 있다(`creating`/`partial` 팩의 잔재를
+    회수하는 운영자 경로다). 비소유자는 공개 여부와 무관하게 미완성 팩을 못 보고
+    (`PackNotFoundError`), ready 팩은 지우지 못한다. 등록부 행이 사라진 팩의 재개는
+    이제 `DeletePackJournalConflict` 가 아니라 `PackNotFoundError` 로 먼저 끝난다.
     """
     require_live_data("delete_pack")
+    principal = _require_bound_principal()
+    # 비소유자는 잠금 파일과 저널에 닿기 전에 여기서 거부된다.
+    authorize_delete(sql, principal, pack_name)
     _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
     _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
 
     with file_lock(delete_journal.lock_filename(pack_name), timeout=lock_timeout):
+        # 잠금을 기다리는 동안 소유권이 바뀌었을 수 있다. 저널을 읽기 전에 다시 건다.
+        # 동일성 스냅샷도 이 검사가 돌려준 행에서 만든다(별도 조회로 갈라지지 않게).
+        row = authorize_delete(sql, principal, pack_name)
         data_dir = lock_data_dir()
         journal = delete_journal.load_journal(data_dir, pack_name)
         existed_before = journal is not None
 
-        current_identity = None
-        if sql is not None:
-            row = get_pack(sql, pack_name)
-            current_identity = {"created_at": row["created_at"]} if row else None
+        current_identity = {"created_at": row["created_at"]}
 
         if journal is not None:
             if not resume:
@@ -2928,8 +2938,18 @@ def incremental_finalize(
 
     반환: {"node_del":…, "chunk_del":…, "edge_del":…, "vec_orphan_del":…,
            "doc_orphan_del":…}
+
+    `sql`(#434): 키워드 전용 필수 인자다. 이 함수는 라이브에만 남은 노드, 문서, 청크,
+    엣지, 벡터를 **지운다.** 진입에서 `require_live_data`, principal 확인,
+    `authorize(sql, principal, pack_name)` 순으로 건 뒤에야 어떤 스토어에든 닿는다.
+    바인딩됐어도 이 팩의 소유자가 아니면(또는 팩이 ready 가 아니면)
+    `PackNotFoundError`/`PackForbiddenError` 로 아무것도 지우지 않고 끝난다. 청크 축
+    `load_chunks_incremental` 과 같은 호출당 1회 검사이며 같은 의도한 모서리(적재 도중
+    소유권 변경)를 갖는다. 호출자는 증분 적재에 넘긴 것과 같은 등록부 `SQLStore` 를 넘긴다.
     """
     require_live_data("incremental_finalize")
+    principal = _require_bound_principal()
+    authorize(sql, principal, pack_name)
     _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
     _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
     live_nodes  = live["nodes"]

@@ -152,7 +152,8 @@ class TestBatched:
 # of them (owned by the same fixed test principal) instead of making each
 # test call create_pack for itself.
 _LIVE_TEST_USER = "test-user"
-_LIVE_TEST_PACKS = ("pack-1", "pack-a", "pack-b", "own-pack", "다른팩", "p")
+_LIVE_TEST_PACKS = ("pack-1", "pack-a", "pack-b", "own-pack", "다른팩", "p",
+                    "pack-c", "없는-팩", "target")   # #434: 삭제 게이트가 등록 행을 요구한다
 
 
 @pytest.fixture
