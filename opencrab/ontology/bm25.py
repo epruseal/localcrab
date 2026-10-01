@@ -101,11 +101,20 @@ class BM25Index:
     Usage:
         index = BM25Index.build(doc_store.list_nodes(limit=10000))
         results = index.search("machine learning", pack_ids=["my-pack"], limit=10)
+
+    The index is a build-time snapshot. ``build`` computes token lists, IDF,
+    average length and pack membership (``_pack_buckets``) once. Do not
+    mutate the input nodes afterwards. ``search`` re-checks each candidate's
+    pack against the requested scope, so a node moved out of a pack never
+    appears for it. A node moved into a pack stays invisible until a rebuild.
     """
 
     def __init__(self) -> None:
         self._docs: list[dict[str, Any]] = []       # raw node docs
         self._tokens: list[list[str]] = []           # tokenised docs
+        # #411: scope_pack_id -> ascending doc positions. Lets a search walk
+        # only the requested packs' documents instead of the whole index.
+        self._pack_buckets: dict[str, list[int]] = {}
         self._df: Counter[str] = Counter()           # document frequency
         self._avgdl: float = 0.0                     # average document length
         self._idf: dict[str, float] = {}             # IDF cache
@@ -142,6 +151,10 @@ class BM25Index:
         idx = cls()
         idx._docs = nodes
         idx._tokens = [_tokenize(_node_text(n)) for n in nodes]
+        for pos, node in enumerate(nodes):
+            pid = scope_pack_id(node)
+            if pid is not None:
+                idx._pack_buckets.setdefault(pid, []).append(pos)
 
         # Document frequency
         for toks in idx._tokens:
@@ -219,35 +232,42 @@ class BM25Index:
 
         scores: list[tuple[int, float]] = []
 
-        for i, (doc, toks) in enumerate(zip(self._docs, self._tokens)):
-            # Space filter
-            if spaces and doc.get("space") not in spaces:
-                continue
-            # Pack filter (#147). Unconditional: the old `if pack_ids and`
-            # guard made an EMPTY pack set mean "no filter", so a principal
-            # who may read no pack would have matched every document in the
-            # index. The index itself is a process-wide singleton holding
-            # every user's nodes -- isolation rests entirely on this line.
-            if not in_pack_scope(doc, _pack_set):
-                continue
-
-            dl = len(toks)
-            tf_map = Counter(toks)
-            score = 0.0
-
-            for term in q_tokens:
-                if term not in self._idf:
+        # #411: walk only the documents of the requested packs. The bucket is
+        # a build-time snapshot, so each candidate's pack is re-checked with
+        # the same strict rule (see the class docstring).
+        for pack_id in _pack_set:
+            for i in self._pack_buckets.get(pack_id, ()):
+                doc = self._docs[i]
+                # Space filter
+                if spaces and doc.get("space") not in spaces:
                     continue
-                tf = tf_map.get(term, 0)
-                idf = self._idf[term]
-                numerator = tf * (_K1 + 1)
-                denominator = tf + _K1 * (1 - _B + _B * dl / max(self._avgdl, 1))
-                score += idf * (numerator / denominator)
+                # Pack filter (#147). Unconditional: an EMPTY pack set never
+                # reaches this loop, and a document with no pack_id is in no
+                # bucket. The index is a process-wide singleton holding every
+                # user's nodes; isolation rests on this scope check.
+                if not in_pack_scope(doc, _pack_set):
+                    continue
 
-            if score > 0:
-                scores.append((i, score))
+                toks = self._tokens[i]
+                dl = len(toks)
+                tf_map = Counter(toks)
+                score = 0.0
 
-        scores.sort(key=lambda x: x[1], reverse=True)
+                for term in q_tokens:
+                    if term not in self._idf:
+                        continue
+                    tf = tf_map.get(term, 0)
+                    idf = self._idf[term]
+                    numerator = tf * (_K1 + 1)
+                    denominator = tf + _K1 * (1 - _B + _B * dl / max(self._avgdl, 1))
+                    score += idf * (numerator / denominator)
+
+                if score > 0:
+                    scores.append((i, score))
+
+        # Ties keep ascending document position, as the old stable
+        # reverse-sort over a position-ordered scan did.
+        scores.sort(key=lambda x: (-x[1], x[0]))
 
         results = []
         for idx, score in scores[:limit]:
