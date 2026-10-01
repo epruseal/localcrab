@@ -269,7 +269,7 @@ SELECT COUNT(*) FROM graph_nodes
 `load_chunks_incremental` 이 이미 이렇게 동작한다. 재현 명령:
 `pytest tests/test_pack_load_r16_node_same_delete_gate.py`.
 
-같은 종류의 공백이 `incremental_finalize` 와 `delete_pack` 에 남아 있다(#434).
+같은 종류의 공백이던 `incremental_finalize` 와 `delete_pack` 은 #434 에서 닫혔다(아래 6절의 삭제 진입점 게이트).
 
 ### 4. 앵커 판정은 **한 곳에서만** 정의한다
 
