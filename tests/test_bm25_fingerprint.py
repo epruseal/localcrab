@@ -1353,14 +1353,78 @@ def test_411_per_pack_search_pins_state_across_publish() -> None:
         hybrid.shutdown_bm25()
 
 
-def test_411_per_pack_search_returns_none_for_loop_fallback() -> None:
+def test_411_per_pack_search_empty_pack_ids_returns_empty_dict() -> None:
     hybrid, _doc_store = _warm_hybrid(["a"])
     try:
         assert hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=[]) == {}
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_per_pack_search_instance_override_returns_none_before_probe() -> None:
+    hybrid, doc_store = _warm_hybrid(["a"])
+    try:
+        hybrid._bm25_search = lambda *a, **k: []  # instance override (test double)
+        doc_store.bm25_fingerprint.reset_mock()
+        assert hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=["a"]) is None
+        assert doc_store.bm25_fingerprint.call_count == 0
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_per_pack_search_exception_returns_none() -> None:
+    hybrid, _doc_store = _warm_hybrid(["a"])
+    try:
         hybrid._bm25.state.index.search = MagicMock(side_effect=RuntimeError("boom"))
         assert hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=["a"]) is None
-        hybrid._bm25_search = lambda *a, **k: []  # instance override (test double)
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_per_pack_search_cold_build_raise_returns_none() -> None:
+    doc_store = MagicMock()
+    doc_store.available = True
+    hybrid = _hybrid(doc_store)
+    try:
+        hybrid._bm25.ensure_built = MagicMock(side_effect=RuntimeError("cold build"))
+        assert hybrid._bm25.state is None
         assert hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=["a"]) is None
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_per_pack_search_state_none_returns_none_without_error(caplog) -> None:
+    hybrid, _doc_store = _warm_hybrid(["a"])
+    try:
+        search = MagicMock(return_value=[])
+        hybrid._bm25.state.index.search = search
+        hybrid._bm25_acquire_state = lambda: None
+        with caplog.at_level(logging.WARNING):
+            assert hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=["a"]) is None
+        assert search.call_count == 0
+        assert "per-pack search error" not in caplog.text
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_per_pack_search_serves_new_state_after_publish() -> None:
+    hybrid, doc_store = _warm_hybrid(["a"])
+    try:
+        hybrid._bm25.mark_stale = lambda: None  # no worker wake
+        fp = doc_store.bm25_fingerprint.return_value
+        new_index = BM25Index.build([_node("g1", pack_id="a", text="gamma")], fingerprint=fp)
+        old = hybrid._bm25.state
+        hybrid._bm25.state = Bm25CacheState(
+            index=new_index,
+            probe_fingerprint=fp,
+            indexed_rows=1,
+            total_rows=1,
+            covered_pack_ids=frozenset({"a"}),
+            generation=old.generation + 1,
+        )
+        got = hybrid._bm25_search_per_pack("gamma", None, 5, pack_ids=["a"])
+        assert [h["node_id"] for h in got["a"]] == ["g1"]
+        assert old.index.search("gamma", limit=5, pack_ids=["a"]) == []
     finally:
         hybrid.shutdown_bm25()
 

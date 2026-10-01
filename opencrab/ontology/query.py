@@ -954,13 +954,13 @@ class HybridQuery:
     ) -> dict[str, list[dict[str, Any]]] | None:
         """#411: per-pack top-``limit`` BM25 hits on ONE pinned cache state.
 
-        The content fallback probes every candidate pack. Calling
-        ``_bm25_search`` per pack runs the fingerprint probe (a whole-table
-        ``COUNT(*)``) once per pack. This method probes once, pins the state
-        and searches each pack on it. Hits per pack equal the per-pack loop's
-        hits while the state does not change. If a new state is published
-        mid-call, the remaining packs still search the pinned state (one
-        consistent generation, as in a single ``query()``).
+        The content fallback probes every candidate pack. A per-pack
+        ``_bm25_search`` call runs the fingerprint probe (a whole-table
+        ``COUNT(*)``) each time. This method probes once, pins the state, and
+        searches each pack on that state. Hits per pack equal the per-pack
+        loop's hits while the state does not change. If a worker publishes a
+        new state mid-call, the remaining packs still search the pinned state
+        (one consistent generation, as in a single ``query()``).
 
         Returns ``None`` when the caller must loop over ``_bm25_search``: an
         instance-level ``_bm25_search`` override exists, the cold build raised,
