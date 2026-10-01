@@ -239,9 +239,13 @@ class TestChunkAxis:
         assert vec1.enum_attempts == 0
 
 
-@pytest.mark.parametrize("exc", [PermissionError("denied"), LookupError("missing")])
-class TestAuthorizationLikeErrorsFromTheBackendPropagate:
-    """열거 단계에서 백엔드가 직접 던진 권한성 예외도 접지 않는다."""
+@pytest.mark.parametrize("exc", [
+    PermissionError("denied"), LookupError("missing"), NameError("x"),
+    ImportError("x"), AssertionError("x"),
+])
+class TestReraisedErrorsFromTheEnumerationPropagate:
+    """열거 단계에서 던져진 재전파 목록의 예외는 접지 않는다. TypeError 와
+    AttributeError 는 위 전용 시험이 두 축에서 이미 고정한다."""
 
     def test_node_axis(self, live, tmp_path, pack_sql, exc):
         builder, graph, docs, state, f, id_map = TestNodeAxis()._baseline(
