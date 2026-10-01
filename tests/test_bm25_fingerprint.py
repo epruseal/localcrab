@@ -1354,9 +1354,11 @@ def test_411_per_pack_search_pins_state_across_publish() -> None:
 
 
 def test_411_per_pack_search_empty_pack_ids_returns_empty_dict() -> None:
-    hybrid, _doc_store = _warm_hybrid(["a"])
+    hybrid, doc_store = _warm_hybrid(["a"])
     try:
+        doc_store.bm25_fingerprint.reset_mock()
         assert hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=[]) == {}
+        assert doc_store.bm25_fingerprint.call_count == 0  # early return, no probe
     finally:
         hybrid.shutdown_bm25()
 
@@ -1435,5 +1437,23 @@ def test_411_probe_failure_still_searches_without_none() -> None:
         doc_store.bm25_fingerprint.side_effect = RuntimeError("probe down")
         got = hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=["a"])
         assert got is not None and got["a"]
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_choose_by_content_hook_path_equals_loop_path() -> None:
+    from opencrab.ontology.pack_registry import PackInfo, _choose_by_content
+
+    packs = [f"p{i}" for i in range(6)]
+    hybrid, doc_store = _warm_hybrid(packs)
+    try:
+        doc_store.supports_keyword = False  # BM25 alone decides the winner
+        registry = [PackInfo(pack_id=p, title=p, description="") for p in packs]
+        via_hook = _choose_by_content("alpha p3", registry, hybrid, spaces=None)
+        hybrid._bm25_search_per_pack = lambda *a, **k: None  # force the loop path
+        via_loop = _choose_by_content("alpha p3", registry, hybrid, spaces=None)
+        assert via_hook[0], "BM25 hits must pick a pack"
+        assert via_hook[0][0][0].pack_id == "p3"
+        assert via_hook == via_loop
     finally:
         hybrid.shutdown_bm25()
