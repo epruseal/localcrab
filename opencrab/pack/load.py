@@ -704,6 +704,48 @@ def _live_vec_ids(
     return vec_ids
 
 
+def _live_vec_ids_or_unconfirmed(
+    vec, pack_name: str
+) -> tuple[set[str] | None, bool]:
+    """증분 적재 두 축(노드, 청크)이 공유하는 열거 진입점(#425).
+
+    반환 `(vec_set, enum_failed)`. `_live_vec_ids` 가 백엔드 오류로 던지면
+    "벡터 상태 미확인"으로 접어 `(None, True)` 를 돌려주고 경고를 남긴다.
+    `None` 은 호출자의 기존 미확인 갈래(열거 불가 백엔드와 같다)로 흘러,
+    열거 결과로는 존재를 확인하지 못한 same 후보의 벡터 유실 회수는 단건 조회로도
+    확인하지 못할 때만 보류되고 `vec_unrecovered` 로 세어진다. 그래프와 문서
+    동기화와 신규 행과 변경 행의 벡터 쓰기는 계속된다. 이 열거 결과로는 어떤
+    벡터도 지우지 않는다. 미회수 슬롯은 다음 적재가 열거에 성공하면 R1 이
+    회수한다. 고아 벡터 회수는 이 열거를 쓰지 않는다(`live_pack_state` 와 `incremental_finalize`).
+
+    삼키는 범위: 백엔드 오류(`Exception` 하위)만이다. 호출 코드의 결함을
+    가리키는 `TypeError`, `AttributeError`, `NameError`, `ImportError`,
+    `AssertionError` 는 다시 던진다. 팩 인가 오류(`PermissionError`,
+    `LookupError`)도 다시 던진다. 인가는 이 호출 앞에서 이미 끝나므로 이
+    분기는 방어다. 한계: 열거 코드의 `ValueError` 와 SQLAlchemy 의 잘못된 SQL
+    오류는 백엔드 오류와 구분되지 않아 같이 접힌다. 접힌 실패는 매 적재 경고와
+    `vec_unrecovered` 로 드러나므로 조용하지 않다. `recover_vectors=True` 이고
+    백엔드가 단건 조회를 지원하면 열거 실패 뒤에도 행마다 단건 조회로 존재를
+    확인한다. 조회가 성공하면 그 판정은 확인된 사실이라 미확인으로 세지 않는다.
+    부재나 다른 팩 소유를 확인한 행은 회수를 시도하고, 이 팩의 슬롯이 이미 있는
+    행은 회수하지 않는다. 조회가 던지면 미확인으로 센다. `enum_failed` 가 거짓이고
+    `vec_set` 이 `None` 이면 종전의 "열거 불가 백엔드"다.
+    """
+    try:
+        return _live_vec_ids(vec, pack_name), False
+    except (TypeError, AttributeError, NameError, ImportError, AssertionError,
+            PermissionError, LookupError):
+        raise
+    except Exception as exc:
+        log.warning(
+            "벡터 ID 열거 실패(%s): 벡터 상태 미확인으로 처리해 "
+            "단건 조회로도 확인하지 못한 행의 벡터 유실 회수를 보류하고 그래프와 "
+            "문서 동기화는 계속한다. 다음 적재가 열거에 성공하면 유실 슬롯을 "
+            "회수한다. 원인 %s: %s",
+            pack_name, type(exc).__name__, exc)
+        return None, True
+
+
 def _sqlalchemy_meta_update_sql(table: str, dialect_name: str) -> str:
     """sqlalchemy(pgvector) 분기의 UPDATE 문. PostgreSQL 에서는 `(:meta)::jsonb`
     명시 캐스트 — PgVectorStore 자신의 INSERT/UPSERT 가 이 컬럼에 쓰는 것과 같은
@@ -1969,6 +2011,13 @@ def load_nodes_incremental(
     필요하다 — 이 소비자는 #332의 청크 축 확장에도 이미 같은 방식으로
     맞춰 갱신한 전례가 있다.
 
+    **열거 실패(#425)**: 이 함수의 시작 열거가 백엔드 오류로 실패하면
+    `_live_vec_ids_or_unconfirmed` 가 "벡터 상태 미확인"으로 접는다. 적재는
+    끝까지 가고, 열거 결과로 존재를 확인하지 못한 same 후보의 벡터 유실 회수는
+    단건 조회로도 확인하지 못할 때만 보류한다. 단건 조회가 부재를 확인한 행은
+    회수를 시도하고 미확인으로 세지 않는다. 보류한 행은 `vec_unrecovered` 에
+    세어지고 경고가 남는다. 반환 형태는 그대로다.
+
     성능 요구치(판정 비용, 코드가 바뀌어도 유지되는 상한): 열거 조회
     (`_live_vec_ids`)는 실행당 정확히 1회. 단건 조회(opt-in, 열거 불가일
     때만)는 판정 루프가 처리하는 입력 행당 최대 1회(파일에 같은 node_id가
@@ -2034,7 +2083,7 @@ def load_nodes_incremental(
     # 라이브와 같아도 벡터만 유실됐을 수 있다. 열거 가능 백엔드에서는
     # recover_vectors 값과 무관하게 항상 검사한다(§5: principal 검사를
     # 통과한 실행당 1회, 저렴).
-    vec_set = _live_vec_ids(vec, pack_name)
+    vec_set, vec_enum_failed = _live_vec_ids_or_unconfirmed(vec, pack_name)
 
     # #377 v3(구현 보고 검토 뒤 리드 지시, 설계 v3 §4): `vec is None`은
     # 이 배포에 벡터 축 자체가 없다는 뜻이지 유실이 아니다. 아래 opt-out
@@ -2330,7 +2379,11 @@ def load_nodes_incremental(
     # 남았는지 정확히 구분한다(원인이 실제와 어긋나면 소비자가 잘못된 조치를
     # 취한다).
     if vec_unrecovered:
-        if not recover_vectors:
+        if vec_enum_failed:
+            log.warning(
+                "벡터 유실 회수 미확인(%s): 벡터 ID 열거 실패로 %d건 확인 못 함. "
+                "다음 적재가 열거에 성공하면 회수한다", pack_name, vec_unrecovered)
+        elif not recover_vectors:
             log.warning(
                 "벡터 유실 회수 미확인(%s): 열거 불가 백엔드에서 %d건 확인 못 함 — "
                 "recover_vectors=True 로 단건 조회 회수를 켤 수 있다",
@@ -2621,6 +2674,13 @@ def load_chunks_incremental(
 
     반환: (c_new, c_txt, c_meta, c_same, err, bypack_ids, vec_unrecovered)
 
+    열거 실패(#425): 시작 열거가 백엔드 오류로 실패하면 `_live_vec_ids_or_unconfirmed`
+    가 "벡터 상태 미확인"으로 접는다. 적재는 끝까지 가고, 열거 결과로 존재를
+    확인하지 못한 same 후보의 벡터 유실 회수는 단건 조회로도 확인하지 못할
+    때만 보류한다. 단건 조회가 부재를 확인한 행은 회수를 시도하고 미확인으로
+    세지 않는다. 보류한 행은 `vec_unrecovered` 에 세어지고 경고가 남는다.
+    반환 형태는 그대로다.
+
     `sql` 과 인가 계약은 `load_chunks` 와 같다(#205) — 키워드 전용 필수 인자,
     호출당 1회 소유자 검사, 첫 쓰기 이전 거부. 그쪽 docstring 이 정본이다.
 
@@ -2661,7 +2721,7 @@ def load_chunks_incremental(
     # 있다(부분 복원·백엔드 삭제). c_same 판정 앞에서 벡터 존재를 확인해 그
     # 경우 txt 경로로 재임베딩시킨다 — 1회 계산, None 이면(벡터 축 없는 배포)
     # 검사 전체를 skip 한다(현행 동작 보존).
-    vec_set = _live_vec_ids(vec, pack_name)
+    vec_set, vec_enum_failed = _live_vec_ids_or_unconfirmed(vec, pack_name)
 
     # #332: vec_set 이 None(열거 불가)이어도 백엔드가 단건 조회를 지원하면
     # recover_vectors=True 로 그 수단을 켠다. `_vec_backend` 와 같은 이유로
@@ -2827,8 +2887,13 @@ def load_chunks_incremental(
     if vec_unrecovered:
         # #332: 실행당 1회, 세 원인 중 무엇으로 미확인이 남았는지 정확히
         # 구분한다 — 안내 문구가 실제 원인과 어긋나면(예: 옵트아웃인데 "조회
-        # 오류" 라고 말하면) 소비자가 잘못된 조치를 취한다.
-        if not recover_vectors:
+        # 오류" 라고 말하면) 소비자가 잘못된 조치를 취한다. #425: 열거 실패가
+        # 네 번째 원인이다.
+        if vec_enum_failed:
+            log.warning(
+                "벡터 유실 회수 미확인(%s): 벡터 ID 열거 실패로 %d건 확인 못 함. "
+                "다음 적재가 열거에 성공하면 회수한다", pack_name, vec_unrecovered)
+        elif not recover_vectors:
             log.warning(
                 "벡터 유실 회수 미확인(%s): 열거 불가 백엔드에서 %d건 확인 못 함 — "
                 "recover_vectors=True 로 단건 조회 회수를 켤 수 있다",
