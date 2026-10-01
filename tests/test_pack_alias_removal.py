@@ -352,6 +352,9 @@ def test_t7_live_alias_does_not_make_every_node_changed(live, tmp_path):
     f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1")])
     _s, _t, _i, props = pack_normalize.transform_node("pack-1", _node(id="n1"))
     live_nodes = {"n1": ("Document", "resource", {**props, "pack": "pack-1"})}
+    # #374: same 판정이 실제 문서 행의 값도 본다. 손으로 지은 `doc_node_spaces` 와
+    # 맞도록 문서 행을 실제로 심는다(없으면 값 비교가 어긋남으로 본다).
+    docs.upsert_node_doc("resource", "Document", "n1", props)
 
     with principal_scope(principal):
         n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(

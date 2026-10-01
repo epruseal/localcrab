@@ -45,12 +45,14 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import re
 import sys
 from collections import Counter
 from collections.abc import Callable
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -1926,6 +1928,117 @@ def _dup_type_node_rows(graph, pack_name: str) -> dict[str, set[str]]:
     return by_node
 
 
+# #374: 문서 sink 자신의 값을 same 판정이 보게 하는 지문. 키셋 페이지 크기.
+_DOC_FP_BATCH = 2000
+
+
+def _canon_json(value) -> str:
+    """지문용 정규 JSON 문자열. 객체는 키 정렬, 배열은 순서 유지.
+
+    숫자는 문맥과 무관한 정확한 10진 표기로 쓴다. PG `jsonb` 는 숫자를 `numeric`
+    으로 저장해서 `1e22` 가 정수 `10**22` 로, `-0.0` 이 `0.0` 으로 돌아온다. 바이트
+    비교는 그런 행을 매 런 어긋남으로 오판한다(#358 형). `Decimal.normalize()` 는
+    문맥 정밀도로 큰 정수 둘을 같게 만들므로 쓰지 않는다. 생성자와 `as_tuple()` 과
+    정수 연산만 쓴다. 불리언과 null 은 숫자와 구분한다.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        dec = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
+        if not dec.is_finite():
+            raise ValueError("non-finite number")
+        sign, digits, exp = dec.as_tuple()
+        if not any(digits):
+            return "0"
+        ds = list(digits)
+        while ds[-1] == 0:
+            ds.pop()
+            exp += 1
+        return f"{'-' if sign else ''}{''.join(map(str, ds))}e{exp}"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=True)
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_canon_json(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{json.dumps(k, ensure_ascii=True)}:{_canon_json(value[k])}"
+            for k in sorted(value)) + "}"
+    raise TypeError(f"not a JSON value: {type(value).__name__}")
+
+
+def _doc_content_fingerprint(node_type: str, props: dict) -> tuple[str, bytes]:
+    """문서 행(`doc_nodes`)의 비교 대상 둘을 `(node_type, properties 지문)` 으로 접는다.
+
+    properties 지문은 `INCREMENTAL_IGNORED_KEYS` 를 뺀 정규 JSON 의 sha256 이다.
+    빼는 키는 그래프 쪽 same 판정과 같다(`id` 와 `space` 는 저장소 주입, `owner_id` 는
+    #378 소관, 폐기 별칭). 문서 행은 `add_node` 가 스탬프한 properties 를 그대로
+    저장하고 그래프 행은 거기에 `id`/`space` 만 더한다. 그래서 같은 필터를 양쪽에
+    쓰면 정상 적재는 같은 지문을 낸다. 지문만 남기는 이유는 행마다 properties
+    사본을 쥐지 않으려는 것이다.
+    """
+    kept = {k: v for k, v in props.items() if k not in INCREMENTAL_IGNORED_KEYS}
+    return node_type, hashlib.sha256(_canon_json(kept).encode("utf-8")).digest()
+
+
+def _doc_node_fingerprints(
+    docs, pack_name: str,
+) -> dict[tuple[str, str], tuple[str, bytes] | None] | None:
+    """이 팩의 `doc_nodes` 행별 `(space, node_id) -> 지문`. 앵커는 뺀다.
+
+    `live_pack_state` 의 `doc_node_spaces` 와 같은 소유 술어(`pack_id`)와 앵커
+    제외를 쓴다. 이 술어는 문자열 `pack_id` 를 가진 JSON 객체만 고른다. 그 밖의
+    행(손상 JSON, 배열, `pack_id` 없음)은 이 맵에도 `doc_node_spaces` 에도 없고
+    기존 `doc_row_missing` 경로가 다룬다. 술어를 통과했어도 지문을 못 만드는 행
+    (JSON5, 무한대 숫자, 깊은 중첩 등)은 값 `None` 으로 남기고 계속 읽는다. `None`
+    은 "비교 불가"이며 어긋남도 부재도 아니다. 그런 행에는 이 검사가 아무것도 하지
+    않는다. 쓰기 게이트가 고칠 수 있는 행도 같이 빠지는 것은 의도한 한계다(게이트를
+    부르지 않고는 둘을 못 가른다). 페이지 조회 자체가 실패하면(드라이버 디코딩 실패
+    등) 맵 전체를 쓸 수 없으므로 `None` 을 돌려주고 호출자가 비교를 건너뛴다. 부분
+    맵은 돌려주지 않는다. properties 를 한 번에 올리지 않도록
+    `(space, node_id)` 키셋으로 나눠 읽고 행마다 지문만 남긴다. 의도한 모서리: 맵은
+    팩의 문서 행 수만큼 상주한다. 팩이 메모리를 넘기면 입력 샤드의 node_id 로
+    범위를 좁히는 것이 업그레이드 경로다.
+    """
+    table = docs._table("doc_nodes")
+    pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
+    anchor_sql = build_anchor_sql(docs._dialect)
+    sql = f"""
+        SELECT space, node_id, node_type, properties
+        FROM {table}
+        WHERE {pred}
+          AND NOT {anchor_sql}
+          AND (space, node_id) > (:last_space, :last_node_id)
+        ORDER BY space, node_id
+        LIMIT :batch
+    """
+    out: dict[tuple[str, str], tuple[str, bytes] | None] = {}
+    last_space = last_node_id = ""
+    while True:
+        try:
+            rows = docs._fetch_all(sql, {
+                "pack": pack_name, "last_space": last_space,
+                "last_node_id": last_node_id, "batch": _DOC_FP_BATCH,
+            })
+        except Exception as exc:
+            log.warning("%s doc 행 지문 조회 실패, 이번 런은 문서 값을 비교하지 않는다(#374): %s",
+                        pack_name, exc)
+            return None
+        for row in rows:
+            space = docs._row_get(row, "space")
+            node_id = docs._row_get(row, "node_id")
+            last_space, last_node_id = space, node_id  # 예외 경로에서도 커서가 전진한다
+            try:
+                out[(space, node_id)] = _doc_content_fingerprint(
+                    docs._row_get(row, "node_type"),
+                    _as_json_dict(docs._row_get(row, "properties")))
+            except Exception:
+                out[(space, node_id)] = None
+        if len(rows) < _DOC_FP_BATCH:
+            return out
+
+
 def load_nodes_incremental(
     pack_name: str,
     nodes_file: Path,
@@ -1941,6 +2054,11 @@ def load_nodes_incremental(
     recover_vectors: bool = False,
 ) -> tuple[int, int, int, int, int, set, int]:
     """노드 증분 적재. 라이브와 동일한 행은 완전 스킵(어떤 스토어도 미접촉).
+
+    "동일"은 그래프 행과 문서 행 양쪽이 파일과 같다는 뜻이다(#374). 문서 행의
+    `node_type` 과 properties(무시 키 제외)가 다르면 same 으로 세지 않고 chg 로
+    다시 쓴다. 문서 행 지문은 이 함수가 시작할 때 `docs` 에서 직접 한 번 읽는다
+    (읽기만 하고 쓰지 않는다).
 
     graph/docs는 명시 파라미터 — OntologyBuilder는 스토어를 내부명(_neo4j/_mongo)으로
     보관하므로 builder 속성 접근은 불가(vendor 실측, 2026-07-22). `vec`도 같은
@@ -2091,6 +2209,14 @@ def load_nodes_incremental(
             "load_nodes_incremental: sql은 필수다(팩 소유권 인가, #424)")
     authorize(sql, principal, pack_name)
 
+    # #374: same 판정이 문서 sink 자신의 값(node_type 컬럼, properties)도 보도록
+    # 문서 행 지문을 한 번 읽는다. 호출자가 넘긴 `doc_node_spaces` 는 행 존재만
+    # 말하므로 값 비교에는 못 쓴다. 시그니처를 바꾸지 않으려고 이 함수가 직접 읽는다
+    # (소비 저장소는 `doc_node_spaces` 만 넘긴다).
+    doc_fps = _doc_node_fingerprints(docs, pack_name)
+    n_doc_stale = 0
+    n_doc_unreadable = 0
+
     # R1(#377, load_chunks_incremental의 #142 재리뷰 패턴 이식): 그래프/문서가
     # 라이브와 같아도 벡터만 유실됐을 수 있다. 열거 가능 백엔드에서는
     # recover_vectors 값과 무관하게 항상 검사한다(§5: principal 검사를
@@ -2204,15 +2330,16 @@ def load_nodes_incremental(
                 # | docs(행 존재/공간 잔재, 앵커)     | **그렇다(의도적 미검사, 이번 라운드가 만든 gap 아님)** | 없음. F4-b 가 doc_node_spaces 조회에서 앵커를 빼고, R2 가 doc_row_missing 에도 같은 제외를 걸어 그 오탐(앵커마다 매 런 행 부재로 오판)을 막았다 |
                 # | docs(공간 잔재, 일반 노드)        | 그렇다                   | _cleanup_stale_doc_spaces(F4-c)                |
                 # | docs.properties.owner_id          | **그렇다, 이 PR 은 안 잡는다(범위 좁힘, 위 상수 주석 참고)** | 없음. owner_id 는 스키마 정의가 없는 순수 시스템 스탬프 필드라 실 데이터에 파일 쪽 owner_id 가 실리지 않는다(2026-09-14 실측: grammar/schema 전역에 owner_id 필드 정의 0건). 안 실리면 재스탬프가 영영 안 되고, 실리면 매 런 전량 재기록이 된다. 양방향으로 어긋난 계약이라 #378 로 이관 |
-                # | docs.node_type                    | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. 문서 upsert 가 자기 node_type 컬럼도 쓰지만 이 비교는 그래프의 node_type 만 본다. same 판정이 문서 sink 자신의 값을 보지 않는 것과 같은 기전이라 #374 로 이관 |
-                # | docs.properties.<그 외 필드>      | **그렇다, 이 PR 은 안 잡는다** | 없음. 위 node_type 과 같은 기전(same 판정이 문서 sink 자신의 값을 안 본다)이라 #374 로 이관한다. codex 재리뷰(2026-09-14)가 지목한 부분 기록 잔존(원본이 properties.space 를 실은 채 다른 속성만 바뀌고 upsert_node_doc 실패)도 이 축이다. space 대칭 필터 이전에는 이 행들이 매 런 chg 로 강제돼 부분 기록 어긋남이 우연히 자가 치유됐다. 이 PR 이 그 우연한 치유를 없앤다 |
+                # | docs.node_type                    | 그렇다                   | doc_row_stale(#374, `_doc_node_fingerprints` 의 node_type 비교). 비교는 행을 읽고 지문으로 만들 수 있고 팩의 지문 조회가 성공했을 때만 한다. 아니면 기존 same 경로를 따르고 비교 생략 집계 경고를 남긴다 |
+                # | docs.properties.<그 외 필드>      | 그렇다                   | doc_row_stale(#374, 무시 키를 뺀 properties 지문 비교). 부분 기록 잔존(그래프 성공, upsert_node_doc 실패)을 다음 런이 고친다. #358 이 없앤 우연한 자가 치유의 대체물이다. node_type 행과 같은 비교 가능 조건이 붙는다 |
                 # | docs(audit_log, 별도 테이블)      | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. MongoDB.log_event 가 문서 upsert 와 같은 try 블록이라 그 실패만으로 stores.docs 상태가 에러로 찍힐 수 있다. #375 로 이관 |
                 # | sql(registry, (space,node_id)->node_type) | **그렇다, 이 PR 은 안 잡는다** | 없음. node_identity_conflict 도 이 registry 를 안 본다. #376 으로 이관 |
                 # | vector(노드 임베딩)               | 그렇다(부분 복원·백엔드 삭제) | vec_row_missing(R1/opt-in, #377 로 해소 — load_chunks_incremental 의 R1/recover_vectors(#332) 와 같은 패턴을 아래 is_same 블록에 이식) |
                 #
                 # 표가 드러내는 것: docs.node_type 과 docs.properties.<그 외 필드>는
-                # #374(same 판정이 문서 sink 자신의 값을 보지 않는다), docs(audit_log)
-                # 는 #375, sql(registry)는 #376, owner_id 는 #378 로 각각 이관했다.
+                # #374 가 위 doc_row_stale 로 닫았다. docs(audit_log)는 #375 가 상태를
+                # 분리했고 치유는 하지 않는다(추가만 되는 이벤트라 비교할 기대 상태가
+                # 없다). sql(registry)는 #376, owner_id 는 #378 로 이관했다.
                 # vector(노드)는 #377 이 이 함수 안에서 직접 해소했다(아래
                 # vec_row_missing). "add_node 가 여러 저장소에 나눠 쓰고 부분
                 # 실패가 가능하다"는 더 큰 부류의 남은 사각지대이며, #358(space 대칭
@@ -2233,10 +2360,30 @@ def load_nodes_incremental(
                 # 전진해 다음 런이 same 으로만 본다, doc 행 영구 유실).
                 # 앵커는 doc_node_spaces 에 애초에 없다(F4-b 가 뺀다) — 검사하면
                 # 앵커마다 매 런 오탐 재적재 루프가 열린다.
+                is_anchor = _is_anchor_node(node_id, props)
                 doc_row_missing = (
-                    not _is_anchor_node(node_id, props)
+                    not is_anchor
                     and space not in doc_node_spaces.get(node_id, set())
                 )
+                # #374: 행이 있어도 값이 `add_node` 가 쓸 것(`file_cmp`, 이 시점엔
+                # `live_cmp` 와 같다)과 다르면 지난 런의 문서 쓰기 실패 잔재다.
+                # 지문 맵에 행이 없으면(호출자 스냅샷 이후 삭제) 같은 취급이다.
+                # 지문 맵이 `None`(조회 실패)이거나 이 행의 값이 `None`(해석 불가)이거나
+                # 파일 쪽 지문을 못 만들면 비교하지 않는다. 기존 same 경로 그대로다.
+                doc_row_stale = False
+                if not is_anchor and not doc_row_missing and doc_fps is not None:
+                    try:
+                        if (space, node_id) not in doc_fps:
+                            doc_row_stale = True  # 스냅샷 뒤 행이 사라졌다
+                        else:
+                            doc_fp = doc_fps[(space, node_id)]
+                            if doc_fp is None:
+                                n_doc_unreadable += 1
+                            else:
+                                doc_row_stale = doc_fp != _doc_content_fingerprint(
+                                    cmp_node_type, file_cmp)
+                    except Exception:
+                        n_doc_unreadable += 1
 
                 # R1/opt-in(#377): doc 과 독립으로 벡터 유실을 판정한다. 하나의
                 # if/else 에 얹으면 ①벡터만 유실인데 doc 로그가 같이 찍히거나
@@ -2268,7 +2415,7 @@ def load_nodes_incremental(
                 # 아니므로 vec_row_missing 은 False 로 남고 vec_unrecovered 도
                 # 안 오른다(#377 v3, 위 진입 전 설명 참고).
 
-                if not doc_row_missing and not vec_row_missing:
+                if not doc_row_missing and not doc_row_stale and not vec_row_missing:
                     n_same += 1
                     # F4-c: 노드 자체는 안 바뀌었어도 doc 이 다른 space 를 가리키는
                     # 채로 남아 있을 수 있다(예: 지난 증분이 이 정리 전에 실패했다).
@@ -2281,6 +2428,9 @@ def load_nodes_incremental(
                 if doc_row_missing:
                     log.warning("doc 행 유실 회수(%s) %s space=%s", pack_name, node_id, space)
                     n_doc_recovered += 1  # #301: 집계. 매 런 0 이 아니면 doc 쓰기가 지속 실패 중이란 신호
+                if doc_row_stale:
+                    log.warning("doc 행 값 어긋남 회수(%s) %s space=%s", pack_name, node_id, space)
+                    n_doc_stale += 1  # #374: 집계. 쓰기 성공이 아니라 재기록 시도 건수다
                 if vec_row_missing:
                     log.warning("벡터 유실 회수(%s) %s", pack_name, node_id)
                 # doc, vec 둘 중 하나라도 missing 이면 same 으로 안 잡고 아래
@@ -2385,6 +2535,23 @@ def load_nodes_incremental(
             "%s 증분 doc 행 유실 회수 누적 %d건(전체 chg=%d), 매 런 "
             "반복되면 doc 쓰기가 지속 실패 중이라는 뜻이다(#301)",
             pack_name, n_doc_recovered, n_chg)
+
+    # #374: 문서 행 값 어긋남 재기록 시도 누적 집계. 쓰기가 계속 실패하면 그래프는
+    # 수렴해도 이 값이 매 런 0 아래로 안 떨어진다(#301 과 같은 신호 형태).
+    if n_doc_stale:
+        log.warning(
+            "%s 증분 doc 행 값 어긋남 회수 누적 %d건(재기록 시도 건수, 성공 건수가 "
+            "아니다), 매 런 반복되면 doc 쓰기가 지속 실패 중이라는 뜻이다(#374)",
+            pack_name, n_doc_stale)
+
+    # #374: 값 비교를 못 한 행. 입력 행 중 문서 값을 비교하지 못한 건수를 한 번 알린다.
+    # 지문 조회 자체가 실패한 런은 정상 행도 비교하지 않았다.
+    if doc_fps is None:
+        log.warning("%s 증분 doc 행 해석 불가 비교 생략: 지문 조회 실패로 이번 런 전체의 "
+                    "문서 값을 비교하지 않았다(#374)", pack_name)
+    elif n_doc_unreadable:
+        log.warning("%s 증분 doc 행 해석 불가 비교 생략 %d건: 문서 값을 읽거나 지문으로 "
+                    "만들 수 없어 비교하지 않았다(#374)", pack_name, n_doc_unreadable)
 
     # #377: 벡터 유실 회수 미확인 누적 집계. load_chunks_incremental(#332)의
     # 종료 후 경고와 같은 패턴 — 실행당 1회, 세 원인 중 무엇으로 미확인이
