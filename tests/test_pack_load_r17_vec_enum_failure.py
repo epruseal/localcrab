@@ -244,8 +244,10 @@ class TestChunkAxis:
     ImportError("x"), AssertionError("x"),
 ])
 class TestReraisedErrorsFromTheEnumerationPropagate:
-    """열거 단계에서 던져진 재전파 목록의 예외는 접지 않는다. TypeError 와
-    AttributeError 는 위 전용 시험이 두 축에서 이미 고정한다."""
+    """열거 단계에서 던져진 재전파 목록의 예외는 접지 않는다. TypeError 는
+    노드 축 전용 시험 하나가, AttributeError 는 청크 축 전용 시험 하나가 이미
+    고정한다. 두 축이 같은 헬퍼를 쓰므로 이 둘은 축마다 하나씩만 둔다. 두 축 모두로
+    넓히는 일은 후속 후보다."""
 
     def test_node_axis(self, live, tmp_path, pack_sql, exc):
         builder, graph, docs, state, f, id_map = TestNodeAxis()._baseline(
