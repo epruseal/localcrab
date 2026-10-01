@@ -150,7 +150,7 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 }
 ```
 
-> **`--allow-query-token` 은 기본 꺼짐이다.** 켜면 `"url": "http://<host>:<port>/mcp?token=<token>"` 형태가 통하지만, URL 자격증명은 액세스 로그·프록시 로그·브라우저 히스토리·Referer 헤더에 남는다. 켠 배포는 토큰을 더 자주 회전하고 클라이언트마다 별도 토큰을 발급할 것.
+> **`--allow-query-token` 은 기본 꺼짐이다.** 켜면 `"url": "http://<host>:<port>/mcp?token=<token>"` 형태가 통하지만, URL 자격증명은 프록시 로그, 브라우저 히스토리, Referer 헤더에 남는다. 서버 자신의 uvicorn 로그는 `token` 값을 가려 기록한다. 헤더 인증이 권장 경로다. 켠 배포는 토큰을 더 자주 회전하고 클라이언트마다 별도 토큰을 발급할 것.
 >
 > **어느 클라이언트가 어느 방식을 지원하는지는 [`docs/mcp-client-auth.md`](docs/mcp-client-auth.md) 를 본다.** 특히 **claude.ai 웹은 커스텀 헤더를 설정할 수 없어 쿼리 파라미터가 유일한 수단**이다. 인증 메커니즘을 제거하거나 기본값을 바꾸기 전에 그 표에서 사용 중인 클라이언트가 없는지 먼저 확인할 것.
 >
