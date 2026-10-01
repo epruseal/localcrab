@@ -369,7 +369,7 @@ class _NoVec:
 
 
 class TestLoadNodesIncremental:
-    def test_identical_row_is_skipped_without_touching_any_store(self, live, tmp_path):
+    def test_identical_row_is_skipped_without_touching_any_store(self, live, tmp_path, pack_sql):
         """**왕복**으로 확인한다: 적재 → 라이브 상태 읽기 → 증분이 same 으로 판정.
 
         기대값을 손으로 지어내면 `live_pack_state` 가 실제로 무엇을 담는지와 어긋나도
@@ -388,20 +388,20 @@ class TestLoadNodesIncremental:
         # 오판하게 만들어 same 이 chg 로 흘러 이 테스트 자체가 R2 검사를
         # 못 지나간다(위 docstring 의 "라이브를 실제로 읽는다" 원칙과 같은 이유).
         n_new, n_chg, n_same, skip, err, ids, _vu = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, live_nodes, graph, docs, state["doc_node_spaces"])
+            "pack-1", f, builder, {}, live_nodes, graph, docs, state["doc_node_spaces"], sql=pack_sql)
         assert (n_new, n_chg, n_same, skip, err) == (0, 0, 1, 0, 0), (
             "라이브와 동일한 행이 same 으로 판정되지 않았다 — 매 증분마다 전량 재적재된다")
         assert ids == {"n1"}
 
-    def test_changed_row_is_counted_as_changed_not_new(self, live, tmp_path):
+    def test_changed_row_is_counted_as_changed_not_new(self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1", 발행연도="2027")])
         live_nodes = {"n1": ("Document", "resource", {"발행연도": "2026", "pack_id": "pack-1"})}
         n_new, n_chg, n_same, skip, err, _, _vu = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, live_nodes, graph, docs, {})
+            "pack-1", f, builder, {}, live_nodes, graph, docs, {}, sql=pack_sql)
         assert (n_new, n_chg, n_same) == (0, 1, 0)
 
-    def test_node_type_change_removes_the_old_row(self, live, tmp_path):
+    def test_node_type_change_removes_the_old_row(self, live, tmp_path, pack_sql):
         """타입이 바뀌면 **구 행을 지운 뒤** 새 타입으로 넣어야 한다.
 
         그래프는 `(node_type, node_id)` 로 행을 잡으므로, 지우지 않으면 같은 id 가
@@ -421,21 +421,21 @@ class TestLoadNodesIncremental:
         f_new = _write_jsonl(tmp_path / "new.jsonl",
                              [_node(id="n1", node_type="Concept", space="concept")])
         _n, n_chg, _s, _sk, _e, _ids, _vu = pack_load.load_nodes_incremental(
-            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {})
+            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {}, sql=pack_sql)
 
         assert n_chg == 1, "타입 변경이 chg 로 세어지지 않았다"
         assert graph.get_node("Concept", "n1") is not None, "새 타입 행이 없다"
         assert graph.get_node("Document", "n1") is None, (
             "구 타입 행이 남았다 — 같은 id 가 두 타입으로 존재하는 고아다")
 
-    def test_unknown_row_is_counted_as_new(self, live, tmp_path):
+    def test_unknown_row_is_counted_as_new(self, live, tmp_path, pack_sql):
         builder, graph, docs = live
         f = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1")])
         n_new, n_chg, n_same, _, _, _, _vu = pack_load.load_nodes_incremental(
-            "pack-1", f, builder, {}, {}, graph, docs, {})
+            "pack-1", f, builder, {}, {}, graph, docs, {}, sql=pack_sql)
         assert (n_new, n_chg, n_same) == (1, 0, 0)
 
-    def test_live_property_drift_converges_in_one_run(self, live, tmp_path):
+    def test_live_property_drift_converges_in_one_run(self, live, tmp_path, pack_sql):
         """**#279 회귀.** 라이브 properties 드리프트는 **한 런에 해소**된다.
 
         라이브 행이 파일에 없는 키를 갖고 있으면 그 런은 전량 chg 다. 그 자체는
@@ -484,7 +484,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"])[:5]
+                state["doc_node_spaces"], sql=pack_sql)[:5]
 
         assert _run() == (0, 3, 0, 0, 0), "드리프트한 행이 chg 로 회수되지 않았다"
         assert _run() == (0, 0, 3, 0, 0), (
@@ -497,7 +497,7 @@ class TestLoadNodesIncremental:
         assert all("legacy_only_key" not in props for _t, _s, props in left.values()), (
             "잔재 키가 라이브에 남았다 — CAS 갱신이 properties 를 전량 치환하지 않았다")
 
-    def test_file_side_store_injected_key_converges_after_first_run(self, live, tmp_path):
+    def test_file_side_store_injected_key_converges_after_first_run(self, live, tmp_path, pack_sql):
         """**#358 회귀.** `INCREMENTAL_IGNORED_KEYS` 는 라이브 쪽에만 걸려 있다.
 
         파일 쪽 원본 행이 중첩 `properties` 에 `space` 를 실어 보내면(레거시
@@ -521,7 +521,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"])[:5]
+                state["doc_node_spaces"], sql=pack_sql)[:5]
 
         assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
         assert _run() == (0, 0, 1, 0, 0), (
@@ -530,7 +530,7 @@ class TestLoadNodesIncremental:
 
     def test_stale_live_space_column_is_corrected_even_when_properties_match(
         self, live, tmp_path
-    ):
+    , pack_sql):
         """**#358 재리뷰 P1-A 회귀.** same 판정은 properties 뿐 아니라 그래프의
         실제 `space_id` 컬럼(`live[1]`)도 목표 space 와 맞는지 봐야 한다.
 
@@ -553,7 +553,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"])[:5]
+                state["doc_node_spaces"], sql=pack_sql)[:5]
 
         assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
 
@@ -572,7 +572,7 @@ class TestLoadNodesIncremental:
         assert after["n1"][1] == "resource", (
             "재기록이 일어났는데도 space_id 가 드리프트한 값에 머물러 있다")
 
-    def test_nested_space_type_error_is_not_same(self, live, tmp_path):
+    def test_nested_space_type_error_is_not_same(self, live, tmp_path, pack_sql):
         """**#379.** 중첩 `properties.space` 가 문자열이 아니면(정수 등) 이 값이
         `same` 판정으로 넘어가면 안 된다. `INCREMENTAL_IGNORED_KEYS`/
         `FILE_SIDE_IGNORED_KEYS` 가 `space` 키를 비교에서 빼는 필터라서, 필터가
@@ -589,7 +589,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"])
+                state["doc_node_spaces"], sql=pack_sql)
 
         f1 = _write_jsonl(tmp_path / "n1.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
@@ -603,7 +603,7 @@ class TestLoadNodesIncremental:
             "중첩 properties.space 타입 오류가 same 으로 통과했다. "
             "전체 적재라면 거부될 값이 증분에서만 통과한다(#379)")
 
-    def test_nested_space_nan_is_not_same(self, live, tmp_path):
+    def test_nested_space_nan_is_not_same(self, live, tmp_path, pack_sql):
         """**#379.** 중첩 `properties.space` 가 NaN 이어도 같은 부류다. NaN 은
         `normalize_space` 의 문자열 타입 검사가 아니라, 그보다 먼저 실행되는
         `normalize_node_properties` 내부 `_validate_json` 의 유한값 검사에서
@@ -616,7 +616,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"])
+                state["doc_node_spaces"], sql=pack_sql)
 
         f1 = _write_jsonl(tmp_path / "n1.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
@@ -628,7 +628,7 @@ class TestLoadNodesIncremental:
         n_same = _run(f2)[2]
         assert n_same == 0, "중첩 properties.space 의 NaN 값이 same 으로 통과했다(#379)"
 
-    def test_nested_id_mismatch_is_not_same_regardless_of_filter_config(self, live, tmp_path):
+    def test_nested_id_mismatch_is_not_same_regardless_of_filter_config(self, live, tmp_path, pack_sql):
         """**#379.** 중첩 `properties.id` 가 노드 id 와 다르면 거부돼야 한다.
 
         이 검출은 `FILE_SIDE_IGNORED_KEYS`/`INCREMENTAL_IGNORED_KEYS` 가 "id" 를
@@ -642,7 +642,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"])
+                state["doc_node_spaces"], sql=pack_sql)
 
         f1 = _write_jsonl(tmp_path / "n1.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
@@ -654,7 +654,7 @@ class TestLoadNodesIncremental:
         n_same = _run(f2)[2]
         assert n_same == 0, "중첩 properties.id 불일치가 same 으로 통과했다(#379)"
 
-    def test_file_side_owner_id_mismatch_is_not_same(self, live, tmp_path):
+    def test_file_side_owner_id_mismatch_is_not_same(self, live, tmp_path, pack_sql):
         """**#379 회귀(이중검증에서 발견).** `owner_id` 는 `prepare_node` 가
         값을 손대지 않는 별도 스탬프 필드다. 기존 설계(위 상수 주석, #358)는
         `owner_id` 를 **라이브 쪽에서만** 필터에서 빼, 파일이 유효한 값의
@@ -672,7 +672,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"])
+                state["doc_node_spaces"], sql=pack_sql)
 
         f1 = _write_jsonl(tmp_path / "n1.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
@@ -687,7 +687,7 @@ class TestLoadNodesIncremental:
             "(#379, owner_id 라이브측 전용 필터 비대칭 회귀)")
         assert n_chg == 1, "owner_id 불일치는 chg 로 재기록돼야 한다(#358 비대칭 유지)"
 
-    def test_codex_r6_counterexample_is_not_same(self, live, tmp_path):
+    def test_codex_r6_counterexample_is_not_same(self, live, tmp_path, pack_sql):
         """**#379, codex 설계검증 6라운드 반례.** 최상위 `space=None` + 중첩
         `properties.space="concept"` + `owner_id=NaN` 세 조건이 겹쳐도 `same`
         으로 넘어가면 안 된다. `owner_id` 는 `prepare_node` 가 손대지 않는
@@ -700,7 +700,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"])
+                state["doc_node_spaces"], sql=pack_sql)
 
         f1 = _write_jsonl(tmp_path / "n1.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
@@ -714,7 +714,7 @@ class TestLoadNodesIncremental:
             "space=null + 중첩 concept + owner_id NaN 조합이 same 으로 통과했다(#379)")
 
     def test_normalized_space_reassignment_avoids_false_doc_row_missing(
-            self, live, tmp_path, caplog):
+            self, live, tmp_path, caplog, pack_sql):
         """**#379 설계 3장 후반부 약속.** `prepare_node` 검증에 성공하면 이후
         처리(`#301` 이 보는 "현재 행의 space")가 참조하는 지역 변수를
         정규화된 `space` 로 재대입해야 한다. 이 파일의 최상위 `space` 는
@@ -732,7 +732,7 @@ class TestLoadNodesIncremental:
             state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
             return pack_load.load_nodes_incremental(
                 "pack-1", f, builder, {}, state["nodes"], graph, docs,
-                state["doc_node_spaces"])
+                state["doc_node_spaces"], sql=pack_sql)
 
         f1 = _write_jsonl(tmp_path / "n1.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
@@ -1551,7 +1551,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
     """
 
     def test_node_write_failure_does_not_block_stale_node_cleanup(
-            self, live, tmp_path, monkeypatch):
+            self, live, tmp_path, monkeypatch, pack_sql):
         builder, graph, docs = live
         nf = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
         pack_load.load_nodes("pack-1", nf, builder, {})
@@ -1569,7 +1569,7 @@ class TestPinRemovalIsNeutralAcrossSinks:
         # 아예 빠졌다 — n1 의 실패와 무관한 stale 후보다.
         f2 = _write_jsonl(tmp_path / "n2.jsonl", [_node(id="n1", 발행연도="2027")])
         n_new, n_chg, n_same, skip, err, bypack_ids, _vu = pack_load.load_nodes_incremental(
-            "pack-1", f2, builder, {}, state["nodes"], graph, docs, {})
+            "pack-1", f2, builder, {}, state["nodes"], graph, docs, {}, sql=pack_sql)
         assert err == 1, f"저장 실패가 err 로 안 잡혔다: n_new={n_new} n_chg={n_chg} err={err}"
         assert bypack_ids == {"n1"}, "저장 실패와 무관하게 bypack_ids 는 채워져야 한다"
 
@@ -4868,7 +4868,7 @@ class TestFailedAddNodeLeavesOldTypedRowIntact:
     다음 증분도 같은 이유로 또 실패해 **영구 소실**된다.
     """
 
-    def test_reclassification_store_failure_keeps_the_old_type(self, live, tmp_path, monkeypatch):
+    def test_reclassification_store_failure_keeps_the_old_type(self, live, tmp_path, monkeypatch, pack_sql):
         builder, graph, docs = live
         f_old = _write_jsonl(tmp_path / "old.jsonl", [_node(id="n1", node_type="Document")])
         pack_load.load_nodes("pack-1", f_old, builder, {})
@@ -4883,7 +4883,7 @@ class TestFailedAddNodeLeavesOldTypedRowIntact:
         f_new = _write_jsonl(tmp_path / "new.jsonl",
                              [_node(id="n1", node_type="Concept", space="concept")])
         n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
-            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {})
+            "pack-1", f_new, builder, {}, live_nodes, graph, docs, {}, sql=pack_sql)
 
         assert err == 1, (
             f"저장 실패가 err 로 안 잡혔다 (n_new={n_new} n_chg={n_chg} err={err})")
@@ -4897,7 +4897,7 @@ class TestDocSpaceResidueCleanup:
     각각 확인한다(2026-08-11 F4 지시).
     """
 
-    def test_type_change_residue_is_cleaned_even_on_the_same_path(self, live, tmp_path):
+    def test_type_change_residue_is_cleaned_even_on_the_same_path(self, live, tmp_path, pack_sql):
         """(a) graph 는 새 타입, doc 은 구 space. 노드가 입력에 아직 있고 same 으로
         끝나는 경로에서도 구 space doc 행이 지워져야 한다."""
         builder, graph, docs = live
@@ -4916,7 +4916,7 @@ class TestDocSpaceResidueCleanup:
         # 같은 파일을 다시 적재 — 노드 자체는 안 바뀌었으므로 same 경로를 타야 한다.
         n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", nf, builder, {}, state["nodes"], graph, docs,
-            state["doc_node_spaces"])
+            state["doc_node_spaces"], sql=pack_sql)
         assert n_same == 1, f"전제 위반 — same 경로가 아니다: new={n_new} chg={n_chg} same={n_same}"
 
         left_spaces = {r[0] for r in docs._conn.execute(
@@ -4968,7 +4968,7 @@ class TestDocSpaceResidueCleanup:
             f"space(concept) 잔재가 남았다: {left_spaces}, res={res}")
 
     def test_space_moving_type_change_cleans_stale_and_legacy_spaces_together(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         """(d, v10 검수: 실제 F4 잔재를 대표하는 시나리오) — 타입이 바뀌면서 space 도
         함께 바뀐다. live 는 구 타입(구 space) 하나, doc 은 구 space 행 + 무관
         legacy space 행 2종. 입력이 신 타입(신 space)으로 들어오면 stale_typed
@@ -4994,7 +4994,7 @@ class TestDocSpaceResidueCleanup:
                            [_node(id="n1", node_type="Concept", space="concept")])
         n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", nf2, builder, {}, state["nodes"], graph, docs,
-            state["doc_node_spaces"])
+            state["doc_node_spaces"], sql=pack_sql)
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             n_new, n_chg, n_same, skip, err)
 
@@ -5008,7 +5008,7 @@ class TestDocSpaceResidueCleanup:
             f"{left_spaces}")
 
     def test_same_space_sequential_type_change_updates_the_single_row_in_place(
-            self, live, tmp_path):
+            self, live, tmp_path, pack_sql):
         """같은 space 안에서 타입만 바뀌는 순차 변경 — `doc_nodes` PK 가
         `(space, node_id)` 라 물리 행은 **하나**로 유지돼야 하고(UPSERT 갱신),
         그 하나가 최종 타입·properties 값을 반영해야 한다. 행 수만 보면 안
@@ -5029,7 +5029,7 @@ class TestDocSpaceResidueCleanup:
                                   properties={"버전": "2"})])
         n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
             "pack-1", nf2, builder, {}, state["nodes"], graph, docs,
-            state["doc_node_spaces"])
+            state["doc_node_spaces"], sql=pack_sql)
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             n_new, n_chg, n_same, skip, err)
 
@@ -5322,7 +5322,7 @@ class TestLoadLogsInsteadOfSwallowing:
     """
 
     def test_stale_typed_doc_delete_failure_is_logged_not_silently_swallowed(
-            self, live, tmp_path, monkeypatch, caplog):
+            self, live, tmp_path, monkeypatch, caplog, pack_sql):
         """`load_nodes_incremental` 의 타입 변경 구 doc 삭제(load.py:604)가 실패하면
         예전엔 `except Exception: pass` 로 조용히 삼켰다 — 이제 `log.warning` 이다.
 
@@ -5345,7 +5345,7 @@ class TestLoadLogsInsteadOfSwallowing:
                            [_node(id="n1", node_type="Concept", space="concept")])
         with caplog.at_level("WARNING", logger="opencrab.pack.load"):
             n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
-                "pack-1", nf2, builder, {}, state["nodes"], graph, docs, {})
+                "pack-1", nf2, builder, {}, state["nodes"], graph, docs, {}, sql=pack_sql)
         assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
             n_new, n_chg, n_same, skip, err)
         assert any("주입된 doc 삭제 실패" in r.getMessage() for r in caplog.records), (

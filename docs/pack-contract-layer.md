@@ -251,6 +251,26 @@ SELECT COUNT(*) FROM graph_nodes
 `NODE_STAMPED`). 증분 재적재가 origin=server 의 owner_id 재스탬프 계약을 실제로
 만족하는지는 이 계약과 무관한 별도 결함이며 #378 로 이관했다.
 
+### 3-1. `load_nodes_incremental(..., sql=)` 도 **필수**다(#424)
+
+`sql` 은 팩 등록부 `SQLStore` 이고 `builder` 에 물린 것과 같은 인스턴스를 넘긴다. 이 함수는
+진입부에서 `require_live_data`, principal 확인, `authorize(sql, principal, pack_name)` 순으로
+**벡터 축 유무와 무관하게** 소유권을 확인한 뒤에야 어떤 스토어에든 닿는다. `vec=None` 이어도
+마찬가지다.
+
+이유는 `same` 판정 행이 `add_node`(행마다 인가하는 자리)를 부르지 않는데도 doc 공간 잔재 정리와
+루프 뒤 구 타입 행 스윕이 삭제하기 때문이다. 인가가 벡터 접근에만 걸려 있던 때는 벡터 축이 없는
+배포에서 소유하지 않은 principal 이 그 팩 노드의 doc 행을 지울 수 있었다. 인가를 분기마다 걸지
+않고 진입의 한 지점에 둔 것이 의도다. 모든 분기가 그 지점을 지난다.
+
+동작 변화: `sql` 을 생략하면(`None`) `ValueError` 이고, 소유하지 않은 principal 이면
+`PackNotFoundError` 또는 `PackForbiddenError` 로 호출 전체가 스토어 접촉 전에 끝난다. 종전에는
+소유하지 않은 행의 `add_node` 실패가 행 단위 `err` 로 세어지고 실행이 계속됐다. 형제 축
+`load_chunks_incremental` 이 이미 이렇게 동작한다. 재현 명령:
+`pytest tests/test_pack_load_r16_node_same_delete_gate.py`.
+
+같은 종류의 공백이 `incremental_finalize` 와 `delete_pack` 에 남아 있다(#434).
+
 ### 4. 앵커 판정은 **한 곳에서만** 정의한다
 
 Python 술어와 SQL 조각을 같은 정의에서 낸다. 두 벌로 두면 갈린다. 두 함정이 실측됐다.

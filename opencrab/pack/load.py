@@ -1786,8 +1786,8 @@ def _require_bound_principal():
     반환값은 청크 로더가 `write_gate.authorize` 에 넘길 principal 이다(#205).
     엣지 로더는 종전대로 문장으로만 부른다. 그쪽 인가는 builder 안에서
     일어난다. 노드 로더 가운데 `load_nodes_incremental`은 다르다(#377
-    2라운드): "same" 판정 행이 builder를 거치지 않고 벡터 백엔드에 직접
-    닿을 수 있어서, 이 반환값을 받아 벡터 접근 직전에 별도로
+    2라운드, #424): "same" 판정 행이 builder를 거치지 않고 벡터 백엔드와 doc
+    삭제에 직접 닿을 수 있어서, 이 반환값을 받아 진입부에서 별도로
     `write_gate.authorize`를 부른다(아래 해당 함수 본문 참고).
     """
     from opencrab.auth import current_principal
@@ -1894,23 +1894,23 @@ def load_nodes_incremental(
     동일한 벡터 스토어 인스턴스를 넘겨야 한다. 기본값 `None`은 벡터 축 없는
     배포에서 이 검사 전체를 안전하게 skip한다(아래 R1 설명).
 
-    `sql`(#377 2라운드, PR #421 codex 리뷰): `vec`가 주어질 때만 필수인
-    키워드 전용 인자다. "same" 판정 행은 `builder.add_node()`(팩 소유권
-    `authorize()`가 도는 자리)에 닿지 않고 벡터 백엔드를 직접 건드리므로,
-    이 함수 진입부에서 별도로 `authorize(sql, principal, pack_name)`을
-    부른다. 그래야 바인딩은 됐지만 이 팩을 소유하지 않은 principal이
-    타인의 비공개 팩 벡터 슬롯 존재 여부를 조회하는 경로가 막힌다.
-    `vec is None`(벡터 축 없는 배포)이면 이 인가 자체가 필요 없으므로
-    `sql`도 생략 가능하다. `vec`는 주어졌는데 `sql`이 없으면 `ValueError`로
-    즉시 실패한다(아래 본문). 호출자는 `builder`가 물린 것과 동일한
-    등록부 `SQLStore` 인스턴스를 넘겨야 한다(청크 축의 `sql` 계약과 같은
-    레지스트리 동일성 요구).
+    `sql`(#377 2라운드, #424): 키워드 전용 필수 인자다(기본값 `None`은
+    생략 시 `TypeError` 대신 `ValueError`를 내려는 것이지 생략을 허용하지
+    않는다). "same" 판정 행은 `builder.add_node()`(팩 소유권 `authorize()`가
+    도는 자리)에 닿지 않고 벡터 백엔드와 doc 정리와 구 타입 스윕을 직접
+    건드리므로, 이 함수 진입부에서 별도로 `authorize(sql, principal,
+    pack_name)`을 부른다. 벡터 축 유무(`vec is None`)와 무관하다. 바인딩은
+    됐지만 이 팩을 소유하지 않은 principal은 `PackNotFoundError` 또는
+    `PackForbiddenError`로 호출 전체가 스토어 접촉 전에 중단된다. 종전에는
+    소유하지 않은 행의 `add_node` 실패만 행 단위로 `err`에 세고 계속
+    진행했고, same 행은 검사 자체가 없었다. 호출자는 `builder`가 물린 것과
+    동일한 등록부 `SQLStore` 인스턴스를 넘겨야 한다(청크 축의 `sql` 계약과
+    같은 레지스트리 동일성 요구).
 
     이 `authorize()`도 호출당 1회이고 대상은 `pack_name`이다. 행마다
-    인가하는 `builder.add_node()`와 달리, 벡터 접근이 걸리는 이 적재가
-    도는 동안 소유권이 바뀌는 창이 남는다. 청크 축
-    `load_chunks_incremental`과 같은 의도한 모서리다(그쪽 독스트링의
-    같은 설명 참고).
+    인가하는 `builder.add_node()`와 달리, 이 적재가 도는 동안 소유권이 바뀌는
+    창이 남는다. 청크 축 `load_chunks_incremental`과 같은 의도한 모서리다
+    (그쪽 독스트링의 같은 설명 참고).
 
     `doc_node_spaces`는 F4-b `live_pack_state` 의 반환이다 — **필수 인자**다.
     노드가 이번 적재에서 space X 로 확인됐는데 doc_nodes 에 다른 space Y 의 행이
@@ -2010,32 +2010,25 @@ def load_nodes_incremental(
             if not ok_del:
                 log.warning("doc 이종 space 정리 실패(반환 False) %s space=%s", node_id, other_space)
 
-    # PR #421 인라인 리뷰(codex, P2, 2026-09-28): 이 블록(벡터 접근)은
-    # 반드시 `_require_bound_principal()` 뒤에 와야 한다. 미바인딩
-    # principal 호출이 principal 오류보다 먼저 벡터 백엔드에 닿으면 안
-    # 된다(형제 축 load_chunks_incremental의 순서인 require_live_data,
-    # principal, authorize, 벡터 열거 순을 여기서도 지킨다).
-    # 정확한 보장은 "principal 오류가 항상 최초 오류"가 아니라 "미바인딩
-    # 호출은 벡터 접근에 도달하지 않는다"이다. require_live_data(위)가
-    # 먼저 실패하면 그 오류가 대신 난다(기존 동작, 이 수정이 바꾸지
-    # 않음). 게이트: tests/test_pack_load_r15_node_vec_gates.py::
-    # TestNodeVecAccessGatedByPrincipal.
+    # 진입 게이트 순서(형제 축 load_chunks_incremental과 같다): require_live_data
+    # (위), principal, authorize, 그 뒤에야 어떤 스토어에든 닿는다. 이 순서는
+    # 두 이슈가 차례로 세웠다.
+    # - PR #421 인라인 리뷰(codex, P2, 2026-09-28): 미바인딩 principal 호출은
+    #   벡터 백엔드에 도달하면 안 된다. 정확한 보장은 "principal 오류가 항상
+    #   최초 오류"가 아니라 "미바인딩 호출은 벡터 접근에 도달하지 않는다"이다.
+    #   require_live_data가 먼저 실패하면 그 오류가 대신 난다.
+    # - #424: same 판정 행은 builder.add_node()(팩 소유권 authorize()가 도는
+    #   자리)를 부르지 않는다. 그 경로의 doc 공간 잔재 정리와 루프 뒤 구 타입
+    #   행 스윕이 인가 없이 삭제했다. 그래서 인가는 벡터 유무와 무관하게
+    #   진입에서 한 번 건다. 이 함수의 모든 분기(same 정리, 스윕, 구 타입
+    #   삭제, 벡터 접근)가 이 한 지점을 지난다. 분기마다 따로 걸지 않는다.
+    # 게이트: tests/test_pack_load_r15_node_vec_gates.py::
+    # TestNodeVecAccessGatedByPrincipal, tests/test_pack_load_r16_node_same_delete_gate.py.
     principal = _require_bound_principal()
-
-    # PR #421 2라운드 리뷰(codex, P2, 2026-09-28): "same" 판정 행은
-    # builder.add_node()(팩 소유권 authorize()가 도는 자리)에 안 닿고
-    # 아래 _live_vec_ids로 벡터 백엔드를 직접 건드린다. 바인딩은 됐지만
-    # 이 팩을 소유하지 않은 principal이 타인의 비공개 팩 벡터 슬롯 존재를
-    # 조회할 수 있었다(#143 invariant 7 위반). vec 접근 직전에만 건다
-    # (vec is None 이면 벡터 축 자체가 없으므로 이 인가도 불필요, 범위
-    # 밖). 게이트: tests/test_pack_load_r15_node_vec_gates.py::
-    # TestNodeVecAccessGatedByPrincipal.
-    if vec is not None:
-        if sql is None:
-            raise ValueError(
-                "load_nodes_incremental: vec가 주어지면 sql도 필수다"
-                "(팩 소유권 인가, #377 2라운드)")
-        authorize(sql, principal, pack_name)
+    if sql is None:
+        raise ValueError(
+            "load_nodes_incremental: sql은 필수다(팩 소유권 인가, #424)")
+    authorize(sql, principal, pack_name)
 
     # R1(#377, load_chunks_incremental의 #142 재리뷰 패턴 이식): 그래프/문서가
     # 라이브와 같아도 벡터만 유실됐을 수 있다. 열거 가능 백엔드에서는
