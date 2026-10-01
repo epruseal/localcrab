@@ -872,6 +872,48 @@ class HybridQuery:
             )
         return warnings
 
+    def _bm25_acquire_state(self) -> Bm25CacheState | None:
+        """Cold-build or probe once, then return the current cache state.
+
+        Shared by ``_bm25_search_state`` (one search) and
+        ``_bm25_search_per_pack`` (many searches on one pinned state), so one
+        code path owns the cold build, the fingerprint probe and
+        ``mark_stale``. Raises when the cold build raises; callers decide the
+        containment.
+        """
+        state = self._bm25.state
+        if state is None:
+            self._bm25.ensure_built(self._doc_store)
+        else:
+            # Local containment: a probe (native) or fallback marker
+            # (legacy) failure here must not abort the search that follows.
+            # On failure we skip only the mark_stale attempt. The caller
+            # captures one state reference right after this call and uses
+            # that single reference for both the search and its coverage
+            # warnings. A concurrent worker publish during this attempt may
+            # make that reference newer than the one read at entry --
+            # harmless, since each state bundles its index and metadata
+            # atomically.
+            try:
+                current_fingerprint = self._bm25_probe_fingerprint()
+            except Exception as exc:
+                logger.debug("BM25 hot-path probe/marker failed: %s", exc)
+                current_fingerprint = None
+            if (
+                current_fingerprint is not None
+                and current_fingerprint != state.probe_fingerprint
+            ):
+                # #422: this is a redundant re-detection of staleness that
+                # an already-scheduled (or about-to-start) rebuild will
+                # resolve on its own next observation. Use mark_stale()
+                # (no epoch bump) instead of invalidate() so that search
+                # traffic during a build window cannot make the
+                # publish-time epoch comparison discard an otherwise
+                # up-to-date candidate. A real write still goes through
+                # invalidate() at its own call sites.
+                self._bm25.mark_stale()
+        return self._bm25.state
+
     def _bm25_search_state(
         self,
         question: str,
@@ -885,40 +927,7 @@ class HybridQuery:
         if not pack_ids:
             return [], []
         try:
-            state = self._bm25.state
-            if state is None:
-                self._bm25.ensure_built(self._doc_store)
-            else:
-                # Local containment: a probe (native) or fallback marker
-                # (legacy) failure here must not abort the search below. On
-                # failure we skip only the mark_stale attempt. We still capture
-                # one state reference right after this block (next line) and use
-                # that single reference for both the search and its coverage
-                # warnings. A concurrent worker publish during this attempt may
-                # make that reference newer than the one read at function entry
-                # -- harmless, since each state bundles its index and metadata
-                # atomically.
-                try:
-                    current_fingerprint = self._bm25_probe_fingerprint()
-                except Exception as exc:
-                    logger.debug(
-                        "BM25 hot-path probe/marker failed: %s", exc
-                    )
-                    current_fingerprint = None
-                if (
-                    current_fingerprint is not None
-                    and current_fingerprint != state.probe_fingerprint
-                ):
-                    # #422: this is a redundant re-detection of staleness that
-                    # an already-scheduled (or about-to-start) rebuild will
-                    # resolve on its own next observation. Use mark_stale()
-                    # (no epoch bump) instead of invalidate() so that search
-                    # traffic during a build window cannot make the
-                    # publish-time epoch comparison discard an otherwise
-                    # up-to-date candidate. A real write still goes through
-                    # invalidate() at its own call sites.
-                    self._bm25.mark_stale()
-            state = self._bm25.state
+            state = self._bm25_acquire_state()
             if state is None:
                 return [], []
             hits = state.index.search(
@@ -934,6 +943,49 @@ class HybridQuery:
         except Exception as exc:
             logger.warning("BM25 search error: %s", exc)
             return [], []
+
+    def _bm25_search_per_pack(
+        self,
+        question: str,
+        spaces: list[str] | None,
+        limit: int,
+        *,
+        pack_ids: list[str],
+    ) -> dict[str, list[dict[str, Any]]] | None:
+        """#411: per-pack top-``limit`` BM25 hits on ONE pinned cache state.
+
+        The content fallback probes every candidate pack. A per-pack
+        ``_bm25_search`` call runs the fingerprint probe (a whole-table
+        ``COUNT(*)``) each time. This method probes once, pins the state, and
+        searches each pack on that state. Hits per pack equal the per-pack
+        loop's hits while the state does not change. If a worker publishes a
+        new state mid-call, the remaining packs still search the pinned state
+        (one consistent generation, as in a single ``query()``).
+
+        Returns ``None`` when the caller must loop over ``_bm25_search``: an
+        instance-level ``_bm25_search`` override exists, the cold build raised,
+        no state exists, or a per-pack search raised.
+        """
+        if self.__dict__.get("_bm25_search") is not None:
+            return None
+        if not pack_ids:
+            return {}
+        try:
+            state = self._bm25_acquire_state()
+            if state is None:
+                return None
+            out: dict[str, list[dict[str, Any]]] = {}
+            for pid in pack_ids:
+                hits = state.index.search(
+                    question, spaces=spaces, limit=limit, pack_ids=[pid]
+                )
+                for hit in hits:
+                    hit["source"] = "bm25"
+                out[pid] = hits
+            return out
+        except Exception as exc:
+            logger.warning("BM25 per-pack search error: %s", exc)
+            return None
 
     def _bm25_search_with_warnings(
         self,
