@@ -2,9 +2,9 @@
 
 두 증분 적재 함수(청크 축, 노드 축)는 시작할 때 라이브 벡터 ID를 한 번
 열거한다. 열거가 예외를 던지면 행 루프 전에 적재가 멈추고 그래프와 문서
-정합화까지 막혔다. 계약: 백엔드 오류는 "벡터 상태 미확인"으로 접어 회수만
-건너뛰고 미확인 카운트와 경고로 드러낸다. 인가 실패와 프로그래밍 오류는
-삼키지 않는다.
+정합화까지 막혔다. 계약: 백엔드 오류는 "벡터 상태 미확인"으로 접는다. 단건
+조회로도 확인하지 못한 same 후보의 회수만 보류하고 미확인 카운트와 경고로
+드러낸다. 인가 실패와 프로그래밍 오류는 삼키지 않는다.
 """
 from __future__ import annotations
 
@@ -237,3 +237,30 @@ class TestChunkAxis:
                 pack_load.load_chunks_incremental(
                     "pack-1", f, vec1, docs, live_chunks, sql=pack_sql)
         assert vec1.enum_attempts == 0
+
+
+@pytest.mark.parametrize("exc", [PermissionError("denied"), LookupError("missing")])
+class TestAuthorizationLikeErrorsFromTheBackendPropagate:
+    """열거 단계에서 백엔드가 직접 던진 권한성 예외도 접지 않는다."""
+
+    def test_node_axis(self, live, tmp_path, pack_sql, exc):
+        builder, graph, docs, state, f, id_map = TestNodeAxis()._baseline(
+            live, tmp_path, pack_sql, [_node(id="n1")])
+        vec1 = _FlakyNodeVec("pack-1")
+        vec1.enum_error = exc
+        builder._vec = vec1
+        with pytest.raises(type(exc)):
+            pack_load.load_nodes_incremental(
+                "pack-1", f, builder, id_map, state["nodes"], graph, docs,
+                state["doc_node_spaces"], vec=vec1, sql=pack_sql)
+
+    def test_chunk_axis(self, live, tmp_path, pack_sql, exc):
+        _b, _g, docs = live
+        f = _write_jsonl(tmp_path / "c.jsonl", [_chunk_row("c1")])
+        pack_load.load_chunks("pack-1", f, _EnumerableVec("pack-1"), docs, sql=pack_sql)
+        live_chunks = _live_chunks_from_docs(docs)
+        vec1 = _FlakyChunkVec("pack-1")
+        vec1.enum_error = exc
+        with pytest.raises(type(exc)):
+            pack_load.load_chunks_incremental(
+                "pack-1", f, vec1, docs, live_chunks, sql=pack_sql)
