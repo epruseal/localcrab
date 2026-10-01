@@ -176,6 +176,21 @@ class TestRealPartialFailure:
         # 그 뒤에는 수렴한다.
         assert _counts(_incremental(live, pack_sql, f2)) == (0, 0, 1, 0, 0)
 
+    def test_stale_aggregate_counts_every_stale_row(
+            self, live, tmp_path, monkeypatch, caplog, pack_sql):
+        builder, _g, docs = live
+        f1 = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1", 발행연도="1"), _node(id="n2", 발행연도="1")])
+        pack_load.load_nodes("pack-1", f1, builder, {})
+        f2 = _write_jsonl(tmp_path / "n2.jsonl", [_node(id="n1", 발행연도="2"), _node(id="n2", 발행연도="2")])
+        with monkeypatch.context() as m:
+            _FailDocWrites(docs, m)
+            assert _counts(_incremental(live, pack_sql, f2)) == (0, 0, 0, 0, 2)
+        with monkeypatch.context() as m, caplog.at_level(logging.WARNING):
+            _FailDocWrites(docs, m)
+            _incremental(live, pack_sql, f2)
+        agg = [x.getMessage() for x in caplog.records if "doc 행 값 어긋남 회수 누적" in x.getMessage()]
+        assert len(agg) == 1 and "누적 2건" in agg[0], agg
+
     def test_persistent_doc_failure_reports_every_run(
             self, live, tmp_path, monkeypatch, caplog, pack_sql):
         """#301 과의 관계: 문서 쓰기가 계속 실패하면 매 런 err 와 집계 경고가 난다."""
@@ -269,13 +284,13 @@ class TestControlsStaySame:
         pack_load.load_nodes("pack-1", f, live[0], {})
         _b, graph, docs = live
         state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
-        calls: list[tuple[str, int]] = []
+        calls: list[tuple[tuple[str, str], int]] = []
         real = docs._fetch_all
 
         def spy(sql, params):
             rows = real(sql, params)
             if "last_node_id" in params:
-                calls.append((params["last_node_id"], len(rows)))
+                calls.append(((params["last_space"], params["last_node_id"]), len(rows)))
             return rows
 
         monkeypatch.setattr(docs, "_fetch_all", spy)
@@ -286,6 +301,38 @@ class TestControlsStaySame:
         assert all(n <= 3 for _c, n in calls), calls
         cursors = [c for c, _n in calls]
         assert cursors == sorted(cursors) and len(set(cursors)) == len(cursors), calls
+
+    def test_pack_spanning_two_spaces_converges_across_page_boundaries(
+            self, live, tmp_path, monkeypatch, pack_sql):
+        """한 팩이 여러 space 에 걸쳐도(노드 타입마다 space 가 갈린다) 키셋 페이지가
+        (space, node_id) 순서로 전진해 전량 same 이다. 정렬 열이나 커서가 space 를
+        무시하는 변이는 건강한 행을 매 런 다시 쓴다."""
+        monkeypatch.setattr(pack_load, "_DOC_FP_BATCH", 2)
+        rows = [
+            _node(id=f"a{i}", node_type="Document", space="resource") if i % 2 == 0
+            else _node(id=f"a{i}", node_type="Agent", space="subject")
+            for i in range(6)
+        ]
+        f = _write_jsonl(tmp_path / "n.jsonl", rows)
+        pack_load.load_nodes("pack-1", f, live[0], {})
+        _b, _g, docs = live
+        assert _counts(_incremental(live, pack_sql, f)) == (0, 0, 6, 0, 0)
+        assert _counts(_incremental(live, pack_sql, f)) == (0, 0, 6, 0, 0)
+        docs._conn.execute("UPDATE doc_nodes SET node_type='Stale' WHERE node_id='a3'")
+        docs._conn.commit()
+        assert _counts(_incremental(live, pack_sql, f)) == (0, 1, 5, 0, 0)
+        assert _counts(_incremental(live, pack_sql, f)) == (0, 0, 6, 0, 0)
+
+    def test_same_node_id_in_two_spaces_pages_without_loss(
+            self, live, tmp_path, monkeypatch, pack_sql):
+        """같은 node_id 의 문서 행이 두 space 에 있어도(구 space 잔재) 스캔이 둘 다 읽는다."""
+        monkeypatch.setattr(pack_load, "_DOC_FP_BATCH", 1)
+        _b, _g, docs = live
+        f = _write_jsonl(tmp_path / "n.jsonl", [_node(id="n1"), _node(id="n2")])
+        pack_load.load_nodes("pack-1", f, live[0], {})
+        docs.upsert_node_doc("concept", "Concept", "n1", {"pack_id": "pack-1"})
+        fps = pack_load._doc_node_fingerprints(docs, "pack-1")
+        assert sorted(fps) == [("concept", "n1"), ("resource", "n1"), ("resource", "n2")]
 
 
 class TestNumericCanonicalForm:
