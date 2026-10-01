@@ -390,7 +390,8 @@ def test_t8a_mixed_row_owned_by_another_pack_survives(live):
     _builder, graph, docs = live
     graph.upsert_node("Document", "mixed", {"pack_id": "pack-b", "pack": "pack-a"})
 
-    pack_load.delete_pack("pack-a", graph, docs, _NoVec())
+    with principal_scope(_owned_principal(_builder._sql, "pack-a")):
+        pack_load.delete_pack("pack-a", graph, docs, _NoVec(), sql=_builder._sql)
 
     assert graph.get_node("Document", "mixed") is not None, (
         "회수 술어가 폐기 별칭을 본다 — 다른 팩 소유 행이 함께 지워졌다(과삭제)")
@@ -401,7 +402,8 @@ def test_t8b_row_owned_by_the_named_pack_is_deleted_despite_a_foreign_alias(live
     _builder, graph, docs = live
     graph.upsert_node("Document", "mine", {"pack_id": "pack-a", "pack": "pack-b"})
 
-    pack_load.delete_pack("pack-a", graph, docs, _NoVec())
+    with principal_scope(_owned_principal(_builder._sql, "pack-a")):
+        pack_load.delete_pack("pack-a", graph, docs, _NoVec(), sql=_builder._sql)
 
     assert graph.get_node("Document", "mine") is None, (
         "회수 술어가 별칭 쪽으로 좁혀졌다 — 자기 팩 소유 행이 회수되지 않았다(누락)")
@@ -419,7 +421,8 @@ def test_t8c_edge_reclaim_is_cascade_only_guard(live):
     graph.upsert_edge("Document", "b1", "relates_to", "Document", "b2",
                       {"pack_id": "pack-a", "pack": "pack-a"})
 
-    pack_load.delete_pack("pack-a", graph, docs, _NoVec())
+    with principal_scope(_owned_principal(_builder._sql, "pack-a")):
+        pack_load.delete_pack("pack-a", graph, docs, _NoVec(), sql=_builder._sql)
 
     assert graph.get_edge("Document", "b1", "relates_to", "Document", "b2") is not None, (
         "양 끝점이 다른 팩인 엣지가 지워졌다 — 엣지 직접 회수 술어가 새로 생겼다. "

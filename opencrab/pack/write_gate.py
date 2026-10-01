@@ -170,8 +170,9 @@ def authorize(
     Putting the default here means every writer that goes through
     ``authorize`` is ready-only unless it explicitly widens the set,
     instead of depending on every future call site remembering to check
-    status itself. Exactly two places widen it today, and both narrow the
-    opening back down some other way:
+    status itself. Exactly two places widen it for writers today, and both
+    narrow the opening back down some other way (the delete entries have
+    their own gate, :func:`authorize_delete`):
 
     - ``OntologyBuilder.add_node``'s ``pack_anchor`` path, to
       ``('creating',)`` -- restricted to that pack's own anchor node by a
@@ -193,6 +194,46 @@ def authorize(
     from opencrab.pack.ownership import assert_writable
 
     return assert_writable(sql, principal, pack_id, allowed_statuses=allowed_statuses)
+
+
+def authorize_delete(sql: Any, principal: Principal, pack_id: str) -> dict[str, Any]:
+    """Owner-only authorization for the pack DELETE entries (#434):
+    ``delete_pack``.
+
+    The third opening of the write gate, and the only one that widens the
+    status set for an owner alone. ``delete_pack`` is the operator recovery
+    path for the residue of a failed fork or ingest, and that residue lives
+    in ``creating`` / ``partial`` packs, which the ready-only default would
+    hide even from the owner.
+
+    - No row, OR a non-ready pack that ``principal`` does not own (whatever
+      its visibility), OR a private pack owned by someone else ->
+      ``PackNotFoundError``. An incomplete pack stays unobservable to
+      everyone but its owner (#170, #143 invariant 7).
+    - A ready, non-private pack owned by someone else ->
+      ``PackForbiddenError`` (same as :func:`authorize`).
+    - Owned by ``principal``, any status -> returns the row.
+
+    Fails closed when the registry is unreachable, like :func:`authorize`.
+    """
+    if not getattr(sql, "available", False):
+        raise RuntimeError(
+            "pack registry unavailable; refusing the delete (ownership cannot "
+            "be verified)"
+        )
+    from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, get_pack
+
+    # One registry read decides every branch. A second read (for example via
+    # ``assert_writable``) would let a row change between the two reads turn
+    # the mask below into ``PackForbiddenError`` for an incomplete pack.
+    row = get_pack(sql, pack_id)
+    if row is None:
+        raise PackNotFoundError(pack_id)
+    if row["owner_id"] == principal.user_id:
+        return row
+    if row["status"] != PACK_STATUS_READY or row["visibility"] == "private":
+        raise PackNotFoundError(pack_id)
+    raise PackForbiddenError(pack_id)
 
 
 def authorize_fork_copy(sql: Any, principal: Principal, pack_id: str) -> dict[str, Any]:

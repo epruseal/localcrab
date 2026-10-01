@@ -26,10 +26,25 @@ import sqlite3
 
 import pytest
 
+from opencrab.auth import Principal, principal_scope
 from opencrab.pack import load as pack_load
+from opencrab.pack.ownership import create_pack
 from opencrab.stores._sql_dialect import POSTGRES, SQLITE
-from tests.test_pack_load import _NoVec, live, pack_sql  # noqa: F401 — 실 스토어 픽스처 재사용
+from tests.test_pack_load import (  # noqa: F401 (실 스토어 픽스처 재사용)
+    _LIVE_TEST_USER,
+    _NoVec,
+    live,
+    pack_sql,
+)
 from tests.test_pack_load_r11_pg_gates import _NoVecFake, _pg_fakes
+
+
+def _own(pack_sql, *pack_ids):
+    """`pack_ids` 를 `_LIVE_TEST_USER` 소유로 등록하고 그 principal 을 돌려준다(#434)."""
+    for pack_id in pack_ids:
+        create_pack(pack_sql, _LIVE_TEST_USER, pack_id)
+    return Principal(user_id=_LIVE_TEST_USER, is_local=True, disabled=False)
+
 
 # ───────────────────────── 게이트 ⓐ: 혼합 형태 e2e ─────────────────────────
 
@@ -44,22 +59,24 @@ class TestMixedFormOwnershipE2E:
         docs.upsert_source("b-only", "B 전용 본문", {"pack_id": "B"})
         docs.upsert_source("a-legacy", "A 레거시(source 만) 본문", {"source": "A"})
 
-    def test_delete_pack_a_spares_the_mixed_and_b_only_docs(self, live, tmp_path):
+    def test_delete_pack_a_spares_the_mixed_and_b_only_docs(self, live, tmp_path, pack_sql):
         _builder, graph, docs = live
         self._seed(docs)
 
-        pack_load.delete_pack("A", graph, docs, _NoVec())
+        with principal_scope(_own(pack_sql, "A")):
+            pack_load.delete_pack("A", graph, docs, _NoVec(), sql=pack_sql)
 
         left = {r[0] for r in docs._conn.execute("SELECT source_id FROM doc_sources")}
         assert "mixed" in left, "혼합 태그 문서(pack_id=B)가 A delete_pack 에 오삭제됐다 — P1 재현"
         assert "b-only" in left, "무관한 B 전용 문서가 A delete_pack 에 지워졌다"
         assert "a-legacy" not in left, "레거시 source-only A 문서가 폴백 매치로 안 지워졌다(회귀)"
 
-    def test_delete_pack_b_removes_the_mixed_doc(self, live, tmp_path):
+    def test_delete_pack_b_removes_the_mixed_doc(self, live, tmp_path, pack_sql):
         _builder, graph, docs = live
         self._seed(docs)
 
-        pack_load.delete_pack("B", graph, docs, _NoVec())
+        with principal_scope(_own(pack_sql, "B")):
+            pack_load.delete_pack("B", graph, docs, _NoVec(), sql=pack_sql)
 
         left = {r[0] for r in docs._conn.execute("SELECT source_id FROM doc_sources")}
         assert "mixed" not in left, "혼합 태그 문서(pack_id=B)가 B delete_pack 에서 안 지워졌다"
@@ -300,13 +317,15 @@ class TestPgFakeNewPredicateNoViolation:
     낸다 — r11 `TestPgShapedFakeStores` 의 4 시나리오(이미 green, 별도 실행
     확인 완료)에 더해 여기서는 **혼합 형태**를 PG fake 로 재현한다."""
 
-    def test_mixed_form_on_pg_fake_delete_pack(self):
+    def test_mixed_form_on_pg_fake_delete_pack(self, pack_sql):
         graph, docs = _pg_fakes()
         graph.seed_node("Document", "n1", "A")
         docs.seed_source("mixed", "본문", pack_id="B", source="A")
         docs.seed_source("b-only", "본문2", pack_id="B")
 
-        node_del, chunk_sql_del, _ = pack_load.delete_pack("A", graph, docs, _NoVecFake())
+        with principal_scope(_own(pack_sql, "A")):
+            node_del, chunk_sql_del, _ = pack_load.delete_pack(
+                "A", graph, docs, _NoVecFake(), sql=pack_sql)
 
         assert node_del == 1
         assert chunk_sql_del == 0, "PG fake 에서도 혼합 문서가 A delete_pack 에 오삭제됐다"
@@ -332,7 +351,7 @@ class TestMutantUnconditionalOrIsCaughtByGateA:
     검출한다는 증명(회귀 검출력)."""
 
     def test_reverting_to_unconditional_or_reproduces_the_p1_bug(self, live, tmp_path,
-                                                                    monkeypatch):
+                                                                    monkeypatch, pack_sql):
         _builder, graph, docs = live
         docs.upsert_source("mixed", "혼합 태그 본문", {"pack_id": "B", "source": "A"})
 
@@ -343,7 +362,8 @@ class TestMutantUnconditionalOrIsCaughtByGateA:
 
         monkeypatch.setattr(pack_load, "_doc_owner_pred", _unconditional_or)
 
-        pack_load.delete_pack("A", graph, docs, _NoVec())
+        with principal_scope(_own(pack_sql, "A")):
+            pack_load.delete_pack("A", graph, docs, _NoVec(), sql=pack_sql)
 
         left = {r[0] for r in docs._conn.execute("SELECT source_id FROM doc_sources")}
         assert "mixed" not in left, (

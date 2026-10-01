@@ -838,7 +838,10 @@ def assert_writable(
     ``write_gate.authorize``'s own docstring; they describe the same two
     openings and must not drift apart. A boolean
     "allow incomplete too" would also open the door for ``partial``, which
-    must stay closed to every writer including the owner.
+    must stay closed to every writer including the owner. The one exception
+    is deletion: ``write_gate.authorize_delete`` admits the OWNER of a
+    ``creating``/``partial`` pack so the operator can reclaim its residue (#434);
+    a non-owner still gets ``PackNotFoundError`` for any incomplete pack.
 
     - No such row, OR its status is not in ``allowed_statuses``, OR it is a
       private row owned by someone else -> ``PackNotFoundError``. All three

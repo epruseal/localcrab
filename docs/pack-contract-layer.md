@@ -269,7 +269,7 @@ SELECT COUNT(*) FROM graph_nodes
 `load_chunks_incremental` 이 이미 이렇게 동작한다. 재현 명령:
 `pytest tests/test_pack_load_r16_node_same_delete_gate.py`.
 
-같은 종류의 공백이 `incremental_finalize` 와 `delete_pack` 에 남아 있다(#434).
+같은 종류의 공백이던 `incremental_finalize` 와 `delete_pack` 은 #434 에서 닫혔다(아래 6절의 삭제 진입점 게이트).
 
 ### 4. 앵커 판정은 **한 곳에서만** 정의한다
 
@@ -320,9 +320,10 @@ URI가 붙은 레코드(`uris` API로 만들어진 레코드 — 이 시스템�
    그것도 지운다)를 담는다.
 2. 운영자가 그 보고를 보고 `resume=True` 를 명시해야만 완주한다.
 3. `resume=True` 라도 팩 동일성 부정 신호(저널 생성 시점 스냅샷 대비 `created_at`
-   불일치 또는 레지스트리 행 소멸)가 있으면 `DeletePackJournalConflict` 로 거부한다.
-   일치는 증명이 아니므로 통과 증거로 쓰지 않고, 불일치만 확실한 부정 신호로 차단에
-   쓴다.
+   불일치)가 있으면 `DeletePackJournalConflict` 로 거부한다. 일치는 증명이 아니므로
+   통과 증거로 쓰지 않고, 불일치만 확실한 부정 신호로 차단에 쓴다. 레지스트리 행이
+   사라진 팩은 이 검사에 닿기 전에 소유권 게이트(아래)가 `PackNotFoundError` 로
+   거부한다(#434, 종전에는 이 자리가 `DeletePackJournalConflict`).
 4. 저널이 찢어져 파싱할 수 없으면 "없음"으로 접지 않고 `DeletePackJournalCorrupt` 를
    던진다.
 
@@ -336,6 +337,16 @@ URI가 붙은 레코드(`uris` API로 만들어진 레코드 — 이 시스템�
 자체가 없으면(구조적 미지원) 즉시 `done=True`, 모양은 있는데 `available=False`면
 (연결·초기화 실패) 재시도 대상으로 `done=False`, `available=True`면 기존 kind 기반
 삭제를 실행하고 확인 결과로 `done` 을 정한다.
+
+**삭제 진입점의 소유권 게이트(#434).** `delete_pack` 과 `incremental_finalize` 는 키워드
+전용 필수 `sql`(등록부 `SQLStore`)을 받고, 진입에서 `require_live_data`, 바인딩된
+principal 확인, 소유권 검사 순으로 건 뒤에야 잠금 파일, 저널, 스토어에 닿는다.
+`incremental_finalize` 는 쓰기 진입점과 같은 `write_gate.authorize`(ready 만)를 쓴다.
+`delete_pack` 은 `write_gate.authorize_delete` 를 쓰고 잠금을 잡은 뒤 저널을 읽기 전에
+한 번 더 부른다. 소유자는 팩 상태와 무관하게 지울 수 있다. `creating`/`partial` 팩의
+잔재를 회수하는 운영자 경로이기 때문이다. 비소유자는 공개 여부와 무관하게 미완성 팩의
+존재를 알 수 없고(`PackNotFoundError`) ready 팩도 지우지 못한다. 검사 뒤 소유권이
+바뀌는 창은 청크 로더와 같은 의도한 모서리다. 재현: `pytest tests/test_pack_delete_gate.py -q`.
 
 완료된 저널은 `delete_pack` 이 스스로 지우지 않는다 — `clear_journal()` 자신의
 docstring 이 "호출자가 부른다"고 명시하며, 완료 직후 축 상태를 다시 확인하려는
