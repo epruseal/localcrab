@@ -1264,3 +1264,112 @@ def test_422_slow_build_with_hammering_search_converges_within_bounded_time() ->
         )
     finally:
         hybrid.shutdown_bm25()
+
+
+# ---------------------------------------------------------------------------
+# #411 -- content fallback pins one BM25 state and probes once
+# ---------------------------------------------------------------------------
+
+
+def _warm_hybrid(packs: list[str]) -> tuple[HybridQuery, MagicMock]:
+    doc_store = MagicMock()
+    doc_store.available = True
+    doc_store.list_nodes = MagicMock(
+        return_value=[_node(f"n-{p}", pack_id=p, text=f"alpha {p}") for p in packs]
+    )
+    doc_store.bm25_fingerprint = MagicMock(return_value=(len(packs), ""))
+    hybrid = _hybrid(doc_store)
+    hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=[packs[0]])  # cold build
+    return hybrid, doc_store
+
+
+def test_411_per_pack_search_probes_once_and_matches_loop() -> None:
+    from opencrab.ontology.pack_registry import PackInfo, _choose_by_content
+
+    packs = [f"p{i}" for i in range(12)]
+    hybrid, doc_store = _warm_hybrid(packs)
+    try:
+        loop_hits = {
+            p: hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=[p])
+            for p in packs
+        }
+        doc_store.bm25_fingerprint.reset_mock()
+        got = hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=packs)
+        assert doc_store.bm25_fingerprint.call_count == 1
+        assert got == loop_hits
+
+        doc_store.bm25_fingerprint.reset_mock()
+        registry = [PackInfo(pack_id=p, title=p, description="") for p in packs]
+        _choose_by_content("alpha", registry, hybrid, spaces=None)
+        assert doc_store.bm25_fingerprint.call_count == 1
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_per_pack_search_marks_stale_once_without_epoch_bump() -> None:
+    packs = ["a", "b", "c"]
+    hybrid, doc_store = _warm_hybrid(packs)
+    try:
+        doc_store.bm25_fingerprint.return_value = (99, "")  # external write
+        epoch = hybrid._bm25._epoch
+        old_state = hybrid._bm25.state
+        marks = []
+        hybrid._bm25.mark_stale = lambda: marks.append(1)  # no worker wake
+        got = hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=packs)
+        assert len(marks) == 1
+        assert hybrid._bm25._epoch == epoch
+        assert set(got) == set(packs)
+        assert hybrid._bm25.state is old_state  # older state served until publish
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_per_pack_search_pins_state_across_publish() -> None:
+    packs = ["a", "b"]
+    hybrid, _doc_store = _warm_hybrid(packs)
+    try:
+        pinned = hybrid._bm25.state
+        real_search = pinned.index.search
+        seen = []
+
+        def publish_after_first(*args, **kwargs):
+            if not seen:
+                hybrid._bm25.state = Bm25CacheState(
+                    index=BM25Index.build([]),
+                    probe_fingerprint=(0, ""),
+                    indexed_rows=0,
+                    total_rows=0,
+                    covered_pack_ids=frozenset(),
+                    generation=pinned.generation + 1,
+                )
+            seen.append(1)
+            return real_search(*args, **kwargs)
+
+        pinned.index.search = publish_after_first
+        got = hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=packs)
+        assert len(seen) == 2  # both packs searched the pinned index
+        assert got["b"], "second pack must still see the pinned generation"
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_per_pack_search_returns_none_for_loop_fallback() -> None:
+    hybrid, _doc_store = _warm_hybrid(["a"])
+    try:
+        assert hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=[]) == {}
+        hybrid._bm25.state.index.search = MagicMock(side_effect=RuntimeError("boom"))
+        assert hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=["a"]) is None
+        hybrid._bm25_search = lambda *a, **k: []  # instance override (test double)
+        assert hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=["a"]) is None
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_411_probe_failure_still_searches_without_none() -> None:
+    hybrid, doc_store = _warm_hybrid(["a"])
+    try:
+        doc_store.bm25_fingerprint.side_effect = RuntimeError("probe down")
+        got = hybrid._bm25_search_per_pack("alpha", None, 5, pack_ids=["a"])
+        assert got is not None and got["a"]
+    finally:
+        hybrid.shutdown_bm25()

@@ -540,8 +540,7 @@ def _choose_by_content(
     pack_hit_scores: dict[str, float] = {}
     truncated_packs: list[str] = []
     # #437: FTS 는 가능하면 한 번의 MATCH 로 팩별 상위 N 을 받는다. 지원하지
-    # 않는 백엔드나 호출 실패(None)는 종전 팩별 루프로 돌아간다. BM25 탐침은
-    # 이 경로와 무관하게 팩마다 돈다.
+    # 않는 백엔드나 호출 실패(None)는 종전 팩별 루프로 돌아간다.
     fts_by_pack: dict[str, list[dict[str, Any]]] | None = None
     per_pack_fts = getattr(hybrid, "_fts_search_per_pack", None)
     if per_pack_fts is not None:
@@ -553,10 +552,27 @@ def _choose_by_content(
         )
         if isinstance(result, dict):
             fts_by_pack = result
-    for pid in (p.pack_id for p in registry):
-        bm25_hits = hybrid._bm25_search(  # noqa: SLF001 — 내부 프로브 전용 호출
-            question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
+    # #411: BM25 도 같은 방식이다. 팩마다 _bm25_search 를 부르면 호출마다
+    # 지문 확인(전 테이블 COUNT)이 돈다. 지원하는 hybrid 는 한 번 확인하고
+    # 고정한 상태로 팩별 결과를 낸다. None 이면 팩별 루프로 돌아간다.
+    bm25_by_pack: dict[str, list[dict[str, Any]]] | None = None
+    per_pack_bm25 = getattr(hybrid, "_bm25_search_per_pack", None)
+    if per_pack_bm25 is not None:
+        result = per_pack_bm25(  # noqa: SLF001 (내부 프로브 전용 호출)
+            question,
+            spaces,
+            PER_PACK_PROBE_LIMIT,
+            pack_ids=[p.pack_id for p in registry],
         )
+        if isinstance(result, dict):
+            bm25_by_pack = result
+    for pid in (p.pack_id for p in registry):
+        if bm25_by_pack is not None:
+            bm25_hits = bm25_by_pack.get(pid, [])
+        else:
+            bm25_hits = hybrid._bm25_search(  # noqa: SLF001 — 내부 프로브 전용 호출
+                question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
+            )
         if fts_by_pack is not None:
             fts_hits = fts_by_pack.get(pid, [])
         else:
