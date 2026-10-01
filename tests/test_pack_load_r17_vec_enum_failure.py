@@ -67,8 +67,12 @@ _CLOSED = sqlite3.ProgrammingError("Cannot operate on a closed database.")
 
 
 def _enum_failure_warnings(caplog):
-    return [r for r in caplog.records
-            if r.levelno >= logging.WARNING and "벡터 ID 열거 실패" in r.getMessage()]
+    """열거 실패 경고(헬퍼)와 요약 경고(적재 끝)를 각각 센다. 둘 다 WARNING 이다."""
+    warns = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    helper = [m for m in warns if m.startswith("벡터 ID 열거 실패(")]
+    summary = [m for m in warns
+               if m.startswith("벡터 유실 회수 미확인(") and "열거 실패로" in m]
+    return helper, summary
 
 
 class TestNodeAxis:
@@ -99,7 +103,8 @@ class TestNodeAxis:
         assert ids == {"n1", "n2"}
         assert vu == 1, "미확인 same 후보가 카운트되지 않았다"
         assert vec1.rows() == {"n2"}, "신규 노드의 벡터 쓰기는 계속돼야 한다"
-        assert len(_enum_failure_warnings(caplog)) >= 1
+        helper, summary = _enum_failure_warnings(caplog)
+        assert len(helper) == 1 and len(summary) == 1
 
     def test_next_run_with_healthy_enumeration_recovers_the_slot(
             self, live, tmp_path, pack_sql):
@@ -192,7 +197,8 @@ class TestChunkAxis:
         assert ids == {"c1", "c2"}
         assert vu == 1
         assert vec1.rows() == {"c2"}
-        assert len(_enum_failure_warnings(caplog)) >= 1
+        helper, summary = _enum_failure_warnings(caplog)
+        assert len(helper) == 1 and len(summary) == 1
 
     def test_healthy_enumeration_control_still_recovers(self, live, tmp_path, pack_sql):
         _b, _g, docs = live
