@@ -738,7 +738,7 @@ def _live_vec_ids_or_unconfirmed(
         raise
     except Exception as exc:
         log.warning(
-            "벡터 ID 열거 실패(%s): %s: %s. 벡터 상태 미확인으로 처리해 "
+            "벡터 ID 열거 실패(%s): %s: %s; 벡터 상태 미확인으로 처리해 "
             "단건 조회로도 확인하지 못한 행의 벡터 유실 회수를 보류하고 그래프와 "
             "문서 동기화는 계속한다. 다음 적재가 열거에 성공하면 유실 슬롯을 "
             "회수한다",
