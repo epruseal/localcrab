@@ -721,7 +721,12 @@ def _live_vec_ids_or_unconfirmed(
     가리키는 `TypeError`, `AttributeError`, `NameError`, `ImportError`,
     `AssertionError` 는 다시 던진다. 팩 인가 오류(`PermissionError`,
     `LookupError`)도 다시 던진다. 인가는 이 호출 앞에서 이미 끝나므로 이
-    분기는 방어다. `enum_failed` 가 거짓이고 `vec_set` 이 `None` 이면 종전의
+    분기는 방어다. 한계: 열거 코드의 `ValueError` 와 SQLAlchemy 의 잘못된 SQL
+    오류는 백엔드 오류와 구분되지 않아 같이 접힌다. 접힌 실패는 매 적재 경고와
+    `vec_unrecovered` 로 드러나므로 조용하지 않다. `recover_vectors=True` 이고
+    백엔드가 단건 조회를 지원하면 열거 실패 뒤에도 행마다 단건 조회로 존재를
+    확인한다. 조회가 성공하면 그 판정은 확인된 사실이라 회수하고 미확인으로
+    세지 않는다. 조회가 던지면 미확인으로 센다. `enum_failed` 가 거짓이고 `vec_set` 이 `None` 이면 종전의
     "열거 불가 백엔드"다.
     """
     try:
@@ -731,7 +736,7 @@ def _live_vec_ids_or_unconfirmed(
         raise
     except Exception as exc:
         log.warning(
-            "벡터 ID 열거 실패(%s): %s: %s — 벡터 상태 미확인으로 처리해 "
+            "벡터 ID 열거 실패(%s): %s: %s. 벡터 상태 미확인으로 처리해 "
             "벡터 회수만 건너뛰고 그래프와 문서 동기화는 계속한다. 다음 적재가 "
             "열거에 성공하면 유실 슬롯을 회수한다",
             pack_name, type(exc).__name__, exc)
@@ -2371,7 +2376,7 @@ def load_nodes_incremental(
     if vec_unrecovered:
         if vec_enum_failed:
             log.warning(
-                "벡터 유실 회수 미확인(%s): 벡터 ID 열거 실패로 %d건 확인 못 함 — "
+                "벡터 유실 회수 미확인(%s): 벡터 ID 열거 실패로 %d건 확인 못 함. "
                 "다음 적재가 열거에 성공하면 회수한다", pack_name, vec_unrecovered)
         elif not recover_vectors:
             log.warning(
@@ -2878,7 +2883,7 @@ def load_chunks_incremental(
         # 네 번째 원인이다.
         if vec_enum_failed:
             log.warning(
-                "벡터 유실 회수 미확인(%s): 벡터 ID 열거 실패로 %d건 확인 못 함 — "
+                "벡터 유실 회수 미확인(%s): 벡터 ID 열거 실패로 %d건 확인 못 함. "
                 "다음 적재가 열거에 성공하면 회수한다", pack_name, vec_unrecovered)
         elif not recover_vectors:
             log.warning(

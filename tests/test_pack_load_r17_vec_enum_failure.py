@@ -113,6 +113,39 @@ class TestNodeAxis:
         assert (n_new, n_chg, n_same, skip, err, vu) == (0, 1, 0, 0, 0, 0)
         assert vec1.rows() == {"n1"}
 
+    def test_failed_run_then_healthy_run_recovers_the_slot(
+            self, live, tmp_path, pack_sql):
+        builder, graph, docs, state, f, id_map = self._baseline(
+            live, tmp_path, pack_sql, [_node(id="n1")])
+        vec1 = _FlakyNodeVec("pack-1")  # n1 슬롯 유실
+        vec1.enum_error = _CLOSED
+        builder._vec = vec1
+        r1 = pack_load.load_nodes_incremental(
+            "pack-1", f, builder, id_map, state["nodes"], graph, docs,
+            state["doc_node_spaces"], vec=vec1, sql=pack_sql)
+        assert (r1[0], r1[1], r1[2], r1[6]) == (0, 0, 1, 1)
+        assert vec1.rows() == set(), "열거 실패 실행은 회수하지 않는다"
+        vec1.enum_error = None  # 같은 백엔드가 복구됐다
+        state2 = pack_load.live_pack_state("pack-1", graph, docs, vec1)
+        r2 = pack_load.load_nodes_incremental(
+            "pack-1", f, builder, id_map, state2["nodes"], graph, docs,
+            state2["doc_node_spaces"], vec=vec1, sql=pack_sql)
+        assert (r2[0], r2[1], r2[2], r2[6]) == (0, 1, 0, 0)
+        assert vec1.rows() == {"n1"}
+
+    def test_opt_in_single_lookup_still_confirms_after_enum_failure(
+            self, live, tmp_path, pack_sql):
+        builder, graph, docs, state, f, id_map = self._baseline(
+            live, tmp_path, pack_sql, [_node(id="n1")])
+        vec1 = _FlakyNodeVec("pack-1")  # n1 슬롯 유실, 단건 조회는 동작
+        vec1.enum_error = _CLOSED
+        builder._vec = vec1
+        r = pack_load.load_nodes_incremental(
+            "pack-1", f, builder, id_map, state["nodes"], graph, docs,
+            state["doc_node_spaces"], vec=vec1, sql=pack_sql, recover_vectors=True)
+        assert (r[0], r[1], r[2], r[6]) == (0, 1, 0, 0)
+        assert vec1.rows() == {"n1"}
+
     def test_programming_error_in_enumeration_still_propagates(
             self, live, tmp_path, pack_sql):
         builder, graph, docs, state, f, id_map = self._baseline(
