@@ -439,10 +439,9 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
     가능하므로, 다른 사용자가 쓸 수 있는 디렉터리라면 그 경로에 미리
     심볼릭 링크를 심어 둘 수 있다. ``O_EXCL``은 그 경로에 이미 무엇이
     있으면(파일이든 링크든) 생성 자체를 거부하고, ``O_NOFOLLOW``는 그 사이
-    심긴 링크를 따라가지 않는다. 모드도 ``umask``에 맡기지 않고 ``0o600``으로
-    못박는다: 스냅샷은 영향받는 모든 행의 ``node_id``와 원본 메타데이터를
-    담으므로, 공유 디렉터리에서 흔한 ``umask 022``(결과 0644)로는 다른 로컬
-    사용자가 그 내용을 읽을 수 있다.
+    심긴 링크를 따라가지 않는다. 제한적인 ``umask``는 요청한 ``0o600``에서
+    소유자 권한까지 제거할 수 있다. 열린 fd의 권한을 ``0o600``으로 확정해야
+    스냅샷의 기밀성과 소유자의 롤백 읽기 권한을 함께 보장한다.
 
     ``os.open``이 지키는 것은 생성되는 그 순간뿐이다(이중 적대검증, 코덱스
     리뷰의 실측 재현). ``json.dump``/``fsync``가 끝나고 ``os.link``가
@@ -493,6 +492,9 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     published = False
     try:
+        # A restrictive umask can remove owner access from the requested mode.
+        # Set the mode on this open descriptor before the file receives backup data.
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as fh:
             json.dump(snapshot, fh, ensure_ascii=False, indent=2)
             fh.flush()

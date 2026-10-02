@@ -508,10 +508,9 @@ class TestBackupTempFileCreatedSecurely:
     임시 파일 경로(``<backup>.tmp-<pid>``)는 pid로만 예측 가능하다. 다른
     사용자가 쓸 수 있는 디렉터리라면 그 경로에 미리 심볼릭 링크를 심어 둘 수
     있고, 평범한 ``open(tmp, "w")``는 그 링크를 그대로 따라가 링크가 가리키는
-    파일을 이 도구의 권한으로 잘라낸다(TOCTOU). 또한 하드링크로 게시되는
-    최종 백업 파일은 호출자의 umask를 그대로 물려받아, 흔한 ``umask 022``
-    에서는 다른 로컬 사용자가 읽을 수 있는 0644가 된다 -- 스냅샷은 영향받는
-    모든 행의 node_id와 원본 메타데이터를 담으므로 정보 노출이다."""
+    파일을 이 도구의 권한으로 잘라낸다(TOCTOU). 또한 제한적인 umask는
+    요청한 0600에서 소유자 권한까지 제거할 수 있다. 스냅샷은 영향받는 모든 행의
+    node_id와 원본 메타데이터를 담으므로, 소유자가 읽을 수 없는 백업은 롤백을 막는다."""
 
     def test_preexisting_symlink_at_tmp_path_is_not_followed(self, tmp_path):
         backup_to = tmp_path / "backup.json"
@@ -527,16 +526,37 @@ class TestBackupTempFileCreatedSecurely:
             "임시 파일 생성이 미리 심긴 심볼릭 링크를 따라가 대상 파일을 덮어썼다"
         )
 
-    def test_backup_file_is_created_with_owner_only_permissions(self, tmp_path):
+    @pytest.mark.parametrize("requested_umask", [0o022, 0o077, 0o777])
+    def test_backup_file_has_exact_owner_permissions(self, tmp_path, requested_umask):
         backup_to = tmp_path / "backup.json"
-        old_umask = os.umask(0o022)
+        old_umask = os.umask(requested_umask)
         try:
             repair.write_backup_atomic(str(backup_to), {"table": "t", "rows": []})
         finally:
             os.umask(old_umask)
 
         mode = stat.S_IMODE(os.stat(backup_to).st_mode)
-        assert mode == 0o600, f"백업 파일이 소유자 전용 권한이 아니다: {oct(mode)}"
+        assert mode == 0o600, f"백업 파일 권한이 0600이 아니다: {oct(mode)}"
+        assert backup_to.read_text(encoding="utf-8"), "소유자가 백업 파일을 다시 읽을 수 없다"
+
+    def test_fchmod_failure_closes_fd_and_unpublishes_backup(self, tmp_path, monkeypatch):
+        backup_to = tmp_path / "backup.json"
+        tmp = tmp_path / f"backup.json.tmp-{os.getpid()}"
+        captured: dict[str, int] = {}
+
+        def fchmod_fails(fd, mode):
+            captured["fd"] = fd
+            raise PermissionError("simulated: fchmod denied")
+
+        monkeypatch.setattr(os, "fchmod", fchmod_fails)
+
+        with pytest.raises(PermissionError, match="fchmod denied"):
+            repair.write_backup_atomic(str(backup_to), {"table": "t", "rows": []})
+
+        assert not backup_to.exists(), "fchmod 실패 뒤 최종 백업이 게시됐다"
+        assert not tmp.exists(), "fchmod 실패 뒤 임시 백업이 남았다"
+        with pytest.raises(OSError):
+            os.fstat(captured["fd"])
 
     def test_tmp_path_swapped_after_write_before_publish_is_not_published(
         self, tmp_path, monkeypatch
