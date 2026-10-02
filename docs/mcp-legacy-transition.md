@@ -51,7 +51,7 @@ grep -rln '"method": "initialize"\|"method": "ping"' tests/
 | `tools/call` 의 present + **falsy 비객체** `arguments`(`null`/`[]`/`0`/`0.0`/`false`/`""`)를 `{}` 로 정규화해 도구를 실행 | **오늘 도구가 실제로 실행되는 입력**이다. 선택적 필드를 JSON null 로 직렬화하는 클라이언트가 낼 수 있는 형상이고 현재 성공하므로, 거부하면 동작하던 호출이 깨진다. 정합의 안전 규칙("도구를 실행시키던 입력은 하나도 바꾸지 않는다")이 여기서 멈추게 한다 |
 | `tools/list` 의 `cursor` 무시 (modern 은 -32602) | #251 이 지목한 name/arguments 축이 아니다 |
 
-응답 봉투 자체(modern 필드 없음, `isError` 없음)는 #136 이 바이트 호환으로 고정했고 그대로다.
+응답 봉투 자체(modern 필드 없음, `isError` 없음)는 #136 이 바이트 호환으로 고정했고 그대로다. 예외는 `pack_ingest`의 최상위 `status: "partial"` 결과다. 이 결과만 outbox 재시도를 위해 `isError: true`를 추가하고 content receipt는 바꾸지 않는다.
 
 ### 재현
 

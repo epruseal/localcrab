@@ -54,6 +54,11 @@ INSTRUCTIONS = (
 )
 
 
+def _is_partial_pack_ingest(name: str, result: Any) -> bool:
+    """Return whether a pack ingest result needs retry acknowledgement."""
+    return name == "pack_ingest" and isinstance(result, dict) and result.get("status") == "partial"
+
+
 class MCPServer:
     """
     Minimal stdio MCP server compatible with Claude Code's MCP protocol.
@@ -388,7 +393,12 @@ class MCPServer:
         # isError covers BOTH error channels the handlers use: raising, and
         # returning a top-level {"error": ...} dict without raising (e.g.
         # graph-handler validation failures) -- issue #136 design §4.2.7.
-        is_error = isinstance(result, dict) and "error" in result
+        # A partial pack_ingest also needs a retry acknowledgement. The result
+        # stays in the content receipt, so this remains a tool result rather
+        # than a JSON-RPC protocol error.
+        is_error = (isinstance(result, dict) and "error" in result) or _is_partial_pack_ingest(
+            name, result
+        )
         content_text = json.dumps(result, ensure_ascii=True, default=str)
         return {
             "resultType": "complete",
@@ -533,11 +543,14 @@ class MCPServer:
             logger.warning("Tool '%s' raised: %s", name, exc)
             result = {"error": safe_tool_error(name, exc)}
 
-        # MCP content format: wrap result in a content list
+        # MCP content format: wrap result in a content list.
+        # A legacy pack_ingest partial is the narrow compatibility exception.
+        # Retain the receipt for outbox users.
+        # Add a retry acknowledgement for outbox users.
         # Use ensure_ascii=True to avoid invalid Unicode surrogates (e.g. from
         # Korean/CJK data) crashing the Claude API JSON parser.
         content_text = json.dumps(result, ensure_ascii=True, default=str)
-        return {
+        response = {
             "content": [
                 {
                     "type": "text",
@@ -545,6 +558,9 @@ class MCPServer:
                 }
             ]
         }
+        if _is_partial_pack_ingest(name, result):
+            response["isError"] = True
+        return response
 
     # ------------------------------------------------------------------
     # Helpers

@@ -101,6 +101,19 @@ class TestLegacyCallShapeNormal:
         assert "_meta" not in result
         assert json.loads(result["content"][0]["text"]) == {"ok": True}
 
+    def test_partial_pack_ingest_adds_retry_acknowledgement(self, server):
+        receipt = {"status": "partial", "node_errors": ["failed"]}
+        with patch("opencrab.mcp.server.dispatch_tool", return_value=receipt):
+            response = _call(server, {"name": "pack_ingest", "arguments": {}})
+        result = response["result"]
+        assert result["isError"] is True
+        assert json.loads(result["content"][0]["text"]) == receipt
+
+    def test_partial_other_tool_keeps_legacy_envelope(self, server):
+        with patch("opencrab.mcp.server.dispatch_tool", return_value={"status": "partial"}):
+            response = _call(server, {"name": "pack_create", "arguments": {}})
+        assert "isError" not in response["result"]
+
     def test_absent_arguments_still_dispatches_empty_dict(self, server):
         with patch("opencrab.mcp.server.dispatch_tool", return_value={"ok": True}) as dispatch:
             response = _call(server, {"name": VISIBLE_TOOL})
