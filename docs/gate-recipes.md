@@ -402,25 +402,62 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
        module, chain = matches[0]
        return "::".join([module] + chain + [name])
 
-   ids = []
-   for tc in suite.findall("testcase"):
-       bad = tc.find("failure")
-       if bad is None:
-           bad = tc.find("error")
-       if bad is None:
-           continue
-       ids.append(reverse_id(tc.get("classname"), tc.get("name")))
-
-   if len(ids) != failures + errors:
+   testcases = suite.findall("testcase")
+   if len(testcases) != tests:
        print(
-           f"VERDICT:UNTRUSTED reason=id-count-mismatch "
-           f"extracted={len(ids)} failures={failures} errors={errors}"
+           f"VERDICT:UNTRUSTED reason=testcase-count-mismatch "
+           f"testcases={len(testcases)} xml_tests={tests}"
        )
        sys.exit(1)
 
-   print(f"VERDICT:COMPLETE tests={tests} skipped={skipped} failed_or_error={len(ids)}")
-   for i in sorted(set(ids)):
-       print(f"ID:{i}")
+   cases = {}
+   failed_or_error = []
+   for tc in testcases:
+       testcase_id = reverse_id(tc.get("classname"), tc.get("name"))
+       has_error = tc.find("error") is not None
+       has_failure = tc.find("failure") is not None
+       skipped_node = tc.find("skipped")
+       if has_error and has_failure:
+           print(f"VERDICT:UNTRUSTED reason=error-and-failure id={testcase_id}")
+           sys.exit(1)
+       if has_error:
+           status = "error"
+           failed_or_error.append(testcase_id)
+       elif has_failure:
+           status = "failure"
+           failed_or_error.append(testcase_id)
+       elif skipped_node is not None and skipped_node.get("type") == "pytest.xfail":
+           status = "xfail"
+       elif skipped_node is not None:
+           status = "skipped"
+       else:
+           status = "pass"
+       if testcase_id in cases:
+           print(f"VERDICT:UNTRUSTED reason=duplicate-id id={testcase_id}")
+           sys.exit(1)
+       cases[testcase_id] = status
+
+   if len(failed_or_error) != failures + errors:
+       print(
+           f"VERDICT:UNTRUSTED reason=id-count-mismatch "
+           f"extracted={len(failed_or_error)} failures={failures} errors={errors}"
+       )
+       sys.exit(1)
+   if len(cases) != len(testcases):
+       print(
+           f"VERDICT:UNTRUSTED reason=case-count-mismatch "
+           f"cases={len(cases)} testcases={len(testcases)}"
+       )
+       sys.exit(1)
+
+   print(
+       f"VERDICT:COMPLETE tests={tests} skipped={skipped} "
+       f"failed_or_error={len(failed_or_error)}"
+   )
+   for testcase_id in sorted(cases):
+       print(f"CASE:{testcase_id} {cases[testcase_id]}")
+   for testcase_id in sorted(set(failed_or_error)):
+       print(f"ID:{testcase_id}")
    PYEOF
    ```
    4번의 개수 대사(`collected` 파싱값과 xml `tests` 속성 비교)는 완주한
@@ -556,68 +593,56 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
    문서 변경만으로 이 저장소의 판정 절차를 완결하기 위해 인라인으로
    둔다. 인라인 상태는 CI가 검사하지 않으므로 저장소 코드가 바뀌면
    내용이 썩을 수 있다는 점에 주의한다).
-5. `VERDICT:COMPLETE`가 나오면 그 뒤에 출력된 `ID:` 줄들을 정렬된
-   집합으로(없으면 빈 집합으로) 뽑아 양쪽(base와 작업) 다 항상 diff한다
-   (빈 집합끼리도 diff 대상이다: "전부 통과"를 diff 생략 사유로 쓰지
-   않는다). `VERDICT:INCOMPLETE`나 `VERDICT:UNTRUSTED`가 나오면 diff를
-   내지 않고 원인부터 조사한다.
+5. 두 실행의 파서 출력을 각자의 요약 파일에 저장한다. 두 요약 파일이 모두
+   `VERDICT:COMPLETE`로 시작할 때만 아래 비교를 실행한다. `INCOMPLETE`나
+   `UNTRUSTED`가 하나라도 있으면 diff를 내지 않고 원인부터 조사한다.
 
-`ID:` 집합 diff만으로는 못 잡는 경우가 있다. 작업 브랜치가 통과하던
-테스트를 삭제하거나 조건부로 deselect하면, 그 테스트는 원래도
-실패/에러 집합에 없었으므로 양쪽 `ID:` 집합은 그대로 같게 보인다.
-이를 잡으려면 `VERDICT:COMPLETE` 줄의 `tests=` 총량도 base와 작업
-양쪽에서 항상 비교한다. 작업 쪽 `tests`가 base보다 작으면 diff
-결과를 그대로 받아들이지 않고 원인을 조사한다(테스트 파일 삭제, 새
-deselect 조건, 리네임에 따른 재수집 실패 등). 그 감소가 PR 본문에
-의도로 명시돼 있지 않으면 회귀로 판단한다. `tests`가 base보다 큰
-경우(새 테스트 추가)는 정상 증가이므로 조사 대상이 아니다.
+   ```bash
+   python3 - /tmp/<base 식별자>-summary.txt /tmp/<작업 식별자>-summary.txt <<'PYEOF'
+   import sys
+   from pathlib import Path
 
-`tests=` 비교만으로도 못 잡는 경우가 있다. 통과하던 테스트를
-`pytest.mark.skip`이나 `xfail`로 바꾸면 그 테스트는 계속 `testsuite`에
-남고 `failure`나 `error` 자식도 없어 `ID:` 집합에 안 잡히며, xml의
-`tests` 속성은 통과, skip, 실패, 에러를 모두 더한 값이라 pass가 skip으로
-바뀌어도 총량이 그대로다(실측: 테스트 2개짜리 모듈에서 하나를
-`@pytest.mark.skip`로 바꾸면 base와 work 둘 다
-`tests="2"`이고 `skipped`만 `0`에서 `1`로 바뀐다). 그래서 `VERDICT:COMPLETE`
-줄에 `skipped=`도 함께 찍어 base와 작업 양쪽에서 비교한다. 작업 쪽
-`skipped`가 base보다 크면 새로 skip 처리된 테스트가 있다는 뜻이니
-원인을 조사하고, PR 본문에 의도로 명시돼 있지 않으면 회귀로
-판단한다. `skipped`가 base보다 작은 경우(기존 skip이 다시 실행됨)는
-정상 감소이므로 조사 대상이 아니다.
+   def read_summary(path):
+       lines = Path(path).read_text(errors="replace").splitlines()
+       if not lines or not lines[0].startswith("VERDICT:COMPLETE "):
+           raise SystemExit(f"incomplete summary: {path}")
+       cases = {}
+       for line in lines[1:]:
+           if not line.startswith("CASE:"):
+               continue
+           body = line.removeprefix("CASE:")
+           testcase_id, sep, status = body.rpartition(" ")
+           if not sep or not testcase_id or not status:
+               raise SystemExit(f"invalid CASE line: {line!r}")
+           if testcase_id in cases:
+               raise SystemExit(f"duplicate CASE id: {testcase_id}")
+           cases[testcase_id] = status
+       return cases
 
-`tests=`와 `skipped=` 비교로도 못 잡는 경우가 남는다. 통과하던 테스트
-N개를 지우거나 deselect하면서 같은 수의 새 테스트를 추가하면, 새
-테스트가 통과하는 한 실패/에러 id 집합도 `tests=`도 `skipped=`도
-그대로 같아 diff가 "동일"을 낸다(실측: 통과 테스트 1개를 지우고
-이름만 다른 통과 테스트 1개를 더하면 두 실행 다
-`VERDICT:COMPLETE tests=2 skipped=0 failed_or_error=0`이고 id 집합도
-총량도 같다). 이 잔여 공백을 닫으려면 실패/에러 id뿐 아니라 xml에
-있는 testcase 전량의 id와 상태를 base와 작업 양쪽에서 뽑아
-(id, 상태) 쌍으로 diff해야 한다(지금 스크립트는 실패/에러 id만
-출력한다). 이 회귀 대사의 선언된 목적은 동작 회귀 검출이고, 통과
-테스트의 net-zero 교체는 동작 회귀가 아니라 커버리지 회귀라 이
-절차의 목적 밖이다. (id, 상태) 쌍 diff로 커버리지 회귀까지 잡는
-확장은 이슈 #383으로 남기고, 이번 절차에는 넣지 않는다. skip
-증가는 이번 절차의 `skipped=` 비교가 잡고, net-zero 교체와 아래
-상태 스왑은 #383이 잡는다. 셋은 커버리지 회귀라는 같은 결함의
-변형이다.
+   base, work = read_summary(sys.argv[1]), read_summary(sys.argv[2])
+   for testcase_id in sorted(base.keys() - work.keys()):
+       print(f"CASE-REMOVED:{testcase_id} {base[testcase_id]}")
+   for testcase_id in sorted(work.keys() - base.keys()):
+       print(f"CASE-ADDED:{testcase_id} {work[testcase_id]}")
+   for testcase_id in sorted(base.keys() & work.keys()):
+       if base[testcase_id] != work[testcase_id]:
+           print(
+               f"CASE-STATE-CHANGED:{testcase_id} "
+               f"{base[testcase_id]}->{work[testcase_id]}"
+           )
+   PYEOF
+   ```
 
-`skipped=` 총량 비교로도 못 잡는 경우가 하나 더 남는다. 이미 skip이던
-테스트가 새로 통과하고 동시에 통과하던 다른 테스트가 새로 skip이나
-xfail로 바뀌면, 양쪽 다 `tests=`와 `skipped=` 총량은 물론 실패/에러
-id 집합과 testcase id 집합 전체도 그대로라 diff가 "동일"을 낸다
-(실측: `test_a`가 pass에서 skip으로, `test_b`가 skip에서 pass로
-동시에 바뀌어도 base/work 둘 다 `tests=2 skipped=1 failures=0`이고
-id 집합도 양쪽 다 `{test_a, test_b}`로 같다). 전량 id 집합 diff만으로는
-이 상태 스왑을 못 잡는다. skip 마스킹은 이 문서가 `skipped=`로
-잡는다. 상태 스왑과 net-zero 교체는 (id, 상태) 쌍 diff가 필요하며
-#383이 다룬다.
+   이 출력은 자동 실패 조건이 아니다. 사람은 삭제, 추가, 상태 변화를 PR의
+   의도와 대사한다. `CASE` 줄은 마지막 공백에서만 나누므로 ID 안의 공백을
+   보존한다. 모든 testcase의 관측 상태를 비교하므로 net-zero 교체와 pass 및
+   skip 상태 교환도 남는다. 상태는 JUnit XML의 관측값이다. non-strict xpass는
+   `pass`, strict xpass는 `failure`로 보이며 이 절차는 xpass를 별도 상태로
+   주장하지 않는다.
 
-이 5단계는 방어가 서로 겹친다. 예를 들어 3번이 없어 xml 부재 상태로
-4번에 넘어가도 xml 파싱 자체가 예외로 죽고, 1번이 종료 코드를 기록하지
-않은 상태로 남아도 2번이 그 미기록 상태를 미완주로 막는다. 한 단계만
-없앤 반례를 만들어도 다른 단계가 대신 잡아 그 단계 단독의 오판정이
-관측되지 않는 경우가 있다. 이것은 결함이 아니라 의도된 중첩이다.
+   기존 실패와 에러 ID 집합, `tests=`, `skipped=`, `failed_or_error=` 값도
+   양쪽에서 계속 대사한다. XML의 `skipped` 집계는 `CASE` 상태에서 다시
+   계산하지 않는다. 이것은 JUnit XML 메타데이터의 별도 계약이다.
 
 `--basetemp`은 pytest가 그 디렉터리를 비우는 파괴적 동작이며, 그 시점은
 세션 시작이 아니라 세션 중 `TempPathFactory.getbasetemp()` 최초 호출(첫
