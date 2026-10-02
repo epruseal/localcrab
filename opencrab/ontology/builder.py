@@ -286,11 +286,11 @@ class OntologyBuilder:
         # `X) DETACH DELETE n //`) even though the request was rejected a few
         # lines later. Validation is pure and cheap; it belongs in front.
         result = validate_node(space, node_type)
-        result.raise_if_invalid()
+        result.raise_node_grammar_error()
 
         # Schema property validation (raises ValueError on failure)
         prop_result = validate_node_properties(node_type, props)
-        prop_result.raise_if_invalid()
+        prop_result.raise_node_grammar_error()
 
         # Identity slot guard (#146, promoted to the gate in #148). Node
         # identity is not qualified by pack on any backend, so writing an id

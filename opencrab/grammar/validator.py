@@ -8,6 +8,7 @@ source of truth for what constitutes a valid ontology operation.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,16 @@ _PROPERTY_TYPE_MAP: dict[str, type | tuple[type, ...]] = {
     "int": int,
     "float": (int, float),
 }
+
+
+def _safe_reason_token(value: Any) -> str:
+    try:
+        text = str(value)
+    except Exception:
+        return "<unprintable>"
+    if type(text) is not str:
+        return "<unprintable>"
+    return re.sub(r"[\x00-\x1f\x7f\x85  ]", "?", text)[:80]
 
 
 def _value_matches_type(value: Any, type_name: str) -> bool:
@@ -83,16 +94,31 @@ for _edge in META_EDGES:
 # ---------------------------------------------------------------------------
 
 
+class GrammarValidationError(ValueError):
+    """A node grammar rejection with safe summary fields."""
+
+    def __init__(self, message: str, *, reason: tuple[str, str, str, str]) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 @dataclass
 class ValidationResult:
     """Outcome of a grammar validation check."""
 
     valid: bool
     error: str | None = None
+    reason: tuple[str, str, str, str] | None = None
 
     def raise_if_invalid(self) -> None:
         if not self.valid:
             raise ValueError(self.error or "Validation failed")
+
+    def raise_node_grammar_error(self) -> None:
+        if not self.valid:
+            if self.reason is None:
+                raise ValueError(self.error or "Validation failed")
+            raise GrammarValidationError(self.error or "Validation failed", reason=self.reason)
 
     def __bool__(self) -> bool:
         return self.valid
@@ -124,6 +150,7 @@ def validate_node(space_id: str, node_type: str) -> ValidationResult:
         return ValidationResult(
             valid=False,
             error=f"Unknown space '{space_id}'. Known spaces: {known}.",
+            reason=("node", "space", "known", _safe_reason_token(type(space_id).__name__)),
         )
 
     if node_type not in _SPACE_NODE_TYPES[space_id]:
@@ -134,6 +161,7 @@ def validate_node(space_id: str, node_type: str) -> ValidationResult:
                 f"Node type '{node_type}' is not valid in space '{space_id}'. "
                 f"Allowed types: {allowed}."
             ),
+            reason=("node", "node_type", "allowed", _safe_reason_token(type(node_type).__name__)),
         )
 
     return ValidationResult(valid=True)
@@ -278,6 +306,7 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
 
     schema_props: dict[str, Any] = schema.get("properties", {})
     errors: list[str] = []
+    reason: tuple[str, str, str, str] | None = None
 
     # Required field check: key presence only. An explicit None is judged by
     # the nullable check below, not here.
@@ -285,6 +314,7 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
         if spec.get("required", False) and "default" not in spec:
             if field not in properties:
                 errors.append(f"Required field '{field}' is missing.")
+                reason = reason or ("property", _safe_reason_token(field), "required", "missing")
 
     # Null and enum value check. An explicit None on a non-nullable field is
     # exactly one error for that field; the enum and type checks below do not
@@ -298,11 +328,15 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
                         f"Field '{field}' must not be null "
                         "(schema declares nullable: false)."
                     )
+                    reason = reason or ("property", _safe_reason_token(field), "non-null", "NoneType")
                 continue
             allowed = spec.get("enum")
             if allowed is not None and value not in allowed:
                 errors.append(
                     f"Field '{field}' must be one of {allowed}, got '{value}'."
+                )
+                reason = reason or (
+                    "property", _safe_reason_token(field), "enum", _safe_reason_token(type(value).__name__),
                 )
 
     # Type check
@@ -319,9 +353,15 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
                     f"Field '{field}' must be of type '{declared_type}', "
                     f"got {type(value).__name__} ({value!r})."
                 )
+                reason = reason or (
+                    "property",
+                    _safe_reason_token(field),
+                    _safe_reason_token(declared_type),
+                    _safe_reason_token(type(value).__name__),
+                )
 
     if errors:
-        return ValidationResult(valid=False, error="; ".join(errors))
+        return ValidationResult(valid=False, error="; ".join(errors), reason=reason)
     return ValidationResult(valid=True)
 
 
