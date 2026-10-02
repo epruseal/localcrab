@@ -265,8 +265,11 @@ SELECT COUNT(*) FROM graph_nodes
 `owner_id` 는 이 인자들의 대상이 아니다. 증분 대조에서 라이브 쪽에서만 빼는
 `INCREMENTAL_IGNORED_KEYS`(`opencrab/pack/load.py`) 의 원소이고, 어떤 노드 타입도
 `owner_id` 를 스키마 필드로 선언하지 않는다(순수 시스템 스탬프 값, `write_gate.py` 의
-`NODE_STAMPED`). 증분 재적재가 origin=server 의 owner_id 재스탬프 계약을 실제로
-만족하는지는 이 계약과 무관한 별도 결함이며 #378 로 이관했다.
+`NODE_STAMPED`). `origin="server"` 는 인가된 `add_node` 쓰기가 실제로 실행될 때
+현재 principal의 스탬프를 쓴다. `same` 행은 그 쓰기를 건너뛰므로 owner 스탬프를
+자동으로 수렴시키지 않으며, 팩 소유권도 이전하지 않는다. 파일이 `owner_id` 를 실으면
+파일 쪽 키가 비교에 남아 반복 `chg` 가 될 수 있다. graph 와 doc 쓰기는 원자적이지
+않으므로 자동 owner 수렴은 별도 기능으로 설계해야 한다(#378).
 
 ### 3-1. `load_nodes_incremental(..., sql=)` 도 **필수**다(#424)
 
