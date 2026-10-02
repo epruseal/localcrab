@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import inspect
+import io
 import json
 import logging
 import pathlib
@@ -25,10 +27,13 @@ from decimal import Decimal
 import pytest
 
 from opencrab.auth import Principal, principal_scope
+from opencrab.grammar import validator as grammar_validator
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.pack import load as pack_load
 from opencrab.pack.normalize import transform_chunk_meta
 from opencrab.pack.ownership import create_pack
+from opencrab.schemas import loader as schema_loader
+from opencrab.schemas.pack_registry import _build_type_schema
 from opencrab.stores.local_graph_store import LocalGraphStore
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 from opencrab.stores.sql_store import SQLStore
@@ -369,6 +374,116 @@ class _NoVec:
 
     def delete(self, ids):
         self.deleted.extend(ids)
+
+
+class TestNodeGrammarSkipSummary:
+    @staticmethod
+    def _invalid_claim(tmp_path):
+        return _write_jsonl(
+            tmp_path / "invalid-claim.jsonl",
+            [
+                _node(
+                    id="claim-1",
+                    node_type="Claim",
+                    space="claim",
+                    properties={
+                        "statement": "valid statement",
+                        "confidence": "secret-invalid-confidence",
+                    },
+                )
+            ],
+        )
+
+    @pytest.mark.parametrize(
+        "separator",
+        ["\n", "\x0b", "\x0c", "\r", "\x1c", "\x1d", "\x1e", "\x85", " ", " "],
+    )
+    def test_summary_token_removes_line_separators(self, separator):
+        rendered = pack_load._safe_summary_token(f"a{separator}b")
+        assert rendered == "a?b"
+        assert rendered.splitlines() == ["a?b"]
+        assert len(pack_load._safe_summary_token("x" * 81)) == 80
+
+    def test_generated_numeric_field_key_has_safe_summary(self, monkeypatch):
+        schema = _build_type_schema(
+            {"name": "test", "spaces": ["claim"], "type_specs": {"Claim": {"required": [17]}}},
+            "Claim",
+        )
+        monkeypatch.setattr(schema_loader, "load_type_schema", lambda _type: schema)
+        result = grammar_validator.validate_node_properties("Claim", {})
+        assert result.reason == ("property", "17", "required", "missing")
+        with pytest.raises(grammar_validator.GrammarValidationError) as caught:
+            result.raise_node_grammar_error()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            pack_load._print_node_skip_reasons("test", Counter({caught.value.reason: 1}))
+        assert "17 expected=required actual=missing x1" in output.getvalue()
+        assert output.getvalue().splitlines() == [output.getvalue().rstrip("\n")]
+
+    def test_hostile_schema_tokens_do_not_break_reason_or_message(self, monkeypatch):
+        class HostileStr(str):
+            def __str__(self):
+                raise RuntimeError("must not render")
+
+        field = HostileStr("field")
+        declared_type = HostileStr("int")
+        schema = {"properties": {field: {"type": declared_type, "required": False}}}
+        monkeypatch.setattr(schema_loader, "load_type_schema", lambda _type: schema)
+        result = grammar_validator.validate_node_properties("Claim", {field: "bad"})
+        assert result.valid is False
+        assert result.reason == ("property", "<unprintable>", "<unprintable>", "str")
+        assert "<unprintable>" in result.error
+        with pytest.raises(grammar_validator.GrammarValidationError):
+            result.raise_node_grammar_error()
+
+    def test_summary_overflow_stays_on_one_line(self):
+        reasons = Counter(
+            {("property", f"field-{i}", "int", "str"): 1 for i in range(9)}
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            pack_load._print_node_skip_reasons("test", reasons)
+        rendered = output.getvalue().rstrip("\n")
+        assert rendered.splitlines() == [rendered]
+        assert "other-kinds=1 other-items=1" in rendered
+        assert "field-8" not in rendered
+
+    def test_full_load_reports_safe_grammar_skip_summary(
+            self, live, tmp_path, capsys):
+        builder, _graph, _docs = live
+        nodes_file = self._invalid_claim(tmp_path)
+
+        assert pack_load.load_nodes("pack-1", nodes_file, builder, {}) == (0, 1, 0)
+        output = capsys.readouterr().out
+        assert "confidence expected=float actual=str x1" in output
+        assert "secret-invalid-confidence" not in output
+
+    def test_incremental_load_reports_safe_grammar_skip_summary(
+            self, live, tmp_path, pack_sql, capsys):
+        builder, graph, docs = live
+        nodes_file = self._invalid_claim(tmp_path)
+
+        result = pack_load.load_nodes_incremental(
+            "pack-1", nodes_file, builder, {}, {}, graph, docs, {}, sql=pack_sql,
+        )
+        assert result[:5] == (0, 0, 0, 1, 0)
+        assert result.ingest_err == 0
+        assert result.cleanup_err == 0
+        output = capsys.readouterr().out
+        assert "confidence expected=float actual=str x1" in output
+        assert "secret-invalid-confidence" not in output
+
+    def test_generic_value_error_does_not_emit_grammar_summary(
+            self, live, tmp_path, monkeypatch, capsys):
+        builder, _graph, _docs = live
+        nodes_file = _write_jsonl(tmp_path / "generic-error.jsonl", [_node(id="n1")])
+
+        def _generic_error(*args, **kwargs):
+            raise ValueError("generic validation failure")
+
+        monkeypatch.setattr(builder, "add_node", _generic_error)
+        assert pack_load.load_nodes("pack-1", nodes_file, builder, {}) == (0, 1, 0)
+        assert "node grammar skip reasons" not in capsys.readouterr().out
 
 
 class TestNodeIncrementalResult:

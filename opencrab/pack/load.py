@@ -62,6 +62,7 @@ from opencrab.common.graph_identity import (
     prepare_node,
 )
 from opencrab.common.pack_tags import RETIRED_KEYS, apply_pack_tag, strip_retired_keys
+from opencrab.grammar.validator import GrammarValidationError
 from opencrab.locking import file_lock, lock_data_dir
 from opencrab.ontology.builder import OntologyBuilder, store_write_failures
 from opencrab.pack import delete_journal
@@ -1876,6 +1877,30 @@ def _require_bound_principal():
         ) from None
 
 
+def _safe_summary_token(value: str) -> str:
+    """Return a bounded token that cannot add a log line."""
+    return re.sub(r"[\x00-\x1f\x7f\x85  ]", "?", value)[:80]
+
+
+def _print_node_skip_reasons(pack_name: str, reasons: Counter) -> None:
+    """Print bounded grammar skip reasons without values from input rows."""
+    if not reasons:
+        return
+    shown = reasons.most_common(8)
+    summary = "; ".join(
+        f"{_safe_summary_token(field)} expected={_safe_summary_token(expected)} "
+        f"actual={_safe_summary_token(actual)} x{count}"
+        for (_kind, field, expected, actual), count in shown
+    )
+    remaining = sum(reasons.values()) - sum(count for _, count in shown)
+    if remaining:
+        summary += f"; other-kinds={len(reasons) - len(shown)} other-items={remaining}"
+    print(
+        f"    [{_safe_summary_token(pack_name)}] node grammar skip reasons ({len(reasons)} kinds): {summary}",
+        flush=True,
+    )
+
+
 def load_nodes(
     pack_name: str,
     nodes_file: Path,
@@ -1885,6 +1910,7 @@ def load_nodes(
     """노드 적재. id_map에 추가. 반환: (ok, skip, err)"""
     require_live_data("load_nodes")
     ok = skip = err = 0
+    grammar_reasons: Counter = Counter()
 
     _require_bound_principal()
     for row in iter_jsonl(nodes_file):  # shard-aware 논리 스트림(단일/분할 투명)
@@ -1904,9 +1930,13 @@ def load_nodes(
                             node_id, space, node_type, "; ".join(fails))
             else:
                 ok += 1
+        except GrammarValidationError as exc:
+            skip += 1
+            grammar_reasons[exc.reason] += 1
+            log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, exc)
         except ValueError as ve:
             skip += 1
-            log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, ve)
+            log.debug("노드 검증 skip %s (%s/%s): %s", node_id, space, node_type, ve)
         except Exception as exc:
             err += 1
             log.warning("노드 오류 %s: %s", node_id, exc)
@@ -1915,6 +1945,7 @@ def load_nodes(
         if done % 500 == 0:
             print(f"    …노드 {done} (ok={ok} skip={skip} err={err})", flush=True)
 
+    _print_node_skip_reasons(pack_name, grammar_reasons)
     return ok, skip, err
 
 
@@ -2180,6 +2211,7 @@ def load_nodes_incremental(
     """
     require_live_data("load_nodes_incremental")
     n_new = n_chg = n_same = skip = ingest_err = cleanup_err = 0
+    grammar_reasons: Counter = Counter()
     n_doc_recovered = 0
     vec_unrecovered = 0  # #377: 판정 시점에 벡터 존재를 확인 못 한 same-후보 입력 행 수
     bypack_ids: set[str] = set()
@@ -2545,9 +2577,13 @@ def load_nodes_incremental(
                     n_new += 1
                 else:
                     n_chg += 1
+        except GrammarValidationError as exc:
+            skip += 1
+            grammar_reasons[exc.reason] += 1
+            log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, exc)
         except ValueError as ve:
             skip += 1
-            log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, ve)
+            log.debug("노드 검증 skip %s (%s/%s): %s", node_id, space, node_type, ve)
         except Exception as exc:
             ingest_err += 1
             log.warning("노드 오류 %s: %s", node_id, exc)
@@ -2637,6 +2673,7 @@ def load_nodes_incremental(
             else:
                 log.warning("구 타입 행 스윕 삭제(%s) %s(%s)", pack_name, node_id, stale_type)
 
+    _print_node_skip_reasons(pack_name, grammar_reasons)
     err = ingest_err + cleanup_err
     return NodeIncrementalResult(
         (n_new, n_chg, n_same, skip, err, bypack_ids, vec_unrecovered),
