@@ -252,7 +252,7 @@ def export_neo4j_opencrab_ingest(
 
     node_count = 0
     edge_count = 0
-    with output.open("w", encoding="utf-8") as handle:
+    with output.open("w", encoding="utf-8", newline="\n") as handle:
         for row in node_rows:
             handle.write(_stable_json(_normalise_node(row)) + "\n")
             node_count += 1

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -157,6 +159,22 @@ def test_requested_pack_outside_the_scope_exports_nothing(tmp_path) -> None:
     assert store.calls, "the exporter did not call the store at all"
     for _name, pack_ids, _limit in store.calls:
         assert pack_ids == [], "the caller's pack_id was not intersected with the scope"
+
+
+def test_neo4j_export_open_uses_lf_newline_argument(tmp_path) -> None:
+    output = tmp_path / "ingest.jsonl"
+    real_open = Path.open
+
+    def _spy(*args, **kwargs):
+        return real_open(*args, **kwargs)
+
+    with patch.object(Path, "open", autospec=True, side_effect=_spy) as mock_open:
+        export_neo4j_opencrab_ingest(FakeNeo4jStore(), output, scope=frozenset())
+
+    assert any(
+        call.args[:2] == (output, "w") and call.kwargs.get("newline") == "\n"
+        for call in mock_open.call_args_list
+    ), mock_open.call_args_list
 
 
 def test_requested_pack_inside_the_scope_exports_it(tmp_path) -> None:

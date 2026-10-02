@@ -530,7 +530,7 @@ class RecordWriter:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._fh = path.open("a", encoding="utf-8")
+        self._fh = path.open("a", encoding="utf-8", newline="\n")
 
     def append(self, result: HealResult) -> None:
         line = json.dumps(

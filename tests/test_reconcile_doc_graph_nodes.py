@@ -12,6 +12,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -842,6 +843,23 @@ class TestMainCli:
 
         doc = LocalSQLDocStore(str(data_dir / "doc_store.db")).get_node_doc("space-a", "g1")
         assert doc is not None, "기록 파일 실패 전에 이미 끝난 스토어 쓰기가 롤백되면 안 된다"
+
+
+def test_record_writer_open_uses_lf_newline_argument(tmp_path):
+    record_path = tmp_path / "run.jsonl"
+    real_open = Path.open
+
+    def _spy(*args, **kwargs):
+        return real_open(*args, **kwargs)
+
+    with patch.object(Path, "open", autospec=True, side_effect=_spy) as mock_open:
+        writer = recon.RecordWriter(record_path)
+        writer.close()
+
+    assert any(
+        call.args[:2] == (record_path, "a") and call.kwargs.get("newline") == "\n"
+        for call in mock_open.call_args_list
+    ), mock_open.call_args_list
 
 
 class TestFormatReportHealSummary:

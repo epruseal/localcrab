@@ -305,7 +305,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "evidence": stage / "evidence/index.jsonl",
         "ingest": stage / "neo4j/opencrab_ingest.jsonl",
     }
-    handles = {k: v.open("w", encoding="utf-8") for k, v in paths.items()}
+    handles = {k: v.open("w", encoding="utf-8", newline="\n") for k, v in paths.items()}
     seen_uuid: set[str] = set()
     row_count = 0
     source_evidence_count = 0

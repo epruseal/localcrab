@@ -131,7 +131,7 @@ def main() -> int:
     started = time.time()
     with make_driver(GraphDatabase, args.uri, args.user, args.password, fetch_size=args.fetch_size, max_connection_lifetime=3600) as driver:
         driver.verify_connectivity()
-        with driver.session() as session, output.open("w", encoding="utf-8") as handle:
+        with driver.session() as session, output.open("w", encoding="utf-8", newline="\n") as handle:
             node_count = export_nodes(session, handle, args.fetch_size)
             edge_count = export_edges(session, handle, args.fetch_size)
 
