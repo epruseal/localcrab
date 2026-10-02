@@ -8,6 +8,7 @@
 import inspect
 import json
 import os
+from collections import Counter
 
 import pytest
 
@@ -166,19 +167,28 @@ class TestEdge:
         pack.edge("r", "e", "contains")
         assert pack.edges[0]["properties"] == {}
 
-    def test_unfit_label_is_replaced_and_original_preserved(self, pack):
+    def test_invalid_label_is_dropped_with_the_direct_key(self, pack):
         pack.node("r", "R", "Document", "resource")
         pack.node("e", "E", "Evidence", "evidence")
         pack.edge("r", "e", "슬쩍만든라벨")
-        assert pack.edges[0]["label"] == "contains"
-        assert pack.edges[0]["properties"]["source_label"] == "슬쩍만든라벨"
+        assert pack.edges == []
+        assert pack._eskip == {("슬쩍만든라벨", "resource", "evidence"): 1}
 
-    def test_direction_reversed_when_only_inverse_pair_exists(self, pack):
-        """(evidence, resource) 는 grammar 에 없고 (resource, evidence) 는 있다."""
+    def test_valid_mapping_reverses_when_its_result_is_allowed(self, pack):
+        pack.node("c", "C", "Concept", "concept")
+        pack.node("e", "E", "Evidence", "evidence")
+        pack.edge("c", "e", "SHOWN_IN")
+        assert (pack.edges[0]["source_id"], pack.edges[0]["target_id"]) == ("e", "c")
+        assert pack._eskip == {}
+
+    def test_invalid_retargeted_edge_uses_the_retargeted_key(self, pack):
+        pack.node("lv", "L", "Lever", "lever")
         pack.node("r", "R", "Document", "resource")
         pack.node("e", "E", "Evidence", "evidence")
-        pack.edge("e", "r", "contains")
-        assert (pack.edges[0]["source_id"], pack.edges[0]["target_id"]) == ("r", "e")
+        pack._ev_of["r"] = ["e"]
+        pack.edge("lv", "r", "invalid")
+        assert pack.edges == []
+        assert pack._eskip == {("invalid", "lever", "evidence"): 1}
 
     def test_claim_to_evidence_keeps_direction_for_loader_reversal(self, pack):
         """KEEP 공간쌍. 파일에는 claim->evidence 로 적히고 적재기가 뒤집는다 —
@@ -255,22 +265,12 @@ class TestEdgeUsesLoaderMappingBeforeFix:
         else:
             assert (e["source_id"], e["target_id"]) == ("s", "t")
 
-    def test_mapped_label_with_invalid_normalized_relation_falls_back_to_fix(self, pack):
-        """`HAS_PART`는 매핑표에 있지만 `lever->outcome`에서 `resolve_edge`가 내는
-
-        `(outcome, part_of, lever, 반전)`은 `outcome->lever`가 `ALLOWED`에 없어 무효다.
-        이럴 때는 기존 `_FIX` 폴백 사슬로 떨어져 `lever->outcome`의 대표값 `raises`가
-        된다(매핑표에 없는 라벨만 `_FIX`로 간다는 설명은 틀렸다는 3절 정정을 고정한다).
-
-        구버전과 신버전이 이 입력에서 같은 결과를 내므로, 신규 분기 삭제 역변이로는
-        이 테스트가 실패하지 않는다: 회귀 검출용이 아니라 폴백 경로 특성화 고정이다.
-        """
+    def test_mapped_label_with_invalid_normalized_relation_is_dropped(self, pack):
         pack.node("lv", "L", "Lever", "lever")
         pack.node("o", "O", "Outcome", "outcome")
         pack.edge("lv", "o", "HAS_PART")
-        e = pack.edges[0]
-        assert e["label"] == "raises"
-        assert (e["source_id"], e["target_id"]) == ("lv", "o")
+        assert pack.edges == []
+        assert pack._eskip == {("HAS_PART", "lever", "outcome"): 1}
 
     def test_trace_src_guard_skips_loader_reversal_into_evidence_or_resource(self, pack):
         """`claim->resource COMPLIES_WITH`는 실제 `LABEL_SPACE_OVERRIDE` 항목이다.
@@ -291,12 +291,12 @@ class TestEdgeUsesLoaderMappingBeforeFix:
         """설계 5절 받아들임 기준: `Pack.edge()`가 63개 라벨 x 81개 공간쌍 = 5,103개
 
         조합 전수에서 내는 최종 결과(관계, 방향, 또는 skip)가, 이 시험이 `resolve_edge`
-        와 `ALLOWED`/`FIX`/`KEEP`/`TRACE_SRC` 표만으로 이 파일 안에서 독립으로 다시
-        계산한 5단계 오라클과 정확히 일치해야 한다. 오라클은 `Pack.edge()`의 내부
-        분기를 재사용하지 않는다. 불일치 목록이 끝에 비어 있는지 한 번만 단언한다.
+        와 `ALLOWED`/`KEEP`/`TRACE_SRC` 표만으로 이 파일 안에서 독립으로 다시
+        계산한 오라클과 정확히 일치해야 한다. 유효하지 않은 매핑은 skip이다.
+        오라클은 `Pack.edge()`의 내부 분기를 재사용하지 않는다.
         """
         from opencrab.pack.normalize import LABEL_SPACE_OVERRIDE, REL_MAP, resolve_edge
-        from opencrab.pack.schema import ALLOWED, FIX, KEEP, TRACE_SRC
+        from opencrab.pack.schema import ALLOWED, KEEP, TRACE_SRC
 
         labels = sorted(set(REL_MAP.keys()) | {k[0] for k in LABEL_SPACE_OVERRIDE})
         mismatches = []
@@ -308,14 +308,17 @@ class TestEdgeUsesLoaderMappingBeforeFix:
                     pack.node(sid, "S", SPACE_DEFAULT_TYPE[src_space], src_space)
                     pack.node(tid, "T", SPACE_DEFAULT_TYPE[tgt_space], tgt_space)
                     before = len(pack.edges)
-                    skipped_before = sum(pack._eskip.values())
+                    skips_before = Counter(pack._eskip)
+                    skipped_before = sum(skips_before.values())
+                    key = (label, src_space, tgt_space)
+                    key_before = pack._eskip[key]
 
                     pack.edge(sid, tid, label)
 
                     after = len(pack.edges)
                     skipped_after = sum(pack._eskip.values())
+                    key_after = pack._eskip[key]
 
-                    allowed = ALLOWED.get((src_space, tgt_space))
                     if (src_space, tgt_space) in KEEP:
                         expect = (KEEP[(src_space, tgt_space)], sid, tid)
                     else:
@@ -326,22 +329,12 @@ class TestEdgeUsesLoaderMappingBeforeFix:
                         )
                         if m_allowed and m_rel in m_allowed and not (m_rev and trace_guard):
                             expect = (m_rel, tid, sid) if m_rev else (m_rel, sid, tid)
-                        elif allowed:
-                            expect = (
-                                FIX.get((src_space, tgt_space)) or sorted(allowed)[0],
-                                sid, tid,
-                            )
-                        elif ALLOWED.get((tgt_space, src_space)) and not trace_guard:
-                            expect = (
-                                FIX.get((tgt_space, src_space))
-                                or sorted(ALLOWED[(tgt_space, src_space)])[0],
-                                tid, sid,
-                            )
                         else:
                             expect = None
 
                     if expect is None:
-                        ok = after == before and skipped_after == skipped_before + 1
+                        ok = (after == before and skipped_after == skipped_before + 1
+                              and key_after == key_before + 1)
                         if not ok:
                             mismatches.append(
                                 (src_space, tgt_space, label, "expected skip",
@@ -349,6 +342,9 @@ class TestEdgeUsesLoaderMappingBeforeFix:
                         continue
 
                     exp_rel, exp_src, exp_tgt = expect
+                    if pack._eskip != skips_before:
+                        mismatches.append((src_space, tgt_space, label, "unexpected skip", None))
+                        continue
                     if after != before + 1:
                         mismatches.append(
                             (src_space, tgt_space, label,
@@ -364,73 +360,28 @@ class TestEdgeUsesLoaderMappingBeforeFix:
         assert mismatches == []
 
 
-class TestFixIsTheRepresentativeNotTheAlphabeticalFirst:
-    """정합 불가 라벨의 대체값은 **FIX 표의 대표값**이지 사전순 첫 원소가 아니다.
 
-    `rel = _FIX.get((ss, tt)) or sorted(allowed)[0]` 에서 `or` 를 `and` 로 바꾸면
-    결과가 `sorted(allowed)[0]` 이 되는데, 스윕에서 그 변이가 살아남았다(2026-08-05).
-    기존 검사가 `resource->evidence` 만 썼고 그 쌍은 FIX 와 sorted[0] 이 같아서
-    두 값을 구분하지 못했기 때문이다.
+class TestInvalidLabelsAreSkipped:
+    """Unmapped labels must not receive a representative grammar relation."""
 
-    실측(2026-08-05): ALLOWED 38 쌍 중 **12 쌍**에서 둘이 다르고, 그중에는 의미가
-    정반대인 것이 있다.
-
-        lever   -> outcome   FIX=raises      sorted[0]=lowers
-        evidence-> claim     FIX=supports    sorted[0]=contradicts
-        policy  -> subject   FIX=requires_approval  sorted[0]=denies
-
-    사전순으로 새면 라이브 그래프에서 엣지 의미가 뒤집힌다. 발산하는 쌍으로 못박는다.
-    """
-
-    @pytest.mark.parametrize("src_space,tgt_space,fix_rel,alpha_first", [
-        ("lever", "outcome", "raises", "lowers"),
-        ("evidence", "claim", "supports", "contradicts"),
-        ("policy", "subject", "requires_approval", "denies"),
+    @pytest.mark.parametrize("src_space,tgt_space", [
+        ("lever", "outcome"),
+        ("evidence", "claim"),
+        ("policy", "subject"),
     ])
-    def test_unfit_label_becomes_the_fix_value(
-            self, pack, src_space, tgt_space, fix_rel, alpha_first):
-        from opencrab.pack.schema import ALLOWED, FIX
-        assert FIX[(src_space, tgt_space)] == fix_rel
-        assert sorted(ALLOWED[(src_space, tgt_space)])[0] == alpha_first
-        assert fix_rel != alpha_first, "발산하지 않으면 이 검사는 두 값을 구분하지 못한다"
-
+    def test_invalid_label_skips_an_allowed_pair(self, pack, src_space, tgt_space):
         pack.node("s", "S", SPACE_DEFAULT_TYPE[src_space], src_space)
         pack.node("t", "T", SPACE_DEFAULT_TYPE[tgt_space], tgt_space)
         pack.edge("s", "t", "정합불가라벨")
-        assert pack.edges[0]["label"] == fix_rel
+        assert pack.edges == []
+        assert pack._eskip == {("정합불가라벨", src_space, tgt_space): 1}
 
-    def test_the_alphabetical_fallback_is_unreachable_but_guarded(self):
-        """`_FIX.get(...) or sorted(allowed)[0]` 의 **or 오른쪽은 현재 도달 불가**다.
-
-        그 전제가 무엇에 의해 지켜지는지를 여기서 못박는다. FIX 에 구멍이 나면
-        `check_grammar_tables` 가 **import 시점에** RuntimeError 로 죽는다 —
-        즉 fallback 이 조용히 발동하는 상태 자체가 존재할 수 없다.
-
-        전제(FIX 가 ALLOWED 를 전부 덮음)와 그 전제를 지키는 가드를 한 자리에서 잇지 않으면,
-        나중에 가드가 사문화됐을 때 fallback 이 사전순 대표값을 조용히 쓰기 시작한다.
-        그 값은 12/38 쌍에서 FIX 와 다르고 일부는 의미가 정반대다(raises vs lowers).
-        """
-        from opencrab.pack.schema import ALLOWED, FIX, check_grammar_tables
-        assert set(FIX) >= set(ALLOWED), "FIX 가 ALLOWED 를 전부 덮어야 fallback 이 도달 불가다"
-        assert all(FIX[k] for k in ALLOWED), "FIX 값이 falsy 면 or 오른쪽이 발동한다"
-        holed = {k: v for k, v in FIX.items() if k != ("lever", "outcome")}
-        with pytest.raises(RuntimeError, match="FIX 대표값이 없다"):
-            check_grammar_tables(ALLOWED, holed)
-
-    def test_reversed_pair_also_uses_the_fix_value(self, pack):
-        """반전 분기도 같은 규칙이다 — 한쪽만 걸면 다른 쪽이 무방비가 된다.
-
-        outcome -> lever 는 grammar 에 없고 lever -> outcome 은 있다. 반전 후
-        FIX=raises / sorted[0]=lowers 로 발산한다.
-        """
-        from opencrab.pack.schema import ALLOWED
-        assert ("outcome", "lever") not in ALLOWED and ("lever", "outcome") in ALLOWED
+    def test_invalid_label_skips_a_reverse_only_pair(self, pack):
         pack.node("o", "O", "Outcome", "outcome")
         pack.node("lv", "L", "Lever", "lever")
         pack.edge("o", "lv", "정합불가라벨")
-        e = pack.edges[0]
-        assert (e["source_id"], e["target_id"]) == ("lv", "o")
-        assert e["label"] == "raises"
+        assert pack.edges == []
+        assert pack._eskip == {("정합불가라벨", "outcome", "lever"): 1}
 
 
 class TestEdgeNeedsBothSpacesToValidate:
@@ -719,26 +670,20 @@ class TestTraceabilityRetarget:
         pack.edge(oc, doc, "supports")
         assert [e for e in pack.edges if oc in (e["source_id"], e["target_id"])] == []
 
-    def test_policy_to_resource_is_a_valid_pair_and_is_not_dropped(self, pack):
-        """policy -> resource 는 정합 공간쌍이라 드롭이 아니라 FIX 된다.
-
-        `_TRACE_SRC` 네 공간을 뭉뚱그려 "전부 드롭"이라고 쓰면 이 케이스에서 거짓이 된다.
-        """
+    def test_policy_to_resource_invalid_label_is_dropped(self, pack):
         doc = pack.resource("d", "문서")
         po = pack.policy("p", "정책")
         pack.edge(po, doc, "supports")
-        edges = [e for e in pack.edges if e["source_id"] == po]
-        assert len(edges) == 1
-        assert edges[0]["target_id"] == doc
-        assert edges[0]["label"] == "classifies"        # FIX 대표값
-        assert edges[0]["properties"]["source_label"] == "supports"
+        assert [e for e in pack.edges if e["source_id"] == po] == []
+        assert pack._eskip[("supports", "policy", "resource")] == 1
 
-    def test_non_traceability_space_still_reverses(self, pack):
-        """가드는 traceability 에만 걸린다 — 일반 공간쌍은 그대로 반전한다."""
+    def test_non_traceability_invalid_edge_is_dropped(self, pack):
+        """The builder skips an invalid edge outside the traceability spaces."""
         doc = pack.resource("d", "문서")
         pack.node("e", "E", "Evidence", "evidence")
         pack.edge("e", doc, "contains")
-        assert (pack.edges[0]["source_id"], pack.edges[0]["target_id"]) == (doc, "e")
+        assert pack.edges == []
+        assert pack._eskip[("contains", "evidence", "resource")] == 1
 
 
 class TestValidateOther:
@@ -969,9 +914,9 @@ class TestDiagnosticsReportRealNumbers:
     def test_fix_substitution_count_is_reported(self, pack, capsys):
         pack.node("r", "R", "Document", "resource")
         pack.node("e", "E", "Evidence", "evidence")
-        pack.edge("r", "e", "슬쩍만든라벨")
+        pack.edge("r", "e", "CONTAINS")
         pack.validate()
-        assert "자동치환(FIX) 엣지 1건" in capsys.readouterr().out
+        assert "정규화 엣지 1건" in capsys.readouterr().out
 
     def test_unlinked_claim_concept_ratio_is_reported(self, pack, capsys):
         pack.claim("c1", "주장1")
@@ -1085,7 +1030,7 @@ class TestDiagnosticsReportRealNumbers:
         생산자는 항상 `properties` 를 넣지만, 이 집계는 **외부에서 만들어진 엣지 목록**에도
         돌 수 있어야 한다.
 
-        **비공허성 보증**: `properties` 를 지운 엣지 옆에 FIX 치환 엣지를 하나 둔다. 그러면
+        **비공허성 보증**: `properties` 를 지운 엣지 옆에 정규화 엣지를 하나 둔다. 그러면
         "터지지 않았다"뿐 아니라 **집계가 실제로 끝까지 돌았다**는 것까지 단언한다.
         그게 없으면 `src_label = None` 로 고정하는 변이도 통과한다(적대 검증 실증).
         """
@@ -1094,10 +1039,10 @@ class TestDiagnosticsReportRealNumbers:
         pack.edge("r", "e", "contains")
         del pack.edges[0]["properties"]                 # properties 키 자체가 없는 엣지
         pack.node("a", "A", "Concept", "concept")
-        pack.edge("a", "e", "정합불가라벨")               # FIX 치환 -> 집계에 잡혀야 한다
+        pack.edge("a", "e", "SHOWN_IN")               # 정규화 -> 집계에 잡혀야 한다
         pack.validate()
         out = capsys.readouterr().out
-        assert "자동치환(FIX) 엣지 1건" in out, \
+        assert "정규화 엣지 1건" in out, \
             "집계가 중간에 죽거나 src_label 을 못 읽으면 이 검사는 공허하다"
         assert "grammar 위반" not in out
 
@@ -1106,17 +1051,17 @@ class TestDiagnosticsReportRealNumbers:
         적용하지 않는다 — `None.get(...)` 로 AttributeError (이슈 #176-1, build.py:271).
 
         키 자체가 없는 경우는 위 테스트가 이미 지킨다. 이 테스트는 값이 명시적으로
-        `None` 인 다른 클래스를 지킨다. 비공허성은 위와 같은 패턴(FIX 치환 엣지 병치)으로 보증한다.
+        `None` 인 다른 클래스를 지킨다. 비공허성은 위와 같은 패턴(정규화 엣지 병치)으로 보증한다.
         """
         pack.node("r", "R", "Document", "resource")
         pack.node("e", "E", "Evidence", "evidence")
         pack.edge("r", "e", "contains")
         pack.edges[0]["properties"] = None               # properties 키는 있으나 값이 None
         pack.node("a", "A", "Concept", "concept")
-        pack.edge("a", "e", "정합불가라벨")               # FIX 치환 -> 집계에 잡혀야 한다
+        pack.edge("a", "e", "SHOWN_IN")               # 정규화 -> 집계에 잡혀야 한다
         pack.validate()
         out = capsys.readouterr().out
-        assert "자동치환(FIX) 엣지 1건" in out, \
+        assert "정규화 엣지 1건" in out, \
             "집계가 중간에 죽거나 src_label 을 못 읽으면 이 검사는 공허하다"
         assert "grammar 위반" not in out
 
@@ -1130,7 +1075,7 @@ class TestDiagnosticsReportRealNumbers:
         pack.edge("r", "e", "contains")
         pack.edges[0]["properties"]["source_label"] = "contains"   # 같은 값
         pack.validate()
-        assert "자동치환(FIX)" not in capsys.readouterr().out
+        assert "정규화" not in capsys.readouterr().out
 
     def test_grammar_violation_blocks_in_strict_mode(self, pack, capsys):
         """위반 리포트의 `if strict: errors.append(msg)` 를 지워도 아무도 안 죽었다.
@@ -1156,7 +1101,7 @@ class TestDiagnosticsReportRealNumbers:
 
     @pytest.mark.parametrize("report,setup", [
         ("grammar 위반", "viol"),
-        ("자동치환(FIX)", "fixed"),
+        ("정규화", "fixed"),
         ("remap 함정", "hazard"),
     ])
     def test_every_detail_report_caps_at_eight(self, pack, capsys, report, setup):
@@ -1167,10 +1112,11 @@ class TestDiagnosticsReportRealNumbers:
                 pack.node(f"a{i}", "A", "Concept", "concept")
                 pack.node(f"b{i}", "B", "Evidence", "evidence")
         elif setup == "fixed":
-            for i in range(9):
-                pack.node(f"a{i}", "A", "Concept", "concept")
-                pack.node(f"b{i}", "B", "Evidence", "evidence")
-                pack.edge(f"a{i}", f"b{i}", f"치환{i}")
+            rows = TestEdgeUsesLoaderMappingBeforeFix.MANIFEST_AUDIT_ROWS[:9]
+            for i, (src_space, tgt_space, label, _, _) in enumerate(rows):
+                pack.node(f"a{i}", "A", SPACE_DEFAULT_TYPE[src_space], src_space)
+                pack.node(f"b{i}", "B", SPACE_DEFAULT_TYPE[tgt_space], tgt_space)
+                pack.edge(f"a{i}", f"b{i}", label)
         else:
             # hazard 키는 (선언 space, node_type, 로더 space) 라 **서로 다른 node_type** 9종이
             # 필요하다. 같은 타입 9개는 1종으로 합쳐져 캡이 관측되지 않는다.
@@ -1187,13 +1133,13 @@ class TestDiagnosticsReportRealNumbers:
     def test_reports_list_actionable_detail_lines_not_just_totals(self, pack, capsys):
         """총계 밑의 **상세 줄**이 실제 작업 지시다 — 루프를 지워도 총계는 그대로다.
 
-        네 리포트(grammar 위반 / FIX 치환 / remap 함정 / 드롭 엣지)의 상세 루프를
+        네 리포트(grammar 위반 / 정규화 / remap 함정 / 드롭 엣지)의 상세 루프를
         삭제하는 변이가 전부 살아남았다(2026-08-05). 총계만 검사했기 때문이다.
         운영자는 "무엇을" 고칠지를 이 줄에서 읽는다.
         """
         pack.node("a", "A", "Concept", "concept")
         pack.node("b", "B", "Evidence", "evidence")
-        pack.edge("a", "b", "정합불가라벨")            # FIX 치환
+        pack.edge("a", "b", "SHOWN_IN")            # 정규화
         pack.node("n1", "L", "TextUnit", "evidence")   # remap 함정
         pack.edge("ghost-a", "ghost-b", "related_to")
         pack.node("ghost-a", "A", "Concept", "concept")
@@ -1201,25 +1147,26 @@ class TestDiagnosticsReportRealNumbers:
         pack.validate()
         out = capsys.readouterr().out
         assert "concept→evidence" in out, "위반·치환 줄에 공간쌍이 나와야 한다"
-        assert "정합불가라벨" in out, "치환 줄에 원본 라벨이 나와야 한다"
+        assert "SHOWN_IN" in out, "치환 줄에 원본 라벨이 나와야 한다"
         assert "node_type='TextUnit'" in out, "함정 줄에 문제의 node_type 이 나와야 한다"
 
     def test_fix_detail_line_shows_the_pair_in_the_edge_direction(self, pack, capsys):
-        """FIX 상세줄의 공간쌍 방향을 **그 줄만 특정해** 못박는다.
+        """정규화 상세줄의 공간쌍 방향을 **그 줄만 특정해** 못박는다.
 
         위 검사는 `"concept→evidence" in out` 인데 그 부분문자열을 **grammar 위반 줄이
-        대신 공급**한다. 그래서 FIX 줄의 `(ss, tt)` 를 `(tt, ss)` 로 뒤집는 변이가
+        대신 공급**한다. 그래서 정규화 줄의 `(ss, tt)` 를 `(tt, ss)` 로 뒤집는 변이가
         135 건 통과한 채 살아남았다(적대 검증 실증, 2026-08-05).
         방향이 뒤집히면 운영자가 반대쪽 공간쌍을 고치러 간다.
         """
         pack.node("a", "A", "Concept", "concept")
         pack.node("b", "B", "Evidence", "evidence")
-        pack.edge("a", "b", "정합불가라벨")           # FIX 치환만 발생(위반 아님)
+        pack.edge("a", "b", "SHOWN_IN")           # 정규화만 발생(위반 아님)
         pack.validate()
-        fix_block = capsys.readouterr().out.split("자동치환(FIX)")[1]
-        line = next(ln for ln in fix_block.splitlines() if "정합불가라벨" in ln)
-        assert "concept→evidence" in line, f"엣지 방향 그대로여야 한다: {line}"
-        assert "evidence→concept" not in line
+        fix_block = capsys.readouterr().out.split("정규화")[1]
+        line = next(ln for ln in fix_block.splitlines() if "SHOWN_IN" in ln)
+        arrow = chr(0x2192)
+        assert f"evidence{arrow}concept" in line, f"정규화한 엣지 방향이어야 한다: {line}"
+        assert f"concept{arrow}evidence" not in line
 
     def test_detail_lines_are_capped_at_eight(self, pack, capsys):
         """상위 8건만 나열한다. 캡이 바뀌면 운영자가 보는 정보량이 조용히 달라진다."""
