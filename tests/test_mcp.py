@@ -1230,6 +1230,15 @@ class TestReBACEngine:
         policies = engine.list_subject_policies("u2")
         assert len(policies) == 2
 
+    def test_list_policies_raises_when_sql_store_is_unavailable(self, engine):
+        engine._sql._available = False
+
+        with pytest.raises(RuntimeError, match="SQL policy store is unavailable"):
+            engine.list_subject_policies("u2")
+
+    def test_list_policies_preserves_a_genuine_empty_result(self, engine):
+        assert engine.list_subject_policies("no-policies") == []
+
 
 # ---------------------------------------------------------------------------
 # ImpactEngine unit tests (with SQLite, no Neo4j)
