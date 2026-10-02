@@ -4968,6 +4968,40 @@ class TestNodeIncrementalErrorAccounting:
         assert result.cleanup_err == 1
         assert result[4] == 1
 
+    @pytest.mark.parametrize("first_outcome, expected_cleanup_err", [(False, 0), (RuntimeError("injected old doc cleanup failure"), 1)])
+    def test_old_doc_cleanup_without_success_stays_in_snapshot_cleanup(
+            self, live, tmp_path, monkeypatch, pack_sql, first_outcome, expected_cleanup_err):
+        """False와 예외는 구 space의 snapshot 정리를 건너뛰게 하면 안 된다."""
+        builder, graph, docs = live
+        old_file = _write_jsonl(
+            tmp_path / "old.jsonl", [_node(id="n1", node_type="Document", space="resource")])
+        pack_load.load_nodes("pack-1", old_file, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        real_delete = docs.delete_node_doc
+        calls = []
+
+        def _first_delete_does_not_succeed(space, node_id):
+            calls.append((space, node_id))
+            if len(calls) == 1:
+                if isinstance(first_outcome, Exception):
+                    raise first_outcome
+                return first_outcome
+            return real_delete(space, node_id)
+
+        monkeypatch.setattr(docs, "delete_node_doc", _first_delete_does_not_succeed)
+        changed_file = _write_jsonl(
+            tmp_path / "changed.jsonl", [_node(id="n1", node_type="Concept", space="concept")])
+        result = pack_load.load_nodes_incremental(
+            "pack-1", changed_file, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"], sql=pack_sql)
+        assert calls == [("resource", "n1"), ("resource", "n1")]
+        assert result.ingest_err == 0
+        assert result.cleanup_err == expected_cleanup_err
+        assert result[4] == expected_cleanup_err
+        left_spaces = {r[0] for r in docs._conn.execute(
+            "SELECT space FROM doc_nodes WHERE node_id=?", ("n1",))}
+        assert left_spaces == {"concept"}
+
     def test_duplicate_type_sweep_error_is_not_an_ingest_error(
             self, live, tmp_path, monkeypatch, pack_sql):
         builder, graph, docs = live
@@ -5090,7 +5124,7 @@ class TestDocSpaceResidueCleanup:
             f"space(concept) 잔재가 남았다: {left_spaces}, res={res}")
 
     def test_space_moving_type_change_cleans_stale_and_legacy_spaces_together(
-            self, live, tmp_path, pack_sql):
+            self, live, tmp_path, pack_sql, caplog):
         """(d, v10 검수: 실제 F4 잔재를 대표하는 시나리오) — 타입이 바뀌면서 space 도
         함께 바뀐다. live 는 구 타입(구 space) 하나, doc 은 구 space 행 + 무관
         legacy space 행 2종. 입력이 신 타입(신 space)으로 들어오면 stale_typed
@@ -5122,12 +5156,52 @@ class TestDocSpaceResidueCleanup:
 
         assert graph.get_node("Document", "n1") is None, "구 타입 그래프 행이 안 지워졌다"
         assert graph.get_node("Concept", "n1") is not None, "신 타입 그래프 행이 없다"
+        assert not any(
+            "doc 이종 space 정리 실패(반환 False) n1 space=resource" in record.message
+            for record in caplog.records
+        ), "구 space를 두 번 지워 거짓 WARNING을 남겼다"
 
         left_spaces = {r[0] for r in docs._conn.execute(
             "SELECT space FROM doc_nodes WHERE node_id=?", ("n1",))}
         assert left_spaces == {"concept"}, (
             f"구 space(resource) · legacy space(subject) 잔재가 안 지워지고 남았다: "
             f"{left_spaces}")
+
+    def test_type_change_cleans_old_space_inserted_after_snapshot(
+            self, live, tmp_path, pack_sql, monkeypatch):
+        """stale_typed 는 snapshot 뒤 생긴 구 space 행도 지워야 한다."""
+        builder, graph, docs = live
+        old = _write_jsonl(
+            tmp_path / "old.jsonl",
+            [_node(id="n1", node_type="Document", space="resource")],
+        )
+        pack_load.load_nodes("pack-1", old, builder, {})
+        assert docs.delete_node_doc("resource", "n1") is True
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        assert state["nodes"]["n1"][:2] == ("Document", "resource")
+        assert "n1" not in state["doc_node_spaces"]
+
+        real_upsert = docs.upsert_node_doc
+
+        def _upsert_with_late_old_space(space, node_type, node_id, properties):
+            result = real_upsert(space, node_type, node_id, properties)
+            if (space, node_type, node_id) == ("concept", "Concept", "n1"):
+                real_upsert("resource", "Document", "n1", {"pack_id": "pack-1"})
+            return result
+
+        monkeypatch.setattr(docs, "upsert_node_doc", _upsert_with_late_old_space)
+        changed = _write_jsonl(
+            tmp_path / "changed.jsonl",
+            [_node(id="n1", node_type="Concept", space="concept")],
+        )
+        result = pack_load.load_nodes_incremental(
+            "pack-1", changed, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"], sql=pack_sql,
+        )
+        assert result[:5] == (0, 1, 0, 0, 0)
+        left_spaces = {r[0] for r in docs._conn.execute(
+            "SELECT space FROM doc_nodes WHERE node_id=?", ("n1",))}
+        assert left_spaces == {"concept"}
 
     def test_same_space_sequential_type_change_updates_the_single_row_in_place(
             self, live, tmp_path, pack_sql):
