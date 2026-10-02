@@ -125,6 +125,33 @@ class TestHandleRequestNormal:
         assert json.loads(result["content"][0]["text"]) == {"ok": 1}
         assert result["_meta"]["io.modelcontextprotocol/serverInfo"] == _SERVER_INFO
 
+    def test_modern_partial_pack_ingest_sets_is_error_and_keeps_receipt(self, server):
+        receipt = {"status": "partial", "node_errors": ["failed"]}
+        with patch("opencrab.mcp.server.dispatch_tool", return_value=receipt):
+            response = server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 31,
+                    "method": "tools/call",
+                    "params": {"name": "pack_ingest", "arguments": {}, "_meta": MODERN_META},
+                }
+            )
+        result = response["result"]
+        assert result["isError"] is True
+        assert json.loads(result["content"][0]["text"]) == receipt
+
+    def test_modern_partial_other_tool_without_error_keeps_success(self, server):
+        with patch("opencrab.mcp.server.dispatch_tool", return_value={"status": "partial"}):
+            response = server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 32,
+                    "method": "tools/call",
+                    "params": {"name": "pack_fork", "arguments": {}, "_meta": MODERN_META},
+                }
+            )
+        assert response["result"]["isError"] is False
+
     def test_modern_tools_call_returned_error_dict_sets_is_error(self, server):
         """dispatch_tool returning {"error": ...} WITHOUT raising must still
         flip isError -- and must remain a JSON-RPC result envelope, not an

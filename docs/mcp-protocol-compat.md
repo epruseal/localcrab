@@ -17,7 +17,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 
 - `server/discover`: resultType/supportedVersions/capabilities/instructions/ttlMs/`cacheScope: "public"` + `_meta.serverInfo`.
 - `tools/list`: resultType, ttlMs, **`cacheScope: "private"`** (#150 — 목록이 principal 별로 달라 공유 캐시 금지), 결정적 순서(레지스트리 `order=` 고정), 단일 페이지(`nextCursor` 없음, 임의 cursor 제시는 -32602).
-- `tools/call`: resultType, `isError` (도구가 예외를 던진 경우와 예외 없이 최상위 `{"error": ...}` 를 반환한 경우 모두 true). 미지 도구는 **-32602** (legacy 는 종전대로 -32601).
+- `tools/call`: resultType, `isError` (도구가 예외를 던진 경우와 예외 없이 최상위 `{"error": ...}` 를 반환한 경우, 또는 `pack_ingest`가 `status: "partial"`을 반환한 경우 true). 미지 도구는 **-32602** (legacy 는 종전대로 -32601).
 - `ping`·`initialize` 는 modern 에서 제거된 메서드 → -32601.
 - 오류: 미지원 버전 → **-32022** + `data.supported/requested`, `_meta` 필수 필드 누락·malformed → -32602.
 - 모든 modern result 에 `_meta.io.modelcontextprotocol/serverInfo` 를 싣는다(오류 응답에는 싣지 않음).
@@ -32,7 +32,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 
 ## legacy 경로 계약 (호환 계층)
 
-`initialize`/`notifications/initialized` handshake, `ping`, modern 표식이 없는 `tools/list`·`tools/call`, JSON-RPC 배치 전부 종전 그대로 동작한다. 응답 봉투도 바이트 호환이다(modern 필드를 섞지 않는다). #136 의 변경은 정확히 하나였다: **initialize 가 미지 버전을 무검증 echo 하지 않는다.** 지원 legacy 버전은 그대로 echo, 버전 부재는 종전 fallback `2024-11-05`, 미지·modern 전용 버전은 서버가 서빙하는 최신 legacy(`2025-11-25`)를 제시하고 클라이언트가 진행 여부를 판단한다(legacy 협상 규칙).
+`initialize`/`notifications/initialized` handshake, `ping`, modern 표식이 없는 `tools/list`·`tools/call`, JSON-RPC 배치 전부 종전 그대로 동작한다. 응답 봉투도 바이트 호환이다(modern 필드를 섞지 않는다). 예외는 `pack_ingest`가 최상위 `status: "partial"`을 반환할 때다. 이 결과에는 outbox 재시도를 위해 `isError: true`를 추가한다. content receipt는 그대로 둔다. #136 의 변경은 정확히 하나였다: **initialize 가 미지 버전을 무검증 echo 하지 않는다.** 지원 legacy 버전은 그대로 echo, 버전 부재는 종전 fallback `2024-11-05`, 미지·modern 전용 버전은 서버가 서빙하는 최신 legacy(`2025-11-25`)를 제시하고 클라이언트가 진행 여부를 판단한다(legacy 협상 규칙).
 
 **`tools/call` 형상 검증(#251)**: legacy 도 modern 과 **같은** 공유 검증기(`validate_tools_call_params`)를 dispatch 이전에 통과한다 — 비문자열 `name`, truthy 비객체 `arguments`, 비객체 `params` 는 -32602 다. 전에는 이 형상들이 dispatch 안에서 터져 내부 TypeError 가 JSON-RPC **성공 봉투**에 실려 나가거나(-32601 로 갈리거나) -32603 이 됐다. 도구를 실행시키던 입력은 하나도 바뀌지 않았다. 남은 era 차이는 정확히 하나: legacy 는 present + **falsy** 비객체 `arguments`(`null`/`[]`/`0`/`0.0`/`false`/`""`)를 종전대로 `{}` 로 정규화해 **도구를 실행한다**(modern 은 -32602). 그 형상은 오늘 성공하는 호출이므로 D절 제거 시점까지 유지한다 — `docs/mcp-legacy-transition.md` §3.
 
