@@ -373,11 +373,11 @@ def _normalize_space(props: dict[str, Any], space_id: str | None) -> tuple[dict[
 def _merge_space(props: dict[str, Any], space_id: Any) -> dict[str, Any]:
     """Fold the graph store's ``space_id`` column into a node's properties.
 
-    The SQL and Kuzu backends keep ``space`` in a dedicated column while
-    ``upsert_node`` only injects ``id`` into ``properties`` -- so a node's space
-    reaches ``properties`` solely when the caller happened to put it there.
-    Neo4jStore, by contrast, writes ``props["space"] = space_id`` on upsert, so
-    its reads carry the space natively and need no folding.
+    All supported graph upserts call ``prepare_node()``, which calls
+    ``normalize_space()`` before persistence. A valid explicit ``space_id``
+    sets ``props["space"]``. When the argument is absent, a valid property
+    space stays in ``props``. This function is a read-time fallback for legacy
+    rows and rows that bypass these upserts. It does not repair stored rows.
 
     Consumers read the space from props (e.g. ``_resolve_space`` in
     opencrab/pack/neo4j_export.py, which the protocol's export docstring names
