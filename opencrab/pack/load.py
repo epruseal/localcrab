@@ -2188,7 +2188,9 @@ def load_nodes_incremental(
     # 판정 노드(정확히 목표 상태)도 스윕이 놓치지 않는다.
     file_types: dict[str, str] = {}
 
-    def _cleanup_stale_doc_spaces(node_id: str, space: str) -> None:
+    def _cleanup_stale_doc_spaces(
+        node_id: str, space: str, already_deleted_spaces: frozenset[str] = frozenset(),
+    ) -> None:
         """이 node_id 가 이번에 `space` 로 확정됐다 — doc_node_spaces 에 기록된
         다른 space 의 doc 행은 이제 고아다.
 
@@ -2201,7 +2203,7 @@ def load_nodes_incremental(
         nonlocal cleanup_err
         if not doc_node_spaces:
             return
-        stale = doc_node_spaces.get(node_id, set()) - {space}
+        stale = doc_node_spaces.get(node_id, set()) - {space} - already_deleted_spaces
         for other_space in stale:
             try:
                 ok_del = docs.delete_node_doc(other_space, node_id)
@@ -2504,6 +2506,7 @@ def load_nodes_incremental(
                 log.warning("노드 저장 실패 %s (%s/%s): %s",
                             node_id, space, node_type, "; ".join(fails))
             else:
+                already_deleted_spaces: frozenset[str] = frozenset()
                 if stale_typed is not None:
                     # 새 행이 저장된 뒤에만 구 타입 행을 지운다.
                     try:
@@ -2528,7 +2531,8 @@ def load_nodes_incremental(
                     # 필요하게 만들었다.
                     if stale_typed[1] != space:
                         try:
-                            docs.delete_node_doc(stale_typed[1], node_id)
+                            if docs.delete_node_doc(stale_typed[1], node_id):
+                                already_deleted_spaces = frozenset({stale_typed[1]})
                         except Exception as exc:
                             cleanup_err += 1
                             log.warning("구 타입 노드 doc 삭제 실패 %s(%s): %s",
@@ -2536,7 +2540,7 @@ def load_nodes_incremental(
                 # F4-c: 저장이 확인된 뒤 doc_node_spaces 기준으로 다른 space 의
                 # doc 행을 정리한다. stale_typed 삭제와는 별개다 — 저건 "타입이
                 # 바뀐 구 행"이고 이건 "같은 노드가 다른 space 로도 찍혀 있던 것"이다.
-                _cleanup_stale_doc_spaces(node_id, space)
+                _cleanup_stale_doc_spaces(node_id, space, already_deleted_spaces)
                 if live is None:
                     n_new += 1
                 else:
