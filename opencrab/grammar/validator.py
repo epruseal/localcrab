@@ -36,14 +36,18 @@ _PROPERTY_TYPE_MAP: dict[str, type | tuple[type, ...]] = {
 }
 
 
-def _safe_reason_token(value: Any) -> str:
+def _message_token(value: Any) -> str:
+    if type(value) is str:
+        return value
     try:
         text = str(value)
     except Exception:
         return "<unprintable>"
-    if type(text) is not str:
-        return "<unprintable>"
-    return re.sub(r"[\x00-\x1f\x7f\x85  ]", "?", text)[:80]
+    return text if type(text) is str else "<unprintable>"
+
+
+def _safe_reason_token(value: Any) -> str:
+    return re.sub(r"[\x00-\x1f\x7f\x85  ]", "?", _message_token(value))[:80]
 
 
 def _value_matches_type(value: Any, type_name: str) -> bool:
@@ -313,7 +317,7 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
     for field, spec in schema_props.items():
         if spec.get("required", False) and "default" not in spec:
             if field not in properties:
-                errors.append(f"Required field '{field}' is missing.")
+                errors.append(f"Required field '{_message_token(field)}' is missing.")
                 reason = reason or ("property", _safe_reason_token(field), "required", "missing")
 
     # Null and enum value check. An explicit None on a non-nullable field is
@@ -325,7 +329,7 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
             if value is None:
                 if not _is_nullable(spec):
                     errors.append(
-                        f"Field '{field}' must not be null "
+                        f"Field '{_message_token(field)}' must not be null "
                         "(schema declares nullable: false)."
                     )
                     reason = reason or ("property", _safe_reason_token(field), "non-null", "NoneType")
@@ -333,7 +337,7 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
             allowed = spec.get("enum")
             if allowed is not None and value not in allowed:
                 errors.append(
-                    f"Field '{field}' must be one of {allowed}, got '{value}'."
+                    f"Field '{_message_token(field)}' must be one of {allowed}, got '{value}'."
                 )
                 reason = reason or (
                     "property", _safe_reason_token(field), "enum", _safe_reason_token(type(value).__name__),
@@ -350,7 +354,7 @@ def validate_node_properties(node_type: str, properties: dict[str, Any]) -> Vali
                 and not _value_matches_type(value, declared_type)
             ):
                 errors.append(
-                    f"Field '{field}' must be of type '{declared_type}', "
+                    f"Field '{_message_token(field)}' must be of type '{_message_token(declared_type)}', "
                     f"got {type(value).__name__} ({value!r})."
                 )
                 reason = reason or (

@@ -394,7 +394,10 @@ class TestNodeGrammarSkipSummary:
             ],
         )
 
-    @pytest.mark.parametrize("separator", ["\n", "\r", "\x1c", "\x1d", "\x1e", "\x85", " ", " "])
+    @pytest.mark.parametrize(
+        "separator",
+        ["\n", "\x0b", "\x0c", "\r", "\x1c", "\x1d", "\x1e", "\x85", " ", " "],
+    )
     def test_summary_token_removes_line_separators(self, separator):
         rendered = pack_load._safe_summary_token(f"a{separator}b")
         assert rendered == "a?b"
@@ -416,6 +419,34 @@ class TestNodeGrammarSkipSummary:
             pack_load._print_node_skip_reasons("test", Counter({caught.value.reason: 1}))
         assert "17 expected=required actual=missing x1" in output.getvalue()
         assert output.getvalue().splitlines() == [output.getvalue().rstrip("\n")]
+
+    def test_hostile_schema_tokens_do_not_break_reason_or_message(self, monkeypatch):
+        class HostileStr(str):
+            def __str__(self):
+                raise RuntimeError("must not render")
+
+        field = HostileStr("field")
+        declared_type = HostileStr("int")
+        schema = {"properties": {field: {"type": declared_type, "required": False}}}
+        monkeypatch.setattr(schema_loader, "load_type_schema", lambda _type: schema)
+        result = grammar_validator.validate_node_properties("Claim", {field: "bad"})
+        assert result.valid is False
+        assert result.reason == ("property", "<unprintable>", "<unprintable>", "str")
+        assert "<unprintable>" in result.error
+        with pytest.raises(grammar_validator.GrammarValidationError):
+            result.raise_node_grammar_error()
+
+    def test_summary_overflow_stays_on_one_line(self):
+        reasons = Counter(
+            {("property", f"field-{i}", "int", "str"): 1 for i in range(9)}
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            pack_load._print_node_skip_reasons("test", reasons)
+        rendered = output.getvalue().rstrip("\n")
+        assert rendered.splitlines() == [rendered]
+        assert "other-kinds=1 other-items=1" in rendered
+        assert "field-8" not in rendered
 
     def test_full_load_reports_safe_grammar_skip_summary(
             self, live, tmp_path, capsys):

@@ -1887,18 +1887,18 @@ def _print_node_skip_reasons(pack_name: str, reasons: Counter) -> None:
     if not reasons:
         return
     shown = reasons.most_common(8)
-    print(
-        f"    [{_safe_summary_token(pack_name)}] node grammar skip reasons ({len(reasons)} kinds): "
-        + "; ".join(
-            f"{_safe_summary_token(field)} expected={_safe_summary_token(expected)} "
-            f"actual={_safe_summary_token(actual)} x{count}"
-            for (_kind, field, expected, actual), count in shown
-        ),
-        flush=True,
+    summary = "; ".join(
+        f"{_safe_summary_token(field)} expected={_safe_summary_token(expected)} "
+        f"actual={_safe_summary_token(actual)} x{count}"
+        for (_kind, field, expected, actual), count in shown
     )
     remaining = sum(reasons.values()) - sum(count for _, count in shown)
     if remaining:
-        print(f"    … {len(reasons) - len(shown)} other kinds {remaining}", flush=True)
+        summary += f"; other-kinds={len(reasons) - len(shown)} other-items={remaining}"
+    print(
+        f"    [{_safe_summary_token(pack_name)}] node grammar skip reasons ({len(reasons)} kinds): {summary}",
+        flush=True,
+    )
 
 
 def load_nodes(
