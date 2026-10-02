@@ -307,8 +307,9 @@ class TestWriteOpenUsesLfNewlineArgument:
         with patch("opencrab.pack.jsonl_io.open", side_effect=_spy) as mock_open:
             appender.write_line('{"id":1}')  # 롤오버를 트리거
         appender.close()
+        rollover_path = target.with_name("chunks.01.jsonl")
         assert any(
-            call.kwargs.get("newline") == "\n"
+            call.args[:1] == (rollover_path,) and call.kwargs.get("newline") == "\n"
             for call in mock_open.call_args_list
         ), mock_open.call_args_list
 

@@ -27,6 +27,23 @@
 | `assembler.py` | 스테이징 디렉토리 → `opencrab-pack-v1` ZIP ([`opencrab-pack-v1.md`](./opencrab-pack-v1.md) 형식, 로컬 그래프 스토어·Neo4j 재현용) | `manifest.json`의 `format_version` 키(`cloud.py`는 `format` 키) |
 | `neo4j_export.py` | 그래프 스냅샷 → Pack v1의 Neo4j ingest 아티팩트 | `assembler.py`가 소비 |
 
+## JSONL writer newline contract
+
+JSONL text writers open their output with `newline="\n"`. This preserves LF as the record boundary on every platform. The reader in `jsonl_io.py` uses the same boundary rule.
+
+| Production path | JSONL output | Contract |
+|---|---|---|
+| `jsonl_io.py` `ShardedAppender` and `write_jsonl_sharded` | append and rewrite shards | `newline="\n"` |
+| `build.py` `Pack.save` | nodes, edges, chunks | delegates to `write_jsonl_sharded` |
+| `assembler.py` `_write_jsonl` | assembled Pack files | `Path.write_text(newline="\n")` |
+| `neo4j_export.py` | Neo4j ingest file | `newline="\n"` |
+| `cloud.py` `jsonl_bytes` | ZIP JSONL entries | `jsonl_bytes` encodes StringIO content as UTF-8 bytes; no file text translation applies |
+| `export_pack_graph_from_neo4j.py` | graph export | `newline="\n"` |
+| `build_nemotron_personas_korea_pack.py` | staged graph, evidence, and ingest files | `newline="\n"` |
+| `reconcile_doc_graph_nodes.py` `RecordWriter` | reconciliation run record | `newline="\n"` |
+
+This table excludes JSONL readers, test fixtures, logs, and writers for non-JSONL files.
+
 ## `cloud.py` vs `assembler.py` — 혼동 금지
 
 이름이 비슷하고 둘 다 "3-jsonl 디렉토리를 ZIP으로 만든다"는 점에서 헷갈리기 쉽지만 소비자·manifest 키·산출물이 전혀 다르다.

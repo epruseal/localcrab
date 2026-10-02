@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -671,6 +672,44 @@ def test_export_script_driver_args(tmp_path):
         "fetch_size": 99,
         "max_connection_lifetime": 3600,
     }
+
+
+def test_export_script_open_uses_lf_newline_argument(tmp_path):
+    output = tmp_path / "out.jsonl"
+    capture: dict = {}
+    argv = [
+        "prog", "--output", str(output), "--uri", "bolt://eh:7687",
+        "--user", "u1", "--password", "p1",
+    ]
+    real_open = Path.open
+
+    def _spy(*args, **kwargs):
+        return real_open(*args, **kwargs)
+
+    with (
+        patch.object(_expg, "GraphDatabase", _make_capturing_driver(capture)),
+        patch.object(sys, "argv", argv),
+        patch.object(Path, "open", autospec=True, side_effect=_spy) as mock_open,
+    ):
+        assert _expg.main() == 0
+
+    assert any(
+        call.args[:2] == (output, "w") and call.kwargs.get("newline") == "\n"
+        for call in mock_open.call_args_list
+    ), mock_open.call_args_list
+
+
+def test_nemotron_builder_jsonl_handles_use_lf_newline_argument():
+    tree = ast.parse((SCRIPTS_DIR / "build_nemotron_personas_korea_pack.py").read_text())
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and any(keyword.arg == "newline" and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "\n" for keyword in node.keywords)
+    ]
+    assert calls
 
 
 # ---------------------------------------------------------------------------
