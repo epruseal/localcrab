@@ -124,6 +124,9 @@ DOC_STORE_SCHEMA = SchemaSpec(
         # bare MAX(updated_at) and any other single-column updated_at lookup
         # still use it fine.
         IndexSpec("idx_doc_nodes_updated_tiebreak", "doc_nodes", "updated_at DESC, space, node_id"),
+        # A space-filtered list_nodes query constrains the first key, so it needs
+        # a separate index that retains the same deterministic order.
+        IndexSpec("idx_doc_nodes_space_updated_tiebreak", "doc_nodes", "space, updated_at DESC, node_id"),
         IndexSpec("idx_audit_ts", "audit_log", "timestamp DESC"),
     ),
 )
