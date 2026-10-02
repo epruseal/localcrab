@@ -110,8 +110,10 @@ class OntologyBuilder:
         -- the pack loader restoring its own dump. A dump can carry an
         ``owner_id`` stamped by a past server (or by the same server before a
         re-init under a new user); treating that as a forged client value
-        rejects the node and silently drops it from the reload. Server-origin
-        overwrites it with the importing principal instead. Every
+        rejects the node and silently drops it from the reload. An authorized
+        call that reaches this write overwrites it with the current principal.
+        This parameter does not require an incremental `same` row to write,
+        converge owner stamps, or transfer pack ownership. Every
         client-reachable path keeps the default.
 
         ``pack_anchor`` (#170, design v4 §3.4) opts into writing ONE
