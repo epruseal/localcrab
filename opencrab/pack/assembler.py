@@ -11,26 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from opencrab.common.hashing import file_sha256
+from opencrab.pack.jsonl_io import iter_jsonl, jsonl_exists
 from opencrab.pack.ownership import PACK_ID_RE as _PACK_ID_RE
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
+    if not jsonl_exists(path):
         return []
-    rows = []
-    # newline="" 로 열어 번역 없이 통째로 읽은 뒤 split("\n") 으로 LF 만 경계로 삼는다.
-    # splitlines() 는 VT/FF/FS/GS/RS/NEL/U+2028/U+2029 까지 줄 경계로 잡는다. 이 가운데
-    # NEL/U+2028/U+2029 는 이스케이프 없이 JSON 문자열 값 안에 나타날 수 있어, splitlines()
-    # 를 쓰면 그 값 안의 문자가 레코드를 조용히 쪼갠다. VT/FF/FS/GS/RS 는 JSON 문법
-    # 어디에도 유효하지 않지만 splitlines() 는 이들도 여전히 경계로 잡는다(#382).
-    # Path.read_text(newline=...) 는 3.13 부터라 이 저장소의 최소 버전(3.11)에서
-    # 못 쓴다(open(newline="") + read() 로 대체).
-    with path.open(encoding="utf-8", newline="") as f:
-        text = f.read()
-    for line in text.split("\n"):
-        if line.strip():
-            rows.append(json.loads(line))
-    return rows
+    return list(iter_jsonl(path))
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -212,11 +200,11 @@ def _load_graph_data(source: Path) -> tuple[list[dict[str, Any]], list[dict[str,
     graph_nodes_src = source / "graph/nodes.jsonl"
     graph_edges_src = source / "graph/edges.jsonl"
     evidence_src = source / "evidence/index.jsonl"
-    if graph_nodes_src.exists():
+    if jsonl_exists(graph_nodes_src):
         nodes = _read_jsonl(graph_nodes_src)
-    if graph_edges_src.exists():
+    if jsonl_exists(graph_edges_src):
         edges = _read_jsonl(graph_edges_src)
-    if evidence_src.exists():
+    if jsonl_exists(evidence_src):
         evidence = _read_jsonl(evidence_src)
     return nodes, edges, evidence, ingest_src, ingest_rows
 
