@@ -4945,6 +4945,52 @@ class TestNodeIncrementalErrorAccounting:
         assert cleanup_result.cleanup_err == 1
         assert cleanup_result[4] == 1
 
+    def test_old_type_graph_cleanup_error_is_not_an_ingest_error(
+            self, live, tmp_path, monkeypatch, pack_sql):
+        builder, graph, docs = live
+        old_file = _write_jsonl(
+            tmp_path / "old.jsonl", [_node(id="n1", node_type="Document", space="resource")])
+        pack_load.load_nodes("pack-1", old_file, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+
+        calls = []
+        def _broken_delete(node_type, node_id):
+            calls.append((node_type, node_id))
+            raise RuntimeError("주입된 구 타입 graph 정리 실패")
+        monkeypatch.setattr(graph, "delete_node", _broken_delete)
+        changed_file = _write_jsonl(
+            tmp_path / "changed.jsonl", [_node(id="n1", node_type="Concept", space="concept")])
+        result = pack_load.load_nodes_incremental(
+            "pack-1", changed_file, builder, {}, state["nodes"], graph, docs, {}, sql=pack_sql)
+
+        assert calls == [("Document", "n1")]
+        assert result.ingest_err == 0
+        assert result.cleanup_err == 1
+        assert result[4] == 1
+
+    def test_duplicate_type_sweep_error_is_not_an_ingest_error(
+            self, live, tmp_path, monkeypatch, pack_sql):
+        builder, graph, docs = live
+        nodes_file = _write_jsonl(tmp_path / "nodes.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", nodes_file, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+        monkeypatch.setattr(
+            pack_load, "_dup_type_node_rows", lambda *args: {"n1": {"Document", "Legacy"}})
+
+        calls = []
+        def _broken_delete(node_type, node_id):
+            calls.append((node_type, node_id))
+            raise RuntimeError("주입된 구 타입 스윕 실패")
+        monkeypatch.setattr(graph, "delete_node", _broken_delete)
+        result = pack_load.load_nodes_incremental(
+            "pack-1", nodes_file, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"], sql=pack_sql)
+
+        assert calls == [("Legacy", "n1")]
+        assert result.ingest_err == 0
+        assert result.cleanup_err == 1
+        assert result[4] == 1
+
     def test_cleanup_errors_do_not_double_count_progress(
             self, live, tmp_path, monkeypatch, pack_sql, capsys):
         builder, graph, docs = live
