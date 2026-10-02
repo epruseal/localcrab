@@ -202,3 +202,50 @@ def test_write_jsonl_uses_lf_newline_argument(tmp_path: Path):
     with patch("pathlib.Path.write_text", autospec=True) as mock_write_text:
         _write_jsonl(p, [{"id": "n1"}])
     assert mock_write_text.call_args.kwargs.get("newline") == "\n"
+
+
+# --- #393: assembler consumes the shared logical JSONL stream ---
+
+
+def test_assemble_pack_v1_reads_base_less_dedicated_shards(tmp_path: Path):
+    source = tmp_path / "stage"
+    rows_by_path = {
+        source / "graph/nodes.00.jsonl": [{"id": "node:a"}],
+        source / "graph/nodes.01.jsonl": [{"id": "node:b"}],
+        source / "graph/edges.00.jsonl": [{"id": "edge:ab", "from_id": "node:a", "to_id": "node:b"}],
+        source / "evidence/index.00.jsonl": [{"id": "evidence:a"}],
+        source / "evidence/index.01.jsonl": [{"id": "evidence:b"}],
+    }
+    for path, rows in rows_by_path.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    out = tmp_path / "pack.zip"
+
+    status = assemble_pack_v1(source, out, pack_id="sharded-pack")
+
+    assert status["nodes"] == 2
+    assert status["edges"] == 1
+    assert status["evidence"] == 2
+    with zipfile.ZipFile(out) as archive:
+        assert [json.loads(line) for line in archive.read("graph/nodes.jsonl").splitlines()] == [
+            {"id": "node:a"},
+            {"id": "node:b"},
+        ]
+        assert [json.loads(line) for line in archive.read("graph/edges.jsonl").splitlines()] == [
+            {"id": "edge:ab", "from_id": "node:a", "to_id": "node:b"}
+        ]
+        assert [json.loads(line) for line in archive.read("evidence/index.jsonl").splitlines()] == [
+            {"id": "evidence:a"},
+            {"id": "evidence:b"},
+        ]
+
+
+def test_assemble_pack_v1_rejects_base_and_shard_graph_input(tmp_path: Path):
+    source = tmp_path / "stage"
+    graph = source / "graph"
+    graph.mkdir(parents=True)
+    (graph / "nodes.jsonl").write_text('{"id": "node:a"}\n', encoding="utf-8")
+    (graph / "nodes.00.jsonl").write_text('{"id": "node:b"}\n', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="base와 shard가 동시에 존재"):
+        assemble_pack_v1(source, tmp_path / "pack.zip", pack_id="invalid-sharded-pack")
