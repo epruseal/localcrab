@@ -80,6 +80,25 @@ from opencrab.stores._vector_base import slot_owner
 # 그 이름에 의존하는 곳은 정의 자신뿐이었다(전수 grep 1건).
 log = logging.getLogger(__name__)
 
+
+class NodeIncrementalResult(tuple):
+    """Keep the seven-value node loader contract and expose error classes."""
+
+    def __new__(
+        cls,
+        values,
+        *,
+        ingest_err: int | None = None,
+        cleanup_err: int | None = None,
+    ):
+        values = tuple(values)
+        if len(values) != 7:
+            raise ValueError("NodeIncrementalResult requires seven values")
+        result = super().__new__(cls, values)
+        result.ingest_err = values[4] if ingest_err is None else ingest_err
+        result.cleanup_err = 0 if cleanup_err is None else cleanup_err
+        return result
+
 # 증분 비교의 키 제외는 두 질문으로 판정한다.
 #
 #   Q1. 파일 쪽 props 가 이 키를 정당한 값으로 실어 올 수 있는가?
@@ -2095,7 +2114,9 @@ def load_nodes_incremental(
     빈 dict(`{}`)는 유효하다 — "대사할 doc 행이 없다"는 사실이고, 없는 것과는
     다르다.
 
-    반환: (n_new, n_chg, n_same, skip, err, bypack_ids, vec_unrecovered)
+    반환: (n_new, n_chg, n_same, skip, err, bypack_ids, vec_unrecovered).
+    `err`는 적재 오류와 정리 오류의 합계다. 반환 객체의 `ingest_err`와
+    `cleanup_err` 속성은 두 오류를 따로 제공한다.
 
     #301: 이 함수는 doc 행 유실 회수(R2, 아래 `doc_row_missing`) 발동 횟수를
     지역 카운터 `n_doc_recovered` 로 세지만 반환값에는 안 싣는다. 대신 진행
@@ -2158,7 +2179,7 @@ def load_nodes_incremental(
     있던 비용)를 그대로 타므로 이 요구치에 포함하지 않는다.
     """
     require_live_data("load_nodes_incremental")
-    n_new = n_chg = n_same = skip = err = 0
+    n_new = n_chg = n_same = skip = ingest_err = cleanup_err = 0
     n_doc_recovered = 0
     vec_unrecovered = 0  # #377: 판정 시점에 벡터 존재를 확인 못 한 same-후보 입력 행 수
     bypack_ids: set[str] = set()
@@ -2177,6 +2198,7 @@ def load_nodes_incremental(
         지우면 그 창을 없앤다. 멱등이다 — 이번에 실패해도(반환 False·예외)
         다음 실행이 `doc_node_spaces` 를 다시 계산해 재시도한다.
         """
+        nonlocal cleanup_err
         if not doc_node_spaces:
             return
         stale = doc_node_spaces.get(node_id, set()) - {space}
@@ -2184,6 +2206,7 @@ def load_nodes_incremental(
             try:
                 ok_del = docs.delete_node_doc(other_space, node_id)
             except Exception as exc:
+                cleanup_err += 1
                 log.warning("doc 이종 space 정리 오류 %s space=%s: %s", node_id, other_space, exc)
                 continue
             if not ok_del:
@@ -2333,7 +2356,7 @@ def load_nodes_incremental(
                 # | docs.node_type                    | 그렇다                   | doc_row_stale(#374, `_doc_node_fingerprints` 의 node_type 비교). 비교는 행을 읽고 지문으로 만들 수 있고 팩의 지문 조회가 성공했을 때만 한다. 아니면 기존 same 경로를 따르고 비교 생략 집계 경고를 남긴다 |
                 # | docs.properties.<그 외 필드>      | 그렇다                   | doc_row_stale(#374, 무시 키를 뺀 properties 지문 비교). 부분 기록 잔존(그래프 성공, upsert_node_doc 실패)을 다음 런이 고친다. #358 이 없앤 우연한 자가 치유의 대체물이다. node_type 행과 같은 비교 가능 조건이 붙는다 |
                 # | docs(audit_log, 별도 테이블)      | **그렇다, 이 PR 은 안 잡는다(2라운드 신규 확인)** | 없음. MongoDB.log_event 가 문서 upsert 와 같은 try 블록이라 그 실패만으로 stores.docs 상태가 에러로 찍힐 수 있다. #375 로 이관 |
-                # | sql(registry, (space,node_id)->node_type) | **그렇다, 이 PR 은 안 잡는다** | 없음. node_identity_conflict 도 이 registry 를 안 본다. #376 으로 이관 |
+                # | sql registry ((space,node_id): node_type) | Yes (a stale type can persist) | Current readers count rows, copy values, or select by id. They do not use node_type for semantic decisions. The same path needs no convergence check. Reconsider this row if an active reader uses node_type for semantic decisions (#376). |
                 # | vector(노드 임베딩)               | 그렇다(부분 복원·백엔드 삭제) | vec_row_missing(R1/opt-in, #377 로 해소 — load_chunks_incremental 의 R1/recover_vectors(#332) 와 같은 패턴을 아래 is_same 블록에 이식) |
                 #
                 # 표가 드러내는 것: docs.node_type 과 docs.properties.<그 외 필드>는
@@ -2421,7 +2444,8 @@ def load_nodes_incremental(
                     # 채로 남아 있을 수 있다(예: 지난 증분이 이 정리 전에 실패했다).
                     # same 경로도 확인한다.
                     _cleanup_stale_doc_spaces(node_id, space)
-                    done = n_new + n_chg + n_same + skip + err
+                    err = ingest_err + cleanup_err
+                    done = n_new + n_chg + n_same + skip + ingest_err
                     if done % 500 == 0:
                         print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err} doc_recovered={n_doc_recovered} vec_unrecovered={vec_unrecovered})", flush=True)
                     continue
@@ -2476,7 +2500,7 @@ def load_nodes_incremental(
             # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
             fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
             if fails:
-                err += 1
+                ingest_err += 1
                 log.warning("노드 저장 실패 %s (%s/%s): %s",
                             node_id, space, node_type, "; ".join(fails))
             else:
@@ -2490,7 +2514,7 @@ def load_nodes_incremental(
                         # 하므로(신 행이 이겨 구 행을 가린다) 다음 런이 same 으로
                         # 보고 재시도하지 않아 구 행 + cascade 엣지가 영구 잔존했다
                         # — err+1 은 즉시 신호, 루프 말미 스윕(아래)이 구조적 회수다.
-                        err += 1
+                        cleanup_err += 1
                         log.warning("구 타입 노드 삭제 실패 %s(%s): %s",
                                     node_id, stale_typed[0], exc)
                     # space 동일성 가드(2026-08-12, 이관 회귀 수정): `doc_nodes`
@@ -2506,6 +2530,7 @@ def load_nodes_incremental(
                         try:
                             docs.delete_node_doc(stale_typed[1], node_id)
                         except Exception as exc:
+                            cleanup_err += 1
                             log.warning("구 타입 노드 doc 삭제 실패 %s(%s): %s",
                                         node_id, stale_typed[1], exc)
                 # F4-c: 저장이 확인된 뒤 doc_node_spaces 기준으로 다른 space 의
@@ -2520,10 +2545,11 @@ def load_nodes_incremental(
             skip += 1
             log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, ve)
         except Exception as exc:
-            err += 1
+            ingest_err += 1
             log.warning("노드 오류 %s: %s", node_id, exc)
 
-        done = n_new + n_chg + n_same + skip + err
+        err = ingest_err + cleanup_err
+        done = n_new + n_chg + n_same + skip + ingest_err
         if done % 500 == 0:
             print(f"    …노드(증분) {done} (new={n_new} chg={n_chg} same={n_same} skip={skip} err={err} doc_recovered={n_doc_recovered} vec_unrecovered={vec_unrecovered})", flush=True)
 
@@ -2602,12 +2628,17 @@ def load_nodes_incremental(
             try:
                 graph.delete_node(stale_type, node_id)
             except Exception as exc:
-                err += 1
+                cleanup_err += 1
                 log.warning("구 타입 행 스윕 삭제 실패 %s(%s): %s", node_id, stale_type, exc)
             else:
                 log.warning("구 타입 행 스윕 삭제(%s) %s(%s)", pack_name, node_id, stale_type)
 
-    return n_new, n_chg, n_same, skip, err, bypack_ids, vec_unrecovered
+    err = ingest_err + cleanup_err
+    return NodeIncrementalResult(
+        (n_new, n_chg, n_same, skip, err, bypack_ids, vec_unrecovered),
+        ingest_err=ingest_err,
+        cleanup_err=cleanup_err,
+    )
 
 
 def load_edges(

@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 import ast
+import copy
 import inspect
 import json
 import logging
 import pathlib
+import pickle
 import re
 from collections import Counter
 from decimal import Decimal
@@ -367,6 +369,23 @@ class _NoVec:
 
     def delete(self, ids):
         self.deleted.extend(ids)
+
+
+class TestNodeIncrementalResult:
+    def test_preserves_the_tuple_contract_and_error_classes(self):
+        result = pack_load.NodeIncrementalResult(
+            (1, 2, 3, 4, 5, {"n1"}, 6), ingest_err=2, cleanup_err=3)
+
+        assert tuple(result) == (1, 2, 3, 4, 5, {"n1"}, 6)
+        assert len(result) == 7
+        assert result[4] == 5
+        assert result[:5] == (1, 2, 3, 4, 5)
+        assert result == (1, 2, 3, 4, 5, {"n1"}, 6)
+        assert result.ingest_err == 2
+        assert result.cleanup_err == 3
+        assert copy.copy(result) == result
+        assert copy.deepcopy(result) == result
+        assert pickle.loads(pickle.dumps(result)).cleanup_err == 3
 
 
 class TestLoadNodesIncremental:
@@ -4893,6 +4912,62 @@ class TestFailedAddNodeLeavesOldTypedRowIntact:
         assert graph.get_node("Concept", "n1") is None, "실패했는데 신규 타입 행이 생겼다"
 
 
+class TestNodeIncrementalErrorAccounting:
+    def test_ingest_and_cleanup_errors_are_separate_and_totalled(
+            self, live, tmp_path, monkeypatch, pack_sql):
+        builder, graph, docs = live
+        seed = _write_jsonl(tmp_path / "seed.jsonl", [_node(id="n1")])
+        pack_load.load_nodes("pack-1", seed, builder, {})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+
+        def _broken_update_node(*args, **kwargs):
+            raise RuntimeError("주입된 적재 실패")
+        monkeypatch.setattr(graph, "update_node", _broken_update_node)
+        changed = _write_jsonl(tmp_path / "changed.jsonl", [_node(id="n1", 발행연도="2027")])
+        ingest_result = pack_load.load_nodes_incremental(
+            "pack-1", changed, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"], sql=pack_sql)
+        assert ingest_result.ingest_err == 1
+        assert ingest_result.cleanup_err == 0
+        assert ingest_result[4] == 1
+
+        monkeypatch.undo()
+        docs.upsert_node_doc("concept", "Concept", "n1", {"pack_id": "pack-1"})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+
+        def _broken_doc_delete(*args, **kwargs):
+            raise RuntimeError("주입된 정리 실패")
+        monkeypatch.setattr(docs, "delete_node_doc", _broken_doc_delete)
+        cleanup_result = pack_load.load_nodes_incremental(
+            "pack-1", seed, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"], sql=pack_sql)
+        assert cleanup_result.ingest_err == 0
+        assert cleanup_result.cleanup_err == 1
+        assert cleanup_result[4] == 1
+
+    def test_cleanup_errors_do_not_double_count_progress(
+            self, live, tmp_path, monkeypatch, pack_sql, capsys):
+        builder, graph, docs = live
+        rows = [_node(id=f"n{i}") for i in range(250)]
+        seed = _write_jsonl(tmp_path / "seed.jsonl", rows)
+        pack_load.load_nodes("pack-1", seed, builder, {})
+        for i in range(250):
+            docs.upsert_node_doc("concept", "Concept", f"n{i}", {"pack_id": "pack-1"})
+        state = pack_load.live_pack_state("pack-1", graph, docs, _NoVec())
+
+        def _broken_doc_delete(*args, **kwargs):
+            raise RuntimeError("주입된 정리 실패")
+        monkeypatch.setattr(docs, "delete_node_doc", _broken_doc_delete)
+        result = pack_load.load_nodes_incremental(
+            "pack-1", seed, builder, {}, state["nodes"], graph, docs,
+            state["doc_node_spaces"], sql=pack_sql)
+
+        assert result[:5] == (0, 0, 250, 0, 250)
+        assert result.ingest_err == 0
+        assert result.cleanup_err == 250
+        assert "…노드(증분) 500" not in capsys.readouterr().out
+
+
 class TestDocSpaceResidueCleanup:
     """F4 — doc 고아 세 부류(타입 변경 잔재 / 입력에서 사라진 고아 / space 어긋남)를
     각각 확인한다(2026-08-11 F4 지시).
@@ -5345,9 +5420,12 @@ class TestLoadLogsInsteadOfSwallowing:
         nf2 = _write_jsonl(tmp_path / "n2.jsonl",
                            [_node(id="n1", node_type="Concept", space="concept")])
         with caplog.at_level("WARNING", logger="opencrab.pack.load"):
-            n_new, n_chg, n_same, skip, err, _ids, _vu = pack_load.load_nodes_incremental(
+            result = pack_load.load_nodes_incremental(
                 "pack-1", nf2, builder, {}, state["nodes"], graph, docs, {}, sql=pack_sql)
-        assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 0), (
+        n_new, n_chg, n_same, skip, err, _ids, _vu = result
+        assert result.ingest_err == 0
+        assert result.cleanup_err == 1
+        assert (n_new, n_chg, n_same, skip, err) == (0, 1, 0, 0, 1), (
             n_new, n_chg, n_same, skip, err)
         assert any("주입된 doc 삭제 실패" in r.getMessage() for r in caplog.records), (
             "타입 변경 구 doc 삭제 실패가 로그에 안 남았다: "
