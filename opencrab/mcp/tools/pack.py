@@ -343,10 +343,10 @@ def _ingest_into_pack(
             if store_write_succeeded(node_stores or {}, "graph"):
                 billable_write = True
         except NodeIdentityConflict:
-            # #468: the graph's global node identity rejects an id that already
-            # names a different node. That is an intended per-item rejection
-            # (ontology_add_node and the legacy text branch report it the same
-            # way), not an internal failure, so no traceback per attempt.
+            # #468: global node identity rejects an id that already names a
+            # different node. This is an intended per-item rejection.
+            # ontology_add_node and the legacy text branch report it the same
+            # way. Log no traceback for it.
             node_errors.append(node_conflict_message(item.get("node_id", "?")))
             logger.warning("_ingest_into_pack: node identity conflict for %s", item.get("node_id", "?"))
         except Exception as exc:
@@ -518,10 +518,10 @@ def _ingest_into_pack(
                     if store_write_succeeded(evidence_stores or {}, "graph"):
                         billable_write = True
             except NodeIdentityConflict:
-                # #468: same rejection as the nodes loop. The marker is a fixed
-                # string that store_write_failures() does not read as a failure
-                # (no "error:" / "no match" prefix), so it never depends on the
-                # caller's id spelling.
+                # #468: same rejection as the nodes loop. The marker is fixed.
+                # store_write_failures() does not read it as a failure because
+                # it has no "error:" or "no match" prefix. The caller's id
+                # spelling cannot change that.
                 node_errors.append(node_conflict_message(source_id))
                 stores["evidence_node"] = "rejected (node identity conflict)"
                 logger.warning("_ingest_into_pack: node identity conflict for %s", source_id)
@@ -1510,9 +1510,9 @@ def pack_create(
         "description": (
             "Add content into an EXISTING localcrab ontology pack. "
             "Caller supplies pre-extracted nodes/edges and/or raw text; the server does NOT call any LLM. "
-            "Fails if the pack does not exist — use pack_create first. "
-            "A node or text whose id already names a different node is reported in node_errors "
-            "as rejected and is not written; the rest of the request still runs.\n\n"
+            "Fails if the pack does not exist; use pack_create first. "
+            "The tool lists a node or text whose id already names a different node in node_errors. "
+            "It does not write that item. It still processes the rest of the request.\n\n"
             + _NINE_SPACE_HINT
         ),
         "inputSchema": {

@@ -1789,7 +1789,7 @@ def test_6_mcp_same_id_different_node_type_conflict_is_reported_as_partial(stack
 
 
 # ---------------------------------------------------------------------------
-# 이슈 #468 — 같은 id 가 다른 노드를 가리키는 거절은 불투명 오류가 아니라 항목 거절로 보고된다
+# 이슈 #468: 같은 id 가 다른 노드를 가리키는 거절은 불투명 오류가 아니라 항목 거절로 보고된다
 # ---------------------------------------------------------------------------
 
 _CONFLICT_FIXED = "node id already names a different node; this item was not written"
@@ -1840,18 +1840,28 @@ def test_468_text_over_existing_logentry_is_reported_as_a_rejected_item(stack, c
     assert not [r for r in caplog.records if r.exc_info]
 
 
-def test_468_nodes_loop_rejection_is_reported_and_later_items_still_land(stack):
-    _seed_logentry(stack, "codex/s/468-b")
-    result = _ingest468(stack, nodes=[
-        {"space": "evidence", "node_type": "TextUnit",
-         "node_id": "codex/s/468-b", "properties": {"text": "충돌"}},
-        {"space": "evidence", "node_type": "TextUnit",
-         "node_id": "codex/s/468-c", "properties": {"text": "정상"}},
-    ])
+def test_468_nodes_loop_rejection_is_reported_and_later_items_still_land(stack, caplog):
+    seeded = _seed_logentry(stack, "codex/s/468-b")
+    doc_before = stack["docs"].get_node_doc("evidence", "codex/s/468-b")
+    vec_before = stack["vector"].get_by_id("codex/s/468-b")
+    with caplog.at_level("ERROR"):
+        result = _ingest468(stack, nodes=[
+            {"space": "evidence", "node_type": "TextUnit",
+             "node_id": "codex/s/468-b", "properties": {"text": "충돌"}},
+            {"space": "evidence", "node_type": "TextUnit",
+             "node_id": "codex/s/468-c", "properties": {"text": "정상"}},
+        ])
     assert result["status"] == "partial", result
     assert result["added_nodes"] == 1, result
     assert result["node_errors"] == [f"codex/s/468-b: {_CONFLICT_FIXED}"], result
+    assert "retryable" not in result
     assert stack["graph"].get_node("TextUnit", "codex/s/468-c") is not None
+    # 거절된 항목은 기존 행을 건드리지 않고, 재시도마다 ERROR 트레이스백이 쌓이지 않는다.
+    assert stack["graph"].get_node("LogEntry", "codex/s/468-b") == seeded
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-b") is None
+    assert stack["docs"].get_node_doc("evidence", "codex/s/468-b") == doc_before
+    assert stack["vector"].get_by_id("codex/s/468-b") == vec_before
+    assert not [r for r in caplog.records if r.exc_info]
 
 
 @pytest.mark.parametrize("source_id", ["error", "no match-468", "codex/s/468-h"])
