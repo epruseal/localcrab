@@ -368,7 +368,9 @@ def test_t7b_live_alias_does_not_make_every_chunk_meta_changed(live, tmp_path):
     builder, _g, docs = live
     row = {"id": "c1", "document_id": "n1", "text": "본문"}
     f = _write_jsonl(tmp_path / "chunks.jsonl", [row])
-    meta = pack_normalize.transform_chunk_meta("pack-1", row)
+    # #110: 적재기가 space 를 항상 채우므로 라이브 기준선도 space 를 가진다.
+    meta = pack_normalize.with_chunk_space(
+        pack_normalize.transform_chunk_meta("pack-1", row), "evidence")
     live_chunks = {"c1": ("본문", {**meta, "pack": "pack-1"})}
 
     # #205: load_chunks_incremental 이 이제 sql= 로 팩 소유권 인가를 건다 --

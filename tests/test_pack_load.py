@@ -30,7 +30,7 @@ from opencrab.auth import Principal, principal_scope
 from opencrab.grammar import validator as grammar_validator
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.pack import load as pack_load
-from opencrab.pack.normalize import transform_chunk_meta
+from opencrab.pack.normalize import transform_chunk_meta, with_chunk_space
 from opencrab.pack.ownership import create_pack
 from opencrab.schemas import loader as schema_loader
 from opencrab.schemas.pack_registry import _build_type_schema
@@ -3950,8 +3950,9 @@ class TestVecMetaUpdateChromaReplace:
         vec = _FakeChromaVec({})
         old_row = _chunk_row("c1", "본문A", stale="old", x="1")
         new_row = _chunk_row("c1", "본문A", x="99")   # 텍스트 불변, 메타만 변경(stale 제거)
-        old_meta = transform_chunk_meta("pack-1", old_row)
-        new_meta = transform_chunk_meta("pack-1", new_row)
+        # #110: 적재기가 청크 metadata 에 space 를 항상 넣으므로 기준선도 space 를 가진다.
+        old_meta = with_chunk_space(transform_chunk_meta("pack-1", old_row), "evidence")
+        new_meta = with_chunk_space(transform_chunk_meta("pack-1", new_row), "evidence")
         vec._collection.seed("c1", embedding=[0.1], document="본문A", metadata=old_meta)
         vec._collection.fail_add_ids = {"c1"}
         live_chunks = {"c1": ("본문A", old_meta)}
@@ -3998,7 +3999,7 @@ class TestVecMetaUpdateChromaReplace:
         vec = _FakeChromaVec({})
         old_row = _chunk_row("c1", "본문A", stale="old", x="1")
         new_row = _chunk_row("c1", "본문A", x="99")
-        old_meta = transform_chunk_meta("pack-1", old_row)
+        old_meta = with_chunk_space(transform_chunk_meta("pack-1", old_row), "evidence")
         expected_meta = dict(old_meta, x="99")   # 겹치는 키 갱신 + stale 잔존(#175)
         vec._collection.seed("c1", embedding=[0.1], document="본문A", metadata=old_meta)
         vec._collection.fail_delete_ids = {"c1"}
@@ -4090,8 +4091,8 @@ class TestVecMetaUpdateChromaUriRealBackend:
 
         old_row = _chunk_row("c1", "본문A", y="1")
         new_row = _chunk_row("c1", "본문A", y="99")   # 텍스트 불변, 메타만 변경
-        old_meta = transform_chunk_meta("pack-1", old_row)
-        new_meta = transform_chunk_meta("pack-1", new_row)
+        old_meta = with_chunk_space(transform_chunk_meta("pack-1", old_row), "evidence")
+        new_meta = with_chunk_space(transform_chunk_meta("pack-1", new_row), "evidence")
 
         self._seed_uri_record(vec, "c1", "본문A", old_meta, "http://example.com/c1")
         live_chunks = {"c1": ("본문A", old_meta)}
