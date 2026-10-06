@@ -673,3 +673,194 @@ def test_space_not_in_grammar_is_reported_and_kept(world, tmp_path, capsys):
     assert rep["before"]["doc"]["space_not_in_grammar"] == {"outside_grammar": 1}
     assert rep["before"]["vector"]["space_not_in_grammar"] == {"outside_grammar": 1}
     assert world.space("doc", "a") == "outside_grammar" and world.space("vec", "a") == "outside_grammar"
+
+_STRICT_METADATA = [
+    '{"pack_id": "pk", "x": NaN}',
+    '{"pack_id": "pk", "x": Infinity}',
+    '{"pack_id": "pk", "x": -Infinity}',
+    '{"pack_id": "first", "pack_id": "pk"}',
+    '{"pack_id": "pk", "space": "claim", "space": "concept"}',
+]
+
+
+@pytest.mark.parametrize("text", _STRICT_METADATA)
+def test_json5_and_duplicate_metadata_is_held(world, tmp_path, capsys, text):
+    world.graph("n1", "concept", {"pack_id": PACK})
+    world.doc("n1", {"pack_id": PACK})
+    world.vector("n1", text, partition=PACK)
+    d = sqlite3.connect(world.root / "doc_store.db")
+    d.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n1'", (text,))
+    d.commit()
+    d.close()
+    before = world.dump()
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 0, rep
+    assert rep["before"]["doc"]["classes"]["hold_bad_meta"] == 1
+    assert rep["before"]["vector"]["classes"]["hold_bad_meta"] == 1
+    assert world.dump() == before
+
+
+def _deep_json_that_recurses():
+    from opencrab.common.graph_identity import parse_properties_object
+
+    text = "{}"
+    while True:
+        text = '{"x":' + text + "}"
+        try:
+            parse_properties_object(text)
+        except RecursionError:
+            return text
+
+
+def test_deep_json_is_held_not_raised(world, tmp_path, capsys):
+    text = _deep_json_that_recurses()
+    assert sqlite3.connect(":memory:").execute("SELECT json_valid(?, 3)", (text,)).fetchone()[0] == 1
+    world.doc("d", text)
+    world.vector("v", text, partition=PACK)
+    world.graph("g", "concept", text)
+    world.doc("g", {"pack_id": PACK})
+    before = world.dump()
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 0, rep
+    assert rep["before"]["doc"]["classes"]["hold_bad_meta"] == 1
+    assert rep["before"]["vector"]["classes"]["hold_bad_meta"] == 1
+    assert rep["before"]["doc"]["classes"]["hold_graph_props_bad"] == 1
+    assert world.dump() == before
+
+
+def test_graph_property_space_wins_over_column(world, tmp_path, capsys):
+    world.graph("n", "resource", {"pack_id": PACK, "space": "concept"})
+    world.doc("n", {"pack_id": PACK})
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 0, rep
+    assert world.space("doc", "n") == "concept"
+
+
+def test_legacy_same_space_different_pack_is_ambiguous(env, tmp_path, capsys):
+    w = World(env, legacy_graph=True)
+    w.graph("n", "concept", {"pack_id": PACK}, node_type="A")
+    w.graph("n", "concept", {"pack_id": "other"}, node_type="B")
+    w.doc("n", {"pack_id": PACK})
+    code, rep = _apply(capsys, w, tmp_path)
+    assert code == 0, rep
+    assert rep["before"]["doc"]["classes"]["hold_graph_ambiguous"] == 1
+
+
+def test_reconcile_detects_committed_space_change(world, tmp_path, capsys):
+    _many(world, 2)
+    orig = bf._write_one_batch
+
+    def wrapped(conn, store, batch, paths, res, allow, stats):
+        done = orig(conn, store, batch, paths, res, allow, stats)
+        if store == "vector":
+            d = sqlite3.connect(world.root / "doc_store.db")
+            d.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n0'", ('{"pack_id":"pk","space":"claim"}',))
+            d.commit()
+            d.close()
+        return done
+
+    bf._write_one_batch = wrapped
+    try:
+        code, rep = _apply(capsys, world, tmp_path, "--batch-size", "1")
+    finally:
+        bf._write_one_batch = orig
+    assert code == 1
+    assert any("does not hold concept" in x for x in rep["reconcile"]["problems"])
+
+
+def test_reconcile_detects_extra_valid_row(world, tmp_path, capsys):
+    _many(world, 1)
+    orig = bf._write_one_batch
+
+    def wrapped(conn, store, batch, paths, res, allow, stats):
+        done = orig(conn, store, batch, paths, res, allow, stats)
+        if store == "vector":
+            world.doc("extra", {"pack_id": PACK, "space": "concept"})
+        return done
+
+    bf._write_one_batch = wrapped
+    try:
+        code, rep = _apply(capsys, world, tmp_path)
+    finally:
+        bf._write_one_batch = orig
+    assert code == 1
+    assert any("total rows changed" in x for x in rep["reconcile"]["problems"])
+
+
+def test_unserializable_row_does_not_block_its_batch(world, tmp_path, capsys, monkeypatch):
+    _many(world, 2)
+    real = bf._new_meta_text
+
+    def fail_one(meta, space):
+        if meta.get("marker") == "bad":
+            raise ValueError("injected serialization failure")
+        return real(meta, space)
+
+    d = sqlite3.connect(world.root / "doc_store.db")
+    d.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n0'", ('{"pack_id":"pk","marker":"bad"}',))
+    d.commit()
+    d.close()
+    monkeypatch.setattr(bf, "_new_meta_text", fail_one)
+    code, rep = _apply(capsys, world, tmp_path, "--batch-size", "2", "--list-ids")
+    assert code == 1
+    assert rep["write"]["committed"]["doc"] == 1
+    assert rep["write"]["skipped_unserializable"] == {"doc": 1, "vector": 0}
+    assert rep["skipped_unserializable_ids"]["doc"] == ["n0"]
+    assert rep["reconcile"]["ok"]
+    assert world.space("doc", "n0") is None and world.space("doc", "n1") == "concept"
+
+
+def test_lone_surrogate_metadata_is_held(world, tmp_path, capsys):
+    world.graph("n", "concept", {"pack_id": PACK})
+    world.doc("n", '{"pack_id":"pk","title":"x\\ud800"}')
+    before = world.dump()
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 0, rep
+    assert rep["before"]["doc"]["classes"]["hold_bad_meta"] == 1
+    assert world.dump() == before
+
+
+def test_apply_holds_lock_during_doc_and_vector_writes(world, env, tmp_path, capsys):
+    _many(world, 1)
+    attempts = []
+
+    def probe_lock(store, _idx):
+        code = textwrap.dedent(f"""
+            from opencrab.locking import write_lock
+            try:
+                with write_lock({str(env)!r}, timeout=0.1):
+                    print('acquired')
+            except TimeoutError:
+                print('busy')
+        """)
+        got = subprocess.check_output([sys.executable, "-c", code], text=True).strip()
+        attempts.append((store, got))
+
+    code, rep = _apply(capsys, world, tmp_path, before_commit=probe_lock)
+    assert code == 0, rep
+    assert attempts == [("doc", "busy"), ("vector", "busy")]
+
+
+def test_dry_run_compares_full_doc_content_and_file_bytes(world, capsys, monkeypatch):
+    world.graph("n", "concept", {"pack_id": PACK})
+    world.doc("n", {"pack_id": PACK}, text="original")
+    d = sqlite3.connect(world.root / "doc_store.db")
+    d.execute("UPDATE doc_sources SET ingested_at='earlier' WHERE source_id='n'")
+    d.commit()
+    d.close()
+    original = bf.scan
+
+    def corrupt(paths, allow, mode="ro"):
+        result = original(paths, allow, mode)
+        if mode == "ro":
+            d = sqlite3.connect(world.root / "doc_store.db")
+            d.execute("UPDATE doc_sources SET text='changed' WHERE source_id='n'")
+            d.commit()
+            d.close()
+        return result
+
+    monkeypatch.setattr(bf, "scan", corrupt)
+    code, _ = _run(capsys)
+    assert code == 1
+    assert sqlite3.connect(world.root / "doc_store.db").execute(
+        "SELECT text FROM doc_sources WHERE source_id='n'").fetchone()[0] == "changed"

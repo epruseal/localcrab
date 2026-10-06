@@ -127,18 +127,19 @@ def parse_meta(text: Any) -> dict[str, Any] | None:
     """Metadata dict. SQL NULL and empty text read as {}. Any other non-object gives None."""
     if text is None or text == "":
         return {}
-    return parse_object_strict(text)
+    return parse_strict_object(text)
 
 
-def parse_object_strict(text: Any) -> dict[str, Any] | None:
-    """The parsed JSON object, or None for NULL, empty text, invalid JSON and any non-object."""
+def parse_strict_object(text: Any) -> dict[str, Any] | None:
+    """Return the read-side JSON object, or None when the text is corrupt."""
     if not isinstance(text, (str, bytes)):
         return None
+    from opencrab.common.graph_identity import GraphPropertyValidationError, parse_properties_object
+
     try:
-        obj = json.loads(text)
-    except ValueError:
+        return parse_properties_object(text)
+    except (GraphPropertyValidationError, RecursionError):
         return None
-    return obj if isinstance(obj, dict) else None
 
 
 def parse_graph_properties(text: Any) -> dict[str, Any] | None:
@@ -147,12 +148,7 @@ def parse_graph_properties(text: Any) -> dict[str, Any] | None:
     The read side rejects duplicate keys, NaN and Infinity, empty text and any
     non-object. This reuses its parser so both agree.
     """
-    from opencrab.common.graph_identity import GraphPropertyValidationError, parse_properties_object
-
-    try:
-        return parse_properties_object(text)
-    except GraphPropertyValidationError:
-        return None
+    return parse_strict_object(text)
 
 
 def _str_or_none(v: Any) -> str | None:
@@ -375,6 +371,27 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
         vconn.close()
 
 
+def dry_run_snapshot(paths: Paths) -> tuple[dict[str, bytes], dict[str, list[tuple[Any, ...]]]]:
+    """Return main-file bytes and all logical rows a dry run must preserve."""
+    files = {name: (paths.data_dir / name).read_bytes()
+             for name in ("graph.db", "doc_store.db", paths.vector.name)}
+    gconn = _open(paths.graph, "ro", False)
+    dconn = _open(paths.doc, "ro", False)
+    vconn = _open(paths.vector, "ro", True)
+    try:
+        rows = {
+            "graph": gconn.execute("SELECT node_type, node_id, space_id, properties FROM graph_nodes ORDER BY node_id, node_type").fetchall(),
+            "doc": dconn.execute("SELECT source_id, text, metadata, ingested_at FROM doc_sources ORDER BY source_id").fetchall(),
+            "fts": dconn.execute("SELECT source_id, text FROM doc_sources_fts ORDER BY source_id").fetchall(),
+            "vector": vconn.execute(f"SELECT node_id, pack_id, document, metadata, embedding FROM {paths.collection} ORDER BY node_id").fetchall(),  # noqa: S608
+        }
+        return files, rows
+    finally:
+        gconn.close()
+        dconn.close()
+        vconn.close()
+
+
 def no_valid(res: dict[str, Any], store: str) -> int:
     return sum(n for c, n in res["classes"][store].items() if c != "skip_valid")
 
@@ -412,7 +429,9 @@ def report_of(res: dict[str, Any], list_ids: bool) -> dict[str, Any]:
 def _new_meta_text(meta: dict[str, Any], space: str) -> str:
     out = dict(meta)
     out["space"] = space
-    return json.dumps(out, ensure_ascii=False, allow_nan=False)
+    from opencrab.stores._json import dump_props
+
+    return dump_props(out)
 
 
 def _write_batches(
@@ -425,7 +444,8 @@ def _write_batches(
     before_commit: Any,
 ) -> dict[str, Any]:
     stats = {"committed": {"doc": [], "vector": []}, "skipped_changed": 0,
-             "skipped_nomatch": 0, "batches": 0, "remaining": {"doc": 0, "vector": 0}}
+             "skipped_nomatch": 0, "skipped_unserializable": {"doc": [], "vector": []},
+             "batches": 0, "remaining": {"doc": 0, "vector": 0}}
     dconn = _open(paths.doc, "rw", False)
     vconn = _open(paths.vector, "rw", True)
     try:
@@ -477,7 +497,11 @@ def _write_one_batch(conn, store, batch, paths, res, allow_pack_missing, stats):
         if now != (cls, space) or row[1] != part:
             stats["skipped_changed"] += 1
             continue
-        text = _new_meta_text(meta, space)
+        try:
+            text = _new_meta_text(meta, space)
+        except (TypeError, ValueError, UnicodeError):
+            stats["skipped_unserializable"][store].append(rid)
+            continue
         if store == "doc":
             cur = conn.execute("UPDATE doc_sources SET metadata = ? WHERE source_id = ?", (text, rid))
         elif part is None:
@@ -552,11 +576,15 @@ def run_apply(paths: Paths, args: argparse.Namespace, before_commit: Any = None)
             "committed": {k: len(v) for k, v in stats["committed"].items()},
             "skipped_changed": stats["skipped_changed"],
             "skipped_nomatch": stats["skipped_nomatch"],
+            "skipped_unserializable": {k: len(v) for k, v in stats["skipped_unserializable"].items()},
             "remaining": stats["remaining"],
         }
+        if args.list_ids:
+            out["skipped_unserializable_ids"] = stats["skipped_unserializable"]
         rec = reconcile(paths, before, stats, args.allow_pack_missing)
         out["reconcile"] = rec
-        return (0 if rec["ok"] else 1), out
+        clean = rec["ok"] and not any(stats["skipped_unserializable"].values())
+        return (0 if clean else 1), out
     finally:
         lock.__exit__(None, None, None)
 
@@ -606,7 +634,12 @@ def main(argv: list[str] | None = None, before_commit: Any = None) -> int:
         print("missing store files: " + ", ".join(absent), file=sys.stderr)
         return 2
     if not args.apply:
+        before_files, before_rows = dry_run_snapshot(paths)
         res = scan(paths, args.allow_pack_missing)
+        after_files, after_rows = dry_run_snapshot(paths)
+        if before_files != after_files or before_rows != after_rows:
+            print("dry run changed a main file or logical row", file=sys.stderr)
+            return 1
         print(json.dumps({"mode": "dry-run", **report_of(res, args.list_ids)}, ensure_ascii=False, indent=2))
         return 0
     code, out = run_apply(paths, args, before_commit)
