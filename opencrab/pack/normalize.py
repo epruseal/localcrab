@@ -410,9 +410,11 @@ CHUNK_DEFAULT_SPACE = "evidence"
 def raw_chunk_space(row: dict) -> str | None:
     """원본 청크 행 metadata 의 space 가 유효하면 그 문자열, 아니면 None.
 
-    `chroma_safe_meta` 가 list/dict 를 `"[]"`/`"{}"` 문자열로 바꾸기 **전**의 원본을
-    본다 — 변환 뒤에 판정하면 무효 값이 유효한 문자열로 둔갑해 라이브 값을 덮는다.
-    유효 판정은 읽기 쪽(`_space_passes`)과 같은 `_valid_space` 다.
+    원본 행 dict 를 읽는다. `transform_chunk_meta` 는 입력 행을 바꾸지 않으므로
+    호출 순서와 무관하게 이 함수는 원본 값을 본다. 변환 결과 안의 문자열화된 값
+    (list/dict 가 `"[]"`/`"{}"` 로 바뀐 것)은 참조하지 않는다. 그 값을 참조하면 무효
+    값이 유효한 문자열로 둔갑해 라이브 값을 덮는다. 유효 판정은 읽기 쪽
+    (`_space_passes`)과 같은 `_valid_space` 다.
     """
     md = row.get("metadata")
     return _valid_space(md.get("space")) if isinstance(md, dict) else None

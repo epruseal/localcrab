@@ -2903,6 +2903,7 @@ def load_chunks(
                 continue
             seen_ids.add(chunk_id)
             # #110: 재적재가 space 를 지우지 않게 결정해 넣는다(신규 적재라 라이브 값 없음).
+            # 결정기는 원본 row 를 읽고 변환 사본의 space 는 참조하지 않는다.
             meta: dict = with_chunk_space(
                 transform_chunk_meta(pack_name, row), resolve_chunk_space(row))
             b_texts.append(row["text"])
@@ -3052,6 +3053,7 @@ def load_chunks_incremental(
             live = live_chunks.get(chunk_id)
             # #110: 라이브 조회 직후, 분기 선택 앞에서 space 를 한 번 결정한다. 비교와
             # 모든 쓰기 큐가 같은 meta 를 쓴다(원본 유효값 > 라이브 유효값 > evidence).
+            # 결정기는 원본 row 를 읽고 변환 사본의 space 는 참조하지 않는다.
             meta = with_chunk_space(
                 transform_chunk_meta(pack_name, row),
                 resolve_chunk_space(row, live[1] if live is not None else None))

@@ -114,7 +114,7 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
 청크 metadata 의 `space` 는 두 청크 적재기(`load_chunks`, `load_chunks_incremental`)가
 `resolve_chunk_space` 로 정한다: 원본 metadata 의 유효한 space(비어 있지 않은 문자열),
 없으면 라이브 metadata 의 유효한 space, 없으면 `evidence`. 판정은
-`chroma_safe_meta` 의 문자열화 이전 원본 값에 한다. 이 두 적재기 밖의 쓰기 경로는
+원본 row 의 값에 한다(변환 사본의 문자열화된 값은 참조하지 않는다). 이 두 적재기 밖의 쓰기 경로는
 이 보장을 받지 않는다.
 
 ### 노드·엣지축에서 `source`·`source_id` 를 회수 키로 쓰지 마라
