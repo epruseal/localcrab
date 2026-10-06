@@ -317,7 +317,11 @@ class ReBACEngine:
         logger.info("DENY %s -> %s -> %s", subject_id, permission, resource_id)
 
     def list_subject_policies(self, subject_id: str) -> list[dict[str, Any]]:
-        """Return all stored policies for a subject."""
+        """Return all stored policies for a subject.
+
+        Raises RuntimeError when the policy store is unavailable. An empty list
+        means a successful query found no policies.
+        """
         if not self._sql.available:
-            return []
+            raise RuntimeError("SQL policy store is unavailable; policies cannot be listed.")
         return self._sql.list_policies(subject_id)
