@@ -534,3 +534,27 @@ def test_reconcile_detects_a_held_record_changing_class(world, tmp_path, capsys)
         bf._write_one_batch = orig
     assert code == 1
     assert any("hold class counts changed" in p for p in rep["reconcile"]["problems"])
+
+
+def test_reconcile_detects_two_held_records_swapping_class(world, tmp_path, capsys):
+    _many(world, 1)
+    world.graph("h1", "concept", {"pack_id": "zzz"})
+    world.graph("h2", "concept", {"pack_id": "zzz"})
+    world.doc("h1", {"pack_id": PACK})          # hold_pack_disagrees
+    world.doc("h2", {})                          # hold_pack_missing
+    orig = bf._write_one_batch
+
+    def wrapped(conn, store, batch, paths, res, allow, stats):
+        done = orig(conn, store, batch, paths, res, allow, stats)
+        if store == "doc":
+            conn.execute("UPDATE doc_sources SET metadata='{}' WHERE source_id='h1'")
+            conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id='h2'", ('{"pack_id": "pk"}',))
+        return done
+
+    bf._write_one_batch = wrapped
+    try:
+        code, rep = _apply(capsys, world, tmp_path)
+    finally:
+        bf._write_one_batch = orig
+    assert code == 1
+    assert any("held id changed class" in p for p in rep["reconcile"]["problems"])

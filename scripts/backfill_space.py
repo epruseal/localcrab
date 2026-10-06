@@ -262,6 +262,7 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
             "distribution": {"doc": collections.Counter(), "vector": collections.Counter()},
             "plan": {"doc": [], "vector": []},
             "held_ids": {"doc": collections.defaultdict(list), "vector": collections.defaultdict(list)},
+            "held_map": {"doc": {}, "vector": {}},
             "space_differs_from_graph": {"doc": 0, "vector": 0},
             "corroboration": collections.Counter(),
             "vector_vs_doc_space_differs": 0,
@@ -281,6 +282,7 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
                 res["distribution"][store][space] += 1
                 res["plan"][store].append((rid, part, space, cls))
             else:
+                res["held_map"][store][rid] = cls
                 lst = res["held_ids"][store][cls]
                 if len(lst) < LIST_CAP:
                     lst.append(rid)
@@ -443,8 +445,8 @@ def reconcile(paths: Paths, before: dict[str, Any], stats: dict[str, Any],
             problems.append(f"{store}: total rows changed")
         if no_valid(after, store) != no_valid(before, store) - n:
             problems.append(f"{store}: no-valid-space count is not before minus committed")
-        if hold_classes(after, store) != hold_classes(before, store):
-            problems.append(f"{store}: hold class counts changed")
+        if after["held_map"][store] != before["held_map"][store]:
+            problems.append(f"{store}: hold class counts changed (a held id changed class)")
     # Every committed id now holds its planned space (full check).
     dconn = _open(paths.doc, "ro", False)
     vconn = _open(paths.vector, "ro", True)
