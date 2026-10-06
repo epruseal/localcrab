@@ -35,8 +35,9 @@ VEC0 NOTES (verified against sqlite-vec 0.1.9):
       ``WHERE embedding MATCH ? AND k = ? [AND pack_id = ?] ORDER BY distance``.
     - metadata columns are limited (16 cols, 6 operators, no IN). We therefore
       store the full metadata dict as an auxiliary JSON column and replicate
-      Chroma ``where`` semantics ($in/$and/space) with a Python post-filter,
-      pushing only single ``pack_id`` equality down to the partition key.
+      Chroma ``where`` semantics ($in/$and/space) with a Python post-filter.
+      The post-filter reads an absent or None ``pack_id`` as the empty owner.
+      Only single ``pack_id`` equality goes down to the partition key.
 
 BINARY 2-STAGE ANN (VECTOR_ANN=binary, docs/vector-backends.md section 4.1):
     Global (no filter) brute-force KNN over 179k×1024d floats is
@@ -1106,7 +1107,8 @@ class SqliteVecStore(_SqliteConnMixin):
 
 
 # ---------------------------------------------------------------------------
-# where-clause parity helpers (replicate Chroma `where` semantics in Python)
+# where-clause parity helpers (replicate Chroma `where` semantics in Python;
+# pack_id reads an absent or None value as the empty owner, see _read_field)
 # ---------------------------------------------------------------------------
 
 
@@ -1163,8 +1165,10 @@ def _build_predicate(
     Supports the operators localcrab actually emits (_build_chroma_where):
     flat ``{field: scalar}`` equality, ``{field: {"$in": [...]}}`` membership,
     ``{"$and": [...]}`` / ``{"$or": [...]}`` composition, plus ``$eq``/``$ne``.
-    A missing metadata key never matches an equality/membership (Chroma
-    semantics). Returns None when ``where`` is empty (no filtering)."""
+    A missing metadata key never matches an equality or membership test, as
+    in Chroma. The key ``pack_id`` is the exception. An absent or None
+    ``pack_id`` reads as the empty owner. The partition column stores the
+    same value. Returns None when ``where`` is empty (no filtering)."""
     if not where:
         return None
 
@@ -1183,9 +1187,24 @@ def _eval_where(clause: dict[str, Any], meta: dict[str, Any]) -> bool:
             if not any(_eval_where(sub, meta) for sub in cond):
                 return False
         else:
-            if not _eval_field(meta.get(key, _MISSING), cond):
+            if not _eval_field(_read_field(meta, key), cond):
                 return False
     return True
+
+
+def _read_field(meta: dict[str, Any], key: str) -> Any:
+    """Read ``key`` for a filter. An absent or None ``pack_id`` reads as ``""``.
+
+    The partition column stores ``slot_owner(meta)``, which gives ``""`` for an
+    absent or None ``pack_id``. The pushdown and this post-filter must agree on
+    those rows (#85). This function folds only an absent or None ``pack_id``.
+    Every other value keeps its reading, including 0 and False, which
+    ``slot_owner`` also folds. Every other missing key reads as ``_MISSING``.
+    """
+    if key == "pack_id":
+        value = meta.get(key)
+        return "" if value is None else value
+    return meta.get(key, _MISSING)
 
 
 _MISSING = object()
