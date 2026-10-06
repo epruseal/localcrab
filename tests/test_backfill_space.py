@@ -1026,7 +1026,7 @@ def test_skipped_ids_are_listed_for_every_kind(world, tmp_path, capsys):
     finally:
         bf._write_one_batch = orig
     assert rep["skipped_changed_ids"]["doc"] == ["n0"]
-    assert rep["skipped_nomatch_ids"] == {"doc": [], "vector": []}
+    assert "skipped_nomatch_ids" not in rep and "skipped_nomatch" not in rep["write"]
     assert rep["skipped_unserializable_ids"] == {"doc": [], "vector": []}
 
 
@@ -1065,3 +1065,252 @@ def test_failed_rollback_does_not_hide_the_original_error(world, tmp_path, capsy
     assert code == 1
     assert rep["error_type"] == "RuntimeError" and "injected" in rep["error_text"]
     assert "rollback broke" in rep["rollback_error"]
+
+
+# ---------------------------------------------------------------------------
+# dry-run protections one at a time, interrupt table, report hygiene
+# ---------------------------------------------------------------------------
+
+_ROW_CASES = {
+    "graph": ("graph", "UPDATE graph_nodes SET properties=? WHERE node_id='n'",
+              ('{"pack_id":"pk","extra":"changed"}',)),
+    "doc_text": ("doc", "UPDATE doc_sources SET text='changed' WHERE source_id='n'", ()),
+    "ingested_at": ("doc", "UPDATE doc_sources SET ingested_at='changed' WHERE source_id='n'", ()),
+    "fts": ("doc", "UPDATE doc_sources_fts SET text='changed' WHERE source_id='n'", ()),
+    "document": ("vector", f"UPDATE {COLL} SET document='changed' WHERE node_id='n'", ()),
+    "embedding": ("vector", f"UPDATE {COLL} SET embedding=? WHERE node_id='n'",
+                  (struct.pack("32f", *([0.2] * 32)),)),
+}
+
+
+@pytest.mark.parametrize("case", list(_ROW_CASES))
+def test_dry_run_row_comparison_detects_a_wal_only_change(world, capsys, monkeypatch, case):
+    """The main file bytes stay fixed (a WAL commit, no checkpoint) and the byte part is
+    replaced by a constant, so only the row comparison can see the change."""
+    world.graph("n", "concept", {"pack_id": PACK})
+    world.doc("n", {"pack_id": PACK}, text="original")
+    world.vector("n", {"pack_id": PACK})
+    paths = bf.Paths(world.root, "vectors.db", COLL)
+    key, sql, args = _ROW_CASES[case]
+    writer = bf._open(getattr(paths, key), "rw", key == "vector")
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        real_snapshot, real_scan = bf.dry_run_snapshot, bf.scan
+
+        def fixed_bytes(p):
+            _files, rows = real_snapshot(p)
+            return {"constant": b"fixed"}, rows
+
+        def corrupt(p, allow, mode="ro"):
+            result = real_scan(p, allow, mode)
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(sql, args)
+            writer.execute("COMMIT")
+            return result
+
+        monkeypatch.setattr(bf, "dry_run_snapshot", fixed_bytes)
+        monkeypatch.setattr(bf, "scan", corrupt)
+        assert bf.main([]) == 1
+        capsys.readouterr()
+    finally:
+        writer.close()
+
+
+def _configured_world(tmp_path, monkeypatch, kind):
+    root = tmp_path / "data"
+    root.mkdir()
+    vpath = {"plain": root / "vectors.db", "nested": root / "nested" / "v.sqlite",
+             "absolute": tmp_path / "elsewhere" / "v.sqlite"}[kind]
+    value = {"plain": "vectors.db", "nested": "nested/v.sqlite", "absolute": str(vpath)}[kind]
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(root))
+    monkeypatch.setenv("STORAGE_MODE", "local")
+    monkeypatch.setenv("VECTOR_DB_FILE", value)
+    monkeypatch.delenv("VECTOR_BACKEND", raising=False)
+    from opencrab.config import get_settings
+
+    get_settings.cache_clear()
+    w = World(root, vector_path=vpath)
+    w.graph("n", "concept", {"pack_id": PACK})
+    w.doc("n", {"pack_id": PACK}, text="original")
+    w.vector("n", {"pack_id": PACK})
+    return w, bf.Paths(root, value, COLL)
+
+
+@pytest.mark.parametrize("key, kind", [("graph", "plain"), ("doc", "plain"), ("vector", "plain"),
+                                       ("vector", "nested"), ("vector", "absolute")])
+def test_dry_run_byte_comparison_detects_a_bytes_only_change(tmp_path, monkeypatch, capsys, key, kind):
+    """No logical row changes. Only the bytes of one main file change."""
+    w, paths = _configured_world(tmp_path, monkeypatch, kind)
+    w.docs.close()  # closing checkpoints the WAL now, so the main file bytes are fixed afterwards
+    w.vec.close()
+    real_scan = bf.scan
+
+    def corrupt(p, allow, mode="ro"):
+        result = real_scan(p, allow, mode)
+        conn = bf._open(getattr(p, key), "rw", key == "vector")
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            conn.execute(f"PRAGMA user_version={version + 1}")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+        return result
+
+    monkeypatch.setattr(bf, "scan", corrupt)
+    assert bf.main([]) == 1
+    capsys.readouterr()
+    from opencrab.config import get_settings
+
+    get_settings.cache_clear()
+
+
+_INTERRUPT_TABLE = [(orig, sec, place)
+                    for orig in (RuntimeError, KeyboardInterrupt)
+                    for sec in (KeyboardInterrupt, SystemExit)
+                    for place in ("rollback", "rescan")]
+
+
+@pytest.mark.parametrize("orig, sec, place", _INTERRUPT_TABLE)
+def test_secondary_interrupts_never_hide_the_original_error(world, env, tmp_path, capsys, monkeypatch,
+                                                            orig, sec, place):
+    _failure_world(world)
+    real_open, real_scan = bf._open, bf.scan
+
+    class Wrapped:
+        def __init__(self, conn):
+            self._c = conn
+
+        def execute(self, sql, *a):
+            if sql == "ROLLBACK":
+                raise sec(3) if sec is SystemExit else sec()
+            return self._c.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    def opener(path, mode, vec):
+        conn = real_open(path, mode, vec)
+        return Wrapped(conn) if place == "rollback" and mode == "rw" and path.name == "doc_store.db" else conn
+
+    calls = {"n": 0}
+
+    def scanner(paths, allow, mode="ro"):
+        calls["n"] += 1
+        if place == "rescan" and calls["n"] == 2:
+            raise sec(3) if sec is SystemExit else sec()
+        return real_scan(paths, allow, mode)
+
+    monkeypatch.setattr(bf, "_open", opener)
+    monkeypatch.setattr(bf, "scan", scanner)
+    code, raised, rep = _run_failing(capsys, world, tmp_path, orig)
+    if orig is KeyboardInterrupt:
+        assert code is None and type(raised) is KeyboardInterrupt
+        assert "exit" not in rep and rep["reraised"] == "KeyboardInterrupt"
+    else:
+        assert code == 1 and raised is None and rep["exit"] == 1
+    assert rep["error_type"] == orig.__name__
+    note = rep["rollback_error"] if place == "rollback" else rep["rescan_error"]
+    assert sec.__name__ in note
+    probe = textwrap.dedent(f"""
+        from opencrab.locking import write_lock
+        with write_lock({str(env)!r}, timeout=0.5):
+            print('acquired')
+    """)
+    assert subprocess.check_output([sys.executable, "-c", probe], text=True).strip() == "acquired"
+    monkeypatch.setattr(bf, "_open", real_open)
+    monkeypatch.setattr(bf, "scan", real_scan)
+    assert _db_counts(world)["doc"][0] == 2
+    code, rep2 = _apply(capsys, world, tmp_path, "--batch-size", "2")
+    assert code == 0 and rep2["reconcile"]["ok"]
+
+
+def test_systemexit_zero_during_write_keeps_its_status_and_prints_no_exit(world, tmp_path, capsys):
+    _failure_world(world)
+
+    def hook(store, idx):
+        if store == "doc" and idx == 1:
+            raise SystemExit(0)
+
+    dest = tmp_path / "bk"
+    dest.mkdir()
+    with pytest.raises(SystemExit) as info:
+        bf.main(["--apply", "--backup-to", str(dest), "--batch-size", "2"], before_commit=hook)
+    assert info.value.code == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert "exit" not in rep and rep["reraised"] == "SystemExit"
+
+
+def _walk(node, path=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield f"{path}/{k}", v
+            yield from _walk(v, f"{path}/{k}")
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from _walk(v, f"{path}[{i}]")
+
+
+def test_failure_report_makes_no_rollback_claim(world, tmp_path, capsys):
+    _failure_world(world)
+    code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
+    for path, value in _walk(rep):
+        key = path.rsplit("/", 1)[-1]
+        assert not ("rolled" in key.lower() or ("rollback" in key.lower() and key != "rollback_error")), path
+        if isinstance(value, str):
+            assert "rolled back" not in value.lower(), path
+
+
+def test_rescan_runs_under_the_write_lock(world, env, tmp_path, capsys, monkeypatch):
+    _failure_world(world)
+    real_scan = bf.scan
+    calls = {"n": 0}
+    seen = []
+
+    def scanner(paths, allow, mode="ro"):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            probe = textwrap.dedent(f"""
+                from opencrab.locking import write_lock
+                try:
+                    with write_lock({str(env)!r}, timeout=0.2):
+                        print('acquired')
+                except TimeoutError:
+                    print('busy')
+            """)
+            seen.append(subprocess.check_output([sys.executable, "-c", probe], text=True).strip())
+        return real_scan(paths, allow, mode)
+
+    monkeypatch.setattr(bf, "scan", scanner)
+    code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
+    assert code == 1 and seen == ["busy"]
+
+
+def test_a_row_count_mismatch_fails_loudly_and_rolls_back(world, tmp_path, capsys, monkeypatch):
+    _many(world, 1)
+    real_open = bf._open
+
+    class Wrapped:
+        def __init__(self, conn):
+            self._c = conn
+
+        def execute(self, sql, *a):
+            cur = self._c.execute(sql, *a)
+            if sql.startswith("UPDATE doc_sources"):
+                class Fake:
+                    rowcount = 0
+                return Fake()
+            return cur
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    monkeypatch.setattr(bf, "_open", lambda path, mode, vec: Wrapped(real_open(path, mode, vec))
+                        if mode == "rw" and path.name == "doc_store.db" else real_open(path, mode, vec))
+    dest = tmp_path / "bk"
+    dest.mkdir()
+    code = bf.main(["--apply", "--backup-to", str(dest)])
+    rep = json.loads(capsys.readouterr().out)
+    assert code == 1 and rep["error_type"] == "AssertionError"
+    assert world.space("doc", "n0") is None

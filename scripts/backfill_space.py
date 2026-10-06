@@ -83,7 +83,10 @@ Copying only the main file leaves the old WAL, which re-applies the later
 writes.
 
 Exit codes: 0 done, 1 failure or reconcile mismatch, 2 usage or unsupported
-mode, 3 write.lock busy.
+mode, 3 write.lock busy. After a failed write the tool prints a report that
+comes from a read-only rescan under the same lock, never from memory counters.
+An interrupt (KeyboardInterrupt, SystemExit) prints the same report without an
+exit value and re-raises, so the process status is the interrupt's own.
 """
 
 from __future__ import annotations
@@ -142,7 +145,7 @@ def parse_strict_object(text: Any) -> dict[str, Any] | None:
 
 
 def parse_graph_properties(text: Any) -> dict[str, Any] | None:
-    """Graph properties by the read side's corruption rule, None when corrupt.
+    """Return the graph properties by the read side's corruption rule, or None when corrupt.
 
     The read side rejects duplicate keys, NaN and Infinity, empty text and any
     non-object. This reuses its parser so both agree.
@@ -159,7 +162,7 @@ INVALID_PACK = object()
 
 
 def pack_of(meta: dict[str, Any] | None) -> Any:
-    """Pack string of a record ("" when absent or null), or INVALID_PACK for a non-string value."""
+    """Return the pack string of a record ("" when absent or null). A non-string value gives INVALID_PACK."""
     if meta is None:
         return INVALID_PACK
     v = meta.get("pack_id")
@@ -444,7 +447,6 @@ def _write_batches(
 ) -> dict[str, Any]:
     stats = {"committed": {"doc": [], "vector": []},
              "skipped_changed": {"doc": [], "vector": []},
-             "skipped_nomatch": {"doc": [], "vector": []},
              "skipped_unserializable": {"doc": [], "vector": []},
              "batches": 0, "remaining": {"doc": 0, "vector": 0}}
     dconn = _open(paths.doc, "rw", False)
@@ -467,7 +469,7 @@ def _write_batches(
                 except BaseException as exc:
                     try:
                         conn.execute("ROLLBACK")
-                    except Exception as rb:
+                    except BaseException as rb:
                         exc.rollback_error = f"{type(rb).__name__}: {rb}"
                     raise
                 stats["batches"] += 1
@@ -517,8 +519,9 @@ def _write_one_batch(conn, store, batch, paths, res, allow_pack_missing, stats):
                 f"UPDATE {paths.collection} SET metadata = ? WHERE node_id = ? AND pack_id = ?",  # noqa: S608
                 (text, rid, part))
         if cur.rowcount != 1:
-            stats["skipped_nomatch"][store].append(rid)
-            continue
+            # The row was re-read inside BEGIN IMMEDIATE and the key is a primary
+            # key, so one row always matches. Fail loudly and roll the batch back.
+            raise AssertionError(f"{store} UPDATE changed {cur.rowcount} rows for {rid}")
         done.append((rid, space))
     return done
 
@@ -577,7 +580,7 @@ def _failure_report(paths: Paths, args: argparse.Namespace, exc: BaseException) 
                 "classes": {c: n for c, n in res["classes"][store].items() if c != "skip_valid"},
             } for store in ("doc", "vector")},
         }
-    except Exception as rescan_exc:
+    except BaseException as rescan_exc:
         out["rescan_error"] = f"{type(rescan_exc).__name__}: {rescan_exc}"
     return out
 
@@ -611,12 +614,11 @@ def run_apply(paths: Paths, args: argparse.Namespace, before_commit: Any = None)
             "batches": stats["batches"],
             "committed": {k: len(v) for k, v in stats["committed"].items()},
             "skipped_changed": sum(len(v) for v in stats["skipped_changed"].values()),
-            "skipped_nomatch": sum(len(v) for v in stats["skipped_nomatch"].values()),
             "skipped_unserializable": {k: len(v) for k, v in stats["skipped_unserializable"].items()},
             "remaining": stats["remaining"],
         }
         if args.list_ids:
-            for kind in ("changed", "nomatch", "unserializable"):
+            for kind in ("changed", "unserializable"):
                 out[f"skipped_{kind}_ids"] = {
                     k: v[:LIST_CAP] for k, v in stats[f"skipped_{kind}"].items()}
         rec = reconcile(paths, before, stats, args.allow_pack_missing)
@@ -685,7 +687,7 @@ def main(argv: list[str] | None = None, before_commit: Any = None) -> int:
     except BaseException as exc:
         report = getattr(exc, "backfill_report", None)
         if report is not None:
-            print(json.dumps({"mode": "apply", "exit": 1, **report}, ensure_ascii=False, indent=2))
+            print(json.dumps({"mode": "apply", "reraised": type(exc).__name__, **report}, ensure_ascii=False, indent=2))
         raise
     print(json.dumps({"mode": "apply", "exit": code, **out}, ensure_ascii=False, indent=2))
     return code
