@@ -233,7 +233,8 @@ def _store_text_under_derived_id(
     carries ``source_id`` (the LogEntry id), a key that a pack fork remaps.
 
     Return ``(outcome, billable)``. The outcome is one of three values.
-    ``"stored"``: the node landed in every store.
+    ``"stored"``: the receipt reports no store failures. Optional stores can
+    still be unavailable.
     ``"failed"``: ``add_node`` reported a store failure. The graph write may have landed.
     ``"rejected"``: an identity check, a derived id conflict or an exception in
     this stage refused the item.
@@ -613,8 +614,8 @@ def _ingest_into_pack(
                         billable_write = True
             except NodeIdentityConflict:
                 # #468: the id already names a different node. #470: when that node
-                # is a same-pack LogEntry, the text is stored in a new TextUnit under
-                # a derived id and the LogEntry is not touched.
+                # is a same-pack LogEntry, this function writes the text to a new
+                # TextUnit under a derived id and leaves the LogEntry unchanged.
                 derived_id = (
                     derive_text_id(source_id)
                     if _derivable_logentry(ctx, source_id, pack_id) else None
@@ -1075,7 +1076,7 @@ def _rank_packs(query: str, enriched: list[dict[str, Any]]) -> list[dict[str, An
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). If source_id already names a LogEntry of the same pack, the TextUnit gets the derived id <source_id>#text (before any fork suffix) and the response reports it in evidence_node.",
+                    "description": "Optional raw text. With text_as_node=true, write an evidence/TextUnit node. When source_id names a same-pack LogEntry, use the derived id <source_id>#text before any fork suffix. The response returns it in evidence_node.",
                 },
                 "text_as_node": {
                     "type": "boolean",
