@@ -569,8 +569,12 @@ class TestBackupTempFileCreatedSecurely:
         fsync 직후(게시 직전) 그 창을 결정적으로 재현한다. 이 창 자체를 막을 수는
         없으므로(``/proc/self/fd`` 매직 심볼릭 링크 게시는 이 환경에서 ``EXDEV``로
         불가능함을 실측 확인함) 실패 시 닫힘(fail-closed) 전략을 쓴다: ``fd``에서
-        직접 얻은 inode와 게시 후 ``backup_to``의 inode가 다르면 그 게시를 지우고
-        예외를 내, 바꿔치기된 내용이 성공으로 위장되어 남지 않게 한다."""
+        직접 얻은 inode와 게시 후 ``backup_to``의 inode가 다르면 writer는 최종
+        파일과 임시 파일을 지우지 않고 보존하며 ``BackupPublicationStateError``
+        (``publication_state == "unconfirmed"``)를 낸다. 이 시험이 단언하는
+        것은 예외 형식과 상태, 최종 파일의 존재, victim 파일 내용의 불변, 같은
+        경로 재시도의 ``FileExistsError``다. 임시 파일 보존은 writer의 계약이며
+        이 시험에 직접 단언은 없다."""
         backup_to = tmp_path / "backup.json"
         victim = tmp_path / "victim.txt"
         victim.write_text("attacker content, not the real snapshot")
@@ -587,15 +591,19 @@ class TestBackupTempFileCreatedSecurely:
 
         monkeypatch.setattr(os, "fsync", fsync_then_swap_tmp_path_once)
 
-        with pytest.raises(OSError, match="publish race detected"):
+        with pytest.raises(repair.BackupPublicationStateError, match="publish race detected") as info:
             repair.write_backup_atomic(str(backup_to), {"table": "t", "rows": []})
 
-        assert not backup_to.exists(), (
-            "바꿔치기된 내용이 실패로 처리되지 않고 최종 백업 경로에 남았다"
-        )
+        # #363 (owner decision D3): the final entry that the link created is preserved, because this
+        # process cannot prove its content after the temp path was replaced. The error says so and the
+        # same path is not retried automatically.
+        assert info.value.publication_state == "unconfirmed"
+        assert backup_to.exists(), "확인하지 못한 최종 파일을 삭제했다"
         assert victim.read_text() == "attacker content, not the real snapshot", (
             "실패 처리 과정이 공격자 소유가 아닌 victim 파일 자체를 건드렸다"
         )
+        with pytest.raises(FileExistsError):
+            repair.write_backup_atomic(str(backup_to), {"table": "t", "rows": []})
 
 
 class TestBackupDirFsyncFailureDoesNotLeaveAStaleBackup:
