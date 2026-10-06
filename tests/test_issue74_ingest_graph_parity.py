@@ -1786,3 +1786,107 @@ def test_6_mcp_same_id_different_node_type_conflict_is_reported_as_partial(stack
     assert result["added_nodes"] == 0, result
     assert result["evidence_node"] is None, result
     assert stack["docs"].get_source("src-6-mcp") is None
+
+
+# ---------------------------------------------------------------------------
+# 이슈 #468: 같은 id 가 다른 노드를 가리키는 거절은 불투명 오류가 아니라 항목 거절로 보고된다
+# ---------------------------------------------------------------------------
+
+_CONFLICT_FIXED = "node id already names a different node; this item was not written"
+_CONFLICT_MARKER = "rejected (node identity conflict)"
+
+
+def _seed_logentry(stack, node_id: str) -> dict[str, Any]:
+    """팩 로더가 만드는 것과 같은 모양의 LogEntry 를 같은 팩에 먼저 심는다."""
+    with principal_scope(ALICE):
+        stack["builder"].add_node(
+            space="evidence", node_type="LogEntry", node_id=node_id,
+            properties={"pack_id": "pack-a", "session_id": "s-468"},
+            pack_id="pack-a",
+        )
+    return stack["graph"].get_node("LogEntry", node_id)
+
+
+def _ingest468(stack, **kw):
+    from opencrab.mcp.tools import _ingest_into_pack
+
+    with principal_scope(ALICE), \
+         patch("opencrab.mcp.tools._get_context", return_value=mcp_ctx_from(stack)):
+        return _ingest_into_pack("pack-a", **kw)
+
+
+def test_468_text_over_existing_logentry_is_reported_as_a_rejected_item(stack, caplog):
+    seeded = _seed_logentry(stack, "codex/s/468-a")
+    doc_before = stack["docs"].get_node_doc("evidence", "codex/s/468-a")
+    vec_before = stack["vector"].get_by_id("codex/s/468-a")
+
+    with caplog.at_level("ERROR"):
+        result = _ingest468(
+            stack, text="대화 원문", source_id="codex/s/468-a", text_as_node=True,
+        )
+
+    assert result["status"] == "partial", result
+    assert result["added_nodes"] == 0 and result["evidence_node"] is None, result
+    assert result["node_errors"] == [f"codex/s/468-a: {_CONFLICT_FIXED}"], result
+    assert result["stores"]["evidence_node"] == _CONFLICT_MARKER, result
+    assert "retryable" not in result
+    # 거절된 항목은 그래프 다리에서 멈춰 문서/벡터/소스 행을 건드리지 않는다.
+    assert stack["graph"].get_node("LogEntry", "codex/s/468-a") == seeded
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-a") is None
+    assert stack["docs"].get_node_doc("evidence", "codex/s/468-a") == doc_before
+    assert stack["vector"].get_by_id("codex/s/468-a") == vec_before
+    assert stack["docs"].get_source("codex/s/468-a") is None
+    # 재시도마다 ERROR 트레이스백이 쌓이지 않는다.
+    assert not [r for r in caplog.records if r.exc_info]
+
+
+def test_468_nodes_loop_rejection_is_reported_and_later_items_still_land(stack, caplog):
+    seeded = _seed_logentry(stack, "codex/s/468-b")
+    doc_before = stack["docs"].get_node_doc("evidence", "codex/s/468-b")
+    vec_before = stack["vector"].get_by_id("codex/s/468-b")
+    with caplog.at_level("ERROR"):
+        result = _ingest468(stack, nodes=[
+            {"space": "evidence", "node_type": "TextUnit",
+             "node_id": "codex/s/468-b", "properties": {"text": "충돌"}},
+            {"space": "evidence", "node_type": "TextUnit",
+             "node_id": "codex/s/468-c", "properties": {"text": "정상"}},
+        ])
+    assert result["status"] == "partial", result
+    assert result["added_nodes"] == 1, result
+    assert result["node_errors"] == [f"codex/s/468-b: {_CONFLICT_FIXED}"], result
+    assert "retryable" not in result
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-c") is not None
+    # 거절된 항목은 기존 행을 건드리지 않고, 재시도마다 ERROR 트레이스백이 쌓이지 않는다.
+    assert stack["graph"].get_node("LogEntry", "codex/s/468-b") == seeded
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-b") is None
+    assert stack["docs"].get_node_doc("evidence", "codex/s/468-b") == doc_before
+    assert stack["vector"].get_by_id("codex/s/468-b") == vec_before
+    assert not [r for r in caplog.records if r.exc_info]
+
+
+@pytest.mark.parametrize("source_id", ["error", "no match-468", "codex/s/468-h"])
+def test_468_marker_does_not_depend_on_the_caller_id_spelling(stack, source_id):
+    """표식이 `store_write_failures` 의 접두사 판정과 섞이지 않아야 한다."""
+    _seed_logentry(stack, source_id)
+    result = _ingest468(stack, text="본문", source_id=source_id, text_as_node=True)
+    assert result["stores"]["evidence_node"] == _CONFLICT_MARKER, result
+    assert result["node_errors"] == [f"{source_id}: {_CONFLICT_FIXED}"], result
+
+
+def test_468_legacy_text_path_keeps_its_own_behaviour(stack):
+    _seed_logentry(stack, "codex/s/468-g")
+    result = _ingest468(
+        stack, text="대화 원문", source_id="codex/s/468-g", text_as_node=False,
+    )
+    assert result["status"] == "partial", result
+    assert result["evidence_node"] is None, result
+
+
+def test_468_clean_ingest_response_is_unchanged(stack):
+    result = _ingest468(stack, text="정상 본문", source_id="codex/s/468-f")
+    assert result["status"] == "ok", result
+    assert result["stores"]["evidence_node"] == "ok", result
+    assert set(result) == {
+        "status", "pack_id", "added_nodes", "added_edges", "node_errors",
+        "edge_errors", "stores", "text_ingested", "evidence_node",
+    }

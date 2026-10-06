@@ -23,6 +23,7 @@ from opencrab.common.text import slugify
 from opencrab.pack.write_gate import (
     edge_identity_conflict,
     identity_reject_message,
+    node_conflict_message,
     node_identity_conflict,
     source_identity_conflict,
 )
@@ -341,6 +342,13 @@ def _ingest_into_pack(
                 added_nodes += 1
             if store_write_succeeded(node_stores or {}, "graph"):
                 billable_write = True
+        except NodeIdentityConflict:
+            # #468: global node identity rejects an id that already names a
+            # different node. This is an intended per-item rejection.
+            # ontology_add_node and the legacy text branch report it the same
+            # way. Log no traceback for it.
+            node_errors.append(node_conflict_message(item.get("node_id", "?")))
+            logger.warning("_ingest_into_pack: node identity conflict for %s", item.get("node_id", "?"))
         except Exception as exc:
             node_errors.append(f"{item.get('node_id', '?')}: {safe_tool_error('_ingest_into_pack', exc)}")
 
@@ -509,6 +517,14 @@ def _ingest_into_pack(
                         stores["evidence_node"] = "ok"
                     if store_write_succeeded(evidence_stores or {}, "graph"):
                         billable_write = True
+            except NodeIdentityConflict:
+                # #468: this is the same rejection the nodes loop handles. The marker is fixed.
+                # store_write_failures() does not read it as a failure because
+                # it has no "error:" or "no match" prefix. The caller's id
+                # spelling cannot change that.
+                node_errors.append(node_conflict_message(source_id))
+                stores["evidence_node"] = "rejected (node identity conflict)"
+                logger.warning("_ingest_into_pack: node identity conflict for %s", source_id)
             except Exception as exc:
                 node_errors.append(f"{source_id} (evidence/TextUnit): {safe_tool_error('_ingest_into_pack', exc)}")
                 # Same shape as builder.py's _safe_store_status(exc) -- the
@@ -1494,7 +1510,9 @@ def pack_create(
         "description": (
             "Add content into an EXISTING localcrab ontology pack. "
             "Caller supplies pre-extracted nodes/edges and/or raw text; the server does NOT call any LLM. "
-            "Fails if the pack does not exist — use pack_create first.\n\n"
+            "The call fails if the pack does not exist. Use pack_create first. "
+            "The tool lists a node or text whose id already names a different node in node_errors. "
+            "It does not write that item. It still processes the rest of the request.\n\n"
             + _NINE_SPACE_HINT
         ),
         "inputSchema": {
