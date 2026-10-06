@@ -1993,13 +1993,114 @@ def test_468_non_owner_is_rejected_and_nothing_is_written(stack):
     assert stack["graph"].get_node("TextUnit", "codex/s/468-n" + _DERIVED) is None
 
 
+def _ingest_with_billing(stack, **kw):
+    """`_ingest468` that also returns the billing mock."""
+    from unittest.mock import MagicMock
+
+    from opencrab.mcp.tools import _ingest_into_pack
+
+    ctx = mcp_ctx_from(stack)
+    ctx["billing"] = MagicMock()
+    ctx["billing"].on_ingest.return_value = {"ok": True}
+    with principal_scope(ALICE), patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        return _ingest_into_pack("pack-a", **kw), ctx["billing"]
+
+
 def test_468_derived_write_store_failure_is_reported_like_the_normal_branch(stack):
     _seed_logentry(stack, "codex/s/468-f2")
     with patch.object(stack["docs"], "upsert_node_doc", side_effect=RuntimeError("doc down")):
-        result = _ingest468(stack, text="본문", source_id="codex/s/468-f2")
+        derived, derived_billing = _ingest_with_billing(
+            stack, text="본문", source_id="codex/s/468-f2")
+        normal, normal_billing = _ingest_with_billing(
+            stack, text="본문", source_id="codex/s/468-plain")
+    for key in ("status", "evidence_node", "added_nodes", "text_ingested"):
+        assert derived[key] == normal[key], (key, derived, normal)
+    assert derived["text_ingested"] is True and derived["status"] == "partial", derived
+    assert derived["node_errors"] and "codex/s/468-f2" + _DERIVED in derived["node_errors"][0], derived
+    assert derived["stores"]["evidence_node"] == normal["stores"]["evidence_node"], (derived, normal)
+    # The graph write landed in both cases, so both bill once.
+    assert derived_billing.on_ingest.call_count == normal_billing.on_ingest.call_count == 1
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("registry down"), ValueError("bad grammar")])
+def test_468_exception_in_the_derivation_stage_is_an_item_error(stack, exc):
+    _seed_logentry(stack, "codex/s/468-e")
+    builder = stack["builder"]
+    real_add_node = builder.add_node
+
+    def add_node(*args, **kw):
+        if str(kw.get("node_id", "")).endswith(_DERIVED):
+            raise exc
+        return real_add_node(*args, **kw)
+
+    with patch.object(builder, "add_node", side_effect=add_node):
+        result = _ingest468(
+            stack, text="본문", source_id="codex/s/468-e",
+            nodes=[{"space": "concept", "node_type": "Topic", "node_id": "t-468-e",
+                    "properties": {}}],
+        )
     assert result["status"] == "partial", result
-    assert result["evidence_node"] is None, result
-    assert result["node_errors"] and "codex/s/468-f2" + _DERIVED in result["node_errors"][0], result
+    assert result["evidence_node"] is None and result["text_ingested"] is False, result
+    assert result["stores"]["evidence_node"] == f"error: {type(exc).__name__}", result
+    assert len(result["node_errors"]) == 1, result
+    if isinstance(exc, ValueError):
+        assert result["node_errors"][0] == "codex/s/468-e (evidence/TextUnit): bad grammar"
+    else:
+        assert "registry down" not in result["node_errors"][0]
+    # The node of the same request that came first stays written.
+    assert stack["graph"].get_node("Topic", "t-468-e") is not None
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-e" + _DERIVED) is None
+
+
+class _FakeGraph:
+    available = True
+
+    def __init__(self, rows=None, error=None):
+        self._rows, self._error = rows, error
+
+    def get_nodes_by_id(self, node_id):
+        if self._error:
+            raise self._error
+        return self._rows
+
+
+_GOOD_ROW = {"node_type": "LogEntry", "space": "evidence", "pack_id": "pack-a", "id": "x"}
+
+
+@pytest.mark.parametrize("rows, error, expected", [
+    ([_GOOD_ROW], None, True),
+    (None, RuntimeError("read failed"), False),
+    ("not a list", None, False),
+    ([], None, False),
+    ([_GOOD_ROW, dict(_GOOD_ROW)], None, False),
+    ([{**_GOOD_ROW, "property_decode_error": True}], None, False),
+    ([{**_GOOD_ROW, "node_type": "TextUnit"}], None, False),
+    ([{**_GOOD_ROW, "space": "concept"}], None, False),
+    ([{**_GOOD_ROW, "pack_id": "pack-b"}], None, False),
+    ([{k: v for k, v in _GOOD_ROW.items() if k != "pack_id"}], None, False),
+])
+def test_468_derivation_gate_admits_only_a_readable_same_pack_evidence_logentry(
+    rows, error, expected,
+):
+    from opencrab.mcp.tools.pack import _derivable_logentry
+
+    ctx = {"neo4j": _FakeGraph(rows=rows, error=error)}
+    assert _derivable_logentry(ctx, "x", "pack-a") is expected
+
+
+def test_468_derived_id_stays_inside_the_node_id_column_after_two_forks():
+    from opencrab.pack.fork_remap import NODE_ID_COLUMN_LIMIT, remap_id
+
+    salts = ["0123456789ab", "ba9876543210"]
+
+    def after_two_forks(n):
+        return remap_id(remap_id("N" * n, salts[0]), salts[1])
+
+    # The derived id would be 257 characters: refused.
+    assert derive_text_id(after_two_forks(226)) is None
+    # The derived id is exactly at the column limit: accepted.
+    derived = derive_text_id(after_two_forks(225))
+    assert derived is not None and len(derived) == NODE_ID_COLUMN_LIMIT
 
 
 def test_468_billing_follows_the_graph_write_of_the_derived_node(stack):
@@ -2051,7 +2152,10 @@ def test_468_derived_text_survives_a_fork_and_a_retry_on_the_fork_target(stack):
     assert stack["graph"].get_node("TextUnit", text_copy) == before
 
 
-@pytest.mark.parametrize("plain", ["a", "codex/s/1", "x#y", "k~notsalt"])
+@pytest.mark.parametrize("plain", [
+    "a", "codex/s/1", "x#y", "k~notsalt", "x\n", "\n",
+    "x~0123456789AB", "x~0123456789a_", "x~0123456789ag",
+])
 def test_468_derived_id_commutes_with_the_fork_remap(plain):
     from opencrab.pack.fork_remap import remap_id
 

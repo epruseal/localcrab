@@ -140,17 +140,22 @@ TEXT_ID_SUFFIX = "#text"
 
 # Trailing run of fork salts. A fork appends one salt per generation.
 _FORK_SALTS_TAIL = re.compile(
-    "(?:" + re.escape(REMAP_SEP) + "[0-9a-f]{" + str(FORK_SALT_BYTES * 2) + "})*$"
+    "(?:" + re.escape(REMAP_SEP) + "[0-9a-f]{" + str(FORK_SALT_BYTES * 2) + r"})*\Z"
 )
 
 
 def derive_text_id(source_id: str) -> str | None:
     """Return the deterministic id of the TextUnit that holds text for ``source_id``.
 
-    The text suffix goes before any trailing fork salts, so that
+    The text suffix goes before any trailing fork salts. Then
     ``remap_id(derive_text_id(x), s) == derive_text_id(remap_id(x, s))``. A fork
-    copy of the derived node and a retry against the fork target then name the
-    same node. Returns ``None`` when the id would not survive a fork remap.
+    copy of the derived node and a retry against the fork target name the same node.
+
+    Return ``None`` in two cases. The id before the salts, plus the suffix, is
+    longer than ``SOURCE_NODE_ID_BUDGET``. Or the whole derived id is longer than
+    ``NODE_ID_COLUMN_LIMIT``. A derived id near the limit can still exceed it after
+    a further fork. The fork then reports its own node length error, as it does
+    for any node of that length.
     """
     tail = _FORK_SALTS_TAIL.search(source_id)
     cut = tail.start() if tail else len(source_id)

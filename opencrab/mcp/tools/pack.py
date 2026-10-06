@@ -225,14 +225,20 @@ def _derivable_logentry(ctx: dict[str, Any], node_id: str, pack_id: str) -> bool
 def _store_text_under_derived_id(
     ctx: dict[str, Any], pack_id: str, source_id: str, derived_id: str,
     node_props: dict[str, Any], node_errors: list[str], stores: dict[str, Any],
-) -> tuple[bool, bool]:
+) -> tuple[str, bool]:
     """Write ``node_props`` as a new evidence/TextUnit at ``derived_id`` (#470).
 
-    The write is the ordinary ``add_node`` path, so ownership, the graph
-    create-or-verify rule and the doc and vector fan-out are unchanged. The
-    node carries ``source_id`` (the LogEntry id), a key that a pack fork remaps.
-    Returns ``(stored, billable)`` and reports the outcome in ``node_errors``
-    and ``stores["evidence_node"]``. It never raises for a per-item failure.
+    The write is the ordinary ``add_node`` path. Ownership, the graph
+    create-or-verify rule and the doc and vector fan-out do not change. The node
+    carries ``source_id`` (the LogEntry id), a key that a pack fork remaps.
+
+    Return ``(outcome, billable)``. The outcome is one of three values.
+    ``"stored"``: the node landed in every store.
+    ``"failed"``: ``add_node`` reported a store failure. The graph write may have landed.
+    ``"rejected"``: an identity check, a derived id conflict or an exception in
+    this stage refused the item.
+    The function reports the result in ``node_errors`` and ``stores["evidence_node"]``.
+    It never raises for a per-item failure.
     """
     from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
@@ -243,7 +249,7 @@ def _store_text_under_derived_id(
             msg = _identity_reject_message("node", source_id, reason)
             node_errors.append(msg)
             stores["evidence_node"] = msg
-            return False, False
+            return "rejected", False
         result = ctx["builder"].add_node(
             space="evidence", node_type="TextUnit", node_id=derived_id,
             properties=props, pack_id=pack_id,
@@ -252,26 +258,26 @@ def _store_text_under_derived_id(
         node_errors.append(derived_conflict_message(source_id, derived_id))
         stores["evidence_node"] = "rejected (derived id conflict)"
         logger.warning("_ingest_into_pack: derived id conflict for %s", source_id)
-        return False, False
+        return "rejected", False
     except ValueError as exc:
         node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
         stores["evidence_node"] = f"error: {type(exc).__name__}"
-        return False, False
+        return "rejected", False
     except Exception as exc:  # noqa: BLE001 -- per-item report, as the text branch does
         node_errors.append(
             f"{source_id} (evidence/TextUnit): {safe_tool_error('_ingest_into_pack', exc)}"
         )
         stores["evidence_node"] = f"error: {type(exc).__name__}"
-        return False, False
+        return "rejected", False
     result_stores = result.get("stores") if isinstance(result, dict) else None
     billable = store_write_succeeded(result_stores or {}, "graph")
     failures = store_write_failures(result_stores or {})
     if failures:
         node_errors.append(f"{derived_id} (evidence/TextUnit): " + "; ".join(failures))
         stores["evidence_node"] = "; ".join(failures)
-        return False, billable
+        return "failed", billable
     stores["evidence_node"] = f"ok (derived id for {source_id})"
-    return True, billable
+    return "stored", billable
 
 
 def _warn_dropped_alias(dropped: str | None, kind: str, ident: str) -> None:
@@ -331,12 +337,11 @@ def _ingest_into_pack(
         carve-out.
 
         With ``text_as_node=True`` an id that already names a LogEntry of the
-        same pack does not reject the text (#470). The text is stored as a new
-        TextUnit at ``derive_text_id(source_id)`` and the LogEntry is not
-        touched. ``evidence_node`` is the derived id and
-        ``stores["evidence_node"]`` names the original id. A different node
-        type, space or pack still rejects the item and ``text_ingested`` is
-        then False.
+        same pack does not reject the text (#470). The function stores the text as
+        a new TextUnit at ``derive_text_id(source_id)`` and leaves the LogEntry
+        alone. ``evidence_node`` is the derived id and ``stores["evidence_node"]``
+        names the original id. A different node type, space or pack still rejects
+        the item. ``text_ingested`` is then False.
 
         Collapsing the two into one path would change ``added_nodes`` /
         ``evidence_node`` and the vector shape for existing callers, so it is
@@ -565,8 +570,9 @@ def _ingest_into_pack(
                 node_props["title"] = meta["title"]
             if meta.get("source"):
                 node_props["source"] = meta["source"]
-            # #470: True when the text was refused for identity reasons. Such an
-            # item is not "ingested", as in the legacy branch below.
+            # #470: True when an identity check or the derived id refused the text.
+            # Such an item is not "ingested", as in the legacy branch below. A store
+            # failure does not set it: the write was attempted.
             text_rejected = False
             try:
                 reason = _node_probe_conflict(
@@ -622,12 +628,12 @@ def _ingest_into_pack(
                     logger.warning("_ingest_into_pack: node identity conflict for %s", source_id)
                     text_rejected = True
                 else:
-                    stored, billed = _store_text_under_derived_id(
+                    outcome, billed = _store_text_under_derived_id(
                         ctx, pack_id, source_id, derived_id, node_props,
                         node_errors, stores,
                     )
-                    text_rejected = not stored
-                    if stored:
+                    text_rejected = outcome == "rejected"
+                    if outcome == "stored":
                         evidence_node = derived_id
                         added_nodes += 1
                     billable_write = billable_write or billed
