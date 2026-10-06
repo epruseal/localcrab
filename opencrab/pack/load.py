@@ -2902,7 +2902,8 @@ def load_chunks(
                 log.debug("청크 중복 ID skip: %s", chunk_id)
                 continue
             seen_ids.add(chunk_id)
-            # #110: 재적재가 space 를 지우지 않게 결정해 넣는다(신규 적재라 라이브 값 없음).
+            # #110: 전량 적재기는 라이브 값을 읽지 않는다. 유효한 원본 space, 없으면 evidence 를 넣고
+            # 기존 레코드 위 재적재는 라이브의 비기본 space 를 이 결과로 바꾼다.
             # 결정기는 원본 row 를 읽고 변환 사본의 space 는 참조하지 않는다.
             meta: dict = with_chunk_space(
                 transform_chunk_meta(pack_name, row), resolve_chunk_space(row))

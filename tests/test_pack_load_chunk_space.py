@@ -6,9 +6,9 @@
 space, 없으면 evidence 를 쓴다. 증분 적재기만 라이브의 유효한 space 를 보존한다.
 
 결정기는 원본 row 를 읽고 변환 사본의 문자열화된 space 는 참조하지 않는다.
-기본 시험은 진짜 SqliteVecStore 와 SQLite 문서 스토어를 쓴다. 실패 주입 시험만
-메타를 기억하는 벡터 더블을 쓴다. 기존 픽스처와 더블은 `tests/test_pack_load*.py`
-에서 재사용한다.
+진짜 SqliteVecStore 와 SQLite 문서 스토어로 도는 묶음(`TestRealSqliteVecStore`)과
+메타를 기억하는 벡터 더블로 도는 묶음이 함께 있다. 실패 주입 시험은 더블로만 돈다.
+기존 픽스처와 더블은 `tests/test_pack_load*.py` 에서 재사용한다.
 """
 from __future__ import annotations
 
