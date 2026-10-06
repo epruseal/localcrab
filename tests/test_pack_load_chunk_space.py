@@ -1,9 +1,14 @@
-"""#110 단계 B: 두 청크 적재기는 재적재 때 유효한 space 를 지우지 않는다.
+"""#110 단계 B: 청크 적재기의 space 결정 계약.
 
-결정 순서는 원본 metadata 의 유효한 space, 라이브 metadata 의 유효한 space,
-evidence 다. 결정기는 원본 row 를 읽고 변환 사본의 문자열화된 space 는 참조하지
-않는다. 기본 보존 시험은 진짜 SqliteVecStore 와 SQLite 문서 스토어를 쓰고, 실패
-주입 시험만 메타를 기억하는 벡터 더블을 쓴다. 기존 픽스처와 더블은 `tests/test_pack_load*.py` 에서 재사용한다.
+`load_chunks`(전량)는 유효한 원본 space, 없으면 evidence 를 쓴다. 라이브 값을
+읽지 않으므로 기존 레코드 위의 전량 재적재는 라이브의 비기본 space 를 이 결과로
+바꾼다. `load_chunks_incremental`(증분)은 유효한 원본 space, 없으면 유효한 라이브
+space, 없으면 evidence 를 쓴다. 증분 적재기만 라이브의 유효한 space 를 보존한다.
+
+결정기는 원본 row 를 읽고 변환 사본의 문자열화된 space 는 참조하지 않는다.
+기본 시험은 진짜 SqliteVecStore 와 SQLite 문서 스토어를 쓴다. 실패 주입 시험만
+메타를 기억하는 벡터 더블을 쓴다. 기존 픽스처와 더블은 `tests/test_pack_load*.py`
+에서 재사용한다.
 """
 from __future__ import annotations
 
@@ -96,7 +101,8 @@ def _counts(res):
     return c_new, c_txt, c_meta, c_same, err
 
 
-_BAD_RAW = [[], {}, 0, False, None, ""]
+# 무효 원본: falsy 값과 truthy 비문자열 값. 후자는 truthiness 판정 변이를 잡는다.
+_BAD_RAW = [[], {}, 0, False, None, "", 5, True, 1.5, ["concept"], {"a": 1}]
 
 
 class TestRawValidity:
@@ -130,12 +136,13 @@ class TestBranchTable:
 
     def test_full_loader_defaults_to_evidence_and_keeps_explicit(
             self, live, tmp_path, pack_sql):
-        vec, docs = _seed(live, tmp_path, pack_sql,
-                          [_row("c1"), _row("c2", space="resource"),
-                           _row("c3", space=[])])
+        rows = [_row("c1"), _row("c2", space="resource")]
+        rows += [_row(f"b{i}", space=bad) for i, bad in enumerate(_BAD_RAW)]
+        vec, docs = _seed(live, tmp_path, pack_sql, rows)
         assert _space_of(vec, docs, "c1") == "evidence"
         assert _space_of(vec, docs, "c2") == "resource"
-        assert _space_of(vec, docs, "c3") == "evidence"
+        for i in range(len(_BAD_RAW)):
+            assert _space_of(vec, docs, f"b{i}") == "evidence"
 
     def test_incremental_new_chunk_defaults_to_evidence(
             self, live, tmp_path, pack_sql):
@@ -230,6 +237,13 @@ class TestInvalidLiveSpace:
         docs.upsert_source("c1", "본문", bad)
         _incr(tmp_path, pack_sql, vec, docs, [_row("c1")])
         assert _space_of(vec, docs, "c1") == "evidence"
+
+    @pytest.mark.parametrize("bad", _BAD_RAW)
+    def test_invalid_raw_resolves_by_live_then_evidence(self, bad):
+        row = _row("c1", space=bad)
+        assert resolve_chunk_space(row) == "evidence"
+        assert resolve_chunk_space(row, {"space": 5}) == "evidence"
+        assert resolve_chunk_space(row, {"space": "concept"}) == "concept"
 
     @pytest.mark.parametrize("live_meta", [{"space": ""}, {}, None])
     def test_empty_or_missing_live_space_is_evidence(self, live_meta):
@@ -336,12 +350,23 @@ class TestRealSqliteVecStore:
         return docs
 
     def test_full_loader_default_and_explicit(self, live, tmp_path, pack_sql, rvec):
-        docs = self._seed(live, tmp_path, pack_sql, rvec,
-                          [_row("c1"), _row("c2", space="resource"),
-                           _row("c3", space=[])])
+        rows = [_row("c1"), _row("c2", space="resource")]
+        rows += [_row(f"b{i}", space=bad) for i, bad in enumerate(_BAD_RAW)]
+        docs = self._seed(live, tmp_path, pack_sql, rvec, rows)
         assert self._both(rvec, docs, "c1") == "evidence"
         assert self._both(rvec, docs, "c2") == "resource"
-        assert self._both(rvec, docs, "c3") == "evidence"
+        for i in range(len(_BAD_RAW)):
+            assert self._both(rvec, docs, f"b{i}") == "evidence"
+
+    def test_full_reload_over_live_concept_replaces_it_with_evidence(
+            self, live, tmp_path, pack_sql, rvec):
+        """문서가 적은 전량 적재기 계약을 고정한다: 라이브 값을 읽지 않는다."""
+        docs = self._seed(live, tmp_path, pack_sql, rvec,
+                          [_row("c1", space="concept")])
+        assert self._both(rvec, docs, "c1") == "concept"
+        f = _write_jsonl(tmp_path / "again.jsonl", [_row("c1")])
+        assert pack_load.load_chunks(PACK, f, rvec, docs, sql=pack_sql) == (1, 0)
+        assert self._both(rvec, docs, "c1") == "evidence"
 
     @pytest.mark.parametrize("bad", _BAD_RAW + ["__missing__"])
     def test_invalid_raw_keeps_live_concept_without_writes(

@@ -111,11 +111,16 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
 `source_doc` 으로 옮기므로, 청크에서 `source` 는 소유 태그가 맞다. 그 계약을 지키는 것이
 청크를 쓰는 **모든** 경로가 `transform_chunk_meta` 를 통과한다는 조건이다.
 
-청크 metadata 의 `space` 는 두 청크 적재기(`load_chunks`, `load_chunks_incremental`)가
-`resolve_chunk_space` 로 정한다: 원본 metadata 의 유효한 space(비어 있지 않은 문자열),
-없으면 라이브 metadata 의 유효한 space, 없으면 `evidence`. 판정은
-원본 row 의 값에 한다(변환 사본의 문자열화된 값은 참조하지 않는다). 이 두 적재기 밖의 쓰기 경로는
-이 보장을 받지 않는다.
+청크 metadata 의 `space` 는 두 청크 적재기가 `resolve_chunk_space` 로 정한다. 유효한 space 는
+비어 있지 않은 문자열이다. 판정은 원본 row 의 값에 한다(변환 사본의 문자열화된 값은 참조하지
+않는다).
+
+- `load_chunks`(전량): 유효한 원본 space, 없으면 `evidence`. 라이브 metadata 를 읽지 않으므로
+  기존 레코드 위의 전량 재적재는 라이브의 비기본 space 를 이 결과로 바꾼다.
+- `load_chunks_incremental`(증분): 유효한 원본 space, 없으면 유효한 라이브 space, 없으면
+  `evidence`.
+
+이 두 적재기 밖의 쓰기 경로는 이 보장을 받지 않는다.
 
 ### 노드·엣지축에서 `source`·`source_id` 를 회수 키로 쓰지 마라
 
