@@ -595,3 +595,13 @@ PYTHONPATH=. python scripts/qa/mutate_module.py . opencrab/pack/load.py \
 
    재현: `pytest tests/test_pack_load_chunk_authz.py`(비소유자 거부와 원본 팩 불변), `pytest tests/test_write_sink_inventory.py`(스토어 쓰기 지점 전량이 writer이거나 선언된 예외인지).
 4. **배포(선택)**: 목적에 따라 `cloud.build_zip` 또는 `assembler.assemble_pack_v1`으로 ZIP 조립.
+
+## 기존 레코드의 space 백필 (#110 단계 A)
+
+청크 적재기는 새로 쓰는 레코드에 유효한 space를 남긴다. 그 이전에 저장된 벡터와 `doc_sources` 레코드는 `scripts/backfill_space.py`로 채운다. 이 도구는 `STORAGE_MODE=local`과 sqlite-vec 벡터 파일만 다룬다.
+
+- 기본은 읽기 전용 점검(dry-run)이다. 쓰기는 `--apply`와 `--backup-to`가 함께 있을 때만 일어난다.
+- 판정 규칙과 보류 분류, 복원 절차(WAL과 SHM 파일 처리 포함), 쓰기 전에 멈출 작성자 목록은 스크립트 docstring이 정본이다.
+- 값을 쓰는 단위는 배치별 트랜잭션이다. 쓴 뒤 같은 판정 함수로 전량을 다시 읽어 대사한다. 대사가 어긋나면 종료 코드 1을 낸다.
+- 유효한 space가 이미 있는 레코드는 그래프 값과 달라도 덮어쓰지 않는다. 문자열 `"[]"` 같은 컨테이너형 문자열은 무효로 보고 교체한다.
+- 재현: `pytest tests/test_backfill_space.py`.
