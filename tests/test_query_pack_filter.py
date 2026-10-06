@@ -147,13 +147,13 @@ def test_t12_vector_search_post_filter_when_unpackaged() -> None:
 
 
 def test_t12_post_filter_overfetch_n_results() -> None:
-    """include_unpackaged=True causes over-fetched n_results: max(min(limit,20)*4, 20)."""
+    """include_unpackaged=True makes the request overfetch: max(min(limit, 80) * 4, 20)."""
     hit = {"id": "v1", "document": "a", "metadata": {"pack_id": "pack-a", "node_id": "n1"}, "distance": 0.1}
     query_mock = MagicMock(return_value=[hit])
     hybrid = _make_hybrid_with_chroma(query_mock)
     hybrid._vector_search("x", spaces=None, limit=5, pack_ids=["pack-a"], include_unpackaged=True)
     kwargs = query_mock.call_args.kwargs
-    # max(min(5, 20) * 4, 20) = max(20, 20) = 20
+    # max(min(5, 80) * 4, 20) = max(20, 20) = 20
     assert kwargs["n_results"] == 20
 
 
@@ -182,7 +182,7 @@ def test_t12_no_overfetch_server_side_path() -> None:
     hybrid = _make_hybrid_with_chroma(query_mock)
     hybrid._vector_search("x", spaces=None, limit=5, pack_ids=["pack-a"], include_unpackaged=False)
     kwargs = query_mock.call_args.kwargs
-    # No over-fetch: min(5, 20) = 5
+    # No overfetch: min(5, 80) = 5
     assert kwargs["n_results"] == 5
 
 
