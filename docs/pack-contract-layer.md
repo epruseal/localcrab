@@ -44,6 +44,8 @@ JSONL text writers open their output with `newline="\n"`. This preserves LF as t
 
 This table excludes JSONL readers, test fixtures, logs, and writers for non-JSONL files.
 
+`ShardedAppender` also closes an unterminated tail. When an existing non-empty shard does not end with LF, the first write adds one LF before the new record. Without it the new record joins the old partial line. The rule applies to the first open and to every rollover shard. A file that ends with LF gets no extra byte. The appender supports one writer per logical file.
+
 ## `cloud.py` vs `assembler.py` — 혼동 금지
 
 이름이 비슷하고 둘 다 "3-jsonl 디렉토리를 ZIP으로 만든다"는 점에서 헷갈리기 쉽지만 소비자·manifest 키·산출물이 전혀 다르다.

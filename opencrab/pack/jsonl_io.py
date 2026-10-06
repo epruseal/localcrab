@@ -197,12 +197,36 @@ class ShardedAppender:
         self.logical = Path(path)
         self.limit = limit if limit is not None else SHARD_LIMIT
         paths = shard_paths(self.logical)
-        self.current = paths[-1] if paths else self.logical
-        self.size = self.current.stat().st_size if self.current.exists() else 0
         self.logical.parent.mkdir(parents=True, exist_ok=True)
+        self._open_current(paths[-1] if paths else self.logical)
+
+    def _open_current(self, path: Path) -> None:
+        """`path` 를 append 로 열고 size 와 구분 개행 필요 여부를 그 파일에서 읽는다.
+
+        최초 열기와 롤오버가 이 한 곳을 공용한다(#471). 비어 있지 않은 파일이 개행으로
+        끝나지 않으면(앞선 쓰기가 줄 중간에서 끊긴 잔재) 첫 `write_line` 이 구분 개행을
+        먼저 쓴다. 거부하지 않고 구분하는 이유: 거부하면 한 번의 중단이 이 논리 파일의
+        이후 모든 append 를 막는다. 구분하면 잘린 줄은 자기 줄에 고립된다. 뒤따르는 정상
+        레코드의 저장 바이트는 보존되고 그 줄만 고치면 다시 읽힌다.
+
+        개행만 빠진 완전한 레코드는 이 개행으로 복구된다. 열기만 하고 쓰지 않으면 파일은
+        바뀌지 않는다.
+
+        비어 있지 않은 기존 파일은 끝 바이트를 읽으므로 읽기 권한이 필요하다. 읽기에
+        실패하면 어떤 바이트도 쓰기 전에 PermissionError 가 전파된다.
+
+        단일 작성자를 전제한다: size 추적이 이미 인스턴스별이라 동시 작성자는 계약 밖이다.
+        """
+        self.current = path
+        self.size = path.stat().st_size if path.exists() else 0
+        self._pending_sep = False
+        if self.size > 0:
+            with open(path, "rb") as probe:
+                probe.seek(-1, os.SEEK_END)
+                self._pending_sep = probe.read(1) != b"\n"
         # newline="\n": 쓰기 계약을 읽기 계약(count_jsonl/iter_jsonl_lines)과 대칭으로
         # 만든다. Linux(os.linesep == "\n")에서는 바이트 출력을 바꾸지 않는다(#382).
-        self._f = open(self.current, "a", encoding="utf-8", newline="\n")
+        self._f = open(path, "a", encoding="utf-8", newline="\n")
 
     def _rollover(self):
         # close() 를 지워도 결과는 같다(2026-08-05 측정: 20KB 버퍼 잔류 상태에서도 첫 shard
@@ -217,15 +241,22 @@ class ShardedAppender:
         # maxsplit=1 이 계약이다. 논리 이름에 점이 있으면(chunks.v1.jsonl) 분할 stem 이
         # `chunks.v1.03` 이 되고 rsplit(".", 2)[1] 은 'v1' 을 집어 int() 에서 터진다.
         idx = int(self.current.stem.rsplit(".", 1)[1]) + 1
-        self.current = _shard_path(self.logical, idx)
-        self._f = open(self.current, "a", encoding="utf-8", newline="\n")
-        self.size = 0
+        self._open_current(_shard_path(self.logical, idx))
+
+    def _close_tail(self) -> None:
+        """개행 없이 끝난 기존 줄을 구분 개행으로 닫는다(#471). 닫을 것이 없으면 아무 일도 안 한다."""
+        if self._pending_sep:
+            self._f.write("\n")
+            self.size += 1
+            self._pending_sep = False
 
     def write_line(self, line: str):
         """개행 미포함 직렬화 라인 1개 기록."""
         nbytes = len(line.encode("utf-8")) + 1
+        self._close_tail()
         if self.size > 0 and self.size + nbytes > self.limit:
             self._rollover()
+            self._close_tail()                   # 롤오버 대상이 미종결 파일이었던 경우
         self._f.write(line + "\n")
         self.size += nbytes
 
