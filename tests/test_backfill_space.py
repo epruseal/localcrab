@@ -56,7 +56,13 @@ class World:
         g.close()
 
     def doc(self, sid, meta, text="본문"):
-        self.docs.upsert_source(sid, text, meta)
+        """Insert one doc row; a str meta is stored as the exact JSON text."""
+        self.docs.upsert_source(sid, text, meta if isinstance(meta, dict) else {})
+        if isinstance(meta, str):
+            d = sqlite3.connect(self.root / "doc_store.db")
+            d.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (meta, sid))
+            d.commit()
+            d.close()
 
     def vector(self, vid, meta, partition="__same__", document="doc text"):
         """Insert one vector row; metadata is written as the exact JSON given."""
@@ -75,8 +81,8 @@ class World:
         out["doc"] = dict(d.execute("SELECT source_id, metadata FROM doc_sources"))
         d.close()
         v = bf._open(self.root / "vectors.db", "ro", True)
-        out["vec"] = {r[0]: (r[1], r[2], r[3]) for r in v.execute(
-            f"SELECT node_id, pack_id, metadata, document FROM {COLL}")}
+        out["vec"] = {r[0]: (r[1], r[2], r[3], r[4]) for r in v.execute(
+            f"SELECT node_id, pack_id, metadata, document, embedding FROM {COLL}")}
         v.close()
         return out
 
@@ -270,8 +276,9 @@ def test_apply_end_to_end(world, tmp_path, capsys):
     # held records are byte-identical, text and embeddings untouched everywhere
     for held in ("v-orphan", "n-other"):
         assert after["vec"][held] == before["vec"][held]
-    for rid, (part, _meta, document) in before["vec"].items():
-        assert after["vec"][rid][0] == part and after["vec"][rid][2] == document
+    for rid, (part, _meta, document, emb) in before["vec"].items():
+        assert emb == _EMB  # the dump really carries the embedding
+        assert (after["vec"][rid][0], after["vec"][rid][2], after["vec"][rid][3]) == (part, document, emb)
     # a second dry run has only held records left
     code, rep2 = _run(capsys)
     assert code == 0
@@ -558,3 +565,73 @@ def test_reconcile_detects_two_held_records_swapping_class(world, tmp_path, caps
         bf._write_one_batch = orig
     assert code == 1
     assert any("held id changed class" in p for p in rep["reconcile"]["problems"])
+
+
+_NON_OBJECT_TEXTS = ["null", "5", "[]", "true", '"s"', "not json"]
+
+
+@pytest.mark.parametrize("text", _NON_OBJECT_TEXTS)
+def test_non_object_metadata_is_held_unchanged(world, tmp_path, capsys, text):
+    world.graph("n1", "concept", {"pack_id": PACK})
+    world.doc("n1", {"pack_id": PACK})
+    world.vector("n1", text, partition=PACK)
+    d = sqlite3.connect(world.root / "doc_store.db")
+    d.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n1'", (text,))
+    d.commit()
+    d.close()
+    before = world.dump()
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 0, rep
+    assert rep["before"]["doc"]["classes"]["hold_bad_meta"] == 1
+    assert rep["before"]["vector"]["classes"]["hold_bad_meta"] == 1
+    assert world.dump() == before
+
+
+def test_missing_metadata_text_reads_as_empty_object(world, tmp_path, capsys):
+    world.graph("n1", "concept", {"pack_id": PACK})
+    world.vector("n1", None, partition="")   # SQL NULL metadata
+    code, rep = _apply(capsys, world, tmp_path, "--allow-pack-missing")
+    assert code == 0, rep
+    assert world.space("vec", "n1") == "concept"
+
+
+@pytest.mark.parametrize("props", ["", "null", "5", "[]", "not json"])
+def test_graph_properties_non_object_is_corrupt_and_never_relaxed(world, tmp_path, capsys, props):
+    world.graph("n1", "concept", props)
+    world.doc("n1", {"pack_id": PACK})
+    before = world.dump()
+    code, rep = _apply(capsys, world, tmp_path, "--allow-pack-missing")
+    assert code == 0
+    assert rep["before"]["doc"]["classes"]["hold_graph_props_bad"] == 1
+    assert world.dump() == before
+
+
+@pytest.mark.parametrize("bad", ["0", "false", "[]", '{"a": 1}'])
+def test_non_string_pack_id_is_held(world, tmp_path, capsys, bad):
+    world.graph("n1", "concept", {"pack_id": PACK})
+    world.doc("n1", f'{{"pack_id": {bad}}}')
+    world.doc("u1", f'{{"pack_id": {bad}}}')                 # unmapped doc
+    world.vector("n1", f'{{"pack_id": {bad}}}', partition="")
+    before = world.dump()
+    code, rep = _apply(capsys, world, tmp_path, "--allow-pack-missing")
+    assert code == 0, rep
+    assert rep["before"]["doc"]["classes"]["hold_pack_invalid"] == 2
+    assert rep["before"]["vector"]["classes"]["hold_pack_invalid"] == 1
+    assert world.dump() == before
+
+
+def test_null_pack_id_still_reads_as_empty(world, tmp_path, capsys):
+    world.graph("n1", "concept", {"pack_id": PACK})
+    world.doc("n1", '{"pack_id": null}')
+    code, rep = _apply(capsys, world, tmp_path)
+    assert rep["before"]["doc"]["classes"]["hold_pack_missing"] == 1
+
+
+@pytest.mark.parametrize("bad", ["0", "false", "[]", '{"a": 1}'])
+def test_doc_with_valid_space_and_invalid_pack_does_not_pair(world, tmp_path, capsys, bad):
+    world.doc("a", f'{{"pack_id": {bad}, "space": "concept"}}')
+    world.vector("a", {}, partition="")
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 0, rep
+    assert rep["before"]["vector"]["classes"]["hold_doc_pair_pack_differs"] == 1
+    assert world.space("vec", "a") is None

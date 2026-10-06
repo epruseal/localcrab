@@ -8,19 +8,27 @@ with a sqlite-vec vector file, ``doc_store.db`` and ``graph.db`` is covered.
 
 Terms
   no valid space   the key is missing, null, an empty string, a non-string
-                   value, or a container-like string (first non-blank
-                   character is ``[`` or ``{``, the ``str()`` of a list or dict
-                   that the old loader path wrote). The query filters drop the
-                   record in all these cases.
-  valid space      any other non-empty string. It is never overwritten, even
-                   when it differs from the graph space (reported only).
+                   value, or a container-like string. A container-like string
+                   starts with ``[`` or ``{`` after blanks. The old loader path
+                   wrote it as the ``str()`` of a list or dict.
+  valid space      any other non-empty string. The tool never overwrites it,
+                   even when it differs from the graph space (reported only).
+
+The container rule is a deliberate narrowing. The read side accepts a
+container-like string as a space name, but it never equals a real space name.
+The tool replaces it so a spaces filter can find the record by a real space.
+A missing or null space never matches a spaces filter. The filters differ for
+the other invalid values, so this tool does not claim one common read rule.
   graph space      a valid, not container-like ``properties.space``, else a
                    valid ``space_id`` column. Duplicate graph rows of one
                    ``node_id`` must agree on (space, pack_id) or the id is held.
 
 Decision for a record without a valid space (one pure function, used by the
 dry run, the plan, the per-batch re-read and the reconcile):
-  - metadata not a JSON object            hold_bad_meta
+  - metadata text that is not a JSON object  hold_bad_meta (NULL and empty
+    text read as an empty object; the tool cannot add a key to any other
+    non-object, and it never rewrites a value it cannot read as an object)
+  - pack_id of a non-string type             hold_pack_invalid
   - vector pack (partition column, NULL read as "") differs from its
     metadata pack_id                       hold_pack_partition_mismatch
   - id in graph_nodes (mapped): ambiguous duplicate rows hold_graph_ambiguous;
@@ -45,13 +53,17 @@ The dry run changes no database content and takes no lock. SQLite may create or
 refresh the ``-wal`` and ``-shm`` sidecars of a WAL database even when it is
 opened ``mode=ro``.
 
-Apply sequence: take ``write.lock`` for the whole run, take a backup set with
-``backup_data_dir``, plan, then write per batch (one transaction per store and
-batch; rows are re-read inside the transaction and written only when the same
-decision still holds; ``UPDATE`` touches metadata only, never text, embedding
-or the FTS index), then reconcile. ``--max-batches N`` stops early; a rerun
-continues because written rows no longer qualify. Each run takes its own
-backup set.
+Apply sequence:
+  1. Take ``write.lock`` for the whole run.
+  2. Take a backup set with ``backup_data_dir``.
+  3. Plan.
+  4. Write per batch. Each batch is one transaction per store. Rows are re-read
+     inside the transaction and written only when the same decision still
+     holds. ``UPDATE`` touches metadata only, never text, embedding or the FTS
+     index.
+  5. Reconcile.
+``--max-batches N`` stops early. A rerun continues because written rows no
+longer qualify. Each run takes its own backup set.
 
 Stop every other writer first. The scheduled conversation reingest and its
 graph import scripts, and these manual scripts, must not run in the window:
@@ -103,20 +115,39 @@ def value_kind(v: Any) -> tuple[str | None, str]:
 
 
 def parse_meta(text: Any) -> dict[str, Any] | None:
-    """Metadata dict, {} for NULL or empty text, None when not a JSON object."""
+    """Metadata dict. SQL NULL and empty text read as {}. Any other non-object gives None."""
     if text is None or text == "":
         return {}
+    return parse_object_strict(text)
+
+
+def parse_object_strict(text: Any) -> dict[str, Any] | None:
+    """The parsed JSON object, or None for NULL, empty text, invalid JSON and any non-object."""
+    if not isinstance(text, (str, bytes)):
+        return None
     try:
         obj = json.loads(text)
-    except (TypeError, ValueError):
+    except ValueError:
         return None
-    if obj is None:
-        return {}
     return obj if isinstance(obj, dict) else None
 
 
 def _str_or_none(v: Any) -> str | None:
     return v if isinstance(v, str) and v else None
+
+
+#: Marks a pack_id of a type the read side keeps as is (number, bool, list, object).
+INVALID_PACK = object()
+
+
+def pack_of(meta: dict[str, Any] | None) -> Any:
+    """Pack string of a record ("" when absent or null), or INVALID_PACK for a non-string value."""
+    if meta is None:
+        return INVALID_PACK
+    v = meta.get("pack_id")
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else INVALID_PACK
 
 
 def build_graph_map(gconn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
@@ -126,7 +157,7 @@ def build_graph_map(gconn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]
     out: dict[str, dict[str, Any]] = {}
     for node_id, space_id, props_text in gconn.execute(
             "SELECT node_id, space_id, properties FROM graph_nodes"):
-        props = parse_meta(props_text)
+        props = parse_object_strict(props_text)
         if props is None:
             entry = {"props_bad": True, "space": None, "pack": None}
             stats["graph_props_bad"] += 1
@@ -192,11 +223,14 @@ def decide(
     valid, _ = value_kind(meta.get("space"))
     if valid is not None:
         return "skip_valid", valid
+    own = pack_of(meta)
+    if own is INVALID_PACK:
+        return "hold_pack_invalid", None
     if store == "doc":
-        pack = _str_or_none(meta.get("pack_id")) or ""
+        pack = own
     else:
         pack = partition_pack or ""
-        if (_str_or_none(meta.get("pack_id")) or "") != pack:
+        if own != pack:
             return "hold_pack_partition_mismatch", None
     g = graph.get(rid)
     if g is not None:
@@ -291,7 +325,7 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
             res["total"]["doc"] += 1
             meta = parse_meta(text)
             cls, space = decide("doc", rid, meta, None, graph, docs, allow_pack_missing)
-            pack = _str_or_none(meta.get("pack_id")) or "" if isinstance(meta, dict) else ""
+            pack = pack_of(meta)
             docs[rid] = (pack, space if (cls == "skip_valid" or cls.startswith("apply")) else None)
             note("doc", rid, cls, space, meta, None)
         for rid, part, text in vconn.execute(
