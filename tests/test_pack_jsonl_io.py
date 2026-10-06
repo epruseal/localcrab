@@ -181,6 +181,107 @@ class TestShardedAppender:
         w.close()
 
 
+class TestAppendAfterUnterminatedTail:
+    """앞선 쓰기가 줄 중간에서 끊겨 파일이 개행 없이 끝난 경우(#471)."""
+
+    def test_complete_record_missing_newline_is_closed_not_merged(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        q.write_bytes(b'{"id": 1}')
+        with ShardedAppender(q) as w:
+            w.write(rec(2))
+        assert q.read_bytes() == b'{"id": 1}\n' + (json.dumps(rec(2)) + "\n").encode()
+        assert [r["id"] for r in iter_jsonl(q)] == [1, 2]
+        assert count_jsonl(q) == 2
+
+    def test_truncated_record_stays_isolated_and_following_record_survives(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        q.write_bytes(b'{"id": 1}\n{"id": 2, "tx')
+        with ShardedAppender(q) as w:
+            w.write(rec(3))
+        lines = list(iter_jsonl_lines(q))
+        assert lines[0] == '{"id": 1}'
+        assert lines[1] == '{"id": 2, "tx'
+        assert json.loads(lines[2]) == rec(3)
+        assert len(lines) == 3
+
+    def test_open_without_write_leaves_file_untouched(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        q.write_bytes(b'{"id": 1}')
+        with ShardedAppender(q):
+            pass
+        assert q.read_bytes() == b'{"id": 1}'
+
+    def test_separator_is_written_once_per_open(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        q.write_bytes(b'{"id": 1}')
+        with ShardedAppender(q) as w:
+            w.write(rec(2))
+            w.write(rec(3))
+        assert [r["id"] for r in iter_jsonl(q)] == [1, 2, 3]
+        assert b"\n\n" not in q.read_bytes()
+
+    def test_unterminated_last_shard_is_closed_before_rollover(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        q.write_bytes(b'{"id": 1}')
+        jsonl_io_mod.os.replace(q, _shard_path(q, 0))
+        with ShardedAppender(q, limit=1) as w:
+            w.write(rec(2))
+            w.write(rec(3))
+        shards = shard_paths(q)
+        assert len(shards) >= 2
+        assert shards[0].read_bytes().endswith(b"\n")
+        assert [r["id"] for r in iter_jsonl(q)] == [1, 2, 3]
+
+    def test_one_byte_unterminated_file_is_closed(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        q.write_bytes(b"{")
+        with ShardedAppender(q) as w:
+            w.write(rec(2))
+        assert q.read_bytes() == b"{\n" + (json.dumps(rec(2)) + "\n").encode()
+
+    def test_rollover_target_that_is_unterminated_gets_the_separator(self, tmp_path):
+        # 연 뒤에 다른 작성자가 다음 번호 shard 를 미종결로 만든 경우(단일 작성자 계약 밖).
+        q = tmp_path / "raw.jsonl"
+        w = ShardedAppender(q, limit=1)
+        w.write(rec(1))
+        _shard_path(q, 1).write_bytes(b'{"id": 9')
+        w.write(rec(2))
+        w.close()
+        assert _shard_path(q, 1).read_bytes() == b'{"id": 9\n' + (json.dumps(rec(2)) + "\n").encode()
+
+    def test_separator_byte_counts_toward_the_limit(self, tmp_path):
+        # 기존 `{}`(2B) + 구분 개행(1B) = 3B. 새 줄 `{}\n`(3B) 을 더하면 6B.
+        q = tmp_path / "raw.jsonl"
+        q.write_bytes(b"{}")
+        with ShardedAppender(q, limit=5) as w:
+            w.write_line("{}")
+        assert not q.exists()
+        assert _shard_path(q, 0).read_bytes() == b"{}\n"
+        assert _shard_path(q, 1).read_bytes() == b"{}\n"
+
+    def test_separator_byte_that_exactly_fits_does_not_roll_over(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        q.write_bytes(b"{}")
+        with ShardedAppender(q, limit=6) as w:
+            w.write_line("{}")
+        assert q.read_bytes() == b"{}\n{}\n"
+
+    def test_well_formed_file_bytes_are_unchanged(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        write_jsonl_sharded(q, [rec(1), rec(2)])
+        before = q.read_bytes()
+        with ShardedAppender(q) as w:
+            w.write(rec(3))
+        assert q.read_bytes() == before + (json.dumps(rec(3)) + "\n").encode()
+
+    def test_empty_existing_file_gets_no_separator(self, tmp_path):
+        q = tmp_path / "raw.jsonl"
+        q.write_bytes(b"")
+        with ShardedAppender(q) as w:
+            w.write(rec(1))
+        assert q.read_bytes() == (json.dumps(rec(1)) + "\n").encode()
+
+
 # ---------------------------------------------------------------------------
 # 논리 스트림 읽기와 loud-fail
 # ---------------------------------------------------------------------------
