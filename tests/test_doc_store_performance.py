@@ -150,6 +150,19 @@ def test_list_nodes_plan_and_statement_count(scaled_stores):
     assert "TEMP B-TREE" not in plan, plan
 
 
+def test_list_nodes_space_plan_and_statement_count(scaled_stores):
+    """space-filtered list_nodes uses its ordered range index without a sort."""
+    store = scaled_stores["sql"][SMALL_N]
+
+    result, statements = _statements(store, lambda: store.list_nodes(space="sp", limit=50000))
+
+    assert len(result) == SMALL_N
+    assert len(statements) == 1, statements
+    plan = _query_plan(store, statements[0])
+    assert "USING INDEX idx_doc_nodes_space_updated_tiebreak" in plan, plan
+    assert "TEMP B-TREE" not in plan, plan
+
+
 def test_get_node_doc_plan_and_statement_count(scaled_stores):
     """get_node_doc 는 문장 1건이고 PK 인덱스 SEARCH 다(전체 SCAN 아님)."""
     store = scaled_stores["sql"][SMALL_N]
