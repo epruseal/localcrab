@@ -17,10 +17,12 @@ import hashlib
 import logging
 from typing import Any
 
-from opencrab.common.graph_identity import GraphReadCapabilityUnavailable
+from opencrab.common.graph_identity import GraphReadCapabilityUnavailable, NodeIdentityConflict
 from opencrab.common.pack_tags import apply_pack_tag
 from opencrab.common.text import slugify
+from opencrab.pack.fork_remap import derive_text_id
 from opencrab.pack.write_gate import (
+    derived_conflict_message,
     edge_identity_conflict,
     identity_reject_message,
     node_conflict_message,
@@ -195,6 +197,83 @@ def _edge_probe_conflict(ctx: dict[str, Any], from_type: str, from_id: str, rela
 _identity_reject_message = identity_reject_message
 
 
+def _derivable_logentry(ctx: dict[str, Any], node_id: str, pack_id: str) -> bool:
+    """Is ``node_id`` a readable same-pack ``evidence/LogEntry``? (#470)
+
+    Only that node may have text stored next to it under a derived id. Any
+    other conflict stays a rejection. A read that fails is "cannot tell" and
+    counts as no.
+    """
+    method = getattr(ctx.get("neo4j"), "get_nodes_by_id", None)
+    if method is None or not pack_id:
+        return False
+    try:
+        rows = method(node_id)
+    except Exception:  # noqa: BLE001 -- cannot tell
+        return False
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return False
+    row = rows[0]
+    return (
+        not row.get("property_decode_error")
+        and row.get("node_type") == "LogEntry"
+        and row.get("space") == "evidence"
+        and row.get("pack_id") == pack_id
+    )
+
+
+def _store_text_under_derived_id(
+    ctx: dict[str, Any], pack_id: str, source_id: str, derived_id: str,
+    node_props: dict[str, Any], node_errors: list[str], stores: dict[str, Any],
+) -> tuple[bool, bool]:
+    """Write ``node_props`` as a new evidence/TextUnit at ``derived_id`` (#470).
+
+    The write is the ordinary ``add_node`` path, so ownership, the graph
+    create-or-verify rule and the doc and vector fan-out are unchanged. The
+    node carries ``source_id`` (the LogEntry id), a key that a pack fork remaps.
+    Returns ``(stored, billable)`` and reports the outcome in ``node_errors``
+    and ``stores["evidence_node"]``. It never raises for a per-item failure.
+    """
+    from opencrab.ontology.builder import store_write_failures, store_write_succeeded
+
+    props = {**node_props, "source_id": source_id}
+    try:
+        reason = _node_probe_conflict(ctx, "evidence", "TextUnit", derived_id, pack_id)
+        if reason:
+            msg = _identity_reject_message("node", source_id, reason)
+            node_errors.append(msg)
+            stores["evidence_node"] = msg
+            return False, False
+        result = ctx["builder"].add_node(
+            space="evidence", node_type="TextUnit", node_id=derived_id,
+            properties=props, pack_id=pack_id,
+        )
+    except NodeIdentityConflict:
+        node_errors.append(derived_conflict_message(source_id, derived_id))
+        stores["evidence_node"] = "rejected (derived id conflict)"
+        logger.warning("_ingest_into_pack: derived id conflict for %s", source_id)
+        return False, False
+    except ValueError as exc:
+        node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
+        stores["evidence_node"] = f"error: {type(exc).__name__}"
+        return False, False
+    except Exception as exc:  # noqa: BLE001 -- per-item report, as the text branch does
+        node_errors.append(
+            f"{source_id} (evidence/TextUnit): {safe_tool_error('_ingest_into_pack', exc)}"
+        )
+        stores["evidence_node"] = f"error: {type(exc).__name__}"
+        return False, False
+    result_stores = result.get("stores") if isinstance(result, dict) else None
+    billable = store_write_succeeded(result_stores or {}, "graph")
+    failures = store_write_failures(result_stores or {})
+    if failures:
+        node_errors.append(f"{derived_id} (evidence/TextUnit): " + "; ".join(failures))
+        stores["evidence_node"] = "; ".join(failures)
+        return False, billable
+    stores["evidence_node"] = f"ok (derived id for {source_id})"
+    return True, billable
+
+
 def _warn_dropped_alias(dropped: str | None, kind: str, ident: str) -> None:
     """Surface a retired `pack` alias that disagreed with the destination pack.
 
@@ -250,6 +329,14 @@ def _ingest_into_pack(
         declines to create a node for a ``source_id`` too long to survive as
         a node id through a fork remap -- ``add_node`` above has no such
         carve-out.
+
+        With ``text_as_node=True`` an id that already names a LogEntry of the
+        same pack does not reject the text (#470). The text is stored as a new
+        TextUnit at ``derive_text_id(source_id)`` and the LogEntry is not
+        touched. ``evidence_node`` is the derived id and
+        ``stores["evidence_node"]`` names the original id. A different node
+        type, space or pack still rejects the item and ``text_ingested`` is
+        then False.
 
         Collapsing the two into one path would change ``added_nodes`` /
         ``evidence_node`` and the vector shape for existing callers, so it is
@@ -473,6 +560,14 @@ def _ingest_into_pack(
             # vector), all tagged with pack_id.  builder.add_node handles vector
             # embedding internally, so we skip hybrid.ingest / mongo.upsert_source
             # to avoid duplicate writes under the same source_id.
+            node_props: dict[str, Any] = {"pack_id": pack_id, "text": text}
+            if meta.get("title"):
+                node_props["title"] = meta["title"]
+            if meta.get("source"):
+                node_props["source"] = meta["source"]
+            # #470: True when the text was refused for identity reasons. Such an
+            # item is not "ingested", as in the legacy branch below.
+            text_rejected = False
             try:
                 reason = _node_probe_conflict(
                     ctx, "evidence", "TextUnit", source_id, pack_id
@@ -481,15 +576,8 @@ def _ingest_into_pack(
                     msg = _identity_reject_message("node", source_id, reason)
                     node_errors.append(msg)
                     stores["evidence_node"] = msg
+                    text_rejected = True
                 else:
-                    node_props: dict[str, Any] = {
-                        "pack_id": pack_id,
-                        "text": text,
-                    }
-                    if meta.get("title"):
-                        node_props["title"] = meta["title"]
-                    if meta.get("source"):
-                        node_props["source"] = meta["source"]
                     evidence_result = ctx["builder"].add_node(
                         space="evidence",
                         node_type="TextUnit",
@@ -518,13 +606,31 @@ def _ingest_into_pack(
                     if store_write_succeeded(evidence_stores or {}, "graph"):
                         billable_write = True
             except NodeIdentityConflict:
-                # #468: this is the same rejection the nodes loop handles. The marker is fixed.
-                # store_write_failures() does not read it as a failure because
-                # it has no "error:" or "no match" prefix. The caller's id
-                # spelling cannot change that.
-                node_errors.append(node_conflict_message(source_id))
-                stores["evidence_node"] = "rejected (node identity conflict)"
-                logger.warning("_ingest_into_pack: node identity conflict for %s", source_id)
+                # #468: the id already names a different node. #470: when that node
+                # is a same-pack LogEntry, the text is stored in a new TextUnit under
+                # a derived id and the LogEntry is not touched.
+                derived_id = (
+                    derive_text_id(source_id)
+                    if _derivable_logentry(ctx, source_id, pack_id) else None
+                )
+                if derived_id is None:
+                    # The marker is fixed. store_write_failures() does not read it
+                    # as a failure because it has no "error:" or "no match" prefix.
+                    # The caller's id spelling cannot change that.
+                    node_errors.append(node_conflict_message(source_id))
+                    stores["evidence_node"] = "rejected (node identity conflict)"
+                    logger.warning("_ingest_into_pack: node identity conflict for %s", source_id)
+                    text_rejected = True
+                else:
+                    stored, billed = _store_text_under_derived_id(
+                        ctx, pack_id, source_id, derived_id, node_props,
+                        node_errors, stores,
+                    )
+                    text_rejected = not stored
+                    if stored:
+                        evidence_node = derived_id
+                        added_nodes += 1
+                    billable_write = billable_write or billed
             except Exception as exc:
                 node_errors.append(f"{source_id} (evidence/TextUnit): {safe_tool_error('_ingest_into_pack', exc)}")
                 # Same shape as builder.py's _safe_store_status(exc) -- the
@@ -533,7 +639,7 @@ def _ingest_into_pack(
                 # writing a `stores[...]` marker from a caught exception
                 # rather than from a builder.add_node/add_edge return value.
                 stores["evidence_node"] = f"error: {type(exc).__name__}"
-            text_ingested = True
+            text_ingested = not text_rejected
         else:
             # Legacy path: through the write_source chokepoint (#148/#74),
             # which now also materialises an evidence/TextUnit graph node
@@ -963,7 +1069,7 @@ def _rank_packs(query: str, enriched: list[dict[str, Any]]) -> list[dict[str, An
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true).",
+                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). If source_id already names a LogEntry of the same pack, the TextUnit gets the derived id <source_id>#text (before any fork suffix) and the response reports it in evidence_node.",
                 },
                 "text_as_node": {
                     "type": "boolean",
@@ -1554,7 +1660,7 @@ def pack_create(
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). Use to append conversation content to a loaded pack.",
+                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). Use to append conversation content to a loaded pack. If source_id already names a LogEntry of the same pack, the TextUnit gets the derived id <source_id>#text (before any fork suffix) and the response reports it in evidence_node.",
                 },
                 "text_as_node": {
                     "type": "boolean",

@@ -32,6 +32,7 @@ from opencrab.config import Settings
 from opencrab.ontology.builder import OntologyBuilder
 from opencrab.ontology.query import HybridQuery
 from opencrab.pack.fork import fork_pack
+from opencrab.pack.fork_remap import derive_text_id
 from opencrab.pack.ownership import PackForbiddenError, PackNotFoundError, create_pack
 from opencrab.pack.source_writer import write_source
 
@@ -1815,29 +1816,254 @@ def _ingest468(stack, **kw):
         return _ingest_into_pack("pack-a", **kw)
 
 
-def test_468_text_over_existing_logentry_is_reported_as_a_rejected_item(stack, caplog):
-    seeded = _seed_logentry(stack, "codex/s/468-a")
-    doc_before = stack["docs"].get_node_doc("evidence", "codex/s/468-a")
-    vec_before = stack["vector"].get_by_id("codex/s/468-a")
+def _seed_node(stack, node_type: str, node_id: str, *, pack_id="pack-a", space="evidence",
+               principal=ALICE, **props) -> dict[str, Any]:
+    with principal_scope(principal):
+        stack["builder"].add_node(
+            space=space, node_type=node_type, node_id=node_id,
+            properties={"pack_id": pack_id, **props}, pack_id=pack_id,
+        )
+    return stack["graph"].get_node(node_type, node_id)
+
+
+def _snapshot(stack, node_type: str, node_id: str):
+    """Graph row, doc row and vector row of one node, for before/after equality."""
+    return (
+        stack["graph"].get_node(node_type, node_id),
+        stack["docs"].get_node_doc("evidence", node_id),
+        stack["vector"].get_by_id(node_id),
+    )
+
+
+def _legs(stack, question: str, pack_id: str = "pack-a"):
+    """Node ids returned by the BM25 leg and by the vector leg."""
+    h = stack["hybrid"]
+    bm25 = {hit.get("node_id") for hit in h._bm25_search(question, None, 10, pack_ids=[pack_id])}
+    vec = {hit.node_id for hit in h._vector_search(question, None, 10, pack_ids=[pack_id])}
+    return bm25, vec
+
+
+_DERIVED = "#text"
+
+
+def test_468_text_over_existing_logentry_is_stored_under_a_derived_id(stack, caplog):
+    seeded_row = _seed_logentry(stack, "codex/s/468-a")
+    before = _snapshot(stack, "LogEntry", "codex/s/468-a")
+    derived = "codex/s/468-a" + _DERIVED
 
     with caplog.at_level("ERROR"):
         result = _ingest468(
-            stack, text="대화 원문", source_id="codex/s/468-a", text_as_node=True,
+            stack, text="zebrafish 대화 원문", source_id="codex/s/468-a", text_as_node=True,
         )
 
-    assert result["status"] == "partial", result
-    assert result["added_nodes"] == 0 and result["evidence_node"] is None, result
-    assert result["node_errors"] == [f"codex/s/468-a: {_CONFLICT_FIXED}"], result
-    assert result["stores"]["evidence_node"] == _CONFLICT_MARKER, result
-    assert "retryable" not in result
-    # 거절된 항목은 그래프 다리에서 멈춰 문서/벡터/소스 행을 건드리지 않는다.
-    assert stack["graph"].get_node("LogEntry", "codex/s/468-a") == seeded
+    assert result["status"] == "ok", result
+    assert result["node_errors"] == [], result
+    assert result["evidence_node"] == derived, result
+    assert result["added_nodes"] == 1, result
+    assert result["text_ingested"] is True, result
+    assert result["stores"]["evidence_node"] == "ok (derived id for codex/s/468-a)", result
+    # The LogEntry is not touched in any store.
+    assert _snapshot(stack, "LogEntry", "codex/s/468-a") == before
+    assert stack["graph"].get_node("LogEntry", "codex/s/468-a") == seeded_row
     assert stack["graph"].get_node("TextUnit", "codex/s/468-a") is None
-    assert stack["docs"].get_node_doc("evidence", "codex/s/468-a") == doc_before
-    assert stack["vector"].get_by_id("codex/s/468-a") == vec_before
     assert stack["docs"].get_source("codex/s/468-a") is None
-    # 재시도마다 ERROR 트레이스백이 쌓이지 않는다.
+    # The text sits in a new TextUnit that points back to the LogEntry.
+    node = stack["graph"].get_node("TextUnit", derived)
+    assert node["text"] == "zebrafish 대화 원문"
+    assert node["source_id"] == "codex/s/468-a"
+    assert node["pack_id"] == "pack-a" and node["owner_id"] == ALICE.user_id
+    # The text is searchable by both legs under the derived id.
+    bm25, vec = _legs(stack, "zebrafish")
+    assert derived in bm25, bm25
+    assert derived in vec, vec
     assert not [r for r in caplog.records if r.exc_info]
+
+
+def test_468_same_request_twice_is_idempotent(stack):
+    _seed_logentry(stack, "codex/s/468-i")
+    first = _ingest468(stack, text="같은 본문", source_id="codex/s/468-i")
+    derived_row = stack["graph"].get_node("TextUnit", "codex/s/468-i" + _DERIVED)
+    digest = stack["graph"].get_node_digest("codex/s/468-i" + _DERIVED)
+    second = _ingest468(stack, text="같은 본문", source_id="codex/s/468-i")
+    assert first["status"] == second["status"] == "ok", (first, second)
+    assert second["evidence_node"] == "codex/s/468-i" + _DERIVED
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-i" + _DERIVED) == derived_row
+    assert stack["graph"].get_node_digest("codex/s/468-i" + _DERIVED) == digest
+
+
+def test_468_same_id_with_different_text_is_a_clear_rejection(stack, caplog):
+    _seed_logentry(stack, "codex/s/468-d")
+    _ingest468(stack, text="첫 본문", source_id="codex/s/468-d")
+    derived = "codex/s/468-d" + _DERIVED
+    kept = stack["graph"].get_node("TextUnit", derived)
+    with caplog.at_level("ERROR"):
+        result = _ingest468(stack, text="다른 본문", source_id="codex/s/468-d")
+    assert result["status"] == "partial", result
+    assert result["node_errors"] == [
+        f"codex/s/468-d: derived id {derived} already names a different node or "
+        "different content; this item was not written"
+    ], result
+    assert result["stores"]["evidence_node"] == "rejected (derived id conflict)", result
+    assert result["evidence_node"] is None and result["added_nodes"] == 0, result
+    assert result["text_ingested"] is False, result
+    assert stack["graph"].get_node("TextUnit", derived) == kept
+    assert not [r for r in caplog.records if r.exc_info]
+
+
+@pytest.mark.parametrize("make_existing", [
+    pytest.param(lambda st, i: _seed_node(st, "TextUnit", i, text="기존"), id="textunit"),
+    pytest.param(lambda st, i: _seed_node(st, "Evidence", i, text="기존"), id="evidence"),
+    pytest.param(lambda st, i: _seed_node(st, "Topic", i, space="concept"), id="other-space"),
+])
+def test_468_other_existing_nodes_keep_the_rejection(stack, make_existing):
+    make_existing(stack, "codex/s/468-o")
+    gtype = stack["graph"].lookup_node_type("codex/s/468-o")
+    doc_before = stack["docs"].get_node_doc("evidence", "codex/s/468-o")
+    result = _ingest468(stack, text="새 본문", source_id="codex/s/468-o")
+    assert result["status"] == "partial", result
+    assert result["node_errors"] == [f"codex/s/468-o: {_CONFLICT_FIXED}"], result
+    assert result["stores"]["evidence_node"] == _CONFLICT_MARKER, result
+    assert result["text_ingested"] is False and result["evidence_node"] is None, result
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-o" + _DERIVED) is None
+    assert stack["graph"].lookup_node_type("codex/s/468-o") == gtype
+    assert stack["docs"].get_node_doc("evidence", "codex/s/468-o") == doc_before
+
+
+def test_468_logentry_of_another_pack_is_rejected_by_the_identity_probe(stack):
+    _seed_node(stack, "LogEntry", "codex/s/468-p", pack_id="pack-b", principal=BOB)
+    result = _ingest468(stack, text="본문", source_id="codex/s/468-p")
+    assert result["node_errors"] == [
+        "codex/s/468-p: identity is already attributed to a different pack"
+    ], result
+    assert result["text_ingested"] is False and result["evidence_node"] is None, result
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-p" + _DERIVED) is None
+
+
+def test_468_logentry_without_pack_id_is_not_derived_from(stack):
+    """The identity probe lets an unattributed legacy row pass. The gate must not."""
+    with principal_scope(ALICE):
+        stack["graph"].upsert_node("LogEntry", "codex/s/468-u", {"session_id": "s"},
+                                   space_id="evidence")
+    result = _ingest468(stack, text="본문", source_id="codex/s/468-u")
+    assert result["node_errors"] == [f"codex/s/468-u: {_CONFLICT_FIXED}"], result
+    assert result["text_ingested"] is False, result
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-u" + _DERIVED) is None
+
+
+def test_468_logentry_typed_node_in_another_space_is_not_derived_from(stack):
+    with principal_scope(ALICE):
+        stack["graph"].upsert_node("LogEntry", "codex/s/468-v", {"pack_id": "pack-a"},
+                                   space_id="concept")
+    result = _ingest468(stack, text="본문", source_id="codex/s/468-v")
+    assert result["node_errors"] == [f"codex/s/468-v: {_CONFLICT_FIXED}"], result
+    assert result["text_ingested"] is False, result
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-v" + _DERIVED) is None
+
+
+def test_468_derived_id_owned_by_another_pack_is_rejected(stack):
+    _seed_logentry(stack, "codex/s/468-x")
+    _seed_node(stack, "TextUnit", "codex/s/468-x" + _DERIVED, pack_id="pack-b",
+               principal=BOB, text="남의 것")
+    foreign = stack["graph"].get_node("TextUnit", "codex/s/468-x" + _DERIVED)
+    result = _ingest468(stack, text="본문", source_id="codex/s/468-x")
+    assert result["status"] == "partial" and result["text_ingested"] is False, result
+    assert result["evidence_node"] is None, result
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-x" + _DERIVED) == foreign
+
+
+def test_468_id_too_long_to_derive_keeps_the_rejection(stack):
+    from opencrab.pack.fork_remap import SOURCE_NODE_ID_BUDGET
+
+    long_id = "L" * (SOURCE_NODE_ID_BUDGET - 2)
+    _seed_logentry(stack, long_id)
+    result = _ingest468(stack, text="본문", source_id=long_id)
+    assert result["node_errors"] == [f"{long_id}: {_CONFLICT_FIXED}"], result
+    assert result["text_ingested"] is False, result
+
+
+def test_468_non_owner_is_rejected_and_nothing_is_written(stack):
+    from opencrab.mcp.tools import _ingest_into_pack
+
+    _seed_logentry(stack, "codex/s/468-n")
+    with principal_scope(BOB), \
+         patch("opencrab.mcp.tools._get_context", return_value=mcp_ctx_from(stack)):
+        result = _ingest_into_pack("pack-a", text="본문", source_id="codex/s/468-n")
+    assert result["status"] == "partial", result
+    assert result["evidence_node"] is None, result
+    assert stack["graph"].get_node("TextUnit", "codex/s/468-n" + _DERIVED) is None
+
+
+def test_468_derived_write_store_failure_is_reported_like_the_normal_branch(stack):
+    _seed_logentry(stack, "codex/s/468-f2")
+    with patch.object(stack["docs"], "upsert_node_doc", side_effect=RuntimeError("doc down")):
+        result = _ingest468(stack, text="본문", source_id="codex/s/468-f2")
+    assert result["status"] == "partial", result
+    assert result["evidence_node"] is None, result
+    assert result["node_errors"] and "codex/s/468-f2" + _DERIVED in result["node_errors"][0], result
+
+
+def test_468_billing_follows_the_graph_write_of_the_derived_node(stack):
+    from unittest.mock import MagicMock
+
+    _seed_logentry(stack, "codex/s/468-b1")
+    ctx = mcp_ctx_from(stack)
+    ctx["billing"] = MagicMock()
+    ctx["billing"].on_ingest.return_value = {"ok": True}
+    from opencrab.mcp.tools import _ingest_into_pack
+
+    with principal_scope(ALICE), patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        _ingest_into_pack("pack-a", text="본문", source_id="codex/s/468-b1")
+    assert ctx["billing"].on_ingest.call_count == 1
+    # An Evidence-typed conflict is rejected and not billed.
+    _seed_node(stack, "Evidence", "codex/s/468-b2", text="기존")
+    ctx["billing"].reset_mock()
+    with principal_scope(ALICE), patch("opencrab.mcp.tools._get_context", return_value=ctx):
+        _ingest_into_pack("pack-a", text="본문", source_id="codex/s/468-b2")
+    ctx["billing"].on_ingest.assert_not_called()
+
+
+def test_468_derived_text_survives_a_fork_and_a_retry_on_the_fork_target(stack):
+    _seed_logentry(stack, "codex/s/468-k")
+    # Same metadata the real pack_ingest tool passes.
+    meta = {"title": "", "source": "pack_ingest"}
+    _ingest468(stack, text="포크 본문", source_id="codex/s/468-k", metadata=meta)
+
+    forked = _fork(stack, principal=ALICE, src_pack_id="pack-a")
+    assert forked.get("status") == "ok", forked
+    new_pack = forked["pack_id"]
+    ids = {
+        r["props"]["id"] for r in stack["graph"].export_nodes(pack_id=new_pack)
+        if r["props"]["id"].startswith("codex/s/468-k")
+    }
+    log_copy = next(i for i in ids if "#text" not in i)
+    text_copy = next(i for i in ids if "#text" in i)
+    assert text_copy == derive_text_id(log_copy), ids
+    before = stack["graph"].get_node("TextUnit", text_copy)
+    assert before["source_id"] == log_copy
+
+    from opencrab.mcp.tools import _ingest_into_pack
+
+    with principal_scope(ALICE), \
+         patch("opencrab.mcp.tools._get_context", return_value=mcp_ctx_from(stack)):
+        retry = _ingest_into_pack(new_pack, text="포크 본문", source_id=log_copy, metadata=meta)
+    assert retry["status"] == "ok", retry
+    assert retry["evidence_node"] == text_copy, retry
+    assert stack["graph"].get_node("TextUnit", text_copy) == before
+
+
+@pytest.mark.parametrize("plain", ["a", "codex/s/1", "x#y", "k~notsalt"])
+def test_468_derived_id_commutes_with_the_fork_remap(plain):
+    from opencrab.pack.fork_remap import remap_id
+
+    for salts in ([], ["0123456789ab"], ["0123456789ab", "ba9876543210"]):
+        original = plain
+        for salt in salts:
+            original = remap_id(original, salt)
+        expected = plain + "#text"
+        for salt in salts:
+            expected = remap_id(expected, salt)
+        assert derive_text_id(original) == expected
+    assert derive_text_id(plain) == plain + "#text"
 
 
 def test_468_nodes_loop_rejection_is_reported_and_later_items_still_land(stack, caplog):
@@ -1867,7 +2093,7 @@ def test_468_nodes_loop_rejection_is_reported_and_later_items_still_land(stack, 
 @pytest.mark.parametrize("source_id", ["error", "no match-468", "codex/s/468-h"])
 def test_468_marker_does_not_depend_on_the_caller_id_spelling(stack, source_id):
     """표식이 `store_write_failures` 의 접두사 판정과 섞이지 않아야 한다."""
-    _seed_logentry(stack, source_id)
+    _seed_node(stack, "Evidence", source_id, text="기존")
     result = _ingest468(stack, text="본문", source_id=source_id, text_as_node=True)
     assert result["stores"]["evidence_node"] == _CONFLICT_MARKER, result
     assert result["node_errors"] == [f"{source_id}: {_CONFLICT_FIXED}"], result

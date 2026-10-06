@@ -296,7 +296,7 @@ def test_foreign_evidence_textunit_rejected(graph):
     assert result["stores"]["evidence_node"] == (
         "victim-src: identity is already attributed to a different pack"
     )
-    assert result["text_ingested"] is True  # attempted, same as any other node_errors case
+    assert result["text_ingested"] is False  # an identity rejection stores nothing (#470)
     ctx["builder"].add_node.assert_not_called()
 
 

@@ -78,6 +78,7 @@ fork 호출마다 하나의 salt로 모든 콘텐츠 id를 결정적으로 재�
 
 from __future__ import annotations
 
+import re
 import secrets
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -131,6 +132,33 @@ def new_salt() -> str:
 def remap_id(old: str, salt: str) -> str:
     """콘텐츠 id 재매핑(규칙 1). 결정적 — 같은 `(old, salt)` 는 항상 같은 값."""
     return f"{old}{REMAP_SEP}{salt}"
+
+
+# #470: suffix of the TextUnit id that stores text rejected because the client's
+# own id already names a LogEntry.
+TEXT_ID_SUFFIX = "#text"
+
+# Trailing run of fork salts. A fork appends one salt per generation.
+_FORK_SALTS_TAIL = re.compile(
+    "(?:" + re.escape(REMAP_SEP) + "[0-9a-f]{" + str(FORK_SALT_BYTES * 2) + "})*$"
+)
+
+
+def derive_text_id(source_id: str) -> str | None:
+    """Return the deterministic id of the TextUnit that holds text for ``source_id``.
+
+    The text suffix goes before any trailing fork salts, so that
+    ``remap_id(derive_text_id(x), s) == derive_text_id(remap_id(x, s))``. A fork
+    copy of the derived node and a retry against the fork target then name the
+    same node. Returns ``None`` when the id would not survive a fork remap.
+    """
+    tail = _FORK_SALTS_TAIL.search(source_id)
+    cut = tail.start() if tail else len(source_id)
+    base = source_id[:cut] + TEXT_ID_SUFFIX
+    derived = base + source_id[cut:]
+    if len(base) > SOURCE_NODE_ID_BUDGET or len(derived) > NODE_ID_COLUMN_LIMIT:
+        return None
+    return derived
 
 
 def build_mapping(
