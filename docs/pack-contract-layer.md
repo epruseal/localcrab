@@ -145,15 +145,15 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
   근거는 `opencrab/pack/fork.py` 모듈 docstring 의 "RETIRED ALIASES" 절에 있다.
 - **`pack` 만 있고 `pack_id` 가 없는 행은 보존한다.** 모순이 아니고, 임의 속성을 그대로
   저장한다는 진입점 계약을 깰 이유가 없다. 읽는 코드가 0곳이라 무해하다.
-- **증분 대조는 `pack` 을 무시한다.** 노드축은 `load.INCREMENTAL_IGNORED_KEYS`(라이브 쪽)와
-  `load.FILE_SIDE_IGNORED_KEYS`(파일 쪽)로 뺀다. 두 상수 모두 `RETIRED_KEYS` 를 포함한다.
+- **증분 대조는 `pack` 을 무시한다.** 노드축은 `load.STORED_NODE_IGNORED_KEYS`(라이브 쪽)와
+  `load.FILE_NODE_IGNORED_KEYS`(파일 쪽)로 뺀다. 두 상수 모두 `RETIRED_KEYS` 를 포함한다.
   청크축은 이 두 상수를 쓰지 않는다. `transform_chunk_meta` 가 파일 쪽 meta 를 만들 때
   `apply_pack_tag` 로 그 자리에서 별칭을 버리고, 비교 직전에는 `strip_retired_keys` 로
   라이브 쪽 meta 에서 뺀다. 빼지 않으면 그 키를 가진 라이브 행이 매 증분 전량 chg 로
   잡히는데, neo4j 의 upsert 는 전달된 키만 SET 하므로 재기록해도 사라지지 않아 그
   재기록이 영구히 반복된다.
 - **노드축 증분 대조는 필터를 걸기 전에 `prepare_node` 로 원본 `props` 를 먼저
-  검증한다(#379).** `INCREMENTAL_IGNORED_KEYS`/`FILE_SIDE_IGNORED_KEYS` 필터는 값을
+  검증한다(#379).** `STORED_NODE_IGNORED_KEYS`/`FILE_NODE_IGNORED_KEYS` 필터는 값을
   검증하지 않고 키만 뺀다. 어떤 필터 키 구성에서도 `prepare_node` 검증 단계 없이
   필터만으로 비교하면 불량 값(중첩 `properties.space` 타입 오류, 중첩
   `properties.id` 불일치 등)이 필터에 걸러진 뒤 같은 노드로 오인돼 `same` 으로
@@ -164,10 +164,10 @@ pytest 대상: `tests/test_pack_jsonl_io.py`의 `TestShardPathsSingleScandirPass
   `prepare_node` 검증에 실패하면 그 행은 `same` 후보에서 빠진다. 이 검증이 비교
   단계 이후 쓰기 시도가 어느 카운터(skip/chg/err)로 떨어지는지는 정하지 않는다.
   `prepare_node` 가 반환한 `props` 는 원본에 없어도 `id` 를 항상 채워 넣으므로,
-  `FILE_SIDE_IGNORED_KEYS` 도 #379 부터 `id` 를 포함한다(안 빼면 파일 쪽에만 이
+  `FILE_NODE_IGNORED_KEYS` 도 #379 부터 `id` 를 포함한다(안 빼면 파일 쪽에만 이
   키가 구조적으로 남아 값이 같아도 매번 chg 로 어긋난다). `owner_id` 는
   `prepare_node` 가 값을 손대지 않으므로 대칭화 대상이 아니며, 기존 설계대로
-  `INCREMENTAL_IGNORED_KEYS`(라이브 쪽)에만 남는다: 파일이 owner_id 를 실으면
+  `STORED_NODE_IGNORED_KEYS`(라이브 쪽)에만 남는다: 파일이 owner_id 를 실으면
   값과 무관하게 항상 chg 로 재기록된다(#378).
 - **properties 형상이 바뀌면 다음 증분 한 번은 전량 chg 다**(#279). 라이브 행의 properties 가
   파일 파생 properties 와 다르면 그 행은 chg 로 잡힌다. 그 런의 CAS 갱신이 properties 를
@@ -263,7 +263,7 @@ SELECT COUNT(*) FROM graph_nodes
 빈 dict 는 유효한 입력이다(대사할 doc 행이 없다는 사실). `None` 과 다르다.
 
 `owner_id` 는 이 인자들의 대상이 아니다. 증분 대조에서 라이브 쪽에서만 빼는
-`INCREMENTAL_IGNORED_KEYS`(`opencrab/pack/load.py`) 의 원소이고, 어떤 노드 타입도
+`STORED_NODE_IGNORED_KEYS`(`opencrab/pack/load.py`) 의 원소이고, 어떤 노드 타입도
 `owner_id` 를 스키마 필드로 선언하지 않는다(순수 시스템 스탬프 값, `write_gate.py` 의
 `NODE_STAMPED`). `origin="server"` 는 인가된 `add_node` 쓰기가 실제로 실행될 때
 현재 principal의 스탬프를 쓴다. `same` 행은 그 쓰기를 건너뛰므로 owner 스탬프를
