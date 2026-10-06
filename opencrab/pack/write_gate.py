@@ -489,6 +489,16 @@ def node_conflict_message(ident: str) -> str:
     return f"{ident}: node id already names a different node; this item was not written"
 
 
+def derived_conflict_message(ident: str, derived: str) -> str:
+    """Report text whose derived TextUnit id already names a different node or
+    different content (#470). The graph rejection does not say which, so the
+    wording does not either."""
+    return (
+        f"{ident}: derived id {derived} already names a different node or "
+        "different content; this item was not written"
+    )
+
+
 def identity_reject_message(kind: str, ident: str, reason: str) -> str:
     """Fixed wording -- #143 invariant 7 means this must NEVER name the other
     pack's id, owner, title, or visibility."""
