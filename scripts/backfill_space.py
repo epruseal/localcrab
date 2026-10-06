@@ -19,6 +19,8 @@ container-like string as a space name, but it never equals a real space name.
 The tool replaces it so a spaces filter can find the record by a real space.
 A missing or null space never matches a spaces filter. The filters differ for
 the other invalid values, so this tool does not claim one common read rule.
+The report counts valid spaces that are not in the grammar (space_not_in_grammar).
+The tool keeps them.
   graph space      a valid, not container-like ``properties.space``, else a
                    valid ``space_id`` column. Duplicate graph rows of one
                    ``node_id`` must agree on (space, pack_id) or the id is held.
@@ -58,8 +60,8 @@ Apply sequence:
   2. Take a backup set with ``backup_data_dir``.
   3. Plan.
   4. Write per batch. Each batch is one transaction per store. Rows are re-read
-     inside the transaction and written only when the same decision still
-     holds. ``UPDATE`` touches metadata only, never text, embedding or the FTS
+     inside the transaction. The tool writes a row only when the same decision
+     still holds. ``UPDATE`` touches metadata only, never text, embedding or the FTS
      index.
   5. Reconcile.
 ``--max-batches N`` stops early. A rerun continues because written rows no
@@ -73,10 +75,13 @@ migrate_chroma_to_sqlite_vec, import_pack_graph_to_neo4j,
 build_nemotron_personas_korea_pack, bench_graph_backends. A writer that skips
 write.lock shows up only as a reconcile mismatch.
 
-Restore: stop every process that opens the store files, delete the target's
-``-wal`` and ``-shm`` files, copy the backup file over the target main file,
-then start the services. Copying only the main file leaves the old WAL, which
-re-applies the later writes.
+Restore:
+  1. Stop every process that opens the store files.
+  2. Delete the ``-wal`` and ``-shm`` files of the target.
+  3. Copy the backup file over the target main file.
+  4. Start the services.
+Copying only the main file leaves the old WAL, which re-applies the later
+writes.
 
 Exit codes: 0 done, 1 failure or reconcile mismatch, 2 usage or unsupported
 mode, 3 write.lock busy.
@@ -92,6 +97,10 @@ import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
+
+from opencrab.grammar.manifest import SPACES as _GRAMMAR
+
+GRAMMAR_SPACES = frozenset(_GRAMMAR)
 
 EVIDENCE = "evidence"
 LIST_CAP = 1000
@@ -132,6 +141,20 @@ def parse_object_strict(text: Any) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
+def parse_graph_properties(text: Any) -> dict[str, Any] | None:
+    """Graph properties by the read side's corruption rule, None when corrupt.
+
+    The read side rejects duplicate keys, NaN and Infinity, empty text and any
+    non-object. This reuses its parser so both agree.
+    """
+    from opencrab.common.graph_identity import GraphPropertyValidationError, parse_properties_object
+
+    try:
+        return parse_properties_object(text)
+    except GraphPropertyValidationError:
+        return None
+
+
 def _str_or_none(v: Any) -> str | None:
     return v if isinstance(v, str) and v else None
 
@@ -157,7 +180,7 @@ def build_graph_map(gconn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]
     out: dict[str, dict[str, Any]] = {}
     for node_id, space_id, props_text in gconn.execute(
             "SELECT node_id, space_id, properties FROM graph_nodes"):
-        props = parse_object_strict(props_text)
+        props = parse_graph_properties(props_text)
         if props is None:
             entry = {"props_bad": True, "space": None, "pack": None}
             stats["graph_props_bad"] += 1
@@ -299,6 +322,7 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
             "held_map": {"doc": {}, "vector": {}},
             "space_differs_from_graph": {"doc": 0, "vector": 0},
             "corroboration": collections.Counter(),
+            "space_not_in_grammar": {"doc": collections.Counter(), "vector": collections.Counter()},
             "vector_vs_doc_space_differs": 0,
         }
         docs: dict[str, tuple[str, str | None]] = {}
@@ -306,6 +330,8 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
         def note(store: str, rid: str, cls: str, space: str | None, meta: Any, part: str | None) -> None:
             res["classes"][store][cls] += 1
             if cls == "skip_valid":
+                if space not in GRAMMAR_SPACES:
+                    res["space_not_in_grammar"][store][space] += 1
                 g = graph.get(rid)
                 if g is not None and g["space"] is not None and g["space"] != space:
                     res["space_differs_from_graph"][store] += 1
@@ -371,6 +397,7 @@ def report_of(res: dict[str, Any], list_ids: bool) -> dict[str, Any]:
             "classes": dict(res["classes"][store]),
             "invalid_kinds": dict(res["invalid_kinds"][store]),
             "planned_space_distribution": dict(res["distribution"][store]),
+            "space_not_in_grammar": dict(res["space_not_in_grammar"][store]),
         }
         if list_ids:
             out[store]["held_ids"] = {k: v for k, v in res["held_ids"][store].items()}

@@ -84,7 +84,16 @@ class World:
         out["vec"] = {r[0]: (r[1], r[2], r[3], r[4]) for r in v.execute(
             f"SELECT node_id, pack_id, metadata, document, embedding FROM {COLL}")}
         v.close()
+        g = sqlite3.connect(self.root / "graph.db")
+        out["graph"] = g.execute("SELECT node_type, node_id, space_id, properties FROM graph_nodes").fetchall()
+        g.close()
         return out
+
+    def stat(self):
+        """Size and mtime of the three main files (the dry run must not change them)."""
+        return {n: (p.stat().st_size, p.stat().st_mtime_ns)
+                for n in ("graph.db", "doc_store.db", "vectors.db")
+                for p in [self.root / n]}
 
     def space(self, store, rid):
         rows = self.dump()["doc" if store == "doc" else "vec"]
@@ -192,10 +201,11 @@ def test_decide(store, meta, part, graph, docs, allow, expect):
 
 def test_dry_run_changes_no_content_and_reports(world, capsys):
     _mixed(world)
-    before = world.dump()
+    before, stat_before = world.dump(), world.stat()
     code, rep = _run(capsys)
     assert code == 0 and rep["mode"] == "dry-run"
-    assert world.dump() == before
+    assert world.dump() == before  # includes the graph rows
+    assert world.stat() == stat_before
     assert rep["doc"]["classes"]["apply_graph"] == 1
     assert rep["vector"]["classes"]["hold_pack_disagrees"] == 1
     assert rep["vector"]["classes"]["hold_orphan"] == 1
@@ -635,3 +645,31 @@ def test_doc_with_valid_space_and_invalid_pack_does_not_pair(world, tmp_path, ca
     assert code == 0, rep
     assert rep["before"]["vector"]["classes"]["hold_doc_pair_pack_differs"] == 1
     assert world.space("vec", "a") is None
+
+
+@pytest.mark.parametrize("props", [
+    '{"pack_id": "other", "pack_id": "pk", "space": "claim", "space": "concept"}',
+    '{"pack_id": "pk", "space": NaN}',
+    '{"pack_id": "pk", "x": Infinity}',
+])
+def test_graph_properties_with_duplicate_keys_or_nan_are_corrupt(world, tmp_path, capsys, props):
+    world.graph("n1", "concept", props)
+    world.doc("n1", {"pack_id": PACK})
+    world.vector("n1", {"pack_id": PACK})
+    before = world.dump()
+    code, rep = _apply(capsys, world, tmp_path, "--allow-pack-missing")
+    assert code == 0, rep
+    assert rep["before"]["doc"]["classes"]["hold_graph_props_bad"] == 1
+    assert rep["before"]["vector"]["classes"]["hold_graph_props_bad"] == 1
+    assert world.dump() == before
+
+
+def test_space_not_in_grammar_is_reported_and_kept(world, tmp_path, capsys):
+    world.doc("a", {"pack_id": PACK, "space": "outside_grammar"})
+    world.vector("a", {"pack_id": PACK, "space": "outside_grammar"})
+    world.doc("b", {"pack_id": PACK, "space": "concept"})
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 0, rep
+    assert rep["before"]["doc"]["space_not_in_grammar"] == {"outside_grammar": 1}
+    assert rep["before"]["vector"]["space_not_in_grammar"] == {"outside_grammar": 1}
+    assert world.space("doc", "a") == "outside_grammar" and world.space("vec", "a") == "outside_grammar"
