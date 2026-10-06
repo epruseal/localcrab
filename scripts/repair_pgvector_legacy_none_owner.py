@@ -156,6 +156,31 @@ class SnapshotError(ValueError):
     """백업 스냅샷 파일이 손상됐거나, 서명이 대상과 다르거나, 중복 node_id가 있을 때."""
 
 
+class BackupPublicationStateError(OSError):
+    """The backup publication state or the database outcome needs an operator.
+
+    ``publication_state`` is one of "published", "not published", "unconfirmed".
+    "unconfirmed" is the only state that means this process could not prove what is
+    on disk. ``db_outcome`` says what happened to the database transaction, or is None
+    when the caller has not set it yet. This process preserves a path when it cannot
+    prove the entry is its own. Do not retry the same backup path automatically.
+    The text names only the backup path chosen by the user and the temp name.
+    """
+
+    def __init__(self, detail: str, *, publication_state: str, db_outcome: str | None = None) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.publication_state = publication_state
+        self.db_outcome = db_outcome
+
+    def __str__(self) -> str:
+        outcome = self.db_outcome if self.db_outcome is not None else "not applicable"
+        state = self.publication_state
+        if state == "unconfirmed":
+            state = "unconfirmed (uncertain)"  # the only state that means this process could not prove what is on disk
+        return f"backup publication state: {state}; database outcome: {outcome}; {self.detail}"
+
+
 def _check_ident(name: str, label: str) -> None:
     if not IDENT_RE.fullmatch(name):
         raise ValueError(f"Unsafe {label}: {name!r}")
@@ -428,7 +453,7 @@ def audit(engine: Any, table: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
+def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> tuple[int, int]:
     """임시 파일에 쓰고 fsync한 뒤 ``os.link()``로 배타 생성, 부모 디렉터리를
     fsync한다. ``os.link``는 대상이 이미 있으면 ``FileExistsError``를 내는
     원자적 단일 syscall이라 "존재하면 실패, 없으면 원자 생성"을 정확히
@@ -448,50 +473,111 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
     실행되기까지의 창에서, unlink 권한이 있는 다른 사용자가 ``tmp`` 경로의
     파일을 지우고 자기 파일이나 심볼릭 링크로 바꿔치기하면, 경로만 보고
     거는 ``os.link(tmp, backup_to)``는 바꿔치기된 대상을 그대로 최종
-    백업으로 게시한다(``os.link``는 기본 ``follow_symlinks=True``라 소스가
-    심볼릭 링크면 그 대상을 따라간다).
+    백업으로 게시한다. 문서상 ``os.link``의 ``follow_symlinks`` 기본값은
+    ``True``다. 측정 플랫폼(Linux, ext4, Python 3.13.5)에서 심볼릭 링크 소스에
+    건 세 호출의 결과는 다음과 같았다. 이전 코드 형태인 ``os.link(src, dst)``
+    (기본 플래그, ``dir_fd`` 없음)와 현재 코드 형태인 ``os.link(src, dst,
+    src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)``는 심볼릭 링크
+    자체를 연결했다. 같은 호출에 ``follow_symlinks=True``를 명시하면 대상을
+    연결했다. 그 밖의 인자 조합은 측정하지 않았다. 현재 코드는
+    ``follow_symlinks=False``를 명시하며 기본값에 기대지 않는다.
 
     경로 대신 이미 연 fd 자체를 거는 ``os.link(f"/proc/self/fd/{fd}",
     backup_to)``(리눅스 매직 심볼릭 링크를 통한 게시)를 먼저 시도했으나,
     procfs와 대상이 같은 ext4 디바이스에 있는데도 ``EXDEV``로 실패함을
     실측 확인했다(``O_TMPFILE``로도 동일). 이 기법은 이식성이 없어 쓰지
-    않는다. 대신 경로 기반 ``os.link`` 뒤 **실패 시 닫힘(fail-closed)**
-    검증을 건다: ``os.link`` 직전 ``fd``에서 ``os.fstat``으로 우리가 실제로
-    쓴 inode(``st_dev``, ``st_ino``)를 기록해 두고, 게시된 ``backup_to``를
-    ``follow_symlinks=False``로 다시 ``os.stat``해 같은 inode인지 대사한다.
-    ``os.link``는 대상이 없을 때만 새 디렉터리 엔트리를 만드는 원자적
-    syscall이므로, 이 지점에 도달했다는 것은 그 엔트리가 바로 우리 호출이
-    막 만든 것이라는 뜻이다 -- 따라서 불일치가 나오면(``tmp``가 그 사이
-    바꿔치기됐다는 뜻) 안전하게 그 엔트리를 지우고 예외를 낸다. 창을 없애진
-    못해도, 바꿔치기된 내용을 성공으로 착각해 조용히 게시하는 일은 없다.
-    ``os.link``로 만드는 최종 파일은 이 임시 파일과 같은 inode를 공유하므로
-    ``0o600`` 모드를 그대로 물려받는다.
+    않는다.
 
-    게시(``os.link``, inode 대사)가 성공한 뒤 곧바로 임시 파일 ``tmp``를
-    지우는 정리(``finally``)가 남아 있다. 이 정리가 실패하면(디렉터리가
-    그 사이 읽기 전용이 되는 등, 이중 적대검증의 실측 재현) ``backup_to``는
-    이미 게시된 채로 그 예외가 새어 나가, 호출자가 DB 트랜잭션을
-    롤백하면서도 낡은 스냅샷이 그 경로를 영구히 점유하는 같은 문제가
-    난다. 그래서 게시가 실제로 끝났음을 표시하는 플래그(``published``)를
-    두고, 그 이후 정리 실패에서만 방금 게시한 ``backup_to``를 지운 뒤
-    원래 예외를 다시 낸다(``tmp``가 애초에 없어 나는 ``FileNotFoundError``는
-    정상 종료로 보아 그대로 무시한다).
+    **부모 디렉터리 fd 고정(#363).** 이 함수는 부모 디렉터리를 한 번 열어
+    그 fd로 모든 연산(``os.open``, ``os.link``, ``os.stat``, ``os.unlink``,
+    ``os.fsync``)을 한다. 상위 경로가 나중에 다른 디렉터리로 바뀌어도 연산은
+    처음 연 디렉터리 객체에 머문다. 경로로 ``unlink``하면 바뀐 상위 경로
+    아래의 무관한 파일을 지운다(실측). fd 상대 ``unlink``는 그렇지 않다.
 
-    게시(``os.link``, inode 대사) 뒤에는 부모 디렉터리를 열어 ``fsync``해
-    디렉터리 엔트리 자체의 내구성을 확보한다. 이 단계가 실패하면(디렉터리
-    fsync를 거부하는 파일시스템, 쓰기 권한은 있어도 읽기 권한이 없는
-    디렉터리 등) 호출자(``repair()``)는 DB 트랜잭션을 롤백하지만, 그 시점에
-    ``backup_to``는 이미 게시돼 있다(이중 적대검증, 코덱스 리뷰의 실측
-    재현). ``os.link``의 배타성 때문에 그 경로는 이후 재시도에서 항상
-    ``FileExistsError``로 막히므로, 실제로는 커밋되지 않은 수리를 커밋된
-    것처럼 보이게 하는 낡은 스냅샷이 그 경로를 영구히 점유한다. 그래서 이
-    fsync 단계가 실패하면 방금 게시한 ``backup_to``를 지운 뒤 원래 예외를
-    다시 낸다: 예외가 새는 모든 경로에서 "아무것도 게시되지 않았다"는
-    불변식을 지켜, 재시도가 항상 깨끗한 상태에서 시작하게 한다."""
-    tmp = f"{backup_to}.tmp-{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    published = False
+    **신뢰 모델.** 부모 디렉터리는 이 프로세스의 소유자 소유이고 다른
+    사용자가 그 안에 쓸 수 없다고 가정한다. 이 가정 아래서는 고정한 디렉터리
+    안의 항목을 다른 사용자가 바꿔치기할 수 없으므로 "inode 확인 뒤 상대
+    ``unlink``"가 다른 파일을 지울 수 없다. 그 안에 쓸 수 있는 주체에게는
+    inode 확인이 증명이 아니라 실패 시 닫힘 탐지일 뿐이다. 협력적 잠금은
+    경로 소유권을 증명하지 않으며 이 함수는 잠금에 기대지 않는다.
+
+    **실패별 결과.** 아래에서 "보존"은 지우지 않는다는 뜻이다.
+      - 링크 전 실패: fd를 닫고, 우리 임시 파일임을 inode로 확인한 때만
+        지운다. 확인하지 못하면 임시 파일을 보존하고 원래 예외에 그 이름을
+        ``add_note``로 붙여 다시 낸다. 게시된 것은 없다.
+      - 링크 뒤 확인(``os.stat``) 실패 또는 inode 불일치: 최종 파일과 임시
+        파일을 모두 보존하고 ``BackupPublicationStateError``
+        (``publication_state="unconfirmed"``)를 낸다. 확인하지 못한 최종
+        파일을 이 함수는 지우지 않는다.
+      - 확인 뒤 임시 파일 정리나 디렉터리 ``fsync`` 실패: 우리 최종 파일임을
+        inode로 확인한 때만 지우고 원래 예외를 낸다(임시 파일이 남았으면 그
+        이름을 노트로 붙인다). 최종 파일을 지우지 못하면 ``"published"``,
+        다른 파일이면 ``"unconfirmed"`` 상태 오류를 낸다. 이미 없으면 지운
+        것으로 본다.
+    파일 fd는 링크 전에 닫으므로 게시 뒤에는 닫기 오류가 결과를 바꾸지
+    못한다. 반환값은 게시한 파일의 ``(st_dev, st_ino)``이며 호출자가 나중에
+    그 파일을 지울 때 신원 확인에 쓴다.
+
+    **이슈 원문과의 차이.** 이슈 #363은 확인 실패 뒤 백업 파일이 남지 않기를
+    요구했다. 소유자 결정 D3이 그것을 좁혔다. 확인하지 못한 최종 파일은 지우지
+    않고 상태 오류로 보고한다.
+
+    **재시도 계약.** 같은 경로의 자동 재시도 거부는 배타 ``os.link``와
+    ``O_EXCL`` 임시 파일 생성으로만 강제한다. 최종 파일이나 같은 PID의 임시
+    파일이 남아 있으면 재실행은 실패한다. 다른 PID에서는 다른 PID의 임시
+    파일만 남은 경우 재실행이 통과할 수 있다. 영구 표식 파일은 없다. 이
+    계약은 운영자 확인이며 지속적 강제가 아니다. SIGKILL은 임시 파일(링크
+    전) 또는 최종 파일(링크 후)을 남기며 이 프로그램은 그것을 알아보지
+    못한다. 운영자가 확인하고 지운다."""
+    path = os.path.abspath(backup_to)
+    directory, name = os.path.split(path)
+    tmp_name = f"{name}.tmp-{os.getpid()}"
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
+        return _write_backup_in_directory(dir_fd, name, tmp_name, path, snapshot)
+    finally:
+        _quiet_close(dir_fd)
+
+
+def _quiet_close(fd: int) -> None:
+    """Close an fd whose close error carries no needed information."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _unlink_if_ours(dir_fd: int, name: str, ident: tuple[int, int]) -> bool:
+    """Remove ``name`` inside ``dir_fd`` only if it is the file this process wrote.
+
+    The function returns True when the entry is gone (removed now, or already absent). It
+    returns False and deletes nothing when the entry has another identity. Any other stat or unlink
+    error propagates. Every call is relative to the pinned directory fd, so a replaced
+    ancestor path cannot redirect it. The identity check is a fail-closed detector for a
+    writer inside the directory. The proof rests on the trust model in the module docstring.
+    """
+    try:
+        found = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    if (found.st_dev, found.st_ino) != ident:
+        return False
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _write_backup_in_directory(
+    dir_fd: int, name: str, tmp_name: str, path: str, snapshot: dict[str, Any]
+) -> tuple[int, int]:
+    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    ident: tuple[int, int] | None = None
+    open_fd: int | None = fd
+    try:
+        written = os.fstat(fd)
+        ident = (written.st_dev, written.st_ino)
         # A restrictive umask can remove owner access from the requested mode.
         # Set the mode on this open descriptor before the file receives backup data.
         os.fchmod(fd, 0o600)
@@ -499,46 +585,111 @@ def write_backup_atomic(backup_to: str, snapshot: dict[str, Any]) -> None:
             json.dump(snapshot, fh, ensure_ascii=False, indent=2)
             fh.flush()
             os.fsync(fd)
-        written = os.fstat(fd)
-        try:
-            os.link(tmp, backup_to)
-        except FileExistsError:
-            raise FileExistsError(f"backup target already exists: {backup_to}") from None
-        published_stat = os.stat(backup_to, follow_symlinks=False)
-        if (published_stat.st_dev, published_stat.st_ino) != (written.st_dev, written.st_ino):
-            os.unlink(backup_to)
-            raise OSError(
-                f"backup publish race detected: {tmp!r} was replaced before it "
-                f"could be linked to {backup_to!r}; refusing to trust the "
-                "published content"
-            )
-        published = True
-    finally:
+        open_fd = None
         os.close(fd)
         try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            if published:
-                try:
-                    os.unlink(backup_to)
-                except OSError:
-                    pass
-            raise
-    dir_path = os.path.dirname(os.path.abspath(backup_to)) or "."
-    try:
-        dir_fd = os.open(dir_path, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        try:
-            os.unlink(backup_to)
-        except OSError:
-            pass
+            os.link(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+        except FileExistsError:
+            raise FileExistsError(f"backup target already exists: {path}") from None
+    except BaseException as exc:
+        if open_fd is not None:
+            _quiet_close(open_fd)
+        _discard_temp_after_failure(dir_fd, tmp_name, ident, exc)
         raise
+
+    # The final entry exists. Confirm it is the file this process wrote.
+    try:
+        published = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise BackupPublicationStateError(
+            f"cannot confirm {path!r} after the link ({exc}); the final file and the temp file "
+            f"{tmp_name!r} are preserved",
+            publication_state="unconfirmed",
+        ) from exc
+    if (published.st_dev, published.st_ino) != ident:
+        raise BackupPublicationStateError(
+            f"backup publish race detected: {tmp_name!r} was replaced before it could be linked to "
+            f"{path!r}; the final file and the temp file are preserved",
+            publication_state="unconfirmed",
+        )
+
+    try:
+        if not _unlink_if_ours(dir_fd, tmp_name, ident):
+            raise OSError(f"temp file {tmp_name!r} is not the file this process wrote; it is preserved")
+        os.fsync(dir_fd)
+    except OSError as failure:
+        _unpublish(dir_fd, name, tmp_name, path, ident, failure)
+        raise
+    return ident
+
+
+def _discard_temp_after_failure(dir_fd: int, tmp_name: str, ident: tuple[int, int] | None, exc: BaseException) -> None:
+    """Failure before the link. Remove the temp only when it is provably ours; else keep it and say so."""
+    if ident is None:
+        exc.add_note(f"temp file {tmp_name!r} preserved: its identity was never recorded")
+        return
+    try:
+        if not _unlink_if_ours(dir_fd, tmp_name, ident):
+            exc.add_note(f"temp file {tmp_name!r} preserved: it is not the file this process wrote")
+    except OSError as cleanup:
+        exc.add_note(f"temp file {tmp_name!r} preserved: cleanup failed ({cleanup})")
+
+
+def _unpublish(
+    dir_fd: int, name: str, tmp_name: str, path: str, ident: tuple[int, int], failure: OSError
+) -> None:
+    """The link is confirmed but a later step failed. Remove our final, or report what stays."""
+    temp_note = _temp_note(tmp_name, _entry_state(dir_fd, tmp_name))
+    try:
+        removed = _unlink_if_ours(dir_fd, name, ident)
+    except OSError as cause:
+        raise BackupPublicationStateError(
+            f"cannot remove {path!r} after: {failure}; the final file is preserved ({cause})"
+            + (f"; {temp_note}" if temp_note else ""),
+            publication_state="published",
+        ) from failure
+    if not removed:
+        raise BackupPublicationStateError(
+            f"{path!r} is not the file this process wrote after: {failure}; it is preserved"
+            + (f"; {temp_note}" if temp_note else ""),
+            publication_state="unconfirmed",
+        ) from failure
+    if temp_note:
+        failure.add_note(f"final removed; {temp_note}")
+
+
+def _entry_state(dir_fd: int, name: str) -> str:
+    """"present", "absent" (only FileNotFoundError), or "unknown" (any other stat error)."""
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    return "present"
+
+
+def _temp_note(tmp_name: str, state: str) -> str:
+    """Words for an operator about a temp file. Empty when the temp is gone."""
+    if state == "present":
+        return f"temp file {tmp_name!r} is preserved"
+    if state == "unknown":
+        return f"temp file {tmp_name!r} is preserved: its state could not be read"
+    return ""
+
+
+def _discard_published_backup(backup_to: str, ident: tuple[int, int]) -> bool:
+    """Remove the backup published by this process. See ``_unlink_if_ours`` for the result.
+
+    This function opens the parent directory fresh. The function preserves an entry when its
+    device or inode differs from the recorded identity. It reports an absent entry as gone.
+    """
+    directory, name = os.path.split(os.path.abspath(backup_to))
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return _unlink_if_ours(dir_fd, name, ident)
+    finally:
+        _quiet_close(dir_fd)
 
 
 def load_snapshot(path: str) -> dict[str, Any]:
@@ -654,6 +805,71 @@ def validate_snapshot_signature(
 # ---------------------------------------------------------------------------
 
 
+def _db_outcome(rollback_error: BaseException | None, commit_started: bool) -> str:
+    if rollback_error is None:
+        return "rolled back"
+    if commit_started:
+        return "unknown (commit started, rollback failed)"
+    return "not committed (rollback failed; the open transaction ends with the connection)"
+
+
+def _settle_failed_repair(
+    exc: Exception,
+    trans: Any,
+    backup_to: str | None,
+    published_ident: tuple[int, int] | None,
+    commit_started: bool,
+) -> Exception:
+    """Roll back, decide the fate of a published backup, and return the exception to raise.
+
+    The returned exception carries ``publication_state`` and ``db_outcome`` so the CLI can say
+    what is true. A rollback failure never escapes this function. The rules apply in order:
+    a. the writer already raised a state error: keep it and add the database outcome.
+    b. the rollback failed: a state error is primary and names both facts.
+    c. nothing was published: return the original error.
+    d. the connection was lost: the commit result is unknown, so keep the backup.
+    e. a definite failure: remove the backup only when it is provably ours.
+    """
+    rollback_error: BaseException | None = None
+    try:
+        trans.rollback()
+    except Exception as failure:
+        rollback_error = failure
+    outcome = _db_outcome(rollback_error, commit_started)
+
+    if isinstance(exc, BackupPublicationStateError):  # a
+        exc.db_outcome = outcome
+        return exc
+    if rollback_error is not None:  # b
+        detail = f"original error: {exc!r}; rollback error: {rollback_error!r}"
+        notes = "; ".join(getattr(exc, "__notes__", []))
+        if notes:
+            detail += f"; notes: {notes}"
+        if published_ident is None:
+            state, detail = "not published", detail + "; no backup was published by this call"
+        else:
+            state, detail = "published", detail + f"; the backup at {backup_to!r} is preserved"
+        return BackupPublicationStateError(detail, publication_state=state, db_outcome=outcome)
+    if published_ident is None:  # c
+        exc.publication_state, exc.db_outcome = "not published", outcome
+        return exc
+    if getattr(exc, "connection_invalidated", False):  # d
+        exc.publication_state, exc.db_outcome = "published", "unknown (connection invalidated)"
+        return exc
+    try:  # e
+        removed = _discard_published_backup(backup_to, published_ident)
+    except OSError as cause:
+        return BackupPublicationStateError(
+            f"cannot remove the backup at {backup_to!r} after: {exc!r} ({cause}); it is preserved",
+            publication_state="published", db_outcome=outcome)
+    if not removed:
+        return BackupPublicationStateError(
+            f"the file at {backup_to!r} is not the one this process wrote after: {exc!r}; it is preserved",
+            publication_state="unconfirmed", db_outcome=outcome)
+    exc.publication_state, exc.db_outcome = "not published", outcome
+    return exc
+
+
 def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any]]:
     """복구를 원자적으로 실행한다.
 
@@ -667,18 +883,41 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
     있어도 대상 행이 0건이면 애초에 백업할 내용도 없다. backup_to가 없는
     (--skip-backup) 경로는 이 전제 자체가 걸리지 않는다.
 
-    반대 방향("백업 게시 + DB 커밋 실패")도 처리한다(이중 적대검증, 코덱스
-    리뷰의 실측 재현): 백업이 이미 게시된 뒤 ``trans.commit()``이 확정적으로
-    실패하면(제약 위반 등, 서버가 트랜잭션을 abort 했다고 보장되는 경우) 그
-    백업 파일을 지운다 -- 안 지우면 커밋되지 않은 수리를 가리키는 파일이
-    남아 이후 재시도를 ``FileExistsError``로 영구히 막는다. 다만 실패가
-    연결 유실(``connection_invalidated``)로 인한 것이면 서버가 실제로
-    커밋했는지 알 수 없으므로, 그때는 백업을 지우지 않고 그대로 둔다 --
-    함부로 지우면 실제로는 성공한 수리의 유일한 복구 수단을 잃을 수 있다.
+    반대 방향("백업 게시 + DB 커밋 실패")과 롤백 실패는 ``_settle_failed_repair``가
+    처리한다. 이 함수가 돌려주는 모든 예외는 ``publication_state``("published",
+    "not published", "unconfirmed")와 ``db_outcome``을 단다.
+
+    예외가 이 두 속성 없이 호출자에게 닿는 곳이 세 군데 있다. 트랜잭션 전의
+    ``engine.connect()`` 호출과 ``conn.begin()`` 호출, 그리고 블록 뒤의 연결
+    컨텍스트 종료(``__exit__``)다. 종료 오류는 정상 커밋 뒤에도 나므로 그때 DB는
+    커밋된 상태다. 백업은 이 호출이 게시했을 때만 있다. ``repair()``는
+    ``backup_to``가 있고 처리한 행이 있을 때만 백업을 쓴다. ``--skip-backup``이거나
+    ``--backup-to``가 있어도 대상 행이 없으면 백업은 없다. 그래서 속성이 없는
+    오류에서는 "백업이 게시됐다"고도 "롤백됐다"고도 말할 수 없다. CLI의 ``OSError``
+    절은 속성이 없는 ``OSError``에 "publication state unknown"과 "database outcome
+    unknown"만 출력한다. 다른 형의 예외(예: SQLAlchemy ``OperationalError``)는 그
+    절을 거치지 않으며 이 모듈은 그에 대한 CLI 문구를 약속하지 않는다.
+
+    이 이슈의 원문은 게시 뒤 확인 실패 시 백업 파일이 남지 않기를 요구했다. 소유자
+    결정 D3이 그것을 좁혔다. 확인 실패 시 최종 파일을 보존하고 명시적 상태 오류를
+    낸다.
+
+      - 롤백이 실패하면 그 사실이 원래 오류를 가리지 않는다.
+        ``BackupPublicationStateError``가 주 오류이고 게시 상태와 DB 결과를
+        함께 적는다. 커밋을 시작한 뒤의 롤백 실패는 DB 결과를 "unknown"으로 쓴다.
+      - 백업이 게시되지 않았으면 원래 오류를 그대로 낸다.
+      - 연결 유실(``connection_invalidated``)이면 서버가 실제로 커밋했는지
+        알 수 없으므로 백업을 지우지 않고 보존한다. 지우면 실제로는 성공한
+        수리의 유일한 복구 수단을 잃을 수 있다.
+      - 확정 실패이면 우리 백업임을 inode로 확인한 때만 지운다. 지우지
+        못하거나 다른 파일이면 보존하고 상태 오류를 낸다.
+    백업을 보존한 상태에서는 같은 경로를 자동으로 재시도하지 않고 운영자가
+    확인한다(``write_backup_atomic``의 재시도 계약).
     """
     from sqlalchemy import text
 
-    backup_published = False
+    published_ident: tuple[int, int] | None = None
+    commit_started = False
     with engine.connect() as conn:
         trans = conn.begin()
         try:
@@ -717,17 +956,11 @@ def repair(engine: Any, table: str, backup_to: str | None) -> list[dict[str, Any
                     "schema": schema,
                     "rows": result_rows,
                 }
-                write_backup_atomic(backup_to, snapshot)
-                backup_published = True
+                published_ident = write_backup_atomic(backup_to, snapshot)
+            commit_started = True
             trans.commit()
         except Exception as exc:
-            trans.rollback()
-            if backup_published and not getattr(exc, "connection_invalidated", False):
-                try:
-                    os.unlink(backup_to)
-                except OSError:
-                    pass
-            raise
+            raise _settle_failed_repair(exc, trans, backup_to, published_ident, commit_started) from exc
     return result_rows
 
 
@@ -925,8 +1158,26 @@ def main(argv: list[str] | None = None) -> int:
     except CountMismatchError as exc:
         print(f"! {exc}")
         return EXIT_COUNT_MISMATCH
+    except BackupPublicationStateError as exc:
+        print(f"! {exc}")
+        for note in getattr(exc, "__notes__", []):
+            print(f"! note: {note}")
+        print("! manual investigation is required. The same backup path must not be retried automatically.")
+        return EXIT_BACKUP
     except (OSError, FileExistsError) as exc:
-        print(f"! backup write failed, repair rolled back: {exc}")
+        state = getattr(exc, "publication_state", None)
+        # An error that carries a publication state passed through the repair settle step and may come
+        # from the commit, not from the backup write.
+        print(f"! {'repair failed' if state else 'backup write failed'}: {exc}")
+        for note in getattr(exc, "__notes__", []):
+            print(f"! note: {note}")
+        outcome = getattr(exc, "db_outcome", None)
+        print(f"! publication state: {state or 'publication state unknown'}")
+        print(f"! database outcome: {outcome or 'database outcome unknown'}")
+        if outcome == "rolled back":
+            print("! repair rolled back")
+        if state == "published":
+            print("! the backup is preserved")
         return EXIT_BACKUP
     except SnapshotError as exc:
         print(f"! {exc}")
