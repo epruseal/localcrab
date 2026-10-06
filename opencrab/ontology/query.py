@@ -132,6 +132,7 @@ class _QueryProfile:
     graph_depth: int
     anchor_limit: int
     rerank_limit: int
+    max_expand_anchors: int
 
 @dataclass(frozen=True)
 class ProbeResult:
@@ -165,6 +166,25 @@ class Bm25CacheState:
 
 
 
+# These constants set the vector request size (#53). The profile clamps
+# ``vector_limit`` to the maximum. The request reads the same constant, so the
+# profile clamp and the request clamp share one value. An overfetch (post
+# filter or error fallback) multiplies once and stays bounded. PG and Chroma
+# have no clamp of their own, so these two caps are the only ones.
+_VECTOR_LIMIT_MAX = 80
+_VECTOR_OVERFETCH = 4
+_VECTOR_FETCH_MAX = _VECTOR_LIMIT_MAX * _VECTOR_OVERFETCH
+
+
+def _vector_request_size(limit: int, *, overfetch: bool) -> int:
+    base = min(limit, _VECTOR_LIMIT_MAX)
+    if not overfetch:
+        return base
+    # Because base is at most _VECTOR_LIMIT_MAX, the product stays within
+    # _VECTOR_FETCH_MAX.
+    return max(base * _VECTOR_OVERFETCH, 20)
+
+
 def _contains_any(text: str, cues: tuple[str, ...]) -> bool:
     lowered = text.lower()
     return any(cue in lowered for cue in cues)
@@ -182,12 +202,15 @@ def _profile_for_query(question: str, limit: int, graph_depth: int) -> _QueryPro
 
     multiplier = 8 if relation_intent or multihop_intent else 4
     return _QueryProfile(
-        vector_limit=min(max(limit * multiplier, 24), 80),
+        vector_limit=min(max(limit * multiplier, 24), _VECTOR_LIMIT_MAX),
         bm25_limit=min(max(limit * (multiplier + 2), 40), 180),
         graph_limit=min(max(limit * (multiplier + 2), 50), 220),
         graph_depth=min(depth, 3),
         anchor_limit=12 if relation_intent or multihop_intent else 6,
         rerank_limit=min(max(limit * 4, 20), 80),
+        # The budget follows the final depth, not the question type, because
+        # callers may pass a depth of 2 or more for a plain question (#59).
+        max_expand_anchors=3 if min(depth, 3) > 1 else 5,
     )
 
 
@@ -753,7 +776,7 @@ class HybridQuery:
             graph_results = self._graph_expand(
                 anchor_ids, profile.graph_depth, profile.graph_limit,
                 pack_ids=pack_ids, include_unpackaged=include_unpackaged,
-                spaces=spaces,
+                spaces=spaces, max_anchors=profile.max_expand_anchors,
             )
             if graph_results:
                 result_lists.append([r.to_dict() for r in graph_results])
@@ -1212,10 +1235,7 @@ class HybridQuery:
                 where = _build_chroma_where(spaces=spaces, pack_ids=pack_ids)
                 effective_pack_filter = None
 
-            if use_post_filter:
-                n_results = max(min(limit, 20) * 4, 20)
-            else:
-                n_results = min(limit, 20)
+            n_results = _vector_request_size(limit, overfetch=use_post_filter)
             try:
                 hits = self._chroma.query(
                     query_text=question,
@@ -1229,7 +1249,9 @@ class HybridQuery:
                 fallback_where = _build_chroma_where(spaces=spaces, pack_ids=None)
                 hits = self._chroma.query(
                     query_text=question,
-                    n_results=max(n_results * 4, 20),
+                    # This request starts from the limit, not from n_results,
+                    # because the post filter request is already overfetched (#53).
+                    n_results=_vector_request_size(limit, overfetch=True),
                     where=fallback_where,
                 )
                 effective_pack_filter = list(pack_ids) if pack_ids else None
@@ -1281,12 +1303,15 @@ class HybridQuery:
         pack_ids: list[str],
         include_unpackaged: bool = False,
         spaces: list[str] | None = None,
+        max_anchors: int | None = None,
     ) -> list[QueryResult]:
         """Expand graph neighbourhood from anchor node IDs.
 
-        Uses at most 3 anchors for depth > 1 (multi-hop) to keep result sets
-        manageable. Edge-type weights adjust the baseline score; a per-hop
-        decay of 0.85 reduces scores for deeper neighbours.
+        The method expands at most ``max_anchors`` anchors. The default is 3
+        for depth > 1 (multi-hop) and 5 otherwise, which keeps result sets
+        manageable. The query pipeline passes the profile's budget (#59).
+        Edge-type weights adjust the baseline score. A per-hop decay of 0.85
+        reduces scores for deeper neighbours.
 
         issue #52: this method previously had no ``spaces`` parameter at
         all — the graph leg silently ignored the caller's space filter and
@@ -1304,7 +1329,8 @@ class HybridQuery:
 
         expanded: list[QueryResult] = []
         seen: set[str] = set(anchor_ids)
-        max_anchors = 3 if depth > 1 else 5
+        if max_anchors is None:
+            max_anchors = 3 if depth > 1 else 5
         hop_decay = 0.85 ** (depth - 1)
 
         for anchor_id in anchor_ids[:max_anchors]:
