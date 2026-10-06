@@ -633,7 +633,7 @@ class TestLoadNodesIncremental:
             "잔재 키가 라이브에 남았다 — CAS 갱신이 properties 를 전량 치환하지 않았다")
 
     def test_file_side_store_injected_key_converges_after_first_run(self, live, tmp_path, pack_sql):
-        """**#358 회귀.** `INCREMENTAL_IGNORED_KEYS` 는 라이브 쪽에만 걸려 있다.
+        """**#358 회귀.** `STORED_NODE_IGNORED_KEYS` 는 라이브 쪽에만 걸려 있다.
 
         파일 쪽 원본 행이 중첩 `properties` 에 `space` 를 실어 보내면(레거시
         생산자가 흔히 쓰는 형태), `absorb_legacy_top_level` 의 stray 판정은
@@ -661,7 +661,7 @@ class TestLoadNodesIncremental:
         assert _run() == (1, 0, 0, 0, 0), "1차 런은 new 여야 한다"
         assert _run() == (0, 0, 1, 0, 0), (
             "2차 런이 same 으로 수렴하지 않았다 — 파일 쪽 properties.space 가 "
-            "FILE_SIDE_IGNORED_KEYS 필터에서 빠져 매 런 chg 로 잡힌다(#358)")
+            "FILE_NODE_IGNORED_KEYS 필터에서 빠져 매 런 chg 로 잡힌다(#358)")
 
     def test_stale_live_space_column_is_corrected_even_when_properties_match(
         self, live, tmp_path
@@ -669,7 +669,7 @@ class TestLoadNodesIncremental:
         """**#358 재리뷰 P1-A 회귀.** same 판정은 properties 뿐 아니라 그래프의
         실제 `space_id` 컬럼(`live[1]`)도 목표 space 와 맞는지 봐야 한다.
 
-        `INCREMENTAL_IGNORED_KEYS`/`FILE_SIDE_IGNORED_KEYS` 가 `space` 를 양쪽
+        `STORED_NODE_IGNORED_KEYS`/`FILE_NODE_IGNORED_KEYS` 가 `space` 를 양쪽
         properties 비교에서 뺀다(파일 쪽 레거시 중첩 `properties.space`
         대칭화, #358). 그런데 그 필터를 걸고 나면 properties 만으로는 space
         불일치를 볼 방법이 없어진다. 레거시 중첩-space 이관 행이 그래프의
@@ -709,8 +709,8 @@ class TestLoadNodesIncremental:
 
     def test_nested_space_type_error_is_not_same(self, live, tmp_path, pack_sql):
         """**#379.** 중첩 `properties.space` 가 문자열이 아니면(정수 등) 이 값이
-        `same` 판정으로 넘어가면 안 된다. `INCREMENTAL_IGNORED_KEYS`/
-        `FILE_SIDE_IGNORED_KEYS` 가 `space` 키를 비교에서 빼는 필터라서, 필터가
+        `same` 판정으로 넘어가면 안 된다. `STORED_NODE_IGNORED_KEYS`/
+        `FILE_NODE_IGNORED_KEYS` 가 `space` 키를 비교에서 빼는 필터라서, 필터가
         걸리기 **전에** `prepare_node` 로 값 자체를 검증하지 않으면 이 불량
         값이 비교에서 통째로 사라져 같은 노드로 오인된다. 전체 적재라면
         `prepare_node` 가 즉시 거부하는 값이다.
@@ -766,7 +766,7 @@ class TestLoadNodesIncremental:
     def test_nested_id_mismatch_is_not_same_regardless_of_filter_config(self, live, tmp_path, pack_sql):
         """**#379.** 중첩 `properties.id` 가 노드 id 와 다르면 거부돼야 한다.
 
-        이 검출은 `FILE_SIDE_IGNORED_KEYS`/`INCREMENTAL_IGNORED_KEYS` 가 "id" 를
+        이 검출은 `FILE_NODE_IGNORED_KEYS`/`STORED_NODE_IGNORED_KEYS` 가 "id" 를
         얼마나 넓게 거르는지에 기대지 않는다. `prepare_node` 자신의
         `normalize_node_properties` 가 필터 실행 전에 이 불일치를 거부하므로,
         필터 키 구성을 바꿔도(#379 설계가 닫는 부류) 이 검출은 유지된다.

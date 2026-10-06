@@ -125,7 +125,7 @@ class NodeIncrementalResult(tuple):
 # 파일에 중첩 id 가 전혀 없던 행도 포함해서), 이 주입을 라이브 쪽에서만
 # 빼면 이제는 모든 행이(중첩 id 유무와 무관하게) 파일 쪽에만 이 키가
 # 구조적으로 남아 매번 chg 로 어긋난다. 그래서 이제는 양쪽에서 같이
-# 뺀다(아래 `FILE_SIDE_IGNORED_KEYS`).
+# 뺀다(아래 `FILE_NODE_IGNORED_KEYS`).
 #
 # ── space : Q1=Yes(중첩 properties.space 로, #125, #358), Q2=No ──
 # 라이브 쪽 값은 `graph_identity.normalize_space` 가 항상 덮어써 신뢰할 수
@@ -166,16 +166,17 @@ class NodeIncrementalResult(tuple):
 #
 # 새 키를 추가할 때는 위 두 질문부터 답하고, Q1=Yes 면 space 처럼 양쪽에서
 # 같이 빼라.
-STORE_INJECTED_KEYS = frozenset({"id", "space", "owner_id"})
-INCREMENTAL_IGNORED_KEYS = STORE_INJECTED_KEYS | RETIRED_KEYS
+# 저장된 노드(그래프 행과 문서 행)의 properties 에서 뺄 키. 라이브 쪽 same 판정과
+# 문서 지문이 이 집합을 쓴다.
+STORED_NODE_IGNORED_KEYS = frozenset({"id", "space", "owner_id"}) | RETIRED_KEYS
 
 # 파일 쪽에서만 추가로 빼는 키(#358, #379). Q1=Yes 라서 양쪽 다 빼야 하는
 # space/id 를 담는다. `owner_id` 는 넣지 않는다. `prepare_node` 가 값을
 # 손대지 않아 대칭화가 강제되지 않고, 위 owner_id 주석대로 파일이 owner_id
 # 를 실으면 값과 무관하게 항상 chg 로 재기록돼야 한다(#378). RETIRED_KEYS 는
 # 위 설명대로 파일 쪽에 실릴 경로가 없어 넣어도 동작에 차이가 없지만,
-# `INCREMENTAL_IGNORED_KEYS` 와 대칭인 이름으로 남겨 둔다.
-FILE_SIDE_IGNORED_KEYS = frozenset({"space", "id"}) | RETIRED_KEYS
+# `STORED_NODE_IGNORED_KEYS` 와 구성을 맞추려고 남겨 둔다.
+FILE_NODE_IGNORED_KEYS = frozenset({"space", "id"}) | RETIRED_KEYS
 
 
 # ── 방언 중립 SQL 빌더(r11 P1, #142 재리뷰) ─────────────────────────────
@@ -2021,14 +2022,14 @@ def _canon_json(value) -> str:
 def _doc_content_fingerprint(node_type: str, props: dict) -> tuple[str, bytes]:
     """문서 행(`doc_nodes`)의 비교 대상 둘을 `(node_type, properties 지문)` 으로 접는다.
 
-    properties 지문은 `INCREMENTAL_IGNORED_KEYS` 를 뺀 정규 JSON 의 sha256 이다.
+    properties 지문은 `STORED_NODE_IGNORED_KEYS` 를 뺀 정규 JSON 의 sha256 이다.
     빼는 키는 그래프 쪽 same 판정과 같다(`id` 와 `space` 는 저장소 주입, `owner_id` 는
     #378 소관, 폐기 별칭). 문서 행은 `add_node` 가 스탬프한 properties 를 그대로
     저장하고 그래프 행은 거기에 `id`/`space` 만 더한다. 그래서 같은 필터를 양쪽에
     쓰면 정상 적재는 같은 지문을 낸다. 지문만 남기는 이유는 행마다 properties
     사본을 쥐지 않으려는 것이다.
     """
-    kept = {k: v for k, v in props.items() if k not in INCREMENTAL_IGNORED_KEYS}
+    kept = {k: v for k, v in props.items() if k not in STORED_NODE_IGNORED_KEYS}
     return node_type, hashlib.sha256(_canon_json(kept).encode("utf-8")).digest()
 
 
@@ -2356,7 +2357,7 @@ def load_nodes_incremental(
                 # 동일성은 아래 딕셔너리 비교가 아니라
                 # `live[0]==cmp_node_type`/`live[1]==cmp_space` 로 이미
                 # 따로 검사하므로, 딕셔너리 비교에서는 기존
-                # `FILE_SIDE_IGNORED_KEYS`/`INCREMENTAL_IGNORED_KEYS` 로
+                # `FILE_NODE_IGNORED_KEYS`/`STORED_NODE_IGNORED_KEYS` 로
                 # 뺀다(안 빼면 `live[2]` 가 이 두 키를 구조적으로 안 담는
                 # 라이브 스냅샷과 매번 chg 로 어긋난다,
                 # test_identical_row_is_skipped_without_touching_any_store /
@@ -2371,9 +2372,9 @@ def load_nodes_incremental(
                 # 없고, 기존 설계(위 상수 주석, #358)가 정한 대로 라이브
                 # 쪽에서만 빠진다(#378 관찰 유지).
                 file_cmp = {k: v for k, v in cmp_props.items()
-                            if k not in FILE_SIDE_IGNORED_KEYS}
+                            if k not in FILE_NODE_IGNORED_KEYS}
                 live_cmp = {k: v for k, v in live[2].items()
-                            if k not in INCREMENTAL_IGNORED_KEYS}
+                            if k not in STORED_NODE_IGNORED_KEYS}
                 # 싱크 완전성 표(#358 재리뷰, 리드 요청). `add_node`
                 # (opencrab/ontology/builder.py) 가 쓰는 영속 저장소 5개가
                 # 이 same 판정 뒤에도 어긋날 수 있는지, 어긋나면 어느 조건이
