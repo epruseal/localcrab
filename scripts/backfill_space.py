@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Backfill a valid ``space`` into existing vector and doc_sources records (#110 part A).
 
-Spaces-filtered queries drop every record whose metadata has no valid space.
-Part B made the pack chunk loaders keep a valid space for new writes; this
+A vector or doc_sources record without a valid space is a backfill candidate.
+A spaces-filtered reader treats malformed values differently per backend, so this tool does not claim one common read rule.
+Part B made the pack chunk loaders keep a valid space for new writes. This
 tool repairs the records that were stored earlier. Only STORAGE_MODE=local
 with a sqlite-vec vector file, ``doc_store.db`` and ``graph.db`` is covered.
 
@@ -13,17 +14,15 @@ Terms
                    wrote it as the ``str()`` of a list or dict.
   valid space      any other non-empty string. The tool never overwrites it,
                    even when it differs from the graph space (reported only).
+  graph space      a valid, not container-like ``properties.space``, else a
+                   valid ``space_id`` column. Duplicate graph rows of one
+                   ``node_id`` must agree on (space, pack_id) or the id is held.
 
 The container rule is a deliberate narrowing. The read side accepts a
 container-like string as a space name, but it never equals a real space name.
 The tool replaces it so a spaces filter can find the record by a real space.
-A missing or null space never matches a spaces filter. The filters differ for
-the other invalid values, so this tool does not claim one common read rule.
-The report counts valid spaces that are not in the grammar (space_not_in_grammar).
-The tool keeps them.
-  graph space      a valid, not container-like ``properties.space``, else a
-                   valid ``space_id`` column. Duplicate graph rows of one
-                   ``node_id`` must agree on (space, pack_id) or the id is held.
+A missing or null space never matches a spaces filter. The report counts valid
+spaces that are not in the grammar (space_not_in_grammar). The tool keeps them.
 
 Decision for a record without a valid space (one pure function, used by the
 dry run, the plan, the per-batch re-read and the reconcile):
@@ -59,9 +58,9 @@ Apply sequence:
   1. Take ``write.lock`` for the whole run.
   2. Take a backup set with ``backup_data_dir``.
   3. Plan.
-  4. Write per batch. Each batch is one transaction per store. Rows are re-read
-     inside the transaction. The tool writes a row only when the same decision
-     still holds. ``UPDATE`` touches metadata only, never text, embedding or the FTS
+  4. Write per batch. Each batch is one transaction per store. The tool
+     re-reads the rows inside the transaction. It writes a row only when the
+     same decision still holds. ``UPDATE`` touches metadata only, never text, embedding or the FTS
      index.
   5. Reconcile.
 ``--max-batches N`` stops early. A rerun continues because written rows no
@@ -124,7 +123,7 @@ def value_kind(v: Any) -> tuple[str | None, str]:
 
 
 def parse_meta(text: Any) -> dict[str, Any] | None:
-    """Metadata dict. SQL NULL and empty text read as {}. Any other non-object gives None."""
+    """Return the metadata dict. SQL NULL and empty text read as {}. Any other non-object gives None."""
     if text is None or text == "":
         return {}
     return parse_strict_object(text)
@@ -373,8 +372,8 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
 
 def dry_run_snapshot(paths: Paths) -> tuple[dict[str, bytes], dict[str, list[tuple[Any, ...]]]]:
     """Return main-file bytes and all logical rows a dry run must preserve."""
-    files = {name: (paths.data_dir / name).read_bytes()
-             for name in ("graph.db", "doc_store.db", paths.vector.name)}
+    files = {"graph": paths.graph.read_bytes(), "doc": paths.doc.read_bytes(),
+             "vector": paths.vector.read_bytes()}
     gconn = _open(paths.graph, "ro", False)
     dconn = _open(paths.doc, "ro", False)
     vconn = _open(paths.vector, "ro", True)
@@ -443,8 +442,10 @@ def _write_batches(
     allow_pack_missing: bool,
     before_commit: Any,
 ) -> dict[str, Any]:
-    stats = {"committed": {"doc": [], "vector": []}, "skipped_changed": 0,
-             "skipped_nomatch": 0, "skipped_unserializable": {"doc": [], "vector": []},
+    stats = {"committed": {"doc": [], "vector": []},
+             "skipped_changed": {"doc": [], "vector": []},
+             "skipped_nomatch": {"doc": [], "vector": []},
+             "skipped_unserializable": {"doc": [], "vector": []},
              "batches": 0, "remaining": {"doc": 0, "vector": 0}}
     dconn = _open(paths.doc, "rw", False)
     vconn = _open(paths.vector, "rw", True)
@@ -463,8 +464,11 @@ def _write_batches(
                     if before_commit is not None:
                         before_commit(store, stats["batches"])
                     conn.execute("COMMIT")
-                except BaseException:
-                    conn.execute("ROLLBACK")
+                except BaseException as exc:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception as rb:
+                        exc.rollback_error = f"{type(rb).__name__}: {rb}"
                     raise
                 stats["batches"] += 1
                 stats["committed"][store].extend(done)
@@ -490,12 +494,12 @@ def _write_one_batch(conn, store, batch, paths, res, allow_pack_missing, stats):
     for rid, part, space, cls in batch:
         row = current.get(rid)
         if row is None:
-            stats["skipped_changed"] += 1
+            stats["skipped_changed"][store].append(rid)
             continue
         meta = parse_meta(row[2])
         now = decide(store, rid, meta, row[1], res["graph"], res["docs"], allow_pack_missing)
         if now != (cls, space) or row[1] != part:
-            stats["skipped_changed"] += 1
+            stats["skipped_changed"][store].append(rid)
             continue
         try:
             text = _new_meta_text(meta, space)
@@ -513,7 +517,7 @@ def _write_one_batch(conn, store, batch, paths, res, allow_pack_missing, stats):
                 f"UPDATE {paths.collection} SET metadata = ? WHERE node_id = ? AND pack_id = ?",  # noqa: S608
                 (text, rid, part))
         if cur.rowcount != 1:
-            stats["skipped_nomatch"] += 1
+            stats["skipped_nomatch"][store].append(rid)
             continue
         done.append((rid, space))
     return done
@@ -551,6 +555,33 @@ def reconcile(paths: Paths, before: dict[str, Any], stats: dict[str, Any],
     return {"ok": not problems, "problems": problems}
 
 
+def _failure_report(paths: Paths, args: argparse.Namespace, exc: BaseException) -> dict[str, Any]:
+    """Describe a failed write phase from a read-only rescan, never from memory counters."""
+    out: dict[str, Any] = {
+        "error": f"{type(exc).__name__}: {exc}",
+        "error_type": type(exc).__name__,
+        "error_text": str(exc),
+        "commit_state_unknown": True,
+        "note": "The failure may have happened before or after the COMMIT of the open batch. "
+                "The rescan below shows the database state under the same lock.",
+    }
+    if getattr(exc, "rollback_error", None):
+        out["rollback_error"] = exc.rollback_error
+    try:
+        res = scan(paths, args.allow_pack_missing, mode="ro")
+        out["rescan"] = {
+            "total": res["total"],
+            **{store: {
+                "valid_space": res["classes"][store].get("skip_valid", 0),
+                "no_valid_space": no_valid(res, store),
+                "classes": {c: n for c, n in res["classes"][store].items() if c != "skip_valid"},
+            } for store in ("doc", "vector")},
+        }
+    except Exception as rescan_exc:
+        out["rescan_error"] = f"{type(rescan_exc).__name__}: {rescan_exc}"
+    return out
+
+
 def run_apply(paths: Paths, args: argparse.Namespace, before_commit: Any = None) -> tuple[int, dict[str, Any]]:
     from opencrab.locking import write_lock
     from opencrab.stores.backup import backup_data_dir
@@ -568,19 +599,26 @@ def run_apply(paths: Paths, args: argparse.Namespace, before_commit: Any = None)
             stats = _write_batches(
                 paths, before["plan"], before, args.batch_size, args.max_batches,
                 args.allow_pack_missing, before_commit)
-        except Exception as exc:
-            out["error"] = f"write failed, batch rolled back: {type(exc).__name__}: {exc}"
-            return 1, out
+        except BaseException as exc:
+            failure = _failure_report(paths, args, exc)
+            out.pop("before", None)
+            out.update(failure)
+            if isinstance(exc, Exception):
+                return 1, out
+            exc.backfill_report = out
+            raise
         out["write"] = {
             "batches": stats["batches"],
             "committed": {k: len(v) for k, v in stats["committed"].items()},
-            "skipped_changed": stats["skipped_changed"],
-            "skipped_nomatch": stats["skipped_nomatch"],
+            "skipped_changed": sum(len(v) for v in stats["skipped_changed"].values()),
+            "skipped_nomatch": sum(len(v) for v in stats["skipped_nomatch"].values()),
             "skipped_unserializable": {k: len(v) for k, v in stats["skipped_unserializable"].items()},
             "remaining": stats["remaining"],
         }
         if args.list_ids:
-            out["skipped_unserializable_ids"] = stats["skipped_unserializable"]
+            for kind in ("changed", "nomatch", "unserializable"):
+                out[f"skipped_{kind}_ids"] = {
+                    k: v[:LIST_CAP] for k, v in stats[f"skipped_{kind}"].items()}
         rec = reconcile(paths, before, stats, args.allow_pack_missing)
         out["reconcile"] = rec
         clean = rec["ok"] and not any(stats["skipped_unserializable"].values())
@@ -642,7 +680,13 @@ def main(argv: list[str] | None = None, before_commit: Any = None) -> int:
             return 1
         print(json.dumps({"mode": "dry-run", **report_of(res, args.list_ids)}, ensure_ascii=False, indent=2))
         return 0
-    code, out = run_apply(paths, args, before_commit)
+    try:
+        code, out = run_apply(paths, args, before_commit)
+    except BaseException as exc:
+        report = getattr(exc, "backfill_report", None)
+        if report is not None:
+            print(json.dumps({"mode": "apply", "exit": 1, **report}, ensure_ascii=False, indent=2))
+        raise
     print(json.dumps({"mode": "apply", "exit": code, **out}, ensure_ascii=False, indent=2))
     return code
 

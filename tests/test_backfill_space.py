@@ -31,14 +31,16 @@ _EMB = struct.pack("32f", *([0.1] * 32))
 class World:
     """A local data directory with graph.db, doc_store.db and vectors.db."""
 
-    def __init__(self, root: Path, legacy_graph: bool = False) -> None:
+    def __init__(self, root: Path, legacy_graph: bool = False, vector_path: Path | None = None) -> None:
         self.root = root
+        self.vpath = vector_path or root / "vectors.db"
+        self.vpath.parent.mkdir(parents=True, exist_ok=True)
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
         from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
         self.docs = LocalSQLDocStore(str(root / "doc_store.db"))
         self.vec = SqliteVecStore(
-            db_path=str(root / "vectors.db"), embedding_function=MockEF(32), dim=32,
+            db_path=str(self.vpath), embedding_function=MockEF(32), dim=32,
             collection_name=COLL)
         g = sqlite3.connect(root / "graph.db")
         pk = "PRIMARY KEY (node_type, node_id)" if legacy_graph else "PRIMARY KEY (node_id)"
@@ -68,7 +70,7 @@ class World:
         """Insert one vector row; metadata is written as the exact JSON given."""
         if partition == "__same__":
             partition = meta.get("pack_id", PACK) if isinstance(meta, dict) else PACK
-        conn = bf._open(self.root / "vectors.db", "rw", True)
+        conn = bf._open(self.vpath, "rw", True)
         text = meta if isinstance(meta, str) or meta is None else json.dumps(meta, ensure_ascii=False)
         conn.execute(
             f"INSERT INTO {COLL}(node_id, pack_id, embedding, document, metadata) VALUES (?,?,?,?,?)",
@@ -80,7 +82,7 @@ class World:
         d = sqlite3.connect(self.root / "doc_store.db")
         out["doc"] = dict(d.execute("SELECT source_id, metadata FROM doc_sources"))
         d.close()
-        v = bf._open(self.root / "vectors.db", "ro", True)
+        v = bf._open(self.vpath, "ro", True)
         out["vec"] = {r[0]: (r[1], r[2], r[3], r[4]) for r in v.execute(
             f"SELECT node_id, pack_id, metadata, document, embedding FROM {COLL}")}
         v.close()
@@ -864,3 +866,202 @@ def test_dry_run_compares_full_doc_content_and_file_bytes(world, capsys, monkeyp
     assert code == 1
     assert sqlite3.connect(world.root / "doc_store.db").execute(
         "SELECT text FROM doc_sources WHERE source_id='n'").fetchone()[0] == "changed"
+
+
+# ---------------------------------------------------------------------------
+# vector file location, failure report, docstring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["nested", "absolute"])
+def test_dry_run_snapshots_the_configured_vector_file(tmp_path, monkeypatch, capsys, kind):
+    root = tmp_path / "data"
+    root.mkdir()
+    vpath = root / "nested" / "v.sqlite" if kind == "nested" else tmp_path / "elsewhere" / "v.sqlite"
+    value = "nested/v.sqlite" if kind == "nested" else str(vpath)
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(root))
+    monkeypatch.setenv("STORAGE_MODE", "local")
+    monkeypatch.setenv("VECTOR_DB_FILE", value)
+    monkeypatch.delenv("VECTOR_BACKEND", raising=False)
+    from opencrab.config import get_settings
+
+    get_settings.cache_clear()
+    w = World(root, vector_path=vpath)
+    w.graph("n", "concept", {"pack_id": PACK})
+    w.vector("n", {"pack_id": PACK})
+    code, rep = _run(capsys)
+    assert code == 0, rep
+    assert rep["vector"]["classes"]["apply_graph"] == 1
+    # the snapshot reads the configured file: a write to it during the scan is detected
+    original = bf.scan
+
+    def corrupt(paths, allow, mode="ro"):
+        result = original(paths, allow, mode)
+        conn = bf._open(vpath, "rw", True)
+        conn.execute(f"UPDATE {COLL} SET document='changed' WHERE node_id='n'")
+        conn.close()
+        return result
+
+    monkeypatch.setattr(bf, "scan", corrupt)
+    assert bf.main([]) == 1
+    capsys.readouterr()
+    get_settings.cache_clear()
+
+
+def _db_counts(world):
+    d = world.dump()
+    return {
+        "doc": (sum(1 for m in d["doc"].values() if json.loads(m).get("space")),
+                sum(1 for m in d["doc"].values() if not json.loads(m).get("space"))),
+        "vector": (sum(1 for v in d["vec"].values() if json.loads(v[1]).get("space")),
+                   sum(1 for v in d["vec"].values() if not json.loads(v[1]).get("space"))),
+    }
+
+
+def _failure_world(world, n=6):
+    _many(world, n)
+
+
+def _run_failing(capsys, world, tmp_path, exc_type):
+    def hook(store, idx):
+        if store == "doc" and idx == 1:
+            raise exc_type("injected")
+
+    dest = tmp_path / "bk"
+    dest.mkdir(parents=True, exist_ok=True)
+    args = ["--apply", "--backup-to", str(dest), "--batch-size", "2"]
+    try:
+        code = bf.main(args, before_commit=hook)
+        raised = None
+    except BaseException as exc:  # noqa: BLE001 - the test inspects the interrupt
+        code, raised = None, exc
+    out = capsys.readouterr().out
+    return code, raised, json.loads(out)
+
+
+@pytest.mark.parametrize("exc_type", [RuntimeError, KeyboardInterrupt])
+def test_failure_report_comes_from_a_rescan_and_rerun_finishes(world, tmp_path, capsys, exc_type):
+    _failure_world(world)
+    code, raised, rep = _run_failing(capsys, world, tmp_path, exc_type)
+    if exc_type is KeyboardInterrupt:
+        assert isinstance(raised, KeyboardInterrupt) and code is None
+    else:
+        assert code == 1 and raised is None
+    assert rep["error_type"] == exc_type.__name__ and rep["commit_state_unknown"] is True
+    counts = _db_counts(world)
+    assert (rep["rescan"]["doc"]["valid_space"], rep["rescan"]["doc"]["no_valid_space"]) == counts["doc"]
+    assert (rep["rescan"]["vector"]["valid_space"], rep["rescan"]["vector"]["no_valid_space"]) == counts["vector"]
+    for key in ("write", "reconcile", "committed", "remaining", "batches"):
+        assert key not in rep
+    assert counts["doc"][0] == 2                      # the first batch stayed committed
+    code, rep2 = _apply(capsys, world, tmp_path, "--batch-size", "2")
+    assert code == 0 and rep2["reconcile"]["ok"]
+    assert _db_counts(world) == {"doc": (6, 0), "vector": (6, 0)}
+
+
+def test_failure_report_records_a_rescan_failure(world, tmp_path, capsys, monkeypatch):
+    _failure_world(world)
+    original = bf.scan
+    calls = {"n": 0}
+
+    def flaky(paths, allow, mode="ro"):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise OSError("rescan broke")
+        return original(paths, allow, mode)
+
+    monkeypatch.setattr(bf, "scan", flaky)
+    code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
+    assert code == 1 and rep["error_type"] == "RuntimeError"
+    assert "rescan" not in rep and "OSError" in rep["rescan_error"]
+
+
+def test_failure_after_commit_is_not_reported_as_rolled_back(world, tmp_path, capsys, monkeypatch):
+    _failure_world(world)
+    real_open = bf._open
+
+    class Wrapped:
+        def __init__(self, conn):
+            self._c = conn
+            self.commits = 0
+
+        def execute(self, sql, *a):
+            cur = self._c.execute(sql, *a)
+            if sql == "COMMIT":
+                self.commits += 1
+                if self.commits == 2:
+                    raise RuntimeError("interrupted right after COMMIT")
+            return cur
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    def opener(path, mode, vec):
+        conn = real_open(path, mode, vec)
+        return Wrapped(conn) if mode == "rw" and path.name == "doc_store.db" else conn
+
+    monkeypatch.setattr(bf, "_open", opener)
+    dest = tmp_path / "bk"
+    dest.mkdir()
+    code = bf.main(["--apply", "--backup-to", str(dest), "--batch-size", "2"])
+    rep = json.loads(capsys.readouterr().out)
+    assert code == 1 and "rolled back" not in json.dumps(rep)
+    counts = _db_counts(world)
+    assert counts["doc"][0] == 4                      # two batches are durable
+    assert (rep["rescan"]["doc"]["valid_space"], rep["rescan"]["doc"]["no_valid_space"]) == counts["doc"]
+
+
+def test_skipped_ids_are_listed_for_every_kind(world, tmp_path, capsys):
+    _many(world, 2)
+    orig = bf._write_one_batch
+
+    def wrapped(conn, store, batch, paths, res, allow, stats):
+        if store == "doc":
+            conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n0'", ('{"pack_id":"pk","space":"claim"}',))
+        return orig(conn, store, batch, paths, res, allow, stats)
+
+    bf._write_one_batch = wrapped
+    try:
+        code, rep = _apply(capsys, world, tmp_path, "--list-ids")
+    finally:
+        bf._write_one_batch = orig
+    assert rep["skipped_changed_ids"]["doc"] == ["n0"]
+    assert rep["skipped_nomatch_ids"] == {"doc": [], "vector": []}
+    assert rep["skipped_unserializable_ids"] == {"doc": [], "vector": []}
+
+
+def test_docstring_states_no_common_read_rule():
+    doc = bf.__doc__
+    first = "A vector or doc_sources record without a valid space is a backfill candidate."
+    second = ("A spaces-filtered reader treats malformed values differently per backend, "
+              "so this tool does not claim one common read rule.")
+    assert first in doc and second in doc and doc.index(first) < doc.index(second)
+    assert "Spaces-filtered queries drop every record whose metadata has no valid space." not in doc
+    assert "drop every record" not in doc
+
+
+def test_failed_rollback_does_not_hide_the_original_error(world, tmp_path, capsys, monkeypatch):
+    _failure_world(world)
+    real_open = bf._open
+
+    class Wrapped:
+        def __init__(self, conn):
+            self._c = conn
+
+        def execute(self, sql, *a):
+            if sql == "ROLLBACK":
+                raise OSError("rollback broke")
+            return self._c.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    def opener(path, mode, vec):
+        conn = real_open(path, mode, vec)
+        return Wrapped(conn) if mode == "rw" and path.name == "doc_store.db" else conn
+
+    monkeypatch.setattr(bf, "_open", opener)
+    code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
+    assert code == 1
+    assert rep["error_type"] == "RuntimeError" and "injected" in rep["error_text"]
+    assert "rollback broke" in rep["rollback_error"]
