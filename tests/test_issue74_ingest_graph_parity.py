@@ -1853,7 +1853,8 @@ def test_468_text_over_existing_logentry_is_stored_under_a_derived_id(stack, cap
 
     with caplog.at_level("ERROR"):
         result = _ingest468(
-            stack, text="zebrafish 대화 원문", source_id="codex/s/468-a", text_as_node=True,
+            stack, text="zebrafish 대화 원문", source_id="codex/s/468-a",
+        metadata={"title": "대화 제목", "source": "pack_ingest"}, text_as_node=True,
         )
 
     assert result["status"] == "ok", result
@@ -1871,6 +1872,7 @@ def test_468_text_over_existing_logentry_is_stored_under_a_derived_id(stack, cap
     node = stack["graph"].get_node("TextUnit", derived)
     assert node["text"] == "zebrafish 대화 원문"
     assert node["source_id"] == "codex/s/468-a"
+    assert node["title"] == "대화 제목" and node["source"] == "pack_ingest"
     assert node["pack_id"] == "pack-a" and node["owner_id"] == ALICE.user_id
     # The text is searchable by both legs under the derived id.
     bm25, vec = _legs(stack, "zebrafish")
@@ -1966,7 +1968,10 @@ def test_468_derived_id_owned_by_another_pack_is_rejected(stack):
                principal=BOB, text="남의 것")
     foreign = stack["graph"].get_node("TextUnit", "codex/s/468-x" + _DERIVED)
     result = _ingest468(stack, text="본문", source_id="codex/s/468-x")
+    expected = "codex/s/468-x: identity is already attributed to a different pack"
     assert result["status"] == "partial" and result["text_ingested"] is False, result
+    assert result["node_errors"] == [expected], result
+    assert result["stores"]["evidence_node"] == expected, result
     assert result["evidence_node"] is None, result
     assert stack["graph"].get_node("TextUnit", "codex/s/468-x" + _DERIVED) == foreign
 
@@ -2034,7 +2039,7 @@ def test_468_exception_in_the_derivation_stage_is_an_item_error(stack, exc):
         return real_add_node(*args, **kw)
 
     with patch.object(builder, "add_node", side_effect=add_node):
-        result = _ingest468(
+        result, billing = _ingest_with_billing(
             stack, text="본문", source_id="codex/s/468-e",
             nodes=[{"space": "concept", "node_type": "Topic", "node_id": "t-468-e",
                     "properties": {}}],
@@ -2049,6 +2054,7 @@ def test_468_exception_in_the_derivation_stage_is_an_item_error(stack, exc):
         assert "registry down" not in result["node_errors"][0]
     # The node of the same request that came first stays written.
     assert stack["graph"].get_node("Topic", "t-468-e") is not None
+    assert billing.on_ingest.call_count == 1
     assert stack["graph"].get_node("TextUnit", "codex/s/468-e" + _DERIVED) is None
 
 
@@ -2103,6 +2109,17 @@ def test_468_derived_id_stays_inside_the_node_id_column_after_two_forks():
     assert derived is not None and len(derived) == NODE_ID_COLUMN_LIMIT
 
 
+def test_468_accepts_the_exact_base_budget(stack):
+    from opencrab.pack.fork_remap import SOURCE_NODE_ID_BUDGET, TEXT_ID_SUFFIX
+
+    source_id = "B" * (SOURCE_NODE_ID_BUDGET - len(TEXT_ID_SUFFIX))
+    _seed_logentry(stack, source_id)
+    result = _ingest468(stack, text="본문", source_id=source_id)
+    assert result["status"] == "ok", result
+    assert result["evidence_node"] == source_id + TEXT_ID_SUFFIX, result
+    assert len(result["evidence_node"]) == SOURCE_NODE_ID_BUDGET
+
+
 def test_468_billing_follows_the_graph_write_of_the_derived_node(stack):
     from unittest.mock import MagicMock
 
@@ -2126,7 +2143,7 @@ def test_468_billing_follows_the_graph_write_of_the_derived_node(stack):
 def test_468_derived_text_survives_a_fork_and_a_retry_on_the_fork_target(stack):
     _seed_logentry(stack, "codex/s/468-k")
     # Same metadata the real pack_ingest tool passes.
-    meta = {"title": "", "source": "pack_ingest"}
+    meta = {"title": "포크 제목", "source": "pack_ingest"}
     _ingest468(stack, text="포크 본문", source_id="codex/s/468-k", metadata=meta)
 
     forked = _fork(stack, principal=ALICE, src_pack_id="pack-a")
@@ -2141,6 +2158,7 @@ def test_468_derived_text_survives_a_fork_and_a_retry_on_the_fork_target(stack):
     assert text_copy == derive_text_id(log_copy), ids
     before = stack["graph"].get_node("TextUnit", text_copy)
     assert before["source_id"] == log_copy
+    assert before["title"] == "포크 제목" and before["source"] == "pack_ingest"
 
     from opencrab.mcp.tools import _ingest_into_pack
 
