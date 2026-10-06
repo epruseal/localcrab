@@ -1853,8 +1853,11 @@ def test_468_text_over_existing_logentry_is_stored_under_a_derived_id(stack, cap
 
     with caplog.at_level("ERROR"):
         result = _ingest468(
-            stack, text="zebrafish 대화 원문", source_id="codex/s/468-a",
-        metadata={"title": "대화 제목", "source": "pack_ingest"}, text_as_node=True,
+            stack,
+            text="zebrafish 대화 원문",
+            source_id="codex/s/468-a",
+            metadata={"title": "대화 제목", "source": "pack_ingest"},
+            text_as_node=True,
         )
 
     assert result["status"] == "ok", result
