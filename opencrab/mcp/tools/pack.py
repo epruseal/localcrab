@@ -518,7 +518,7 @@ def _ingest_into_pack(
                     if store_write_succeeded(evidence_stores or {}, "graph"):
                         billable_write = True
             except NodeIdentityConflict:
-                # #468: same rejection as the nodes loop. The marker is fixed.
+                # #468: this is the same rejection the nodes loop handles. The marker is fixed.
                 # store_write_failures() does not read it as a failure because
                 # it has no "error:" or "no match" prefix. The caller's id
                 # spelling cannot change that.
@@ -1510,7 +1510,7 @@ def pack_create(
         "description": (
             "Add content into an EXISTING localcrab ontology pack. "
             "Caller supplies pre-extracted nodes/edges and/or raw text; the server does NOT call any LLM. "
-            "Fails if the pack does not exist; use pack_create first. "
+            "The call fails if the pack does not exist. Use pack_create first. "
             "The tool lists a node or text whose id already names a different node in node_errors. "
             "It does not write that item. It still processes the rest of the request.\n\n"
             + _NINE_SPACE_HINT
