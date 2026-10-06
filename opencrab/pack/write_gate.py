@@ -482,6 +482,13 @@ def source_identity_conflict(
     ])
 
 
+def node_conflict_message(ident: str) -> str:
+    """Report one item the graph rejected because its id already names a
+    different node (#468). Fixed wording: it describes only the rejected
+    item, predicts nothing about a retry, and carries no store detail."""
+    return f"{ident}: node id already names a different node; this item was not written"
+
+
 def identity_reject_message(kind: str, ident: str, reason: str) -> str:
     """Fixed wording -- #143 invariant 7 means this must NEVER name the other
     pack's id, owner, title, or visibility."""
