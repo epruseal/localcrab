@@ -24,6 +24,7 @@ from opencrab.pack.schema import (
     SPACE_DEFAULT_TYPE,
     absorb_legacy_top_level,
 )
+from opencrab.stores._graph_common import _valid_space
 
 # grammar에서 허용 node_type 집합 동적 생성 (하드코딩 없이 manifest 기준)
 _GRAMMAR_NODE_TYPES: frozenset[str] = frozenset(
@@ -399,4 +400,34 @@ def transform_chunk_meta(pack_name: str, row: dict) -> dict:
     meta["source"]  = pack_name
     if row.get("document_id"):
         meta["document_id"] = row["document_id"]
+    return meta
+
+
+# 청크가 소속 space 를 못 얻을 때의 기본값(#110). 청크는 evidence 공간의 레코드다.
+CHUNK_DEFAULT_SPACE = "evidence"
+
+
+def raw_chunk_space(row: dict) -> str | None:
+    """원본 청크 행 metadata 의 space 가 유효하면 그 문자열, 아니면 None.
+
+    `chroma_safe_meta` 가 list/dict 를 `"[]"`/`"{}"` 문자열로 바꾸기 **전**의 원본을
+    본다 — 변환 뒤에 판정하면 무효 값이 유효한 문자열로 둔갑해 라이브 값을 덮는다.
+    유효 판정은 읽기 쪽(`_space_passes`)과 같은 `_valid_space` 다.
+    """
+    md = row.get("metadata")
+    return _valid_space(md.get("space")) if isinstance(md, dict) else None
+
+
+def resolve_chunk_space(row: dict, live_meta: dict | None = None) -> str:
+    """청크 space 결정: 유효한 원본 값, 없으면 유효한 라이브 값, 없으면 evidence."""
+    raw = raw_chunk_space(row)
+    if raw is not None:
+        return raw
+    live = _valid_space(live_meta.get("space")) if isinstance(live_meta, dict) else None
+    return live if live is not None else CHUNK_DEFAULT_SPACE
+
+
+def with_chunk_space(meta: dict, space: str) -> dict:
+    """`transform_chunk_meta` 결과에 결정된 space 를 정확히 하나 넣는다."""
+    meta["space"] = space
     return meta

@@ -69,9 +69,11 @@ from opencrab.pack import delete_journal
 from opencrab.pack.jsonl_io import iter_jsonl
 from opencrab.pack.live_data import require_live_data
 from opencrab.pack.normalize import (
+    resolve_chunk_space,
     resolve_edge,
     transform_chunk_meta,
     transform_node,
+    with_chunk_space,
 )
 from opencrab.pack.write_gate import authorize, authorize_delete
 from opencrab.stores._sql_dialect import SQLITE, SqlDialect, json_valid_expr
@@ -2900,7 +2902,9 @@ def load_chunks(
                 log.debug("청크 중복 ID skip: %s", chunk_id)
                 continue
             seen_ids.add(chunk_id)
-            meta: dict = transform_chunk_meta(pack_name, row)
+            # #110: 재적재가 space 를 지우지 않게 결정해 넣는다(신규 적재라 라이브 값 없음).
+            meta: dict = with_chunk_space(
+                transform_chunk_meta(pack_name, row), resolve_chunk_space(row))
             b_texts.append(row["text"])
             b_ids.append(chunk_id)
             b_metas.append(meta)
@@ -3045,8 +3049,12 @@ def load_chunks_incremental(
             seen_ids.add(chunk_id)
             bypack_ids.add(chunk_id)  # 중복 제외 후
 
-            meta = transform_chunk_meta(pack_name, row)
             live = live_chunks.get(chunk_id)
+            # #110: 라이브 조회 직후, 분기 선택 앞에서 space 를 한 번 결정한다. 비교와
+            # 모든 쓰기 큐가 같은 meta 를 쓴다(원본 유효값 > 라이브 유효값 > evidence).
+            meta = with_chunk_space(
+                transform_chunk_meta(pack_name, row),
+                resolve_chunk_space(row, live[1] if live is not None else None))
 
             if live is None:
                 b_ids.append(chunk_id)
