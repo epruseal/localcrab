@@ -47,12 +47,14 @@ dry run, the plan, the per-batch re-read and the reconcile):
       other vectors                          hold_orphan
 
 Usage
-  backfill_space.py                                  dry run (default)
+  backfill_space.py --dry-run-scratch DIR            dry run (default)
   backfill_space.py --apply --backup-to DIR          write
 
-The dry run changes no database content and takes no lock. SQLite may create or
-refresh the ``-wal`` and ``-shm`` sidecars of a WAL database even when it is
-opened ``mode=ro``.
+The dry run changes no database content and takes no lock. Its scratch root
+must already exist and must not be ``/tmp``. Each run creates one UUID child
+there. Success removes that child and keeps the root. A failure keeps the child
+for inspection. SQLite may create or refresh the ``-wal`` and ``-shm`` sidecars
+of a WAL database even when it is opened ``mode=ro``.
 
 Apply sequence:
   1. Take ``write.lock`` for the whole run.
@@ -93,13 +95,17 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
+from opencrab.common.hashing import file_sha256
 from opencrab.grammar.manifest import SPACES as _GRAMMAR
 
 GRAMMAR_SPACES = frozenset(_GRAMMAR)
@@ -177,7 +183,8 @@ def build_graph_map(gconn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]
     seen: dict[str, tuple[Any, ...]] = {}
     out: dict[str, dict[str, Any]] = {}
     for node_id, space_id, props_text in gconn.execute(
-            "SELECT node_id, space_id, properties FROM graph_nodes"):
+        "SELECT node_id, space_id, properties FROM graph_nodes"
+    ):
         props = parse_graph_properties(props_text)
         if props is None:
             entry = {"props_bad": True, "space": None, "pack": None}
@@ -210,7 +217,9 @@ def build_graph_map(gconn: sqlite3.Connection) -> tuple[dict[str, dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def _mapped_decision(g: dict[str, Any], pack: str, allow_pack_missing: bool) -> tuple[str, str | None]:
+def _mapped_decision(
+    g: dict[str, Any], pack: str, allow_pack_missing: bool
+) -> tuple[str, str | None]:
     if g["ambiguous"]:
         return "hold_graph_ambiguous", None
     if g["props_bad"]:
@@ -293,7 +302,9 @@ def _open(path: Path, mode: str, vec: bool) -> sqlite3.Connection:
 class Paths:
     def __init__(self, data_dir: Path, vector_file: str, collection: str) -> None:
         self.data_dir = data_dir
-        self.vector = (data_dir / vector_file) if not os.path.isabs(vector_file) else Path(vector_file)
+        self.vector = (
+            (data_dir / vector_file) if not os.path.isabs(vector_file) else Path(vector_file)
+        )
         self.collection = collection
         self.doc = data_dir / "doc_store.db"
         self.graph = data_dir / "graph.db"
@@ -316,7 +327,10 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
             "invalid_kinds": {"doc": collections.Counter(), "vector": collections.Counter()},
             "distribution": {"doc": collections.Counter(), "vector": collections.Counter()},
             "plan": {"doc": [], "vector": []},
-            "held_ids": {"doc": collections.defaultdict(list), "vector": collections.defaultdict(list)},
+            "held_ids": {
+                "doc": collections.defaultdict(list),
+                "vector": collections.defaultdict(list),
+            },
             "held_map": {"doc": {}, "vector": {}},
             "space_differs_from_graph": {"doc": 0, "vector": 0},
             "corroboration": collections.Counter(),
@@ -325,7 +339,9 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
         }
         docs: dict[str, tuple[str, str | None]] = {}
 
-        def note(store: str, rid: str, cls: str, space: str | None, meta: Any, part: str | None) -> None:
+        def note(
+            store: str, rid: str, cls: str, space: str | None, meta: Any, part: str | None
+        ) -> None:
             res["classes"][store][cls] += 1
             if cls == "skip_valid":
                 if space not in GRAMMAR_SPACES:
@@ -335,7 +351,9 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
                     res["space_differs_from_graph"][store] += 1
                 return
             if isinstance(meta, dict):
-                res["invalid_kinds"][store][value_kind(meta.get("space"))[1] if "space" in meta else "missing"] += 1
+                res["invalid_kinds"][store][
+                    value_kind(meta.get("space"))[1] if "space" in meta else "missing"
+                ] += 1
             if cls.startswith("apply"):
                 res["distribution"][store][space] += 1
                 res["plan"][store].append((rid, part, space, cls))
@@ -353,7 +371,8 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
             docs[rid] = (pack, space if (cls == "skip_valid" or cls.startswith("apply")) else None)
             note("doc", rid, cls, space, meta, None)
         for rid, part, text in vconn.execute(
-                f"SELECT node_id, pack_id, metadata FROM {paths.collection}"):  # noqa: S608
+            f"SELECT node_id, pack_id, metadata FROM {paths.collection}"
+        ):  # noqa: S608
             res["total"]["vector"] += 1
             meta = parse_meta(text)
             cls, space = decide("vector", rid, meta, part, graph, docs, allow_pack_missing)
@@ -373,25 +392,392 @@ def scan(paths: Paths, allow_pack_missing: bool, mode: str = "ro") -> dict[str, 
         vconn.close()
 
 
-def dry_run_snapshot(paths: Paths) -> tuple[dict[str, bytes], dict[str, list[tuple[Any, ...]]]]:
-    """Return main-file bytes and all logical rows a dry run must preserve."""
-    files = {"graph": paths.graph.read_bytes(), "doc": paths.doc.read_bytes(),
-             "vector": paths.vector.read_bytes()}
-    gconn = _open(paths.graph, "ro", False)
-    dconn = _open(paths.doc, "ro", False)
-    vconn = _open(paths.vector, "ro", True)
+def _digest_value(digest: Any, value: Any) -> None:
+    """Add one typed SQLite value to a stream digest."""
+    if value is None:
+        digest.update(b"N")
+        return
+    if isinstance(value, bytes):
+        tag, raw = b"B", value
+    elif isinstance(value, str):
+        tag, raw = b"S", value.encode("utf-8")
+    elif isinstance(value, int):
+        tag, raw = b"I", str(value).encode("ascii")
+    elif isinstance(value, float):
+        tag, raw = b"F", value.hex().encode("ascii")
+    else:
+        raise TypeError(f"unsupported SQLite value: {type(value).__name__}")
+    digest.update(tag + len(raw).to_bytes(8, "big") + raw)
+
+
+def _digest_rows(cursor: Any) -> str:
+    digest = hashlib.sha256()
+    for row in cursor:
+        for value in row:
+            _digest_value(digest, value)
+    return digest.hexdigest()
+
+
+def _record_db(run: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(run / "report.db")
     try:
-        rows = {
-            "graph": gconn.execute("SELECT node_type, node_id, space_id, properties FROM graph_nodes ORDER BY node_id, node_type").fetchall(),
-            "doc": dconn.execute("SELECT source_id, text, metadata, ingested_at FROM doc_sources ORDER BY source_id").fetchall(),
-            "fts": dconn.execute("SELECT source_id, text FROM doc_sources_fts ORDER BY source_id").fetchall(),
-            "vector": vconn.execute(f"SELECT node_id, pack_id, document, metadata, embedding FROM {paths.collection} ORDER BY node_id").fetchall(),  # noqa: S608
+        conn.executescript("""
+            CREATE TABLE graph (id TEXT PRIMARY KEY, props_bad INTEGER NOT NULL, space TEXT,
+                                pack TEXT, ambiguous INTEGER NOT NULL);
+            CREATE TABLE docs (id TEXT PRIMARY KEY, pack TEXT NOT NULL,
+                               invalid_pack INTEGER NOT NULL, space TEXT);
+            CREATE TABLE counts (store TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL,
+                                 value INTEGER NOT NULL, PRIMARY KEY(store, kind, key));
+            CREATE TABLE held (store TEXT NOT NULL, class TEXT NOT NULL, id TEXT NOT NULL,
+                               PRIMARY KEY(store, class, id));
+        """)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _inc(report: sqlite3.Connection, store: str, kind: str, key: str, value: int = 1) -> None:
+    report.execute(
+        """
+        INSERT INTO counts(store, kind, key, value) VALUES (?, ?, ?, ?)
+        ON CONFLICT(store, kind, key) DO UPDATE SET value=value+excluded.value
+    """,
+        (store, kind, key, value),
+    )
+
+
+def _graph_get(report: sqlite3.Connection, rid: str) -> dict[str, Any] | None:
+    row = report.execute(
+        "SELECT props_bad, space, pack, ambiguous FROM graph WHERE id=?", (rid,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {"props_bad": bool(row[0]), "space": row[1], "pack": row[2], "ambiguous": bool(row[3])}
+
+
+def _doc_get(report: sqlite3.Connection, rid: str) -> tuple[Any, str | None] | None:
+    row = report.execute("SELECT pack, invalid_pack, space FROM docs WHERE id=?", (rid,)).fetchone()
+    if row is None:
+        return None
+    return (INVALID_PACK if row[1] else row[0], row[2])
+
+
+def _decide_report(
+    store: str,
+    rid: str,
+    meta: dict[str, Any] | None,
+    part: str | None,
+    report: sqlite3.Connection,
+    allow: bool,
+) -> tuple[str, str | None]:
+    """Use the shared decision rules with one-record disk-backed maps."""
+    graph = _graph_get(report, rid)
+    docs = (
+        {}
+        if store == "doc"
+        else ({rid: _doc_get(report, rid)} if _doc_get(report, rid) is not None else {})
+    )
+    return decide(store, rid, meta, part, {} if graph is None else {rid: graph}, docs, allow)
+
+
+def _note_report(
+    report: sqlite3.Connection,
+    store: str,
+    rid: str,
+    cls: str,
+    space: str | None,
+    meta: dict[str, Any] | None,
+    graph: dict[str, Any] | None,
+) -> None:
+    _inc(report, store, "total", "all")
+    _inc(report, store, "class", cls)
+    if cls == "skip_valid":
+        if space not in GRAMMAR_SPACES:
+            _inc(report, store, "non_grammar", space or "")
+        if graph is not None and graph["space"] is not None and graph["space"] != space:
+            _inc(report, store, "graph_diff", "all")
+        return
+    if isinstance(meta, dict):
+        kind = value_kind(meta.get("space"))[1] if "space" in meta else "missing"
+        _inc(report, store, "invalid", kind)
+    if cls.startswith("apply"):
+        _inc(report, store, "distribution", space or "")
+    else:
+        report.execute("INSERT OR IGNORE INTO held VALUES (?, ?, ?)", (store, cls, rid))
+
+
+def _logical_snapshot(paths: Paths) -> dict[str, str]:
+    gconn, dconn, vconn = (
+        _open(paths.graph, "ro", False),
+        _open(paths.doc, "ro", False),
+        _open(paths.vector, "ro", True),
+    )
+    try:
+        vector = hashlib.sha256()
+        for _rowid, node_id, _chunk_id, _chunk_offset in vconn.execute(
+            f"SELECT rowid, id, chunk_id, chunk_offset FROM {paths.collection}_rowids"
+        ):  # noqa: S608
+            row = vconn.execute(
+                f"SELECT node_id, pack_id, embedding, document, metadata FROM {paths.collection} WHERE node_id=?",  # noqa: S608
+                (node_id,),
+            ).fetchone()
+            if row is None or row[0] != node_id:
+                raise RuntimeError("vector shadow id has no matching public row")
+            for value in row:
+                _digest_value(vector, value)
+        return {
+            "graph_file": file_sha256(paths.graph),
+            "doc_file": file_sha256(paths.doc),
+            "vector_file": file_sha256(paths.vector),
+            "graph": _digest_rows(
+                gconn.execute("SELECT node_type, node_id, space_id, properties FROM graph_nodes")
+            ),
+            "doc": _digest_rows(
+                dconn.execute("SELECT source_id, text, metadata, ingested_at FROM doc_sources")
+            ),
+            "fts": _digest_rows(
+                dconn.execute("SELECT rowid, source_id, text FROM doc_sources_fts ORDER BY rowid")
+            ),
+            "vector": vector.hexdigest(),
         }
-        return files, rows
     finally:
         gconn.close()
         dconn.close()
         vconn.close()
+
+
+def _write_map(out: Any, cursor: Any) -> None:
+    """Write a JSON object directly from an ordered cursor."""
+    out.write("{")
+    first = True
+    for key, value in cursor:
+        if not first:
+            out.write(",")
+        json.dump(key, out, ensure_ascii=False)
+        out.write(":")
+        json.dump(value, out)
+        first = False
+    out.write("}")
+
+
+def _write_held(out: Any, report: sqlite3.Connection, store: str) -> None:
+    out.write("{")
+    current: str | None = None
+    count = 0
+    first_class = True
+    for cls, rid in report.execute(
+        "SELECT class, id FROM held WHERE store=? ORDER BY class, id", (store,)
+    ):
+        if cls != current:
+            if current is not None:
+                out.write("]")
+            if not first_class:
+                out.write(",")
+            json.dump(cls, out, ensure_ascii=False)
+            out.write(":[")
+            current, count, first_class = cls, 0, False
+        if count < LIST_CAP:
+            if count:
+                out.write(",")
+            json.dump(rid, out, ensure_ascii=False)
+            count += 1
+    if current is not None:
+        out.write("]")
+    out.write("}")
+
+
+def _write_report_json(report: sqlite3.Connection, list_ids: bool, out: Any) -> None:
+    """Serialize report rows without an unbounded Python map."""
+    out.write('{"mode":"dry-run","total":{')
+    for index, store in enumerate(("doc", "vector")):
+        if index:
+            out.write(",")
+        json.dump(store, out)
+        out.write(":")
+        value = report.execute(
+            "SELECT value FROM counts WHERE store=? AND kind='total' AND key='all'", (store,)
+        ).fetchone()
+        out.write(str(value[0] if value else 0))
+    out.write('},"graph":')
+    _write_map(
+        out,
+        report.execute(
+            "SELECT key, value FROM counts WHERE store='graph' AND kind='stat' ORDER BY key"
+        ),
+    )
+    out.write(',"space_differs_from_graph":{')
+    for index, store in enumerate(("doc", "vector")):
+        if index:
+            out.write(",")
+        json.dump(store, out)
+        out.write(":")
+        value = report.execute(
+            "SELECT value FROM counts WHERE store=? AND kind='graph_diff' AND key='all'", (store,)
+        ).fetchone()
+        out.write(str(value[0] if value else 0))
+    out.write('},"vector_corroboration":')
+    _write_map(
+        out,
+        report.execute(
+            "SELECT key, value FROM counts WHERE store='vector' AND kind='corroboration' ORDER BY key"
+        ),
+    )
+    out.write(',"vector_vs_doc_space_differs":')
+    value = report.execute(
+        "SELECT value FROM counts WHERE store='vector' AND kind='vector_doc_diff' AND key='all'"
+    ).fetchone()
+    out.write(str(value[0] if value else 0))
+    for store in ("doc", "vector"):
+        out.write(",")
+        json.dump(store, out)
+        out.write(':{"no_valid_space":')
+        value = report.execute(
+            "SELECT COALESCE(SUM(value), 0) FROM counts WHERE store=? AND kind='class' AND key != 'skip_valid'",
+            (store,),
+        ).fetchone()[0]
+        out.write(str(value))
+        for field, kind in (
+            ("classes", "class"),
+            ("invalid_kinds", "invalid"),
+            ("planned_space_distribution", "distribution"),
+            ("space_not_in_grammar", "non_grammar"),
+        ):
+            out.write(",")
+            json.dump(field, out)
+            out.write(":")
+            _write_map(
+                out,
+                report.execute(
+                    "SELECT key, value FROM counts WHERE store=? AND kind=? ORDER BY key",
+                    (store, kind),
+                ),
+            )
+        if list_ids:
+            out.write(',"held_ids":')
+            _write_held(out, report, store)
+        out.write("}")
+    out.write("}")
+
+
+def _run_dry_run(paths: Paths, args: argparse.Namespace) -> int:
+    """Write the report and remove its scratch child after stdout flushes."""
+    root = args.dry_run_scratch
+    if root is None or not root.is_dir() or root.resolve() == Path("/tmp"):
+        print(
+            "dry run failed: --dry-run-scratch must name an existing non-/tmp directory",
+            file=sys.stderr,
+        )
+        return 1
+    run = root / f"backfill-space-{uuid.uuid4()}"
+    report: sqlite3.Connection | None = None
+    try:
+        run.mkdir(mode=0o700)
+        report = _record_db(run)
+        before = _logical_snapshot(paths)
+        gconn, dconn, vconn = (
+            _open(paths.graph, "ro", False),
+            _open(paths.doc, "ro", False),
+            _open(paths.vector, "ro", True),
+        )
+        try:
+            for rid, space_id, props_text in gconn.execute(
+                "SELECT node_id, space_id, properties FROM graph_nodes"
+            ):
+                if not isinstance(rid, str):
+                    raise ValueError("unsupported graph identifier")
+                props = parse_graph_properties(props_text)
+                if props is None:
+                    entry = (1, None, None)
+                    _inc(report, "graph", "stat", "graph_props_bad")
+                else:
+                    pspace, pkind = value_kind(props.get("space"))
+                    cspace, _ = value_kind(space_id)
+                    if pkind == "container":
+                        _inc(report, "graph", "stat", "graph_space_container_like")
+                    if pspace is not None and cspace is not None and pspace != cspace:
+                        _inc(report, "graph", "stat", "graph_column_differs_props")
+                    entry = (
+                        0,
+                        pspace if pspace is not None else cspace,
+                        _str_or_none(props.get("pack_id")),
+                    )
+                prior = report.execute(
+                    "SELECT props_bad, space, pack FROM graph WHERE id=?", (rid,)
+                ).fetchone()
+                if prior is None:
+                    report.execute("INSERT INTO graph VALUES (?, ?, ?, ?, 0)", (rid, *entry))
+                elif prior != entry:
+                    report.execute("UPDATE graph SET ambiguous=1 WHERE id=?", (rid,))
+            for rid, text in dconn.execute("SELECT source_id, metadata FROM doc_sources"):
+                if not isinstance(rid, str):
+                    raise ValueError("unsupported document identifier")
+                meta = parse_meta(text)
+                graph = _graph_get(report, rid)
+                cls, space = _decide_report("doc", rid, meta, None, report, args.allow_pack_missing)
+                pack = pack_of(meta)
+                stored_pack = "" if pack is INVALID_PACK else pack
+                report.execute(
+                    "INSERT INTO docs VALUES (?, ?, ?, ?)",
+                    (
+                        rid,
+                        stored_pack,
+                        int(pack is INVALID_PACK),
+                        space if cls == "skip_valid" or cls.startswith("apply") else None,
+                    ),
+                )
+                _note_report(report, "doc", rid, cls, space, meta, graph)
+            for _rowid, rid, _chunk_id, _chunk_offset in vconn.execute(
+                f"SELECT rowid, id, chunk_id, chunk_offset FROM {paths.collection}_rowids"
+            ):  # noqa: S608
+                row = vconn.execute(
+                    f"SELECT node_id, pack_id, metadata FROM {paths.collection} WHERE node_id=?",
+                    (rid,),
+                ).fetchone()  # noqa: S608
+                if row is None or row[0] != rid or not isinstance(rid, str):
+                    raise ValueError("unsupported vector identifier")
+                _node_id, part, text = row
+                meta = parse_meta(text)
+                graph = _graph_get(report, rid)
+                cls, space = _decide_report(
+                    "vector", rid, meta, part, report, args.allow_pack_missing
+                )
+                _note_report(report, "vector", rid, cls, space, meta, graph)
+                if graph is not None and isinstance(meta, dict):
+                    if cls == "apply_graph" or cls == "skip_valid":
+                        corroborated = (
+                            _doc_get(report, rid) is not None or meta.get("node_id") == rid
+                        )
+                        _inc(
+                            report,
+                            "vector",
+                            "corroboration",
+                            "corroborated" if corroborated else "pk_only",
+                        )
+                    pair = _doc_get(report, rid)
+                    if cls == "apply_graph" and pair is not None and pair[1] not in (None, space):
+                        _inc(report, "vector", "vector_doc_diff", "all")
+            report.commit()
+        finally:
+            gconn.close()
+            dconn.close()
+            vconn.close()
+        _write_report_json(report, args.list_ids, sys.stdout)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        if before != _logical_snapshot(paths):
+            raise RuntimeError("dry run changed a main file or logical row")
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        if report is not None:
+            report.close()
+        try:
+            print(f"dry run failed: {exc}; dry-run scratch retained at {run}", file=sys.stderr)
+        except OSError:
+            pass
+        return 1
+    report.close()
+    shutil.rmtree(run)
+    return 0
 
 
 def no_valid(res: dict[str, Any], store: str) -> int:
@@ -445,10 +831,13 @@ def _write_batches(
     allow_pack_missing: bool,
     before_commit: Any,
 ) -> dict[str, Any]:
-    stats = {"committed": {"doc": [], "vector": []},
-             "skipped_changed": {"doc": [], "vector": []},
-             "skipped_unserializable": {"doc": [], "vector": []},
-             "batches": 0, "remaining": {"doc": 0, "vector": 0}}
+    stats = {
+        "committed": {"doc": [], "vector": []},
+        "skipped_changed": {"doc": [], "vector": []},
+        "skipped_unserializable": {"doc": [], "vector": []},
+        "batches": 0,
+        "remaining": {"doc": 0, "vector": 0},
+    }
     dconn = _open(paths.doc, "rw", False)
     vconn = _open(paths.vector, "rw", True)
     try:
@@ -458,11 +847,12 @@ def _write_batches(
                 if max_batches is not None and stats["batches"] >= max_batches:
                     stats["remaining"][store] = len(items) - start
                     break
-                batch = items[start:start + batch_size]
+                batch = items[start : start + batch_size]
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     done = _write_one_batch(
-                        conn, store, batch, paths, res, allow_pack_missing, stats)
+                        conn, store, batch, paths, res, allow_pack_missing, stats
+                    )
                     if before_commit is not None:
                         before_commit(store, stats["batches"])
                     conn.execute("COMMIT")
@@ -486,11 +876,13 @@ def _write_one_batch(conn, store, batch, paths, res, allow_pack_missing, stats):
     if store == "doc":
         rows = conn.execute(
             f"SELECT source_id, NULL, metadata FROM doc_sources WHERE source_id IN ({marks})",  # noqa: S608
-            ids).fetchall()
+            ids,
+        ).fetchall()
     else:
         rows = conn.execute(
             f"SELECT node_id, pack_id, metadata FROM {paths.collection} WHERE node_id IN ({marks})",  # noqa: S608
-            ids).fetchall()
+            ids,
+        ).fetchall()
     current = {r[0]: r for r in rows}
     done = []
     for rid, part, space, cls in batch:
@@ -509,15 +901,19 @@ def _write_one_batch(conn, store, batch, paths, res, allow_pack_missing, stats):
             stats["skipped_unserializable"][store].append(rid)
             continue
         if store == "doc":
-            cur = conn.execute("UPDATE doc_sources SET metadata = ? WHERE source_id = ?", (text, rid))
+            cur = conn.execute(
+                "UPDATE doc_sources SET metadata = ? WHERE source_id = ?", (text, rid)
+            )
         elif part is None:
             cur = conn.execute(
                 f"UPDATE {paths.collection} SET metadata = ? WHERE node_id = ? AND pack_id IS NULL",  # noqa: S608
-                (text, rid))
+                (text, rid),
+            )
         else:
             cur = conn.execute(
                 f"UPDATE {paths.collection} SET metadata = ? WHERE node_id = ? AND pack_id = ?",  # noqa: S608
-                (text, rid, part))
+                (text, rid, part),
+            )
         if cur.rowcount != 1:
             # The row was re-read inside BEGIN IMMEDIATE and the key is a primary
             # key, so one row always matches. Fail loudly and roll the batch back.
@@ -526,8 +922,9 @@ def _write_one_batch(conn, store, batch, paths, res, allow_pack_missing, stats):
     return done
 
 
-def reconcile(paths: Paths, before: dict[str, Any], stats: dict[str, Any],
-              allow_pack_missing: bool) -> dict[str, Any]:
+def reconcile(
+    paths: Paths, before: dict[str, Any], stats: dict[str, Any], allow_pack_missing: bool
+) -> dict[str, Any]:
     """Rescan and compare with the pre-write scan. Returns {"ok", "problems"}."""
     after = scan(paths, allow_pack_missing)
     problems: list[str] = []
@@ -544,8 +941,9 @@ def reconcile(paths: Paths, before: dict[str, Any], stats: dict[str, Any],
     vconn = _open(paths.vector, "ro", True)
     try:
         for store, conn, sql in (
-                ("doc", dconn, "SELECT metadata FROM doc_sources WHERE source_id = ?"),
-                ("vector", vconn, f"SELECT metadata FROM {paths.collection} WHERE node_id = ?")):  # noqa: S608
+            ("doc", dconn, "SELECT metadata FROM doc_sources WHERE source_id = ?"),
+            ("vector", vconn, f"SELECT metadata FROM {paths.collection} WHERE node_id = ?"),
+        ):  # noqa: S608
             for rid, space in stats["committed"][store]:
                 row = conn.execute(sql, (rid,)).fetchone()
                 meta = parse_meta(row[0]) if row else None
@@ -566,7 +964,7 @@ def _failure_report(paths: Paths, args: argparse.Namespace, exc: BaseException) 
         "error_text": str(exc),
         "commit_state_unknown": True,
         "note": "The failure may have happened before or after the COMMIT of the open batch. "
-                "The rescan below shows the database state under the same lock.",
+        "The rescan below shows the database state under the same lock.",
     }
     if getattr(exc, "rollback_error", None):
         out["rollback_error"] = exc.rollback_error
@@ -574,18 +972,25 @@ def _failure_report(paths: Paths, args: argparse.Namespace, exc: BaseException) 
         res = scan(paths, args.allow_pack_missing, mode="ro")
         out["rescan"] = {
             "total": res["total"],
-            **{store: {
-                "valid_space": res["classes"][store].get("skip_valid", 0),
-                "no_valid_space": no_valid(res, store),
-                "classes": {c: n for c, n in res["classes"][store].items() if c != "skip_valid"},
-            } for store in ("doc", "vector")},
+            **{
+                store: {
+                    "valid_space": res["classes"][store].get("skip_valid", 0),
+                    "no_valid_space": no_valid(res, store),
+                    "classes": {
+                        c: n for c, n in res["classes"][store].items() if c != "skip_valid"
+                    },
+                }
+                for store in ("doc", "vector")
+            },
         }
     except BaseException as rescan_exc:
         out["rescan_error"] = f"{type(rescan_exc).__name__}: {rescan_exc}"
     return out
 
 
-def run_apply(paths: Paths, args: argparse.Namespace, before_commit: Any = None) -> tuple[int, dict[str, Any]]:
+def run_apply(
+    paths: Paths, args: argparse.Namespace, before_commit: Any = None
+) -> tuple[int, dict[str, Any]]:
     from opencrab.locking import write_lock
     from opencrab.stores.backup import backup_data_dir
 
@@ -597,11 +1002,20 @@ def run_apply(paths: Paths, args: argparse.Namespace, before_commit: Any = None)
     try:
         backup = backup_data_dir(paths.data_dir, args.backup_to, lock_timeout=args.lock_timeout)
         before = scan(paths, args.allow_pack_missing, mode="ro")
-        out: dict[str, Any] = {"backup_set": str(backup.set_dir), "before": report_of(before, args.list_ids)}
+        out: dict[str, Any] = {
+            "backup_set": str(backup.set_dir),
+            "before": report_of(before, args.list_ids),
+        }
         try:
             stats = _write_batches(
-                paths, before["plan"], before, args.batch_size, args.max_batches,
-                args.allow_pack_missing, before_commit)
+                paths,
+                before["plan"],
+                before,
+                args.batch_size,
+                args.max_batches,
+                args.allow_pack_missing,
+                before_commit,
+            )
         except BaseException as exc:
             failure = _failure_report(paths, args, exc)
             out.pop("before", None)
@@ -614,13 +1028,16 @@ def run_apply(paths: Paths, args: argparse.Namespace, before_commit: Any = None)
             "batches": stats["batches"],
             "committed": {k: len(v) for k, v in stats["committed"].items()},
             "skipped_changed": sum(len(v) for v in stats["skipped_changed"].values()),
-            "skipped_unserializable": {k: len(v) for k, v in stats["skipped_unserializable"].items()},
+            "skipped_unserializable": {
+                k: len(v) for k, v in stats["skipped_unserializable"].items()
+            },
             "remaining": stats["remaining"],
         }
         if args.list_ids:
             for kind in ("changed", "unserializable"):
                 out[f"skipped_{kind}_ids"] = {
-                    k: v[:LIST_CAP] for k, v in stats[f"skipped_{kind}"].items()}
+                    k: v[:LIST_CAP] for k, v in stats[f"skipped_{kind}"].items()
+                }
         rec = reconcile(paths, before, stats, args.allow_pack_missing)
         out["reconcile"] = rec
         clean = rec["ok"] and not any(stats["skipped_unserializable"].values())
@@ -642,8 +1059,16 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--max-batches", type=int, help="stop after this many batches")
     p.add_argument("--batch-size", type=int, default=500)
     p.add_argument("--list-ids", action="store_true", help="list held ids (capped per class)")
-    p.add_argument("--allow-pack-missing", action="store_true",
-                   help="apply the graph space when a pack_id is missing on either side")
+    p.add_argument(
+        "--dry-run-scratch",
+        type=Path,
+        help="existing non-/tmp directory for report-only dry-run state",
+    )
+    p.add_argument(
+        "--allow-pack-missing",
+        action="store_true",
+        help="apply the graph space when a pack_id is missing on either side",
+    )
     p.add_argument("--lock-timeout", type=float, default=30.0)
     return p
 
@@ -656,6 +1081,12 @@ def main(argv: list[str] | None = None, before_commit: Any = None) -> int:
     if args.backup_to and not args.apply:
         print("--backup-to is only valid with --apply", file=sys.stderr)
         return 2
+    if args.apply and args.dry_run_scratch:
+        print("--dry-run-scratch is only valid without --apply", file=sys.stderr)
+        return 2
+    if not args.apply and args.dry_run_scratch is None:
+        print("dry run needs --dry-run-scratch", file=sys.stderr)
+        return 2
     if args.batch_size < 1 or (args.max_batches is not None and args.max_batches < 1):
         print("--batch-size and --max-batches must be at least 1", file=sys.stderr)
         return 2
@@ -666,7 +1097,10 @@ def main(argv: list[str] | None = None, before_commit: Any = None) -> int:
     get_settings.cache_clear()
     cfg = get_settings()
     if cfg.storage_mode != "local" or cfg.vector_backend_resolved != "sqlite-vec":
-        print("only STORAGE_MODE=local with the sqlite-vec vector backend is supported", file=sys.stderr)
+        print(
+            "only STORAGE_MODE=local with the sqlite-vec vector backend is supported",
+            file=sys.stderr,
+        )
         return 2
     paths = Paths(Path(cfg.local_data_dir), cfg.vector_db_file, cfg.vector_collection)
     absent = paths.missing()
@@ -674,20 +1108,19 @@ def main(argv: list[str] | None = None, before_commit: Any = None) -> int:
         print("missing store files: " + ", ".join(absent), file=sys.stderr)
         return 2
     if not args.apply:
-        before_files, before_rows = dry_run_snapshot(paths)
-        res = scan(paths, args.allow_pack_missing)
-        after_files, after_rows = dry_run_snapshot(paths)
-        if before_files != after_files or before_rows != after_rows:
-            print("dry run changed a main file or logical row", file=sys.stderr)
-            return 1
-        print(json.dumps({"mode": "dry-run", **report_of(res, args.list_ids)}, ensure_ascii=False, indent=2))
-        return 0
+        return _run_dry_run(paths, args)
     try:
         code, out = run_apply(paths, args, before_commit)
     except BaseException as exc:
         report = getattr(exc, "backfill_report", None)
         if report is not None:
-            print(json.dumps({"mode": "apply", "reraised": type(exc).__name__, **report}, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {"mode": "apply", "reraised": type(exc).__name__, **report},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         raise
     print(json.dumps({"mode": "apply", "exit": code, **out}, ensure_ascii=False, indent=2))
     return code

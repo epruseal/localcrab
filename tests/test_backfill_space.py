@@ -6,6 +6,7 @@ LocalSQLDocStore and a SQLite graph.db. The live data directory is never opened.
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import sqlite3
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,7 +33,9 @@ _EMB = struct.pack("32f", *([0.1] * 32))
 class World:
     """A local data directory with graph.db, doc_store.db and vectors.db."""
 
-    def __init__(self, root: Path, legacy_graph: bool = False, vector_path: Path | None = None) -> None:
+    def __init__(
+        self, root: Path, legacy_graph: bool = False, vector_path: Path | None = None
+    ) -> None:
         self.root = root
         self.vpath = vector_path or root / "vectors.db"
         self.vpath.parent.mkdir(parents=True, exist_ok=True)
@@ -40,13 +44,14 @@ class World:
 
         self.docs = LocalSQLDocStore(str(root / "doc_store.db"))
         self.vec = SqliteVecStore(
-            db_path=str(self.vpath), embedding_function=MockEF(32), dim=32,
-            collection_name=COLL)
+            db_path=str(self.vpath), embedding_function=MockEF(32), dim=32, collection_name=COLL
+        )
         g = sqlite3.connect(root / "graph.db")
         pk = "PRIMARY KEY (node_type, node_id)" if legacy_graph else "PRIMARY KEY (node_id)"
         g.execute(
             "CREATE TABLE graph_nodes (node_type TEXT NOT NULL, node_id TEXT NOT NULL, "
-            f"space_id TEXT, properties TEXT NOT NULL DEFAULT '{{}}', {pk})")
+            f"space_id TEXT, properties TEXT NOT NULL DEFAULT '{{}}', {pk})"
+        )
         g.commit()
         g.close()
 
@@ -71,10 +76,13 @@ class World:
         if partition == "__same__":
             partition = meta.get("pack_id", PACK) if isinstance(meta, dict) else PACK
         conn = bf._open(self.vpath, "rw", True)
-        text = meta if isinstance(meta, str) or meta is None else json.dumps(meta, ensure_ascii=False)
+        text = (
+            meta if isinstance(meta, str) or meta is None else json.dumps(meta, ensure_ascii=False)
+        )
         conn.execute(
             f"INSERT INTO {COLL}(node_id, pack_id, embedding, document, metadata) VALUES (?,?,?,?,?)",
-            (vid, partition, _EMB, document, text))
+            (vid, partition, _EMB, document, text),
+        )
         conn.close()
 
     def dump(self):
@@ -83,19 +91,27 @@ class World:
         out["doc"] = dict(d.execute("SELECT source_id, metadata FROM doc_sources"))
         d.close()
         v = bf._open(self.vpath, "ro", True)
-        out["vec"] = {r[0]: (r[1], r[2], r[3], r[4]) for r in v.execute(
-            f"SELECT node_id, pack_id, metadata, document, embedding FROM {COLL}")}
+        out["vec"] = {
+            r[0]: (r[1], r[2], r[3], r[4])
+            for r in v.execute(
+                f"SELECT node_id, pack_id, metadata, document, embedding FROM {COLL}"
+            )
+        }
         v.close()
         g = sqlite3.connect(self.root / "graph.db")
-        out["graph"] = g.execute("SELECT node_type, node_id, space_id, properties FROM graph_nodes").fetchall()
+        out["graph"] = g.execute(
+            "SELECT node_type, node_id, space_id, properties FROM graph_nodes"
+        ).fetchall()
         g.close()
         return out
 
     def stat(self):
         """Size and mtime of the three main files (the dry run must not change them)."""
-        return {n: (p.stat().st_size, p.stat().st_mtime_ns)
-                for n in ("graph.db", "doc_store.db", "vectors.db")
-                for p in [self.root / n]}
+        return {
+            n: (p.stat().st_size, p.stat().st_mtime_ns)
+            for n in ("graph.db", "doc_store.db", "vectors.db")
+            for p in [self.root / n]
+        }
 
     def space(self, store, rid):
         rows = self.dump()["doc" if store == "doc" else "vec"]
@@ -123,6 +139,11 @@ def world(env):
 
 
 def _run(capsys, *argv, **kw):
+    if "--apply" not in argv and "--dry-run-scratch" not in argv:
+        scratch = kw.pop("dry_run_scratch", None)
+        if scratch is None:
+            scratch = Path.cwd()
+        argv = (*argv, "--dry-run-scratch", str(scratch))
     code = bf.main(list(argv), **kw)
     out = capsys.readouterr().out
     return code, (json.loads(out) if out.strip().startswith("{") else out)
@@ -156,11 +177,21 @@ def _mixed(world):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value, kind", [
-    (None, "null"), ("", "empty"), (5, "non_string"), (True, "non_string"),
-    ([], "non_string"), ({"a": 1}, "non_string"), ("[]", "container"),
-    (" {}", "container"), ("[\"x\"]", "container"), ("concept", "valid"),
-])
+@pytest.mark.parametrize(
+    "value, kind",
+    [
+        (None, "null"),
+        ("", "empty"),
+        (5, "non_string"),
+        (True, "non_string"),
+        ([], "non_string"),
+        ({"a": 1}, "non_string"),
+        ("[]", "container"),
+        (" {}", "container"),
+        ('["x"]', "container"),
+        ("concept", "valid"),
+    ],
+)
 def test_value_kind(value, kind):
     space, k = bf.value_kind(value)
     assert k == kind
@@ -171,27 +202,101 @@ def _g(space="concept", pack=PACK, ambiguous=False, props_bad=False):
     return {"space": space, "pack": pack, "ambiguous": ambiguous, "props_bad": props_bad}
 
 
-@pytest.mark.parametrize("store, meta, part, graph, docs, allow, expect", [
-    ("doc", None, None, {}, {}, False, ("hold_bad_meta", None)),
-    ("doc", {"space": "claim"}, None, {"i": _g("concept")}, {}, False, ("skip_valid", "claim")),
-    ("doc", {"pack_id": PACK}, None, {"i": _g()}, {}, False, ("apply_graph", "concept")),
-    ("doc", {"pack_id": PACK}, None, {"i": _g(pack="o")}, {}, False, ("hold_pack_disagrees", None)),
-    ("doc", {}, None, {"i": _g()}, {}, False, ("hold_pack_missing", None)),
-    ("doc", {}, None, {"i": _g()}, {}, True, ("apply_graph", "concept")),
-    ("doc", {"pack_id": PACK}, None, {"i": _g(pack=None)}, {}, False, ("hold_pack_missing", None)),
-    ("doc", {"pack_id": PACK}, None, {"i": _g(ambiguous=True)}, {}, True, ("hold_graph_ambiguous", None)),
-    ("doc", {"pack_id": PACK}, None, {"i": _g(props_bad=True)}, {}, True, ("hold_graph_props_bad", None)),
-    ("doc", {"pack_id": PACK}, None, {"i": _g(space=None)}, {}, True, ("hold_graph_space_missing", None)),
-    ("doc", {"pack_id": PACK}, None, {}, {}, False, ("apply_source_default", "evidence")),
-    ("vector", {"pack_id": "p"}, "q", {}, {}, False, ("hold_pack_partition_mismatch", None)),
-    ("vector", {}, None, {}, {}, False, ("hold_orphan", None)),
-    ("vector", {"source_id": "s"}, None, {}, {}, False, ("apply_source_default", "evidence")),
-    ("vector", {"pack_id": PACK}, PACK, {}, {"i": (PACK, "concept")}, False, ("apply_source_default", "concept")),
-    ("vector", {"pack_id": PACK}, PACK, {}, {"i": ("x", "concept")}, False, ("hold_doc_pair_pack_differs", None)),
-    ("vector", {"pack_id": PACK}, PACK, {}, {"i": (PACK, None)}, False, ("hold_doc_pair_held", None)),
-    ("vector", {"pack_id": PACK}, PACK, {"i": _g("resource")}, {"i": (PACK, "concept")}, False,
-     ("apply_graph", "resource")),
-])
+@pytest.mark.parametrize(
+    "store, meta, part, graph, docs, allow, expect",
+    [
+        ("doc", None, None, {}, {}, False, ("hold_bad_meta", None)),
+        ("doc", {"space": "claim"}, None, {"i": _g("concept")}, {}, False, ("skip_valid", "claim")),
+        ("doc", {"pack_id": PACK}, None, {"i": _g()}, {}, False, ("apply_graph", "concept")),
+        (
+            "doc",
+            {"pack_id": PACK},
+            None,
+            {"i": _g(pack="o")},
+            {},
+            False,
+            ("hold_pack_disagrees", None),
+        ),
+        ("doc", {}, None, {"i": _g()}, {}, False, ("hold_pack_missing", None)),
+        ("doc", {}, None, {"i": _g()}, {}, True, ("apply_graph", "concept")),
+        (
+            "doc",
+            {"pack_id": PACK},
+            None,
+            {"i": _g(pack=None)},
+            {},
+            False,
+            ("hold_pack_missing", None),
+        ),
+        (
+            "doc",
+            {"pack_id": PACK},
+            None,
+            {"i": _g(ambiguous=True)},
+            {},
+            True,
+            ("hold_graph_ambiguous", None),
+        ),
+        (
+            "doc",
+            {"pack_id": PACK},
+            None,
+            {"i": _g(props_bad=True)},
+            {},
+            True,
+            ("hold_graph_props_bad", None),
+        ),
+        (
+            "doc",
+            {"pack_id": PACK},
+            None,
+            {"i": _g(space=None)},
+            {},
+            True,
+            ("hold_graph_space_missing", None),
+        ),
+        ("doc", {"pack_id": PACK}, None, {}, {}, False, ("apply_source_default", "evidence")),
+        ("vector", {"pack_id": "p"}, "q", {}, {}, False, ("hold_pack_partition_mismatch", None)),
+        ("vector", {}, None, {}, {}, False, ("hold_orphan", None)),
+        ("vector", {"source_id": "s"}, None, {}, {}, False, ("apply_source_default", "evidence")),
+        (
+            "vector",
+            {"pack_id": PACK},
+            PACK,
+            {},
+            {"i": (PACK, "concept")},
+            False,
+            ("apply_source_default", "concept"),
+        ),
+        (
+            "vector",
+            {"pack_id": PACK},
+            PACK,
+            {},
+            {"i": ("x", "concept")},
+            False,
+            ("hold_doc_pair_pack_differs", None),
+        ),
+        (
+            "vector",
+            {"pack_id": PACK},
+            PACK,
+            {},
+            {"i": (PACK, None)},
+            False,
+            ("hold_doc_pair_held", None),
+        ),
+        (
+            "vector",
+            {"pack_id": PACK},
+            PACK,
+            {"i": _g("resource")},
+            {"i": (PACK, "concept")},
+            False,
+            ("apply_graph", "resource"),
+        ),
+    ],
+)
 def test_decide(store, meta, part, graph, docs, allow, expect):
     assert bf.decide(store, "i", meta, part, graph, docs, allow) == expect
 
@@ -201,9 +306,15 @@ def test_decide(store, meta, part, graph, docs, allow, expect):
 # ---------------------------------------------------------------------------
 
 
-def test_dry_run_changes_no_content_and_reports(world, capsys):
+def test_dry_run_changes_no_content_and_reports(world, capsys, monkeypatch):
     _mixed(world)
     before, stat_before = world.dump(), world.stat()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("dry-run must not use legacy full-memory scan")
+
+    monkeypatch.setattr(bf, "scan", forbidden)
+    monkeypatch.setattr(bf, "report_of", forbidden)
     code, rep = _run(capsys)
     assert code == 0 and rep["mode"] == "dry-run"
     assert world.dump() == before  # includes the graph rows
@@ -212,6 +323,79 @@ def test_dry_run_changes_no_content_and_reports(world, capsys):
     assert rep["vector"]["classes"]["hold_pack_disagrees"] == 1
     assert rep["vector"]["classes"]["hold_orphan"] == 1
     assert rep["vector"]["planned_space_distribution"]
+
+
+@pytest.mark.parametrize(
+    "doc_meta, expected",
+    [
+        ({"pack_id": []}, "hold_doc_pair_pack_differs"),
+        ({"pack_id": [], "space": "concept"}, "hold_doc_pair_pack_differs"),
+        ("[]", "hold_doc_pair_pack_differs"),
+        ({"pack_id": "", "space": "concept"}, "apply_source_default"),
+    ],
+)
+def test_dry_run_restores_invalid_doc_pack_for_vector_pair(world, capsys, doc_meta, expected):
+    world.doc("pair", doc_meta)
+    world.vector("pair", {"pack_id": ""}, partition="")
+    legacy = bf.scan(bf.Paths(world.root, "vectors.db", COLL), False)
+    code, report = _run(capsys)
+    assert code == 0
+    assert legacy["classes"]["vector"] == {expected: 1}
+    assert report["vector"]["classes"] == {expected: 1}
+
+
+def test_dry_run_mapped_empty_pack_keeps_graph_hold(world, capsys):
+    world.graph("mapped", None, {"pack_id": PACK})
+    world.doc("mapped", {"pack_id": ""})
+    world.vector("mapped", {"pack_id": ""}, partition="")
+    legacy = bf.scan(bf.Paths(world.root, "vectors.db", COLL), False)
+    code, report = _run(capsys)
+    assert code == 0
+    assert legacy["classes"]["vector"] == {"hold_graph_space_missing": 1}
+    assert report["vector"]["classes"] == {"hold_graph_space_missing": 1}
+    assert bf.decide("vector", "held", {"pack_id": ""}, "", {}, {"held": ("", None)}) == (
+        "hold_doc_pair_held",
+        None,
+    )
+
+
+def test_docstring_states_required_dry_run_scratch():
+    assert "backfill_space.py --dry-run-scratch DIR" in bf.__doc__
+    assert "Success removes that child and keeps the root." in bf.__doc__
+    assert "A failure keeps the child" in bf.__doc__
+
+
+class _FailingOutput(io.StringIO):
+    def __init__(self, fail_at):
+        super().__init__()
+        self.fail_at = fail_at
+        self.calls = []
+
+    def write(self, value):
+        self.calls.append("write")
+        if self.fail_at == "write":
+            raise OSError("injected body failure")
+        return super().write(value)
+
+    def flush(self):
+        self.calls.append("flush")
+        if self.fail_at == "flush":
+            raise BrokenPipeError("injected flush failure")
+        return super().flush()
+
+
+def test_run_dry_run_keeps_child_when_flush_fails(world, tmp_path, monkeypatch, capsys):
+    output = _FailingOutput("flush")
+    monkeypatch.setattr(bf.sys, "stdout", output)
+    args = SimpleNamespace(dry_run_scratch=tmp_path, list_ids=False, allow_pack_missing=False)
+    code = bf._run_dry_run(bf.Paths(world.root, "vectors.db", COLL), args)
+    err = capsys.readouterr().err
+    children = list(tmp_path.glob("backfill-space-*"))
+    assert code == 1
+    assert output.calls[-1] == "flush"
+    assert len(children) == 1 and children[0].is_dir()
+    assert str(children[0]) in err
+    assert tmp_path.is_dir()
 
 
 def test_dry_run_does_not_wait_for_write_lock(world, env, capsys):
@@ -234,9 +418,12 @@ def test_apply_requires_backup(world, capsys):
     assert world.dump() == before
 
 
-def test_unsupported_mode_exits_2(world, monkeypatch, capsys):
+def test_unsupported_mode_exits_2(world, monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("STORAGE_MODE", "docker")
-    assert bf.main([]) == 2
+    assert bf.main(["--dry-run-scratch", str(tmp_path)]) == 2
+    assert capsys.readouterr().err == (
+        "only STORAGE_MODE=local with the sqlite-vec vector backend is supported\n"
+    )
 
 
 def _hold_lock(data_dir: Path):
@@ -277,20 +464,24 @@ def test_apply_end_to_end(world, tmp_path, capsys):
     code, rep = _apply(capsys, world, tmp_path)
     assert code == 0, rep
     assert rep["reconcile"]["ok"], rep["reconcile"]
-    assert world.space("doc", "n1") == "concept"            # mapped to graph
-    assert world.space("doc", "d-unmapped") == "evidence"    # source default
-    assert world.space("doc", "d-valid") == "claim"          # valid kept
+    assert world.space("doc", "n1") == "concept"  # mapped to graph
+    assert world.space("doc", "d-unmapped") == "evidence"  # source default
+    assert world.space("doc", "d-valid") == "claim"  # valid kept
     assert world.space("vec", "n1") == "concept"
-    assert world.space("vec", "n2") == "resource"            # empty replaced
+    assert world.space("vec", "n2") == "resource"  # empty replaced
     assert world.space("vec", "v-src") == "evidence"
-    assert world.space("vec", "d-unmapped") == "evidence"    # follows its doc row
+    assert world.space("vec", "d-unmapped") == "evidence"  # follows its doc row
     after = world.dump()
     # held records are byte-identical, text and embeddings untouched everywhere
     for held in ("v-orphan", "n-other"):
         assert after["vec"][held] == before["vec"][held]
     for rid, (part, _meta, document, emb) in before["vec"].items():
         assert emb == _EMB  # the dump really carries the embedding
-        assert (after["vec"][rid][0], after["vec"][rid][2], after["vec"][rid][3]) == (part, document, emb)
+        assert (after["vec"][rid][0], after["vec"][rid][2], after["vec"][rid][3]) == (
+            part,
+            document,
+            emb,
+        )
     # a second dry run has only held records left
     code, rep2 = _run(capsys)
     assert code == 0
@@ -306,9 +497,13 @@ def test_queries_with_spaces_find_backfilled_records(world, tmp_path, capsys):
     assert world.vec.query("x", 5, where={"space": {"$in": ["concept"]}}) == []
     code, rep = _apply(capsys, world, tmp_path)
     assert code == 0, rep
-    assert [h["source_id"] if "source_id" in h else h.get("id")
-            for h in world.docs.keyword_search("사과", pack_ids=[PACK], spaces=["concept"])] == ["n1"]
-    assert [h["id"] for h in world.vec.query("x", 5, where={"space": {"$in": ["concept"]}})] == ["n1"]
+    assert [
+        h["source_id"] if "source_id" in h else h.get("id")
+        for h in world.docs.keyword_search("사과", pack_ids=[PACK], spaces=["concept"])
+    ] == ["n1"]
+    assert [h["id"] for h in world.vec.query("x", 5, where={"space": {"$in": ["concept"]}})] == [
+        "n1"
+    ]
 
 
 def test_valid_space_is_kept_even_when_graph_differs(world, tmp_path, capsys):
@@ -327,8 +522,10 @@ def test_invalid_values_are_replaced(world, tmp_path, capsys, bad):
     world.doc("n1", {"pack_id": PACK})
     world.vector("n1", f'{{"pack_id": "{PACK}", "space": {bad}}}')
     d = sqlite3.connect(world.root / "doc_store.db")
-    d.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n1'",
-              (f'{{"pack_id": "{PACK}", "space": {bad}}}',))
+    d.execute(
+        "UPDATE doc_sources SET metadata=? WHERE source_id='n1'",
+        (f'{{"pack_id": "{PACK}", "space": {bad}}}',),
+    )
     d.commit()
     d.close()
     code, rep = _apply(capsys, world, tmp_path)
@@ -405,7 +602,7 @@ def test_unmapped_vector_follows_doc_space_and_pair_rules(world, tmp_path, capsy
     world.doc("b", {"pack_id": "other", "space": "concept"})
     world.vector("b", {"pack_id": PACK})
     world.graph("h", "concept", {"pack_id": "zzz"})
-    world.doc("h", {"pack_id": PACK})            # held doc (graph pack disagrees)
+    world.doc("h", {"pack_id": PACK})  # held doc (graph pack disagrees)
     world.vector("h-twin", {"pack_id": PACK, "source_id": "h"})
     world.doc("c", {"pack_id": PACK})
     world.vector("c", {"pack_id": PACK})
@@ -462,7 +659,9 @@ def test_batch_failure_rolls_back_that_batch_and_rerun_converges(env, tmp_path, 
     code, rep = _apply(capsys, w, tmp_path / "b", "--batch-size", "3", before_commit=boom)
     assert code == 1 and "injected" in rep["error"]
     mid = w.dump()
-    assert sum(1 for m in mid["doc"].values() if json.loads(m).get("space")) == 3  # first batch kept
+    assert (
+        sum(1 for m in mid["doc"].values() if json.loads(m).get("space")) == 3
+    )  # first batch kept
     code, rep = _apply(capsys, w, tmp_path / "b", "--batch-size", "3")
     assert code == 0 and rep["reconcile"]["ok"]
     assert w.dump() == ref_dump
@@ -490,8 +689,10 @@ def test_changed_row_is_skipped_by_reread(world, tmp_path, capsys):
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
         if store == "doc":
-            conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n0'",
-                         (json.dumps({"pack_id": PACK, "space": "claim"}),))
+            conn.execute(
+                "UPDATE doc_sources SET metadata=? WHERE source_id='n0'",
+                (json.dumps({"pack_id": PACK, "space": "claim"}),),
+            )
         return orig(conn, store, batch, paths, res, allow, stats)
 
     bf._write_one_batch = wrapped
@@ -529,7 +730,10 @@ def test_apply_text_and_fts_untouched(world, tmp_path, capsys):
     code, _ = _apply(capsys, world, tmp_path)
     assert code == 0
     d = sqlite3.connect(world.root / "doc_store.db")
-    assert d.execute("SELECT text FROM doc_sources WHERE source_id='n1'").fetchone()[0] == "바나나 본문"
+    assert (
+        d.execute("SELECT text FROM doc_sources WHERE source_id='n1'").fetchone()[0]
+        == "바나나 본문"
+    )
     assert d.execute("SELECT source_id, text FROM doc_sources_fts").fetchall() == fts_before
     d.close()
 
@@ -537,7 +741,7 @@ def test_apply_text_and_fts_untouched(world, tmp_path, capsys):
 def test_reconcile_detects_a_held_record_changing_class(world, tmp_path, capsys):
     _many(world, 1)
     world.graph("h", "concept", {"pack_id": "zzz"})
-    world.doc("h", {"pack_id": PACK})          # hold_pack_disagrees
+    world.doc("h", {"pack_id": PACK})  # hold_pack_disagrees
     orig = bf._write_one_batch
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
@@ -559,15 +763,17 @@ def test_reconcile_detects_two_held_records_swapping_class(world, tmp_path, caps
     _many(world, 1)
     world.graph("h1", "concept", {"pack_id": "zzz"})
     world.graph("h2", "concept", {"pack_id": "zzz"})
-    world.doc("h1", {"pack_id": PACK})          # hold_pack_disagrees
-    world.doc("h2", {})                          # hold_pack_missing
+    world.doc("h1", {"pack_id": PACK})  # hold_pack_disagrees
+    world.doc("h2", {})  # hold_pack_missing
     orig = bf._write_one_batch
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
         done = orig(conn, store, batch, paths, res, allow, stats)
         if store == "doc":
             conn.execute("UPDATE doc_sources SET metadata='{}' WHERE source_id='h1'")
-            conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id='h2'", ('{"pack_id": "pk"}',))
+            conn.execute(
+                "UPDATE doc_sources SET metadata=? WHERE source_id='h2'", ('{"pack_id": "pk"}',)
+            )
         return done
 
     bf._write_one_batch = wrapped
@@ -601,7 +807,7 @@ def test_non_object_metadata_is_held_unchanged(world, tmp_path, capsys, text):
 
 def test_missing_metadata_text_reads_as_empty_object(world, tmp_path, capsys):
     world.graph("n1", "concept", {"pack_id": PACK})
-    world.vector("n1", None, partition="")   # SQL NULL metadata
+    world.vector("n1", None, partition="")  # SQL NULL metadata
     code, rep = _apply(capsys, world, tmp_path, "--allow-pack-missing")
     assert code == 0, rep
     assert world.space("vec", "n1") == "concept"
@@ -622,7 +828,7 @@ def test_graph_properties_non_object_is_corrupt_and_never_relaxed(world, tmp_pat
 def test_non_string_pack_id_is_held(world, tmp_path, capsys, bad):
     world.graph("n1", "concept", {"pack_id": PACK})
     world.doc("n1", f'{{"pack_id": {bad}}}')
-    world.doc("u1", f'{{"pack_id": {bad}}}')                 # unmapped doc
+    world.doc("u1", f'{{"pack_id": {bad}}}')  # unmapped doc
     world.vector("n1", f'{{"pack_id": {bad}}}', partition="")
     before = world.dump()
     code, rep = _apply(capsys, world, tmp_path, "--allow-pack-missing")
@@ -649,11 +855,14 @@ def test_doc_with_valid_space_and_invalid_pack_does_not_pair(world, tmp_path, ca
     assert world.space("vec", "a") is None
 
 
-@pytest.mark.parametrize("props", [
-    '{"pack_id": "other", "pack_id": "pk", "space": "claim", "space": "concept"}',
-    '{"pack_id": "pk", "space": NaN}',
-    '{"pack_id": "pk", "x": Infinity}',
-])
+@pytest.mark.parametrize(
+    "props",
+    [
+        '{"pack_id": "other", "pack_id": "pk", "space": "claim", "space": "concept"}',
+        '{"pack_id": "pk", "space": NaN}',
+        '{"pack_id": "pk", "x": Infinity}',
+    ],
+)
 def test_graph_properties_with_duplicate_keys_or_nan_are_corrupt(world, tmp_path, capsys, props):
     world.graph("n1", "concept", props)
     world.doc("n1", {"pack_id": PACK})
@@ -674,7 +883,11 @@ def test_space_not_in_grammar_is_reported_and_kept(world, tmp_path, capsys):
     assert code == 0, rep
     assert rep["before"]["doc"]["space_not_in_grammar"] == {"outside_grammar": 1}
     assert rep["before"]["vector"]["space_not_in_grammar"] == {"outside_grammar": 1}
-    assert world.space("doc", "a") == "outside_grammar" and world.space("vec", "a") == "outside_grammar"
+    assert (
+        world.space("doc", "a") == "outside_grammar"
+        and world.space("vec", "a") == "outside_grammar"
+    )
+
 
 _STRICT_METADATA = [
     '{"pack_id": "pk", "x": NaN}',
@@ -716,7 +929,9 @@ def _deep_json_that_recurses():
 
 def test_deep_json_is_held_not_raised(world, tmp_path, capsys):
     text = _deep_json_that_recurses()
-    assert sqlite3.connect(":memory:").execute("SELECT json_valid(?, 3)", (text,)).fetchone()[0] == 1
+    assert (
+        sqlite3.connect(":memory:").execute("SELECT json_valid(?, 3)", (text,)).fetchone()[0] == 1
+    )
     world.doc("d", text)
     world.vector("v", text, partition=PACK)
     world.graph("g", "concept", text)
@@ -756,7 +971,10 @@ def test_reconcile_detects_committed_space_change(world, tmp_path, capsys):
         done = orig(conn, store, batch, paths, res, allow, stats)
         if store == "vector":
             d = sqlite3.connect(world.root / "doc_store.db")
-            d.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n0'", ('{"pack_id":"pk","space":"claim"}',))
+            d.execute(
+                "UPDATE doc_sources SET metadata=? WHERE source_id='n0'",
+                ('{"pack_id":"pk","space":"claim"}',),
+            )
             d.commit()
             d.close()
         return done
@@ -799,7 +1017,10 @@ def test_unserializable_row_does_not_block_its_batch(world, tmp_path, capsys, mo
         return real(meta, space)
 
     d = sqlite3.connect(world.root / "doc_store.db")
-    d.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n0'", ('{"pack_id":"pk","marker":"bad"}',))
+    d.execute(
+        "UPDATE doc_sources SET metadata=? WHERE source_id='n0'",
+        ('{"pack_id":"pk","marker":"bad"}',),
+    )
     d.commit()
     d.close()
     monkeypatch.setattr(bf, "_new_meta_text", fail_one)
@@ -850,22 +1071,24 @@ def test_dry_run_compares_full_doc_content_and_file_bytes(world, capsys, monkeyp
     d.execute("UPDATE doc_sources SET ingested_at='earlier' WHERE source_id='n'")
     d.commit()
     d.close()
-    original = bf.scan
+    original = bf._write_report_json
 
-    def corrupt(paths, allow, mode="ro"):
-        result = original(paths, allow, mode)
-        if mode == "ro":
-            d = sqlite3.connect(world.root / "doc_store.db")
-            d.execute("UPDATE doc_sources SET text='changed' WHERE source_id='n'")
-            d.commit()
-            d.close()
-        return result
+    def corrupt(report, list_ids, out):
+        d = sqlite3.connect(world.root / "doc_store.db")
+        d.execute("UPDATE doc_sources SET text='changed' WHERE source_id='n'")
+        d.commit()
+        d.close()
+        return original(report, list_ids, out)
 
-    monkeypatch.setattr(bf, "scan", corrupt)
+    monkeypatch.setattr(bf, "_write_report_json", corrupt)
     code, _ = _run(capsys)
     assert code == 1
-    assert sqlite3.connect(world.root / "doc_store.db").execute(
-        "SELECT text FROM doc_sources WHERE source_id='n'").fetchone()[0] == "changed"
+    assert (
+        sqlite3.connect(world.root / "doc_store.db")
+        .execute("SELECT text FROM doc_sources WHERE source_id='n'")
+        .fetchone()[0]
+        == "changed"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +1100,9 @@ def test_dry_run_compares_full_doc_content_and_file_bytes(world, capsys, monkeyp
 def test_dry_run_snapshots_the_configured_vector_file(tmp_path, monkeypatch, capsys, kind):
     root = tmp_path / "data"
     root.mkdir()
-    vpath = root / "nested" / "v.sqlite" if kind == "nested" else tmp_path / "elsewhere" / "v.sqlite"
+    vpath = (
+        root / "nested" / "v.sqlite" if kind == "nested" else tmp_path / "elsewhere" / "v.sqlite"
+    )
     value = "nested/v.sqlite" if kind == "nested" else str(vpath)
     monkeypatch.setenv("LOCAL_DATA_DIR", str(root))
     monkeypatch.setenv("STORAGE_MODE", "local")
@@ -892,18 +1117,17 @@ def test_dry_run_snapshots_the_configured_vector_file(tmp_path, monkeypatch, cap
     code, rep = _run(capsys)
     assert code == 0, rep
     assert rep["vector"]["classes"]["apply_graph"] == 1
-    # the snapshot reads the configured file: a write to it during the scan is detected
-    original = bf.scan
+    # the logical digest reads the configured file: a write before report serialization is detected
+    original = bf._write_report_json
 
-    def corrupt(paths, allow, mode="ro"):
-        result = original(paths, allow, mode)
+    def corrupt(report, list_ids, out):
         conn = bf._open(vpath, "rw", True)
         conn.execute(f"UPDATE {COLL} SET document='changed' WHERE node_id='n'")
         conn.close()
-        return result
+        return original(report, list_ids, out)
 
-    monkeypatch.setattr(bf, "scan", corrupt)
-    assert bf.main([]) == 1
+    monkeypatch.setattr(bf, "_write_report_json", corrupt)
+    assert _run(capsys)[0] == 1
     capsys.readouterr()
     get_settings.cache_clear()
 
@@ -911,10 +1135,14 @@ def test_dry_run_snapshots_the_configured_vector_file(tmp_path, monkeypatch, cap
 def _db_counts(world):
     d = world.dump()
     return {
-        "doc": (sum(1 for m in d["doc"].values() if json.loads(m).get("space")),
-                sum(1 for m in d["doc"].values() if not json.loads(m).get("space"))),
-        "vector": (sum(1 for v in d["vec"].values() if json.loads(v[1]).get("space")),
-                   sum(1 for v in d["vec"].values() if not json.loads(v[1]).get("space"))),
+        "doc": (
+            sum(1 for m in d["doc"].values() if json.loads(m).get("space")),
+            sum(1 for m in d["doc"].values() if not json.loads(m).get("space")),
+        ),
+        "vector": (
+            sum(1 for v in d["vec"].values() if json.loads(v[1]).get("space")),
+            sum(1 for v in d["vec"].values() if not json.loads(v[1]).get("space")),
+        ),
     }
 
 
@@ -949,11 +1177,16 @@ def test_failure_report_comes_from_a_rescan_and_rerun_finishes(world, tmp_path, 
         assert code == 1 and raised is None
     assert rep["error_type"] == exc_type.__name__ and rep["commit_state_unknown"] is True
     counts = _db_counts(world)
-    assert (rep["rescan"]["doc"]["valid_space"], rep["rescan"]["doc"]["no_valid_space"]) == counts["doc"]
-    assert (rep["rescan"]["vector"]["valid_space"], rep["rescan"]["vector"]["no_valid_space"]) == counts["vector"]
+    assert (rep["rescan"]["doc"]["valid_space"], rep["rescan"]["doc"]["no_valid_space"]) == counts[
+        "doc"
+    ]
+    assert (
+        rep["rescan"]["vector"]["valid_space"],
+        rep["rescan"]["vector"]["no_valid_space"],
+    ) == counts["vector"]
     for key in ("write", "reconcile", "committed", "remaining", "batches"):
         assert key not in rep
-    assert counts["doc"][0] == 2                      # the first batch stayed committed
+    assert counts["doc"][0] == 2  # the first batch stayed committed
     code, rep2 = _apply(capsys, world, tmp_path, "--batch-size", "2")
     assert code == 0 and rep2["reconcile"]["ok"]
     assert _db_counts(world) == {"doc": (6, 0), "vector": (6, 0)}
@@ -1007,8 +1240,10 @@ def test_failure_after_commit_is_not_reported_as_rolled_back(world, tmp_path, ca
     rep = json.loads(capsys.readouterr().out)
     assert code == 1 and "rolled back" not in json.dumps(rep)
     counts = _db_counts(world)
-    assert counts["doc"][0] == 4                      # two batches are durable
-    assert (rep["rescan"]["doc"]["valid_space"], rep["rescan"]["doc"]["no_valid_space"]) == counts["doc"]
+    assert counts["doc"][0] == 4  # two batches are durable
+    assert (rep["rescan"]["doc"]["valid_space"], rep["rescan"]["doc"]["no_valid_space"]) == counts[
+        "doc"
+    ]
 
 
 def test_skipped_ids_are_listed_for_every_kind(world, tmp_path, capsys):
@@ -1017,7 +1252,10 @@ def test_skipped_ids_are_listed_for_every_kind(world, tmp_path, capsys):
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
         if store == "doc":
-            conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id='n0'", ('{"pack_id":"pk","space":"claim"}',))
+            conn.execute(
+                "UPDATE doc_sources SET metadata=? WHERE source_id='n0'",
+                ('{"pack_id":"pk","space":"claim"}',),
+            )
         return orig(conn, store, batch, paths, res, allow, stats)
 
     bf._write_one_batch = wrapped
@@ -1033,8 +1271,10 @@ def test_skipped_ids_are_listed_for_every_kind(world, tmp_path, capsys):
 def test_docstring_states_no_common_read_rule():
     doc = bf.__doc__
     first = "A vector or doc_sources record without a valid space is a backfill candidate."
-    second = ("A spaces-filtered reader treats malformed values differently per backend, "
-              "so this tool does not claim one common read rule.")
+    second = (
+        "A spaces-filtered reader treats malformed values differently per backend, "
+        "so this tool does not claim one common read rule."
+    )
     assert first in doc and second in doc and doc.index(first) < doc.index(second)
     assert "Spaces-filtered queries drop every record whose metadata has no valid space." not in doc
     assert "drop every record" not in doc
@@ -1072,14 +1312,20 @@ def test_failed_rollback_does_not_hide_the_original_error(world, tmp_path, capsy
 # ---------------------------------------------------------------------------
 
 _ROW_CASES = {
-    "graph": ("graph", "UPDATE graph_nodes SET properties=? WHERE node_id='n'",
-              ('{"pack_id":"pk","extra":"changed"}',)),
+    "graph": (
+        "graph",
+        "UPDATE graph_nodes SET properties=? WHERE node_id='n'",
+        ('{"pack_id":"pk","extra":"changed"}',),
+    ),
     "doc_text": ("doc", "UPDATE doc_sources SET text='changed' WHERE source_id='n'", ()),
     "ingested_at": ("doc", "UPDATE doc_sources SET ingested_at='changed' WHERE source_id='n'", ()),
     "fts": ("doc", "UPDATE doc_sources_fts SET text='changed' WHERE source_id='n'", ()),
     "document": ("vector", f"UPDATE {COLL} SET document='changed' WHERE node_id='n'", ()),
-    "embedding": ("vector", f"UPDATE {COLL} SET embedding=? WHERE node_id='n'",
-                  (struct.pack("32f", *([0.2] * 32)),)),
+    "embedding": (
+        "vector",
+        f"UPDATE {COLL} SET embedding=? WHERE node_id='n'",
+        (struct.pack("32f", *([0.2] * 32)),),
+    ),
 }
 
 
@@ -1097,22 +1343,16 @@ def test_dry_run_row_comparison_detects_a_wal_only_change(world, capsys, monkeyp
         assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
         writer.execute("PRAGMA wal_autocheckpoint=0")
         writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        real_snapshot, real_scan = bf.dry_run_snapshot, bf.scan
+        original = bf._write_report_json
 
-        def fixed_bytes(p):
-            _files, rows = real_snapshot(p)
-            return {"constant": b"fixed"}, rows
-
-        def corrupt(p, allow, mode="ro"):
-            result = real_scan(p, allow, mode)
+        def corrupt(report, list_ids, out):
             writer.execute("BEGIN IMMEDIATE")
             writer.execute(sql, args)
             writer.execute("COMMIT")
-            return result
+            return original(report, list_ids, out)
 
-        monkeypatch.setattr(bf, "dry_run_snapshot", fixed_bytes)
-        monkeypatch.setattr(bf, "scan", corrupt)
-        assert bf.main([]) == 1
+        monkeypatch.setattr(bf, "_write_report_json", corrupt)
+        assert _run(capsys)[0] == 1
         capsys.readouterr()
     finally:
         writer.close()
@@ -1121,8 +1361,11 @@ def test_dry_run_row_comparison_detects_a_wal_only_change(world, capsys, monkeyp
 def _configured_world(tmp_path, monkeypatch, kind):
     root = tmp_path / "data"
     root.mkdir()
-    vpath = {"plain": root / "vectors.db", "nested": root / "nested" / "v.sqlite",
-             "absolute": tmp_path / "elsewhere" / "v.sqlite"}[kind]
+    vpath = {
+        "plain": root / "vectors.db",
+        "nested": root / "nested" / "v.sqlite",
+        "absolute": tmp_path / "elsewhere" / "v.sqlite",
+    }[kind]
     value = {"plain": "vectors.db", "nested": "nested/v.sqlite", "absolute": str(vpath)}[kind]
     monkeypatch.setenv("LOCAL_DATA_DIR", str(root))
     monkeypatch.setenv("STORAGE_MODE", "local")
@@ -1138,43 +1381,55 @@ def _configured_world(tmp_path, monkeypatch, kind):
     return w, bf.Paths(root, value, COLL)
 
 
-@pytest.mark.parametrize("key, kind", [("graph", "plain"), ("doc", "plain"), ("vector", "plain"),
-                                       ("vector", "nested"), ("vector", "absolute")])
-def test_dry_run_byte_comparison_detects_a_bytes_only_change(tmp_path, monkeypatch, capsys, key, kind):
+@pytest.mark.parametrize(
+    "key, kind",
+    [
+        ("graph", "plain"),
+        ("doc", "plain"),
+        ("vector", "plain"),
+        ("vector", "nested"),
+        ("vector", "absolute"),
+    ],
+)
+def test_dry_run_byte_comparison_detects_a_bytes_only_change(
+    tmp_path, monkeypatch, capsys, key, kind
+):
     """No logical row changes. Only the bytes of one main file change."""
     w, paths = _configured_world(tmp_path, monkeypatch, kind)
     w.docs.close()  # closing checkpoints the WAL now, so the main file bytes are fixed afterwards
     w.vec.close()
-    real_scan = bf.scan
+    original = bf._write_report_json
 
-    def corrupt(p, allow, mode="ro"):
-        result = real_scan(p, allow, mode)
-        conn = bf._open(getattr(p, key), "rw", key == "vector")
+    def corrupt(report, list_ids, out):
+        conn = bf._open(getattr(paths, key), "rw", key == "vector")
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             conn.execute(f"PRAGMA user_version={version + 1}")
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         finally:
             conn.close()
-        return result
+        return original(report, list_ids, out)
 
-    monkeypatch.setattr(bf, "scan", corrupt)
-    assert bf.main([]) == 1
+    monkeypatch.setattr(bf, "_write_report_json", corrupt)
+    assert _run(capsys)[0] == 1
     capsys.readouterr()
     from opencrab.config import get_settings
 
     get_settings.cache_clear()
 
 
-_INTERRUPT_TABLE = [(orig, sec, place)
-                    for orig in (RuntimeError, KeyboardInterrupt)
-                    for sec in (KeyboardInterrupt, SystemExit)
-                    for place in ("rollback", "rescan")]
+_INTERRUPT_TABLE = [
+    (orig, sec, place)
+    for orig in (RuntimeError, KeyboardInterrupt)
+    for sec in (KeyboardInterrupt, SystemExit)
+    for place in ("rollback", "rescan")
+]
 
 
 @pytest.mark.parametrize("orig, sec, place", _INTERRUPT_TABLE)
-def test_secondary_interrupts_never_hide_the_original_error(world, env, tmp_path, capsys, monkeypatch,
-                                                            orig, sec, place):
+def test_secondary_interrupts_never_hide_the_original_error(
+    world, env, tmp_path, capsys, monkeypatch, orig, sec, place
+):
     _failure_world(world)
     real_open, real_scan = bf._open, bf.scan
 
@@ -1192,7 +1447,11 @@ def test_secondary_interrupts_never_hide_the_original_error(world, env, tmp_path
 
     def opener(path, mode, vec):
         conn = real_open(path, mode, vec)
-        return Wrapped(conn) if place == "rollback" and mode == "rw" and path.name == "doc_store.db" else conn
+        return (
+            Wrapped(conn)
+            if place == "rollback" and mode == "rw" and path.name == "doc_store.db"
+            else conn
+        )
 
     calls = {"n": 0}
 
@@ -1257,7 +1516,9 @@ def test_failure_report_makes_no_rollback_claim(world, tmp_path, capsys):
     code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
     for path, value in _walk(rep):
         key = path.rsplit("/", 1)[-1]
-        assert not ("rolled" in key.lower() or ("rollback" in key.lower() and key != "rollback_error")), path
+        assert not (
+            "rolled" in key.lower() or ("rollback" in key.lower() and key != "rollback_error")
+        ), path
         if isinstance(value, str):
             assert "rolled back" not in value.lower(), path
 
@@ -1298,16 +1559,25 @@ def test_a_row_count_mismatch_fails_loudly_and_rolls_back(world, tmp_path, capsy
         def execute(self, sql, *a):
             cur = self._c.execute(sql, *a)
             if sql.startswith("UPDATE doc_sources"):
+
                 class Fake:
                     rowcount = 0
+
                 return Fake()
             return cur
 
         def __getattr__(self, name):
             return getattr(self._c, name)
 
-    monkeypatch.setattr(bf, "_open", lambda path, mode, vec: Wrapped(real_open(path, mode, vec))
-                        if mode == "rw" and path.name == "doc_store.db" else real_open(path, mode, vec))
+    monkeypatch.setattr(
+        bf,
+        "_open",
+        lambda path, mode, vec: (
+            Wrapped(real_open(path, mode, vec))
+            if mode == "rw" and path.name == "doc_store.db"
+            else real_open(path, mode, vec)
+        ),
+    )
     dest = tmp_path / "bk"
     dest.mkdir()
     code = bf.main(["--apply", "--backup-to", str(dest)])
