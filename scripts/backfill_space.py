@@ -56,6 +56,13 @@ there. Success removes that child and keeps the root. A failure keeps the child
 for inspection. SQLite may create or refresh the ``-wal`` and ``-shm`` sidecars
 of a WAL database even when it is opened ``mode=ro``.
 
+Apply state:
+  Apply creates an owner-only ``apply-state.db`` under the new backup set.
+  It keeps resolver, plan, outcome and report state there. A state write after
+  a source COMMIT can fail, so the report marks that commit state unknown and
+  keeps the backup and state file for inspection. A fresh run takes a new
+  backup and state file. It does not resume a prior state file automatically.
+
 Apply sequence:
   1. Take ``write.lock`` for the whole run.
   2. Take a backup set with ``backup_data_dir``.
@@ -507,7 +514,35 @@ def _note_report(
         report.execute("INSERT OR IGNORE INTO held VALUES (?, ?, ?)", (store, cls, rid))
 
 
-def _logical_snapshot(paths: Paths) -> dict[str, str]:
+def _vector_bit_digest(paths: Paths) -> str | None:
+    """Return the vec0 bit-column digest when the qualified schema exposes it."""
+    conn = _open(paths.vector, "ro", True)
+    try:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (paths.collection,)
+        ).fetchone()
+        if not sql or "embedding_bit" not in (sql[0] or ""):
+            return None
+        digest = hashlib.sha256()
+        for _rowid, node_id, _chunk_id, _chunk_offset in conn.execute(
+            f"SELECT rowid, id, chunk_id, chunk_offset FROM {paths.collection}_rowids"
+        ):  # noqa: S608
+            row = conn.execute(
+                f"SELECT node_id, embedding_bit FROM {paths.collection} WHERE node_id=?", (node_id,)
+            ).fetchone()  # noqa: S608
+            if row is None or row[0] != node_id:
+                raise RuntimeError("vector shadow id has no matching public row")
+            for value in row:
+                _digest_value(digest, value)
+        return digest.hexdigest()
+    finally:
+        conn.close()
+
+
+def _logical_snapshot(
+    paths: Paths, *, include_metadata: bool = True, include_files: bool = True
+) -> dict[str, str]:
+    """Return logical digests. Apply excludes planned metadata and file hashes."""
     gconn, dconn, vconn = (
         _open(paths.graph, "ro", False),
         _open(paths.doc, "ro", False),
@@ -515,11 +550,18 @@ def _logical_snapshot(paths: Paths) -> dict[str, str]:
     )
     try:
         vector = hashlib.sha256()
+        vector_sql = vconn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (paths.collection,)
+        ).fetchone()
+        has_bit = bool(vector_sql and "embedding_bit" in (vector_sql[0] or ""))
+        fields = "node_id, pack_id, embedding, document, metadata"
+        if has_bit:
+            fields = "node_id, pack_id, embedding, embedding_bit, document, metadata"
         for _rowid, node_id, _chunk_id, _chunk_offset in vconn.execute(
             f"SELECT rowid, id, chunk_id, chunk_offset FROM {paths.collection}_rowids"
         ):  # noqa: S608
             row = vconn.execute(
-                f"SELECT node_id, pack_id, embedding, document, metadata FROM {paths.collection} WHERE node_id=?",  # noqa: S608
+                f"SELECT {fields} FROM {paths.collection} WHERE node_id=?",  # noqa: S608
                 (node_id,),
             ).fetchone()
             if row is None or row[0] != node_id:
@@ -814,12 +856,551 @@ def report_of(res: dict[str, Any], list_ids: bool) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _state_after_commit(state: sqlite3.Connection) -> None:
+    """Commit private state after a durable source batch commit."""
+    state.commit()
+
+
+def _apply_state_db(backup_dir: Path) -> sqlite3.Connection:
+    """Create private state for one apply run under its backup set."""
+    path = backup_dir / "apply-state.db"
+    conn = sqlite3.connect(path)
+    try:
+        os.chmod(path, 0o600)
+        conn.executescript("""
+            CREATE TABLE graph (
+                row_id INTEGER PRIMARY KEY, key_type TEXT NOT NULL, key_value BLOB,
+                props_bad INTEGER NOT NULL, space TEXT, pack TEXT, ambiguous INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX graph_key_first ON graph(key_type, key_value);
+            CREATE TABLE docs (
+                row_id INTEGER PRIMARY KEY, key_type TEXT NOT NULL, key_value BLOB,
+                pack TEXT NOT NULL, invalid_pack INTEGER NOT NULL, space TEXT
+            );
+            CREATE UNIQUE INDEX docs_key_last ON docs(key_type, key_value);
+            CREATE TABLE plan (
+                row_id INTEGER PRIMARY KEY, store TEXT NOT NULL,
+                raw_type TEXT NOT NULL, raw_value BLOB NOT NULL,
+                partition TEXT, space TEXT NOT NULL, class TEXT NOT NULL
+            );
+            CREATE TABLE outcome (
+                plan_row_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, space TEXT
+            );
+            CREATE TABLE counter (
+                store TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL,
+                value INTEGER NOT NULL, PRIMARY KEY(store, kind, key)
+            );
+            CREATE TABLE held (
+                row_id INTEGER PRIMARY KEY, store TEXT NOT NULL,
+                key_type TEXT NOT NULL, key_value BLOB NOT NULL,
+                occurrence INTEGER NOT NULL, display_id BLOB, class TEXT NOT NULL,
+                UNIQUE(store, key_type, key_value, occurrence)
+            );
+            CREATE TABLE held_occurrence (
+                store TEXT NOT NULL, key_type TEXT NOT NULL, key_value BLOB NOT NULL,
+                next_occurrence INTEGER NOT NULL,
+                PRIMARY KEY(store, key_type, key_value)
+            );
+        """)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _resolver_key(value: Any) -> tuple[str, bytes | None]:
+    """Encode current Python dictionary equality without SQLite affinity."""
+    if value is None:
+        return "null", b""
+    if isinstance(value, bytes):
+        return "blob", value
+    if isinstance(value, str):
+        return "text", value.encode("utf-8")
+    if isinstance(value, bool):
+        return "integer", str(int(value)).encode("ascii")
+    if isinstance(value, int):
+        return "integer", str(value).encode("ascii")
+    if isinstance(value, float):
+        if value == float("inf"):
+            return "real_inf", b"+"
+        if value == float("-inf"):
+            return "real_inf", b"-"
+        if value.is_integer():
+            return "integer", str(int(value)).encode("ascii")
+        return "real", value.hex().encode("ascii")
+    raise TypeError(f"unsupported resolver key: {type(value).__name__}")
+
+
+def _state_graph_get(state: sqlite3.Connection, rid: Any) -> dict[str, Any] | None:
+    key_type, key_value = _resolver_key(rid)
+    row = state.execute(
+        "SELECT props_bad, space, pack, ambiguous FROM graph WHERE key_type=? AND key_value IS ?",
+        (key_type, key_value),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"props_bad": bool(row[0]), "space": row[1], "pack": row[2], "ambiguous": bool(row[3])}
+
+
+def _state_doc_get(state: sqlite3.Connection, rid: Any) -> tuple[Any, str | None] | None:
+    key_type, key_value = _resolver_key(rid)
+    row = state.execute(
+        "SELECT pack, invalid_pack, space FROM docs WHERE key_type=? AND key_value IS ?",
+        (key_type, key_value),
+    ).fetchone()
+    if row is None:
+        return None
+    return (INVALID_PACK if row[1] else row[0], row[2])
+
+
+def _raw_identity(value: Any) -> tuple[str, bytes]:
+    """Encode original SQLite/Python value for physical row identity."""
+    if value is None:
+        return "null", b""
+    if isinstance(value, bytes):
+        return "blob", value
+    if isinstance(value, str):
+        return "text", value.encode("utf-8")
+    if isinstance(value, int):
+        return "integer", str(value).encode("ascii")
+    if isinstance(value, float):
+        if value == float("inf"):
+            return "real_inf", b"+"
+        if value == float("-inf"):
+            return "real_inf", b"-"
+        return "real", value.hex().encode("ascii")
+    raise TypeError(f"unsupported raw identity: {type(value).__name__}")
+
+
+def _raw_value(raw_type: str, raw_value: bytes) -> Any:
+    if raw_type == "null":
+        return None
+    if raw_type == "blob":
+        return raw_value
+    if raw_type == "text":
+        return raw_value.decode("utf-8")
+    if raw_type == "integer":
+        return int(raw_value)
+    if raw_type == "real_inf":
+        return float("inf") if raw_value == b"+" else float("-inf")
+    if raw_type == "real":
+        return float.fromhex(raw_value.decode("ascii"))
+    raise ValueError(raw_type)
+
+
+def _next_held_occurrence(
+    state: sqlite3.Connection, store: str, key_type: str, key_value: bytes
+) -> int:
+    """Persist and return the next physical occurrence for one resolver key."""
+    row = state.execute(
+        """INSERT INTO held_occurrence(store, key_type, key_value, next_occurrence)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(store, key_type, key_value) DO UPDATE
+        SET next_occurrence=next_occurrence+1
+        RETURNING next_occurrence-1""",
+        (store, key_type, key_value),
+    ).fetchone()
+    return row[0]
+
+
+def _state_inc(state: sqlite3.Connection, store: str, kind: str, key: str, value: int = 1) -> None:
+    state.execute(
+        """INSERT INTO counter VALUES (?, ?, ?, ?)
+        ON CONFLICT(store, kind, key) DO UPDATE SET value=value+excluded.value""",
+        (store, kind, key, value),
+    )
+
+
+def _state_map(state: sqlite3.Connection, store: str, kind: str) -> dict[str, int]:
+    return {
+        key: value
+        for key, value in state.execute(
+            "SELECT key, value FROM counter WHERE store=? AND kind=? ORDER BY key", (store, kind)
+        )
+    }
+
+
+def _write_state_map(out: Any, state: sqlite3.Connection, store: str, kind: str) -> None:
+    out.write("{")
+    first = True
+    for key, value in state.execute(
+        "SELECT key, value FROM counter WHERE store=? AND kind=? ORDER BY key", (store, kind)
+    ):
+        if not first:
+            out.write(",")
+        json.dump(key, out, ensure_ascii=False)
+        out.write(":")
+        json.dump(value, out)
+        first = False
+    out.write("}")
+
+
+def _state_before_report(state: sqlite3.Connection, list_ids: bool) -> dict[str, Any]:
+    """Build the established report shape from bounded state counters."""
+    out = {
+        "total": {},
+        "graph": _state_map(state, "graph", "stat"),
+        "space_differs_from_graph": {},
+        "vector_corroboration": _state_map(state, "vector", "corroboration"),
+        "vector_vs_doc_space_differs": _state_map(state, "vector", "vector_doc_diff").get("all", 0),
+    }
+    for store in ("doc", "vector"):
+        classes = _state_map(state, store, "class")
+        out["total"][store] = _state_map(state, store, "total").get("all", 0)
+        out["space_differs_from_graph"][store] = _state_map(state, store, "graph_diff").get(
+            "all", 0
+        )
+        out[store] = {
+            "no_valid_space": sum(value for key, value in classes.items() if key != "skip_valid"),
+            "classes": classes,
+            "invalid_kinds": _state_map(state, store, "invalid"),
+            "planned_space_distribution": _state_map(state, store, "distribution"),
+            "space_not_in_grammar": _state_map(state, store, "non_grammar"),
+        }
+        if list_ids:
+            held = {}
+            for cls, raw_type, raw_value in state.execute(
+                "SELECT class, key_type, display_id FROM held WHERE store=? ORDER BY class, row_id",
+                (store,),
+            ):
+                rid = _raw_value(raw_type, raw_value)
+                held.setdefault(cls, [])
+                if len(held[cls]) < LIST_CAP:
+                    held[cls].append(rid)
+            out[store]["held_ids"] = held
+    return out
+
+
+def _scan_apply_state(paths: Paths, state: sqlite3.Connection, allow: bool) -> dict[str, Any]:
+    """Stream current stores into private resolver and plan state."""
+    gconn, dconn, vconn = (
+        _open(paths.graph, "ro", False),
+        _open(paths.doc, "ro", False),
+        _open(paths.vector, "ro", True),
+    )
+    try:
+        for rid, space_id, props_text in gconn.execute(
+            "SELECT node_id, space_id, properties FROM graph_nodes"
+        ):
+            props = parse_graph_properties(props_text)
+            if props is None:
+                entry = (1, None, None)
+                _state_inc(state, "graph", "stat", "graph_props_bad")
+            else:
+                pspace, pkind = value_kind(props.get("space"))
+                cspace, _ = value_kind(space_id)
+                if pkind == "container":
+                    _state_inc(state, "graph", "stat", "graph_space_container_like")
+                if pspace is not None and cspace is not None and pspace != cspace:
+                    _state_inc(state, "graph", "stat", "graph_column_differs_props")
+                entry = (
+                    0,
+                    pspace if pspace is not None else cspace,
+                    _str_or_none(props.get("pack_id")),
+                )
+            key_type, key_value = _resolver_key(rid)
+            prior = state.execute(
+                "SELECT row_id, props_bad, space, pack FROM graph WHERE key_type=? AND key_value IS ?",
+                (key_type, key_value),
+            ).fetchone()
+            if prior is None:
+                state.execute(
+                    "INSERT INTO graph(key_type, key_value, props_bad, space, pack, ambiguous) VALUES (?, ?, ?, ?, ?, 0)",
+                    (key_type, key_value, *entry),
+                )
+            elif prior[1:] != entry:
+                state.execute("UPDATE graph SET ambiguous=1 WHERE row_id=?", (prior[0],))
+        for rid, text in dconn.execute("SELECT source_id, metadata FROM doc_sources"):
+            meta = parse_meta(text)
+            g = _state_graph_get(state, rid)
+            cls, space = decide("doc", rid, meta, None, {} if g is None else {rid: g}, {}, allow)
+            pack = pack_of(meta)
+            key_type, key_value = _resolver_key(rid)
+            state.execute(
+                """INSERT INTO docs(key_type, key_value, pack, invalid_pack, space)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(key_type, key_value) DO UPDATE SET
+                    pack=excluded.pack, invalid_pack=excluded.invalid_pack, space=excluded.space""",
+                (
+                    key_type,
+                    key_value,
+                    "" if pack is INVALID_PACK else pack,
+                    int(pack is INVALID_PACK),
+                    space if cls == "skip_valid" or cls.startswith("apply") else None,
+                ),
+            )
+            _state_inc(state, "doc", "total", "all")
+            _state_inc(state, "doc", "class", cls)
+            if cls == "skip_valid":
+                if space not in GRAMMAR_SPACES:
+                    _state_inc(state, "doc", "non_grammar", space or "")
+                if g is not None and g["space"] is not None and g["space"] != space:
+                    _state_inc(state, "doc", "graph_diff", "all")
+            elif isinstance(meta, dict):
+                _state_inc(
+                    state,
+                    "doc",
+                    "invalid",
+                    value_kind(meta.get("space"))[1] if "space" in meta else "missing",
+                )
+            if not cls.startswith("apply") and cls != "skip_valid":
+                key_type, key_value = _resolver_key(rid)
+                occurrence = _next_held_occurrence(state, "doc", key_type, key_value)
+                state.execute(
+                    "INSERT INTO held(store, key_type, key_value, occurrence, display_id, class) VALUES ('doc', ?, ?, ?, ?, ?)",
+                    (key_type, key_value, occurrence, rid, cls),
+                )
+            if cls.startswith("apply"):
+                _state_inc(state, "doc", "distribution", space or "")
+                raw_type, raw_value = _raw_identity(rid)
+                state.execute(
+                    "INSERT INTO plan(store, raw_type, raw_value, partition, space, class) VALUES ('doc', ?, ?, NULL, ?, ?)",
+                    (raw_type, raw_value, space, cls),
+                )
+        for rid, part, text in vconn.execute(
+            f"SELECT node_id, pack_id, metadata FROM {paths.collection}"
+        ):  # noqa: S608
+            meta = parse_meta(text)
+            g, doc = _state_graph_get(state, rid), _state_doc_get(state, rid)
+            cls, space = decide(
+                "vector",
+                rid,
+                meta,
+                part,
+                {} if g is None else {rid: g},
+                {} if doc is None else {rid: doc},
+                allow,
+            )
+            _state_inc(state, "vector", "total", "all")
+            _state_inc(state, "vector", "class", cls)
+            if g is not None and isinstance(meta, dict):
+                if cls == "apply_graph" or cls == "skip_valid":
+                    corroborated = (
+                        _state_doc_get(state, rid) is not None or meta.get("node_id") == rid
+                    )
+                    _state_inc(
+                        state,
+                        "vector",
+                        "corroboration",
+                        "corroborated" if corroborated else "pk_only",
+                    )
+                doc_pair = _state_doc_get(state, rid)
+                if (
+                    cls == "apply_graph"
+                    and doc_pair is not None
+                    and doc_pair[1] not in (None, space)
+                ):
+                    _state_inc(state, "vector", "vector_doc_diff", "all")
+            if cls == "skip_valid":
+                if space not in GRAMMAR_SPACES:
+                    _state_inc(state, "vector", "non_grammar", space or "")
+                if g is not None and g["space"] is not None and g["space"] != space:
+                    _state_inc(state, "vector", "graph_diff", "all")
+            elif isinstance(meta, dict):
+                _state_inc(
+                    state,
+                    "vector",
+                    "invalid",
+                    value_kind(meta.get("space"))[1] if "space" in meta else "missing",
+                )
+            if not cls.startswith("apply") and cls != "skip_valid":
+                key_type, key_value = _resolver_key(rid)
+                occurrence = _next_held_occurrence(state, "vector", key_type, key_value)
+                state.execute(
+                    "INSERT INTO held(store, key_type, key_value, occurrence, display_id, class) VALUES ('vector', ?, ?, ?, ?, ?)",
+                    (key_type, key_value, occurrence, rid, cls),
+                )
+            if cls.startswith("apply"):
+                _state_inc(state, "vector", "distribution", space or "")
+                raw_type, raw_value = _raw_identity(rid)
+                state.execute(
+                    "INSERT INTO plan(store, raw_type, raw_value, partition, space, class) VALUES ('vector', ?, ?, ?, ?, ?)",
+                    (raw_type, raw_value, part, space, cls),
+                )
+        state.commit()
+        return {
+            "graph": {},
+            "docs": {},
+            "plan": {"doc": [], "vector": []},
+            "total": {"doc": 0, "vector": 0},
+            "classes": {"doc": collections.Counter(), "vector": collections.Counter()},
+            "held_map": {"doc": {}, "vector": {}},
+            "graph_stats": {},
+            "invalid_kinds": {"doc": collections.Counter(), "vector": collections.Counter()},
+            "distribution": {"doc": collections.Counter(), "vector": collections.Counter()},
+            "held_ids": {
+                "doc": collections.defaultdict(list),
+                "vector": collections.defaultdict(list),
+            },
+            "space_differs_from_graph": {"doc": 0, "vector": 0},
+            "corroboration": collections.Counter(),
+            "space_not_in_grammar": {"doc": collections.Counter(), "vector": collections.Counter()},
+            "vector_vs_doc_space_differs": 0,
+        }
+    finally:
+        gconn.close()
+        dconn.close()
+        vconn.close()
+
+
+def _plan_state(state: sqlite3.Connection, plan: dict[str, list[tuple]]) -> None:
+    for store in ("doc", "vector"):
+        state.executemany(
+            "INSERT INTO plan VALUES (?, ?, ?, ?, ?)",
+            ((store, rid, part, space, cls) for rid, part, space, cls in plan[store]),
+        )
+    state.commit()
+
+
+def _state_stats(
+    state: sqlite3.Connection, remaining: dict[str, int], batches: int
+) -> dict[str, Any]:
+    """Return bounded outcome counts from private state."""
+    stats = {
+        "batches": batches,
+        "remaining": remaining,
+        "committed": {"doc": 0, "vector": 0},
+        "skipped_changed": {"doc": 0, "vector": 0},
+        "skipped_unserializable": {"doc": 0, "vector": 0},
+    }
+    for store, kind, count in state.execute(
+        "SELECT plan.store, outcome.kind, count(*) FROM outcome JOIN plan ON plan.row_id=outcome.plan_row_id GROUP BY plan.store, outcome.kind"
+    ):
+        stats[kind][store] = count
+    return stats
+
+
 def _new_meta_text(meta: dict[str, Any], space: str) -> str:
     out = dict(meta)
     out["space"] = space
     from opencrab.stores._json import dump_props
 
     return dump_props(out)
+
+
+def _write_state_batches(
+    paths: Paths,
+    state: sqlite3.Connection,
+    batch_size: int,
+    max_batches: int | None,
+    allow_pack_missing: bool,
+    before_commit: Any,
+) -> dict[str, Any]:
+    """Write ordered private-state plans and persist outcomes after COMMIT."""
+    batches = 0
+    remaining = {"doc": 0, "vector": 0}
+    dconn = _open(paths.doc, "rw", False)
+    vconn = _open(paths.vector, "rw", True)
+    try:
+        for store, conn in (("doc", dconn), ("vector", vconn)):
+            cursor = state.execute(
+                "SELECT row_id, raw_type, raw_value, partition, space, class FROM plan WHERE store=? ORDER BY row_id",
+                (store,),
+            )
+            while batch := cursor.fetchmany(batch_size):
+                if max_batches is not None and batches >= max_batches:
+                    remaining[store] += len(batch) + sum(1 for _ in cursor)
+                    break
+                local = {
+                    "skipped_changed": {"doc": [], "vector": []},
+                    "skipped_unserializable": {"doc": [], "vector": []},
+                }
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    done = _write_state_one_batch(
+                        conn, store, batch, paths, state, allow_pack_missing, local
+                    )
+                    if before_commit is not None:
+                        before_commit(store, batches)
+                    conn.execute("COMMIT")
+                except BaseException as exc:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except BaseException as rollback:
+                        exc.rollback_error = f"{type(rollback).__name__}: {rollback}"
+                    raise
+                try:
+                    state.executemany("INSERT INTO outcome VALUES (?, 'committed', ?)", done)
+                    state.executemany(
+                        "INSERT INTO outcome VALUES (?, 'skipped_changed', NULL)",
+                        ((row_id,) for row_id in local["skipped_changed"][store]),
+                    )
+                    state.executemany(
+                        "INSERT INTO outcome VALUES (?, 'skipped_unserializable', NULL)",
+                        ((row_id,) for row_id in local["skipped_unserializable"][store]),
+                    )
+                    _state_after_commit(state)
+                except BaseException as exc:
+                    exc.commit_state_unknown = True
+                    raise
+                batches += 1
+    finally:
+        dconn.close()
+        vconn.close()
+    return _state_stats(state, remaining, batches)
+
+
+def _write_state_one_batch(conn, store, batch, paths, state, allow_pack_missing, stats):
+    """Re-read typed physical plan rows and decide through private resolver rows."""
+    done = []
+    for row_id, raw_type, raw_value, part, space, cls in batch:
+        rid = _raw_value(raw_type, raw_value)
+        if raw_type == "null":
+            # Legacy IN (...) never matches NULL, so record a skip and continue.
+            stats["skipped_changed"][store].append(row_id)
+            continue
+        if store == "doc":
+            sql = (
+                "SELECT source_id, NULL, metadata FROM doc_sources WHERE source_id IS NULL"
+                if rid is None
+                else "SELECT source_id, NULL, metadata FROM doc_sources WHERE source_id=?"
+            )
+        else:
+            sql = (
+                f"SELECT node_id, pack_id, metadata FROM {paths.collection} WHERE node_id IS NULL"
+                if rid is None
+                else f"SELECT node_id, pack_id, metadata FROM {paths.collection} WHERE node_id=?"
+            )  # noqa: S608
+        row = conn.execute(sql, () if rid is None else (rid,)).fetchone()
+        if row is None or _raw_identity(row[0]) != (raw_type, raw_value):
+            stats["skipped_changed"][store].append(row_id)
+            continue
+        meta = parse_meta(row[2])
+        graph = _state_graph_get(state, rid)
+        doc = _state_doc_get(state, rid) if store != "doc" else None
+        now = decide(
+            store,
+            rid,
+            meta,
+            row[1],
+            {} if graph is None else {rid: graph},
+            {} if doc is None else {rid: doc},
+            allow_pack_missing,
+        )
+        if now != (cls, space) or row[1] != part:
+            stats["skipped_changed"][store].append(row_id)
+            continue
+        try:
+            text = _new_meta_text(meta, space)
+        except (TypeError, ValueError, UnicodeError):
+            stats["skipped_unserializable"][store].append(row_id)
+            continue
+        if store == "doc":
+            cur = conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (text, rid))
+        elif part is None:
+            cur = conn.execute(
+                f"UPDATE {paths.collection} SET metadata=? WHERE node_id=? AND pack_id IS NULL",
+                (text, rid),
+            )  # noqa: S608
+        else:
+            cur = conn.execute(
+                f"UPDATE {paths.collection} SET metadata=? WHERE node_id=? AND pack_id=?",
+                (text, rid, part),
+            )  # noqa: S608
+        if cur.rowcount != 1:
+            raise AssertionError(f"{store} UPDATE changed {cur.rowcount} rows for {rid}")
+        done.append((row_id, space))
+    return done
 
 
 def _write_batches(
@@ -922,6 +1503,263 @@ def _write_one_batch(conn, store, batch, paths, res, allow_pack_missing, stats):
     return done
 
 
+def _state_outcomes(state: sqlite3.Connection, store: str, kind: str):
+    return state.execute(
+        "SELECT plan.raw_type, plan.raw_value, outcome.space FROM outcome JOIN plan ON plan.row_id=outcome.plan_row_id WHERE plan.store=? AND outcome.kind=? ORDER BY plan.row_id",
+        (store, kind),
+    )
+
+
+_cursor_observer: Any = None
+
+
+def _limited_cursor(state: sqlite3.Connection, sql: str, params: tuple[Any, ...]):
+    cursor = state.execute(sql, params)
+    if _cursor_observer is not None:
+        return _cursor_observer(cursor)
+    return cursor
+
+
+def _limited_state_ids(state: sqlite3.Connection, store: str, kind: str, limit: int):
+    """Yield at most limit outcome IDs from a cursor that tests can count."""
+    cursor = _limited_cursor(
+        state,
+        "SELECT plan.raw_type, plan.raw_value FROM outcome JOIN plan ON plan.row_id=outcome.plan_row_id WHERE plan.store=? AND outcome.kind=? ORDER BY plan.row_id LIMIT ?",
+        (store, kind, limit),
+    )
+    for raw_type, raw_value in cursor:
+        yield _raw_value(raw_type, raw_value)
+
+
+def _write_apply_report(
+    state: sqlite3.Connection,
+    out: Any,
+    args: argparse.Namespace,
+    code: int,
+    rec: dict[str, Any],
+    stats: dict[str, Any],
+    backup_set: str,
+) -> None:
+    """Write apply output from private state cursors without a before report map."""
+    out.write('{"mode":"apply","exit":')
+    out.write(str(code))
+    out.write(',"backup_set":')
+    json.dump(backup_set, out)
+    out.write(',"before":{"total":{')
+    for index, store in enumerate(("doc", "vector")):
+        if index:
+            out.write(",")
+        json.dump(store, out)
+        out.write(":")
+        value = state.execute(
+            "SELECT value FROM counter WHERE store=? AND kind='total' AND key='all'", (store,)
+        ).fetchone()
+        out.write(str(value[0] if value else 0))
+    out.write('},"graph":')
+    _write_state_map(out, state, "graph", "stat")
+    out.write(',"space_differs_from_graph":{')
+    for index, store in enumerate(("doc", "vector")):
+        if index:
+            out.write(",")
+        json.dump(store, out)
+        out.write(":")
+        value = state.execute(
+            "SELECT value FROM counter WHERE store=? AND kind='graph_diff' AND key='all'", (store,)
+        ).fetchone()
+        out.write(str(value[0] if value else 0))
+    out.write('},"vector_corroboration":')
+    _write_state_map(out, state, "vector", "corroboration")
+    out.write(',"vector_vs_doc_space_differs":')
+    value = state.execute(
+        "SELECT value FROM counter WHERE store='vector' AND kind='vector_doc_diff' AND key='all'"
+    ).fetchone()
+    out.write(str(value[0] if value else 0))
+    for store in ("doc", "vector"):
+        out.write(",")
+        json.dump(store, out)
+        out.write(':{"no_valid_space":')
+        value = state.execute(
+            "SELECT COALESCE(SUM(value), 0) FROM counter WHERE store=? AND kind='class' AND key != 'skip_valid'",
+            (store,),
+        ).fetchone()[0]
+        out.write(str(value))
+        for field, kind in (
+            ("classes", "class"),
+            ("invalid_kinds", "invalid"),
+            ("planned_space_distribution", "distribution"),
+            ("space_not_in_grammar", "non_grammar"),
+        ):
+            out.write(",")
+            json.dump(field, out)
+            out.write(":")
+            _write_state_map(out, state, store, kind)
+        if args.list_ids:
+            out.write(',"held_ids":{')
+            first_class = True
+            for (cls,) in state.execute(
+                "SELECT DISTINCT class FROM held WHERE store=? ORDER BY class", (store,)
+            ):
+                if not first_class:
+                    out.write(",")
+                json.dump(cls, out, ensure_ascii=False)
+                out.write(":[")
+                first_id = True
+                for (rid,) in state.execute(
+                    "SELECT display_id FROM held WHERE store=? AND class=? ORDER BY row_id LIMIT ?",
+                    (store, cls, LIST_CAP),
+                ):
+                    if not first_id:
+                        out.write(",")
+                    json.dump(rid, out, ensure_ascii=False)
+                    first_id = False
+                out.write("]")
+                first_class = False
+            out.write("}")
+        out.write("}")
+    out.write('},"write":')
+    json.dump(
+        {
+            "batches": stats["batches"],
+            "committed": stats["committed"],
+            "skipped_changed": sum(stats["skipped_changed"].values()),
+            "skipped_unserializable": stats["skipped_unserializable"],
+            "remaining": stats["remaining"],
+        },
+        out,
+    )
+    if args.list_ids:
+        for label, kind in (
+            ("skipped_changed_ids", "skipped_changed"),
+            ("skipped_unserializable_ids", "skipped_unserializable"),
+        ):
+            out.write(",")
+            json.dump(label, out)
+            out.write(":{")
+            for index, store in enumerate(("doc", "vector")):
+                if index:
+                    out.write(",")
+                json.dump(store, out)
+                out.write(":")
+                ids = list(_limited_state_ids(state, store, kind, LIST_CAP))
+                json.dump(ids, out, ensure_ascii=False)
+            out.write("}")
+    out.write(',"reconcile":')
+    json.dump(rec, out)
+    out.write("}")
+
+
+def _fresh_resolver_state(paths: Paths, parent: Path, allow: bool) -> sqlite3.Connection:
+    """Build a current resolver snapshot for failure or reconcile classification."""
+    fresh_dir = parent / f"current-resolver-{uuid.uuid4()}"
+    fresh_dir.mkdir(mode=0o700)
+    fresh = _apply_state_db(fresh_dir)
+    _scan_apply_state(paths, fresh, allow)
+    return fresh
+
+
+def _stream_apply_state(paths: Paths, state: sqlite3.Connection, allow: bool):
+    """Yield current classifications through the disk resolver without full maps."""
+    dconn, vconn = _open(paths.doc, "ro", False), _open(paths.vector, "ro", True)
+    try:
+        for rid, text in dconn.execute("SELECT source_id, metadata FROM doc_sources"):
+            meta = parse_meta(text)
+            graph = _state_graph_get(state, rid)
+            cls, space = decide(
+                "doc", rid, meta, None, {} if graph is None else {rid: graph}, {}, allow
+            )
+            yield "doc", rid, cls, space
+        for rid, part, text in vconn.execute(
+            f"SELECT node_id, pack_id, metadata FROM {paths.collection}"
+        ):  # noqa: S608
+            meta = parse_meta(text)
+            graph, doc = _state_graph_get(state, rid), _state_doc_get(state, rid)
+            cls, space = decide(
+                "vector",
+                rid,
+                meta,
+                part,
+                {} if graph is None else {rid: graph},
+                {} if doc is None else {rid: doc},
+                allow,
+            )
+            yield "vector", rid, cls, space
+    finally:
+        dconn.close()
+        vconn.close()
+
+
+def reconcile_state(
+    paths: Paths,
+    state: sqlite3.Connection,
+    stats: dict[str, Any],
+    allow_pack_missing: bool,
+) -> dict[str, Any]:
+    """Reconcile with state outcome cursors instead of outcome Python lists."""
+    state_path = Path(state.execute("PRAGMA database_list").fetchone()[2])
+    fresh = _fresh_resolver_state(paths, state_path.parent, allow_pack_missing)
+    # Fresh scan populated occurrence rows for its own held snapshot. Reconcile
+    # needs a new current-stream sequence that starts at zero for every key.
+    fresh.execute("DELETE FROM held_occurrence")
+    fresh.commit()
+    problems: list[str] = []
+    totals = {"doc": 0, "vector": 0}
+    no_valid_after = {"doc": 0, "vector": 0}
+    seen_held = {"doc": 0, "vector": 0}
+    for store, rid, cls, _space in _stream_apply_state(paths, fresh, allow_pack_missing):
+        totals[store] += 1
+        if cls != "skip_valid":
+            no_valid_after[store] += 1
+        if not cls.startswith("apply") and cls != "skip_valid":
+            key_type, key_value = _resolver_key(rid)
+            occurrence = _next_held_occurrence(fresh, store, key_type, key_value)
+            expected = state.execute(
+                "SELECT class FROM held WHERE store=? AND key_type=? AND key_value=? AND occurrence=?",
+                (store, key_type, key_value, occurrence),
+            ).fetchone()
+            if expected is None or expected[0] != cls:
+                problem = f"{store}: hold class counts changed (a held id changed class)"
+                if problem not in problems:
+                    problems.append(problem)
+            else:
+                seen_held[store] += 1
+    for store in ("doc", "vector"):
+        n = stats["committed"][store]
+        before_total = _state_map(state, store, "total").get("all", 0)
+        before_classes = _state_map(state, store, "class")
+        before_no_valid = sum(value for key, value in before_classes.items() if key != "skip_valid")
+        if totals[store] != before_total:
+            problems.append(f"{store}: total rows changed")
+        if no_valid_after[store] != before_no_valid - n:
+            problems.append(f"{store}: no-valid-space count is not before minus committed")
+        expected_count = state.execute(
+            "SELECT count(*) FROM held WHERE store=?", (store,)
+        ).fetchone()[0]
+        if seen_held[store] != expected_count:
+            problems.append(f"{store}: hold class counts changed (a held id changed class)")
+    dconn = _open(paths.doc, "ro", False)
+    vconn = _open(paths.vector, "ro", True)
+    try:
+        for store, conn, sql in (
+            ("doc", dconn, "SELECT metadata FROM doc_sources WHERE source_id = ?"),
+            ("vector", vconn, f"SELECT metadata FROM {paths.collection} WHERE node_id = ?"),
+        ):  # noqa: S608
+            for raw_type, raw_value, space in _state_outcomes(state, store, "committed"):
+                rid = _raw_value(raw_type, raw_value)
+                row = conn.execute(
+                    sql.replace(" = ?", " IS NULL") if rid is None else sql,
+                    () if rid is None else (rid,),
+                ).fetchone()
+                meta = parse_meta(row[0]) if row else None
+                if not isinstance(meta, dict) or meta.get("space") != space:
+                    problems.append(f"{store}: {rid} does not hold {space}")
+                    break
+    finally:
+        dconn.close()
+        vconn.close()
+        fresh.close()
+    return {"ok": not problems, "problems": problems}
+
+
 def reconcile(
     paths: Paths, before: dict[str, Any], stats: dict[str, Any], allow_pack_missing: bool
 ) -> dict[str, Any]:
@@ -956,7 +1794,42 @@ def reconcile(
     return {"ok": not problems, "problems": problems}
 
 
-def _failure_report(paths: Paths, args: argparse.Namespace, exc: BaseException) -> dict[str, Any]:
+def _state_rescan_summary(paths: Paths, state: sqlite3.Connection, allow: bool) -> dict[str, Any]:
+    """Build a bounded failure summary with a fresh current-source resolver."""
+    state_path = Path(state.execute("PRAGMA database_list").fetchone()[2])
+    fresh_dir = state_path.parent / f"failure-rescan-{uuid.uuid4()}"
+    fresh_dir.mkdir(mode=0o700)
+    fresh = _apply_state_db(fresh_dir)
+    try:
+        _scan_apply_state(paths, fresh, allow)
+        total = {"doc": 0, "vector": 0}
+        classes = {"doc": collections.Counter(), "vector": collections.Counter()}
+        for store, _rid, cls, _space in _stream_apply_state(paths, fresh, allow):
+            total[store] += 1
+            classes[store][cls] += 1
+        return {
+            "total": total,
+            **{
+                store: {
+                    "valid_space": classes[store].get("skip_valid", 0),
+                    "no_valid_space": sum(
+                        n for cls, n in classes[store].items() if cls != "skip_valid"
+                    ),
+                    "classes": {cls: n for cls, n in classes[store].items() if cls != "skip_valid"},
+                }
+                for store in ("doc", "vector")
+            },
+        }
+    finally:
+        fresh.close()
+
+
+def _failure_report(
+    paths: Paths,
+    args: argparse.Namespace,
+    exc: BaseException,
+    state: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
     """Describe a failed write phase from a read-only rescan, never from memory counters."""
     out: dict[str, Any] = {
         "error": f"{type(exc).__name__}: {exc}",
@@ -969,20 +1842,9 @@ def _failure_report(paths: Paths, args: argparse.Namespace, exc: BaseException) 
     if getattr(exc, "rollback_error", None):
         out["rollback_error"] = exc.rollback_error
     try:
-        res = scan(paths, args.allow_pack_missing, mode="ro")
-        out["rescan"] = {
-            "total": res["total"],
-            **{
-                store: {
-                    "valid_space": res["classes"][store].get("skip_valid", 0),
-                    "no_valid_space": no_valid(res, store),
-                    "classes": {
-                        c: n for c, n in res["classes"][store].items() if c != "skip_valid"
-                    },
-                }
-                for store in ("doc", "vector")
-            },
-        }
+        if state is None:
+            raise RuntimeError("apply state is unavailable for failure rescan")
+        out["rescan"] = _state_rescan_summary(paths, state, args.allow_pack_missing)
     except BaseException as rescan_exc:
         out["rescan_error"] = f"{type(rescan_exc).__name__}: {rescan_exc}"
     return out
@@ -1001,48 +1863,41 @@ def run_apply(
         return 3, {"error": str(exc)}
     try:
         backup = backup_data_dir(paths.data_dir, args.backup_to, lock_timeout=args.lock_timeout)
-        before = scan(paths, args.allow_pack_missing, mode="ro")
+        pre_bit = _vector_bit_digest(paths)
+        state = _apply_state_db(backup.set_dir)
+        before = _scan_apply_state(paths, state, args.allow_pack_missing)
         out: dict[str, Any] = {
             "backup_set": str(backup.set_dir),
-            "before": report_of(before, args.list_ids),
+            "state_path": str(backup.set_dir / "apply-state.db"),
         }
         try:
-            stats = _write_batches(
+            stats = _write_state_batches(
                 paths,
-                before["plan"],
-                before,
+                state,
                 args.batch_size,
                 args.max_batches,
                 args.allow_pack_missing,
                 before_commit,
             )
         except BaseException as exc:
-            failure = _failure_report(paths, args, exc)
-            out.pop("before", None)
+            failure = _failure_report(paths, args, exc, state)
             out.update(failure)
+            if getattr(exc, "commit_state_unknown", False):
+                out["commit_state_unknown"] = True
             if isinstance(exc, Exception):
                 return 1, out
             exc.backfill_report = out
             raise
-        out["write"] = {
-            "batches": stats["batches"],
-            "committed": {k: len(v) for k, v in stats["committed"].items()},
-            "skipped_changed": sum(len(v) for v in stats["skipped_changed"].values()),
-            "skipped_unserializable": {
-                k: len(v) for k, v in stats["skipped_unserializable"].items()
-            },
-            "remaining": stats["remaining"],
-        }
-        if args.list_ids:
-            for kind in ("changed", "unserializable"):
-                out[f"skipped_{kind}_ids"] = {
-                    k: v[:LIST_CAP] for k, v in stats[f"skipped_{kind}"].items()
-                }
-        rec = reconcile(paths, before, stats, args.allow_pack_missing)
-        out["reconcile"] = rec
+        rec = reconcile_state(paths, state, stats, args.allow_pack_missing)
+        if pre_bit != _vector_bit_digest(paths):
+            rec["ok"] = False
+            rec["problems"].append("embedding_bit changed during apply")
         clean = rec["ok"] and not any(stats["skipped_unserializable"].values())
+        out.update({"write": stats, "reconcile": rec, "list_ids": args.list_ids})
         return (0 if clean else 1), out
     finally:
+        if "state" in locals():
+            state.close()
         lock.__exit__(None, None, None)
 
 
@@ -1122,7 +1977,17 @@ def main(argv: list[str] | None = None, before_commit: Any = None) -> int:
                 )
             )
         raise
-    print(json.dumps({"mode": "apply", "exit": code, **out}, ensure_ascii=False, indent=2))
+    if args.apply and "state_path" in out and "reconcile" in out:
+        state = sqlite3.connect(out["state_path"])
+        try:
+            _write_apply_report(
+                state, sys.stdout, args, code, out["reconcile"], out["write"], out["backup_set"]
+            )
+            sys.stdout.write("\n")
+        finally:
+            state.close()
+    else:
+        print(json.dumps({"mode": "apply", "exit": code, **out}, ensure_ascii=False, indent=2))
     return code
 
 

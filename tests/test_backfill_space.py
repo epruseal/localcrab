@@ -458,6 +458,86 @@ def test_apply_exits_3_when_lock_busy_and_writes_nothing(world, env, tmp_path, c
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("list_ids", [False, True])
+@pytest.mark.parametrize("legacy_graph", [False, True])
+def test_apply_before_report_matches_legacy_scan(env, tmp_path, capsys, list_ids, legacy_graph):
+    world = World(env, legacy_graph=legacy_graph)
+    _mixed(world)
+    paths = bf.Paths(world.root, "vectors.db", COLL)
+    legacy = bf.report_of(bf.scan(paths, False), list_ids)
+    extra = ("--list-ids",) if list_ids else ()
+    code, report = _apply(capsys, world, tmp_path, *extra)
+    assert code == 0
+    assert report["before"] == legacy
+
+
+def test_apply_report_cursor_consumes_only_the_cap(monkeypatch):
+    state = sqlite3.connect(":memory:")
+    state.execute(
+        "CREATE TABLE plan(row_id INTEGER PRIMARY KEY, store TEXT, raw_type TEXT, raw_value BLOB)"
+    )
+    state.execute("CREATE TABLE outcome(plan_row_id INTEGER PRIMARY KEY, kind TEXT, space TEXT)")
+    state.executemany(
+        "INSERT INTO plan(store, raw_type, raw_value) VALUES ('doc', 'text', ?)",
+        ((f"n{index:08d}".encode(),) for index in range(bf.LIST_CAP + 1)),
+    )
+    state.executemany(
+        "INSERT INTO outcome VALUES (?, 'skipped_changed', NULL)",
+        ((index + 1,) for index in range(bf.LIST_CAP + 1)),
+    )
+    seen = []
+
+    class CountingCursor:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def __iter__(self):
+            for row in self.cursor:
+                seen.append(row)
+                yield row
+
+    monkeypatch.setattr(bf, "_cursor_observer", CountingCursor)
+    ids = list(bf._limited_state_ids(state, "doc", "skipped_changed", bf.LIST_CAP))
+    assert len(ids) == bf.LIST_CAP
+    assert len(seen) == bf.LIST_CAP
+    state.close()
+
+
+def test_apply_before_report_caps_held_ids_in_cursor(world, tmp_path, capsys):
+    for index in range(bf.LIST_CAP + 1):
+        world.vector(f"orphan-{index:04d}", {"pack_id": PACK})
+    paths = bf.Paths(world.root, "vectors.db", COLL)
+    legacy = bf.report_of(bf.scan(paths, False), True)
+    code, report = _apply(capsys, world, tmp_path, "--list-ids")
+    assert code == 0
+    assert report["before"] == legacy
+    assert len(report["before"]["vector"]["held_ids"]["hold_orphan"]) == bf.LIST_CAP
+
+
+def test_apply_integer_id_preserves_type_and_updates_like_legacy(env, tmp_path, capsys):
+    world = World(env)
+    root = world.root
+    graph = sqlite3.connect(root / "graph.db")
+    graph.execute("INSERT INTO graph_nodes VALUES ('Entity', 1, 'concept', '{\"pack_id\":\"pk\"}')")
+    graph.commit()
+    graph.close()
+    docs = sqlite3.connect(root / "doc_store.db")
+    docs.execute("INSERT INTO doc_sources VALUES (1, 'text', '{\"pack_id\":\"pk\"}', 'stamp')")
+    docs.execute("INSERT INTO doc_sources_fts VALUES (1, 'text')")
+    docs.commit()
+    docs.close()
+    # No vector row is needed: the doc candidate exercises physical typed plan re-read.
+    code, report = _apply(capsys, world, tmp_path)
+    assert code == 0 and report["reconcile"]["ok"]
+    docs = sqlite3.connect(root / "doc_store.db")
+    row = docs.execute(
+        "SELECT typeof(source_id), metadata FROM doc_sources WHERE source_id=1"
+    ).fetchone()
+    docs.close()
+    # The production doc schema has TEXT affinity, so SQLite preserves its current text storage.
+    assert row[0] == "text" and json.loads(row[1])["space"] == "concept"
+
+
 def test_apply_end_to_end(world, tmp_path, capsys):
     _mixed(world)
     before = world.dump()
@@ -685,7 +765,7 @@ def test_changed_row_is_skipped_by_reread(world, tmp_path, capsys):
     _many(world, 2)
 
     # A row that gains a valid space between plan and write is not overwritten.
-    orig = bf._write_one_batch
+    orig = bf._write_state_one_batch
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
         if store == "doc":
@@ -695,11 +775,11 @@ def test_changed_row_is_skipped_by_reread(world, tmp_path, capsys):
             )
         return orig(conn, store, batch, paths, res, allow, stats)
 
-    bf._write_one_batch = wrapped
+    bf._write_state_one_batch = wrapped
     try:
         code, rep = _apply(capsys, world, tmp_path)
     finally:
-        bf._write_one_batch = orig
+        bf._write_state_one_batch = orig
     assert world.space("doc", "n0") == "claim"
     assert rep["write"]["skipped_changed"] == 1
     assert code == 1  # reconcile sees the foreign write as a mismatch
@@ -742,7 +822,7 @@ def test_reconcile_detects_a_held_record_changing_class(world, tmp_path, capsys)
     _many(world, 1)
     world.graph("h", "concept", {"pack_id": "zzz"})
     world.doc("h", {"pack_id": PACK})  # hold_pack_disagrees
-    orig = bf._write_one_batch
+    orig = bf._write_state_one_batch
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
         done = orig(conn, store, batch, paths, res, allow, stats)
@@ -750,11 +830,11 @@ def test_reconcile_detects_a_held_record_changing_class(world, tmp_path, capsys)
             conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id='h'", ('{"x": 1}',))
         return done
 
-    bf._write_one_batch = wrapped
+    bf._write_state_one_batch = wrapped
     try:
         code, rep = _apply(capsys, world, tmp_path)
     finally:
-        bf._write_one_batch = orig
+        bf._write_state_one_batch = orig
     assert code == 1
     assert any("hold class counts changed" in p for p in rep["reconcile"]["problems"])
 
@@ -765,7 +845,7 @@ def test_reconcile_detects_two_held_records_swapping_class(world, tmp_path, caps
     world.graph("h2", "concept", {"pack_id": "zzz"})
     world.doc("h1", {"pack_id": PACK})  # hold_pack_disagrees
     world.doc("h2", {})  # hold_pack_missing
-    orig = bf._write_one_batch
+    orig = bf._write_state_one_batch
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
         done = orig(conn, store, batch, paths, res, allow, stats)
@@ -776,11 +856,11 @@ def test_reconcile_detects_two_held_records_swapping_class(world, tmp_path, caps
             )
         return done
 
-    bf._write_one_batch = wrapped
+    bf._write_state_one_batch = wrapped
     try:
         code, rep = _apply(capsys, world, tmp_path)
     finally:
-        bf._write_one_batch = orig
+        bf._write_state_one_batch = orig
     assert code == 1
     assert any("held id changed class" in p for p in rep["reconcile"]["problems"])
 
@@ -965,7 +1045,7 @@ def test_legacy_same_space_different_pack_is_ambiguous(env, tmp_path, capsys):
 
 def test_reconcile_detects_committed_space_change(world, tmp_path, capsys):
     _many(world, 2)
-    orig = bf._write_one_batch
+    orig = bf._write_state_one_batch
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
         done = orig(conn, store, batch, paths, res, allow, stats)
@@ -979,18 +1059,18 @@ def test_reconcile_detects_committed_space_change(world, tmp_path, capsys):
             d.close()
         return done
 
-    bf._write_one_batch = wrapped
+    bf._write_state_one_batch = wrapped
     try:
         code, rep = _apply(capsys, world, tmp_path, "--batch-size", "1")
     finally:
-        bf._write_one_batch = orig
+        bf._write_state_one_batch = orig
     assert code == 1
     assert any("does not hold concept" in x for x in rep["reconcile"]["problems"])
 
 
 def test_reconcile_detects_extra_valid_row(world, tmp_path, capsys):
     _many(world, 1)
-    orig = bf._write_one_batch
+    orig = bf._write_state_one_batch
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
         done = orig(conn, store, batch, paths, res, allow, stats)
@@ -998,11 +1078,11 @@ def test_reconcile_detects_extra_valid_row(world, tmp_path, capsys):
             world.doc("extra", {"pack_id": PACK, "space": "concept"})
         return done
 
-    bf._write_one_batch = wrapped
+    bf._write_state_one_batch = wrapped
     try:
         code, rep = _apply(capsys, world, tmp_path)
     finally:
-        bf._write_one_batch = orig
+        bf._write_state_one_batch = orig
     assert code == 1
     assert any("total rows changed" in x for x in rep["reconcile"]["problems"])
 
@@ -1192,21 +1272,75 @@ def test_failure_report_comes_from_a_rescan_and_rerun_finishes(world, tmp_path, 
     assert _db_counts(world) == {"doc": (6, 0), "vector": (6, 0)}
 
 
+def test_failure_rescan_uses_current_graph_resolver(world, tmp_path, capsys):
+    _many(world, 1)
+    world.graph("h", "concept", {"pack_id": "pk"})
+    world.doc("h", {"pack_id": "pk"})
+
+    def mutate_then_fail(store, index):
+        if store == "doc":
+            graph = sqlite3.connect(world.root / "graph.db")
+            graph.execute(
+                "UPDATE graph_nodes SET properties=? WHERE node_id='h'", ('{"pack_id":"other"}',)
+            )
+            graph.commit()
+            graph.close()
+            raise RuntimeError("injected")
+
+    dest = tmp_path / "bk"
+    dest.mkdir()
+    code = bf.main(["--apply", "--backup-to", str(dest)], before_commit=mutate_then_fail)
+    report = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert report["rescan"]["doc"]["classes"]["hold_pack_disagrees"] == 1
+
+
 def test_failure_report_records_a_rescan_failure(world, tmp_path, capsys, monkeypatch):
     _failure_world(world)
-    original = bf.scan
-    calls = {"n": 0}
 
-    def flaky(paths, allow, mode="ro"):
-        calls["n"] += 1
-        if calls["n"] >= 2:
-            raise OSError("rescan broke")
-        return original(paths, allow, mode)
+    def flaky(paths, state, allow):
+        raise OSError("rescan broke")
 
-    monkeypatch.setattr(bf, "scan", flaky)
+    monkeypatch.setattr(bf, "_state_rescan_summary", flaky)
     code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
     assert code == 1 and rep["error_type"] == "RuntimeError"
     assert "rescan" not in rep and "OSError" in rep["rescan_error"]
+
+
+@pytest.mark.parametrize("exc_type", [RuntimeError, KeyboardInterrupt])
+def test_state_failure_after_source_commit_preserves_durable_write(
+    world, tmp_path, capsys, monkeypatch, exc_type
+):
+    _many(world, 2)
+    original = bf._state_after_commit
+    calls = {"n": 0}
+
+    def fail_once(state):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise exc_type("state persistence failed")
+        return original(state)
+
+    monkeypatch.setattr(bf, "_state_after_commit", fail_once)
+    dest = tmp_path / "bk"
+    dest.mkdir()
+    try:
+        code = bf.main(["--apply", "--backup-to", str(dest), "--batch-size", "2"])
+        raised = None
+    except BaseException as exc:  # noqa: BLE001
+        code, raised = None, exc
+    report = json.loads(capsys.readouterr().out)
+    if exc_type is KeyboardInterrupt:
+        assert code is None and isinstance(raised, KeyboardInterrupt)
+        assert report["reraised"] == "KeyboardInterrupt"
+    else:
+        assert code == 1 and raised is None
+    assert report["commit_state_unknown"] is True
+    assert any(dest.iterdir())
+    assert _db_counts(world)["doc"][0] == 2
+    code, rerun = _apply(capsys, world, tmp_path, "--batch-size", "2")
+    assert code == 0 and rerun["reconcile"]["ok"]
+    assert _db_counts(world) == {"doc": (2, 0), "vector": (2, 0)}
 
 
 def test_failure_after_commit_is_not_reported_as_rolled_back(world, tmp_path, capsys, monkeypatch):
@@ -1248,7 +1382,7 @@ def test_failure_after_commit_is_not_reported_as_rolled_back(world, tmp_path, ca
 
 def test_skipped_ids_are_listed_for_every_kind(world, tmp_path, capsys):
     _many(world, 2)
-    orig = bf._write_one_batch
+    orig = bf._write_state_one_batch
 
     def wrapped(conn, store, batch, paths, res, allow, stats):
         if store == "doc":
@@ -1258,11 +1392,11 @@ def test_skipped_ids_are_listed_for_every_kind(world, tmp_path, capsys):
             )
         return orig(conn, store, batch, paths, res, allow, stats)
 
-    bf._write_one_batch = wrapped
+    bf._write_state_one_batch = wrapped
     try:
         code, rep = _apply(capsys, world, tmp_path, "--list-ids")
     finally:
-        bf._write_one_batch = orig
+        bf._write_state_one_batch = orig
     assert rep["skipped_changed_ids"]["doc"] == ["n0"]
     assert "skipped_nomatch_ids" not in rep and "skipped_nomatch" not in rep["write"]
     assert rep["skipped_unserializable_ids"] == {"doc": [], "vector": []}
@@ -1431,7 +1565,7 @@ def test_secondary_interrupts_never_hide_the_original_error(
     world, env, tmp_path, capsys, monkeypatch, orig, sec, place
 ):
     _failure_world(world)
-    real_open, real_scan = bf._open, bf.scan
+    real_open, real_rescan = bf._open, bf._state_rescan_summary
 
     class Wrapped:
         def __init__(self, conn):
@@ -1455,14 +1589,14 @@ def test_secondary_interrupts_never_hide_the_original_error(
 
     calls = {"n": 0}
 
-    def scanner(paths, allow, mode="ro"):
+    def scanner(paths, state, allow):
         calls["n"] += 1
-        if place == "rescan" and calls["n"] == 2:
+        if place == "rescan":
             raise sec(3) if sec is SystemExit else sec()
-        return real_scan(paths, allow, mode)
+        return real_rescan(paths, state, allow)
 
     monkeypatch.setattr(bf, "_open", opener)
-    monkeypatch.setattr(bf, "scan", scanner)
+    monkeypatch.setattr(bf, "_state_rescan_summary", scanner)
     code, raised, rep = _run_failing(capsys, world, tmp_path, orig)
     if orig is KeyboardInterrupt:
         assert code is None and type(raised) is KeyboardInterrupt
@@ -1479,7 +1613,7 @@ def test_secondary_interrupts_never_hide_the_original_error(
     """)
     assert subprocess.check_output([sys.executable, "-c", probe], text=True).strip() == "acquired"
     monkeypatch.setattr(bf, "_open", real_open)
-    monkeypatch.setattr(bf, "scan", real_scan)
+    monkeypatch.setattr(bf, "_state_rescan_summary", real_rescan)
     assert _db_counts(world)["doc"][0] == 2
     code, rep2 = _apply(capsys, world, tmp_path, "--batch-size", "2")
     assert code == 0 and rep2["reconcile"]["ok"]
@@ -1525,25 +1659,22 @@ def test_failure_report_makes_no_rollback_claim(world, tmp_path, capsys):
 
 def test_rescan_runs_under_the_write_lock(world, env, tmp_path, capsys, monkeypatch):
     _failure_world(world)
-    real_scan = bf.scan
-    calls = {"n": 0}
+    real_rescan = bf._state_rescan_summary
     seen = []
 
-    def scanner(paths, allow, mode="ro"):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            probe = textwrap.dedent(f"""
-                from opencrab.locking import write_lock
-                try:
-                    with write_lock({str(env)!r}, timeout=0.2):
-                        print('acquired')
-                except TimeoutError:
-                    print('busy')
-            """)
-            seen.append(subprocess.check_output([sys.executable, "-c", probe], text=True).strip())
-        return real_scan(paths, allow, mode)
+    def scanner(paths, state, allow):
+        probe = textwrap.dedent(f"""
+            from opencrab.locking import write_lock
+            try:
+                with write_lock({str(env)!r}, timeout=0.2):
+                    print('acquired')
+            except TimeoutError:
+                print('busy')
+        """)
+        seen.append(subprocess.check_output([sys.executable, "-c", probe], text=True).strip())
+        return real_rescan(paths, state, allow)
 
-    monkeypatch.setattr(bf, "scan", scanner)
+    monkeypatch.setattr(bf, "_state_rescan_summary", scanner)
     code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
     assert code == 1 and seen == ["busy"]
 
