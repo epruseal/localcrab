@@ -25,6 +25,7 @@ from opencrab.pack.write_gate import (
     CONFLICT_UNVERIFIABLE,
     REJECT_DERIVED_CONFLICT,
     REJECT_FOREIGN_PACK,
+    REJECT_GRAMMAR,
     REJECT_NODE_CONFLICT,
     derived_conflict_message,
     edge_identity_conflict,
@@ -375,7 +376,7 @@ def _ingest_into_pack(
         GraphWriteUnavailable,
         NodeIdentityConflict,
     )
-    from opencrab.grammar.validator import validate_edge, validate_node
+    from opencrab.grammar.validator import GrammarValidationError, validate_edge, validate_node
     from opencrab.mcp.tools import _clean_meta, _clean_str, _get_context
     from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
@@ -430,6 +431,7 @@ def _ingest_into_pack(
                 # caller-facing message, not the broad `except Exception`
                 # below that this fix targets.
                 node_errors.append(f"{item_node_id}: {exc}")
+                final_rejections.append(REJECT_GRAMMAR)
                 continue
             reason = _node_probe_conflict(
                 ctx, item_space, item_node_type, item_node_id, pack_id
@@ -472,6 +474,11 @@ def _ingest_into_pack(
             node_errors.append(node_conflict_message(item.get("node_id", "?")))
             final_rejections.append(REJECT_NODE_CONFLICT)
             logger.warning("_ingest_into_pack: node identity conflict for %s", item.get("node_id", "?"))
+        except GrammarValidationError as exc:
+            # #480: the builder's grammar verdict on the node (a property check) is
+            # final. The text stays the generic safe text.
+            node_errors.append(f"{item.get('node_id', '?')}: {safe_tool_error('_ingest_into_pack', exc)}")
+            final_rejections.append(REJECT_GRAMMAR)
         except Exception as exc:
             node_errors.append(f"{item.get('node_id', '?')}: {safe_tool_error('_ingest_into_pack', exc)}")
 
@@ -494,6 +501,7 @@ def _ingest_into_pack(
                 # from a static allowed-relations list plus the caller's own
                 # supplied value.
                 edge_errors.append(f"{item_from_id}->{item_to_id}: {exc}")
+                final_rejections.append(REJECT_GRAMMAR)
                 continue
 
             # Endpoint types are resolved the same way builder.add_edge

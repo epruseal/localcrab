@@ -487,6 +487,7 @@ def source_identity_conflict(
 REJECT_NODE_CONFLICT = "node_identity_conflict"
 REJECT_DERIVED_CONFLICT = "derived_id_conflict"
 REJECT_FOREIGN_PACK = "foreign_pack_identity"
+REJECT_GRAMMAR = "grammar_rejected"
 
 
 def node_conflict_message(ident: str) -> str:

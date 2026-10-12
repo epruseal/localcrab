@@ -2502,3 +2502,81 @@ def test_480_derived_id_probe_reason_decides_retryable(stack, reason):
     else:
         assert result["retryable"] is True, result
         assert "reject_codes" not in result, result
+
+
+# ---------------------------------------------------------------------------
+# #480: node and edge grammar rejections are final
+# ---------------------------------------------------------------------------
+
+
+def _grammar_nodes():
+    return {
+        "unknown-type": {"space": "evidence", "node_type": "NoSuchType", "node_id": "480-g1",
+                         "properties": {}},
+        "document-without-title": {"space": "resource", "node_type": "Document",
+                                   "node_id": "480-g2", "properties": {"pack_id": "pack-a"}},
+        "claim-without-statement": {"space": "evidence", "node_type": "Claim",
+                                    "node_id": "480-g3", "properties": {"pack_id": "pack-a"}},
+    }
+
+
+@pytest.mark.parametrize("name", ["unknown-type", "document-without-title", "claim-without-statement"])
+def test_480_node_grammar_rejection_is_final(stack, name):
+    result = _ingest468(stack, nodes=[_grammar_nodes()[name]])
+    assert result["status"] == "partial" and len(result["node_errors"]) == 1, result
+    assert result["retryable"] is False, result
+    assert result["reject_codes"] == ["grammar_rejected"], result
+
+
+def test_480_edge_grammar_rejection_is_final(stack):
+    _seed_node(stack, "Topic", "480-ge1", space="concept")
+    _seed_node(stack, "Topic", "480-ge2", space="concept")
+    edge = {"from_space": "concept", "from_id": "480-ge1", "relation": "no_such_relation",
+            "to_space": "concept", "to_id": "480-ge2"}
+    result = _ingest468(stack, edges=[edge])
+    assert result["status"] == "partial" and len(result["edge_errors"]) == 1, result
+    assert result["retryable"] is False, result
+    assert result["reject_codes"] == ["grammar_rejected"], result
+
+
+def test_480_grammar_rejections_report_one_code_and_mix_with_other_final_codes(stack):
+    _seed_logentry(stack, "codex/s/480-gm")
+    result = _ingest468(stack, nodes=[
+        _grammar_nodes()["unknown-type"], _grammar_nodes()["document-without-title"],
+        {"space": "evidence", "node_type": "TextUnit", "node_id": "codex/s/480-gm",
+         "properties": {"text": "충돌"}},
+    ])
+    assert len(result["node_errors"]) == 3, result
+    assert result["retryable"] is False, result
+    assert result["reject_codes"] == ["grammar_rejected", "node_identity_conflict"], result
+
+
+def test_480_grammar_rejection_with_a_store_failure_stays_retryable(stack):
+    with patch.object(stack["docs"], "upsert_node_doc", side_effect=RuntimeError("doc down")):
+        result = _ingest468(stack, nodes=[
+            _grammar_nodes()["unknown-type"],
+            {"space": "evidence", "node_type": "TextUnit", "node_id": "480-gs",
+             "properties": {"text": "정상"}},
+        ])
+    assert len(result["node_errors"]) == 2, result
+    assert result["retryable"] is True, result
+    assert "reject_codes" not in result, result
+
+
+def test_480_a_failing_validator_stays_retryable(stack):
+    with patch("opencrab.grammar.validator.validate_node", side_effect=RuntimeError("manifest gone")):
+        result = _ingest468(stack, nodes=[_grammar_nodes()["unknown-type"]])
+    assert result["status"] == "partial" and len(result["node_errors"]) == 1, result
+    assert result["retryable"] is True, result
+    assert "reject_codes" not in result, result
+
+
+def test_480_a_plain_builder_value_error_stays_retryable(stack):
+    with patch.object(stack["builder"], "add_node", side_effect=ValueError("not a grammar verdict")):
+        result = _ingest468(stack, nodes=[
+            {"space": "evidence", "node_type": "TextUnit", "node_id": "480-gv",
+             "properties": {"text": "본문"}},
+        ])
+    assert len(result["node_errors"]) == 1, result
+    assert result["retryable"] is True, result
+    assert "reject_codes" not in result, result
