@@ -202,13 +202,20 @@ def _edge_probe_conflict(ctx: dict[str, Any], from_type: str, from_id: str, rela
 _identity_reject_message = identity_reject_message
 
 
-def _derivable_logentry(ctx: dict[str, Any], node_id: str, pack_id: str) -> bool | None:
-    """Is ``node_id`` a readable same-pack ``evidence/LogEntry``? (#470, #480)
+# #470, #488: node types at ``source_id`` that may have text stored next to them
+# under a derived id. A LogEntry is the Codex session record. A TextUnit is an
+# earlier text of the same source, for example the first text of a Claude session.
+_DERIVABLE_SOURCE_TYPES = ("LogEntry", "TextUnit")
 
-    Only that node may have text stored next to it under a derived id. Any
+
+def _derivable_source(ctx: dict[str, Any], node_id: str, pack_id: str) -> bool | None:
+    """Is ``node_id`` a readable same-pack evidence LogEntry or TextUnit? (#470, #480, #488)
+
+    Only such a node may have text stored next to it under a derived id. Any
     other conflict stays a rejection.
 
-    ``True``: exactly one readable row, a same-pack evidence LogEntry.
+    ``True``: exactly one readable row, a same-pack evidence node of a type in
+    ``_DERIVABLE_SOURCE_TYPES``.
     ``False``: the answer is final. The call has no pack id, or exactly one
     readable row is another type, space or pack.
     ``None``: cannot tell. The read method is missing or raised, the result is
@@ -230,7 +237,7 @@ def _derivable_logentry(ctx: dict[str, Any], node_id: str, pack_id: str) -> bool
     if row.get("property_decode_error"):
         return None
     return (
-        row.get("node_type") == "LogEntry"
+        row.get("node_type") in _DERIVABLE_SOURCE_TYPES
         and row.get("space") == "evidence"
         and row.get("pack_id") == pack_id
     )
@@ -245,7 +252,8 @@ def _store_text_under_derived_id(
 
     The write is the ordinary ``add_node`` path. Ownership, the graph
     create-or-verify rule and the doc and vector fan-out do not change. The node
-    carries ``source_id`` (the LogEntry id), a key that a pack fork remaps.
+    carries ``source_id`` (the id of the source LogEntry or TextUnit), a key that
+    a pack fork remaps.
 
     Return ``(outcome, billable)``. The outcome is one of five values.
     ``"stored"``: the receipt reports no store failures. Optional stores can
@@ -360,22 +368,36 @@ def _ingest_into_pack(
         a node id through a fork remap -- ``add_node`` above has no such
         carve-out.
 
-        With ``text_as_node=True`` an id that already names a LogEntry of the
-        same pack does not by itself reject the text (#470). The function leaves
-        the LogEntry alone and tries two derived TextUnit ids in order (#483).
+        With ``text_as_node=True`` the write at ``source_id`` can meet a graph
+        identity conflict. The node at that id can be an evidence LogEntry or an
+        evidence TextUnit of the same pack. Then the conflict does not by itself
+        reject the text (#470, #488). The function leaves that node alone and
+        tries two derived TextUnit ids in order (#483). A Codex session puts a
+        LogEntry at the id. A Claude session puts its first text, a TextUnit, at
+        the id.
+
+        A TextUnit with the same text and metadata does not conflict. The write
+        is idempotent and ``evidence_node`` is ``source_id``.
+
         Slot 1 is ``derive_text_id(source_id)``. When that id is too long to
-        build, the item is rejected with ``node_identity_conflict``. When slot 1
-        already holds another node or another text after the ownership probe
-        passed, slot 2 is ``derive_text_id(source_id, digest)``. ``digest`` is
-        the first 16 hex of the sha256 of the text. When slot 2 is too long to
-        build, the function does not try it. It reports the slot 1 conflict as
-        ``derived_id_conflict``. A node of another pack at a slot id rejects the
-        text without a further slot. The length checks are the
-        ``SOURCE_NODE_ID_BUDGET`` and ``NODE_ID_COLUMN_LIMIT`` checks of
-        ``derive_text_id``. ``evidence_node`` is the id that holds the text and
-        ``stores["evidence_node"]`` names the original id. A different node
-        type, space or pack still rejects the item, and so does a conflict on
-        the final derived id. ``text_ingested`` is then False.
+        build, the function rejects the item with ``node_identity_conflict``.
+        Slot 1 can already hold another node or another text after the
+        ownership probe passed. Then slot 2 is ``derive_text_id(source_id,
+        digest)``. ``digest`` is the first 16 hex of the sha256 of the text.
+
+        When slot 2 is too long to build, the function does not try it. It
+        reports the slot 1 conflict as ``derived_id_conflict``. A node of
+        another pack at a slot id rejects the text without a further slot. The
+        length checks are the ``SOURCE_NODE_ID_BUDGET`` and
+        ``NODE_ID_COLUMN_LIMIT`` checks of ``derive_text_id``.
+
+        ``evidence_node`` is the id that holds the text, and
+        ``stores["evidence_node"]`` names the original id. A derived TextUnit
+        names its source in its ``source_id`` property. A text stored at
+        ``source_id`` itself has no such property, and its node id is the
+        source. A different node type, space or pack still rejects the item.
+        So does a conflict on the final derived id. ``text_ingested`` is then
+        False.
 
         A partial result carries ``retryable`` and, when it is False,
         ``reject_codes`` (#480). The table "pack_ingest partial 결과의 retryable
@@ -670,10 +692,11 @@ def _ingest_into_pack(
                     if store_write_succeeded(evidence_stores or {}, "graph"):
                         billable_write = True
             except NodeIdentityConflict:
-                # #468: the id already names a different node. #470: when that node
-                # is a same-pack LogEntry, this function writes the text to a new
-                # TextUnit under a derived id and leaves the LogEntry unchanged.
-                derivable = _derivable_logentry(ctx, source_id, pack_id)
+                # #468: the id already names a different node. #470, #488: when that
+                # node is a same-pack LogEntry or TextUnit, this function writes the
+                # text to a new TextUnit under a derived id and leaves that node
+                # unchanged.
+                derivable = _derivable_source(ctx, source_id, pack_id)
                 derived_id = derive_text_id(source_id) if derivable else None
                 if derived_id is None:
                     # The marker is fixed. store_write_failures() does not read it
@@ -684,7 +707,7 @@ def _ingest_into_pack(
                     logger.warning("_ingest_into_pack: node identity conflict for %s", source_id)
                     text_rejected = True
                     # ``None`` means the read could not tell. A derived id too
-                    # long to build, or a definite non-LogEntry, is final.
+                    # long to build, or a definite other node, is final.
                     if derivable is not None:
                         final_rejections.append(REJECT_NODE_CONFLICT)
                 else:
@@ -1177,7 +1200,7 @@ def _rank_packs(query: str, enriched: list[dict[str, Any]]) -> list[dict[str, An
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text. With text_as_node=true, write an evidence/TextUnit node. When source_id names a same-pack LogEntry, use the derived id <source_id>#text before any fork suffix. If <source_id>#text would exceed the id length limit, the server refuses the text with node_identity_conflict. That id can already hold another node or another text after the ownership check passed. Then use <source_id>#text-<digest> instead, where the digest is the first 16 hex of the sha256 of the text. A node of another pack at <source_id>#text refuses the text. If <source_id>#text is occupied and <source_id>#text-<digest> would exceed the id length limit, the server does not try it and refuses the text with derived_id_conflict. The response returns the id in evidence_node.",
+                    "description": "Optional raw text. With text_as_node=true, write an evidence/TextUnit node. When source_id names a same-pack evidence LogEntry, or a same-pack evidence TextUnit with other content, use the derived id <source_id>#text before any fork suffix. If <source_id>#text would exceed the id length limit, the server refuses the text with node_identity_conflict. That id can already hold another node or another text after the ownership check passed. Then use <source_id>#text-<digest> instead, where the digest is the first 16 hex of the sha256 of the text. A node of another pack at <source_id>#text refuses the text. If <source_id>#text is occupied and <source_id>#text-<digest> would exceed the id length limit, the server does not try it and refuses the text with derived_id_conflict. The response returns the id in evidence_node.",
                 },
                 "text_as_node": {
                     "type": "boolean",
@@ -1774,7 +1797,7 @@ def pack_create(
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). Use to append conversation content to a loaded pack. If source_id already names a LogEntry of the same pack, the TextUnit gets the derived id <source_id>#text (before any fork suffix). If <source_id>#text would exceed the id length limit, the server refuses the text with node_identity_conflict. That id can already hold another node or another text after the ownership check passed. Then the TextUnit gets <source_id>#text-<digest>, where the digest is the first 16 hex of the sha256 of the text. A node of another pack at <source_id>#text refuses the text. If <source_id>#text is occupied and <source_id>#text-<digest> would exceed the id length limit, the server does not try it and refuses the text with derived_id_conflict. The response reports the id in evidence_node.",
+                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). Use to append conversation content to a loaded pack. If source_id already names an evidence LogEntry of the same pack, or an evidence TextUnit of the same pack with other content, the TextUnit gets the derived id <source_id>#text (before any fork suffix). If <source_id>#text would exceed the id length limit, the server refuses the text with node_identity_conflict. That id can already hold another node or another text after the ownership check passed. Then the TextUnit gets <source_id>#text-<digest>, where the digest is the first 16 hex of the sha256 of the text. A node of another pack at <source_id>#text refuses the text. If <source_id>#text is occupied and <source_id>#text-<digest> would exceed the id length limit, the server does not try it and refuses the text with derived_id_conflict. The response reports the id in evidence_node.",
                 },
                 "text_as_node": {
                     "type": "boolean",
