@@ -52,8 +52,8 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 | 엣지 루프 | 문법 거부(관계 확인) | 최종 | `grammar_rejected` |
 | 엣지 루프 | probe 확인 불능, 끝점 미해결, 엣지 식별 충돌, 저장 실패, 그 밖의 예외 | 재시도 | |
 | 텍스트(`text_as_node` true) | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
-| 텍스트 | 노드 식별 충돌이고 대상이 같은 팩의 LogEntry가 아님이 확정, 또는 첫 파생 id(`#text`)를 만들 수 없음 | 최종 | `node_identity_conflict` |
-| 텍스트 | 노드 식별 충돌이고 LogEntry 여부를 읽을 수 없음 | 재시도 | |
+| 텍스트 | 노드 식별 충돌이고 대상이 같은 팩의 evidence LogEntry나 TextUnit이 아님이 확정, 또는 첫 파생 id(`#text`)를 만들 수 없음 | 최종 | `node_identity_conflict` |
+| 텍스트 | 노드 식별 충돌이고 대상 노드를 읽을 수 없음 | 재시도 | |
 | 텍스트 | 소유권 probe 확인 불능, 저장 실패, 그 밖의 예외 | 재시도 | |
 | 파생 TextUnit | 파생 id의 소유권 probe가 타 팩 귀속을 확인, 또는 마지막으로 시도한 파생 id가 식별 충돌. `#text`가 소유권 probe를 통과한 다른 노드나 다른 본문을 담고 있으면 마지막 파생 id는 본문 digest id다. 단, digest id가 id 길이 예산을 넘으면 digest id는 시도하지 않고 `#text` 충돌을 이 코드로 보고한다(아래 "이어진 세션의 본문" 절) | 최종 | `derived_id_conflict` |
 | 파생 TextUnit | probe 확인 불능, 문법 거부, 저장 실패, 그 밖의 예외 | 재시도 | |
@@ -66,23 +66,23 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 
 최종 거부의 의미: 외부에서 데이터를 고치지 않는 한 같은 입력을 다시 보내도 성공할 수 없다. 클라이언트는 `retryable: false`를 읽어 재시도를 멈출 수 있다(#480).
 
-## 이어진 세션의 본문과 격리 payload 재적재 (#483)
+## 이어진 세션의 본문과 격리 payload 재적재 (#483, #488)
 
-같은 세션을 다른 LogEntry 속성(예: 더 늦은 `ended_at`)으로 다시 보내면 LogEntry 쓰기는 계속 `node_identity_conflict`로 거부된다. 본문은 파생 TextUnit 두 슬롯에 차례로 저장을 시도한다. 슬롯 규칙의 정본은 `_ingest_into_pack` docstring이다.
+같은 세션을 다른 LogEntry 속성(예: 더 늦은 `ended_at`)으로 다시 보내면 LogEntry 쓰기는 계속 `node_identity_conflict`로 거부된다. 본문은 파생 TextUnit 두 슬롯에 차례로 저장을 시도한다. Claude 세션은 LogEntry 없이 첫 본문을 `source_id` 자체에 TextUnit으로 저장한다. 그 TextUnit과 다른 본문이 오면 본문은 같은 두 슬롯에 저장을 시도한다(#488). 슬롯 규칙의 정본은 `_ingest_into_pack` docstring이다.
 
 - 슬롯 1은 `derive_text_id(source_id)`, 곧 `<id>#text`다. 슬롯 1이 비어 있으면 본문은 여기에 저장을 시도한다. 슬롯 1 id가 id 길이 예산을 넘어 만들어지지 않으면 본문은 `node_identity_conflict`로 거부된다.
 - 슬롯 1에 다른 노드나 다른 본문이 있고 소유권 probe가 통과하면 슬롯 2 `derive_text_id(source_id, digest)`에 저장을 시도한다. `digest`는 정제한 본문의 UTF-8 바이트 sha256 앞 16 hex다. 슬롯 1을 타 팩 노드가 점유하면 본문은 `derived_id_conflict`로 거부되고 슬롯 2는 시도하지 않는다. 슬롯 2 id가 id 길이 예산을 넘어 만들어지지 않을 때도 슬롯 2는 시도하지 않고 본문은 `derived_id_conflict`로 거부된다. 경계는 docstring이 정한다.
-- 같은 본문을 같은 메타데이터로 다시 보내면 같은 노드를 찾고 새 행을 만들지 않는다. 한 세션의 모든 본문 버전은 같은 `source_id` 속성을 가진다.
+- 같은 본문을 같은 메타데이터로 다시 보내면 같은 노드를 찾고 새 행을 만들지 않는다. 파생 슬롯의 본문은 `source_id` 속성으로 출처를 가리킨다. `source_id` 자체에 저장된 첫 본문은 그 속성이 없고 노드 id가 곧 출처다.
 
-훅의 재전송처럼 요청에 LogEntry 재기록이 들어 있고, 본문이 슬롯 1이나 슬롯 2에 저장되고, 다른 오류가 없으면 결과는 partial이고 오류는 LogEntry 거부 하나다. 이때 `retryable`은 false이고 `reject_codes`는 `["node_identity_conflict"]`다. 본문이 거부되거나 다른 오류가 있으면 위 retryable 표가 각 오류의 코드를 정한다. opencrab-dump 훅(#274)은 오류 문구로 영수증을 분류하므로 이 영수증을 영구 거부로 보고 `localcrab-outbox/quarantine/`에 격리한다.
+훅의 재전송처럼 요청에 LogEntry 재기록이 들어 있다고 하자. 본문이 슬롯 1이나 슬롯 2에 저장되고 다른 오류가 없으면 결과는 partial이고 오류는 LogEntry 거부 하나다. 이때 `retryable`은 false이고 `reject_codes`는 `["node_identity_conflict"]`다. 본문이 거부되거나 다른 오류가 있으면 위 retryable 표가 각 오류의 코드를 정한다. Claude 훅이 이어진 세션을 보내면 세션 Document와 Claim의 속성이 바뀐다. 일부 턴 Evidence도 바뀔 수 있다. 그 노드들의 식별 충돌도 최종 거부다. opencrab-dump 훅은 `retryable: false` 영수증을 영구 거부로 보고 `localcrab-outbox/quarantine/`에 격리한다. 본문이 저장됐어도 격리한다.
 
 ### 이 변경 전에 격리된 payload의 재적재
 
 격리되었다고 해서 본문을 잃은 것은 아니다. 같은 본문에 `ended_at`만 늦은 재전송도 격리된다. 이 변경 전에는 새 본문을 담은 재전송이 그 본문을 잃었다. `.reason` 파일에는 일반 영구 거부 표지만 있으므로 재전송이 필요한지는 서버 상태로 판정한다. 라이브 재적재는 리드가 수행한다.
 
 1. 전제: 이 변경을 담은 서버를 배포했다. 훅은 #274를 머지한 판이다.
-2. 대상: Codex 세션 payload만 다룬다. `pack_ingest` 인자에 비어 있지 않은 `text`와 `source_id`가 있고, 엣지가 없고, 노드가 하나다. 그 노드는 `node_id`가 `source_id`와 같은 evidence/LogEntry다. 그 밖의 격리 파일은 모두 그대로 둔다. 이 절차는 다른 거부 항목을 판정하지 않는다.
-3. 저장 확인(재전송 전후에 쓴다): 두 슬롯 id를 서버 함수 `derive_text_id(source_id)`와 `derive_text_id(source_id, digest)`로 계산한다. `digest`는 서버가 적용하는 `_clean_str`을 거친 본문의 UTF-8 바이트 sha256 앞 16 hex다. fork salt가 id 끝에 남으므로 문자열 연결로 id를 만들지 않는다. 두 id 가운데 하나가 일치하는 노드를 담으면 본문은 저장된 것이다. 일치하는 노드는 evidence/TextUnit이다. 그 `pack_id`는 payload의 팩과 같다. 그 `source_id`는 payload의 `source_id`와 같다. 그 `text`는 정제한 payload 본문과 같다.
+2. 대상: 세션 payload만 다룬다. `pack_ingest` 인자에 비어 있지 않은 `text`와 `source_id`가 있고 엣지가 없다. Codex 세션 payload는 노드가 하나이고, 그 노드는 `node_id`가 `source_id`와 같은 evidence/LogEntry다. Claude 세션 payload는 `source_id`가 `claude/`로 시작하고, 노드는 resource/Document, claim/Claim, evidence/Evidence뿐이다. 그 밖의 격리 파일은 모두 그대로 둔다. 이 절차는 본문 저장만 판정하고 다른 거부 항목(예: 낡은 훅 형식의 문법 거부)은 판정하지 않는다.
+3. 저장 확인(재전송 전후에 쓴다): 두 슬롯 id를 서버 함수 `derive_text_id(source_id)`와 `derive_text_id(source_id, digest)`로 계산한다. `digest`는 서버가 적용하는 `_clean_str`을 거친 본문의 UTF-8 바이트 sha256 앞 16 hex다. fork salt가 id 끝에 남으므로 문자열 연결로 id를 만들지 않는다. 후보 id는 이 두 슬롯 id와 `source_id` 자체다. 후보 가운데 하나가 일치하는 노드를 담으면 본문은 저장된 것이다. 일치하는 노드는 evidence/TextUnit이다. 그 `pack_id`는 payload의 팩과 같다. 그 `text`는 정제한 payload 본문과 같다. 슬롯 id의 노드는 `source_id` 속성이 payload의 `source_id`와 같아야 한다. `source_id` 자체의 노드는 id 일치로 출처를 확인한다.
 4. 절차(운영자, 대상 하나씩, opencrab-dump 훅 README 절차를 따른다):
    1. 저장 확인을 한다. 참이면 본문을 잃지 않았다. 6단계로 간다.
    2. 파일을 outbox에 `reingest483-<원래 이름>`으로 복사한다. 접두는 사본과 그 재격리본을 찾기 쉽게 한다. 원본은 격리에 둔다.
@@ -98,7 +98,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
      - 거짓이고 사본이 어디에도 없으면 2단계로 간다.
    같은 파일을 다시 보내도 같은 노드를 찾고 새 행을 만들지 않는다.
 
-서버 쪽 동작의 재현 명령: `pytest tests/test_issue74_ingest_graph_parity.py -k 483`.
+서버 쪽 동작의 재현 명령: `pytest tests/test_issue74_ingest_graph_parity.py -k "483 or 488"`.
 
 ## 클라이언트 호환성 매트릭스
 

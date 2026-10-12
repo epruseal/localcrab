@@ -134,8 +134,8 @@ def remap_id(old: str, salt: str) -> str:
     return f"{old}{REMAP_SEP}{salt}"
 
 
-# #470: suffix of the TextUnit id that stores text rejected because the client's
-# own id already names a LogEntry.
+# #470, #488: suffix of the TextUnit id that stores text rejected because the
+# client's own id already names a LogEntry or another text (a TextUnit).
 TEXT_ID_SUFFIX = "#text"
 
 # Trailing run of fork salts. A fork appends one salt per generation.

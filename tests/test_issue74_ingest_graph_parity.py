@@ -1925,8 +1925,9 @@ def test_483_same_id_with_different_text_is_stored_under_a_digest_id(stack, capl
     assert not [r for r in caplog.records if r.exc_info]
 
 
+# #488: a same-pack evidence TextUnit at the id is now a text source. See the
+# test_488 tests below.
 @pytest.mark.parametrize("make_existing", [
-    pytest.param(lambda st, i: _seed_node(st, "TextUnit", i, text="기존"), id="textunit"),
     pytest.param(lambda st, i: _seed_node(st, "Evidence", i, text="기존"), id="evidence"),
     pytest.param(lambda st, i: _seed_node(st, "Topic", i, space="concept"), id="other-space"),
 ])
@@ -2093,26 +2094,29 @@ _GOOD_ROW = {"node_type": "LogEntry", "space": "evidence", "pack_id": "pack-a", 
     ([], None, None),
     ([_GOOD_ROW, dict(_GOOD_ROW)], None, None),
     ([{**_GOOD_ROW, "property_decode_error": True}], None, None),
-    ([{**_GOOD_ROW, "node_type": "TextUnit"}], None, False),
+    ([{**_GOOD_ROW, "node_type": "TextUnit"}], None, True),
+    ([{**_GOOD_ROW, "node_type": "TextUnit", "pack_id": "pack-b"}], None, False),
+    ([{**_GOOD_ROW, "node_type": "TextUnit", "space": "concept"}], None, False),
+    ([{**_GOOD_ROW, "node_type": "Evidence"}], None, False),
     ([{**_GOOD_ROW, "space": "concept"}], None, False),
     ([{**_GOOD_ROW, "pack_id": "pack-b"}], None, False),
     ([{k: v for k, v in _GOOD_ROW.items() if k != "pack_id"}], None, False),
 ])
-def test_468_derivation_gate_admits_only_a_readable_same_pack_evidence_logentry(
+def test_468_derivation_gate_admits_only_a_readable_same_pack_evidence_source(
     rows, error, expected,
 ):
-    from opencrab.mcp.tools.pack import _derivable_logentry
+    from opencrab.mcp.tools.pack import _derivable_source
 
     ctx = {"neo4j": _FakeGraph(rows=rows, error=error)}
-    assert _derivable_logentry(ctx, "x", "pack-a") is expected
+    assert _derivable_source(ctx, "x", "pack-a") is expected
 
 
 def test_480_derivation_gate_without_a_read_method_cannot_tell():
-    from opencrab.mcp.tools.pack import _derivable_logentry
+    from opencrab.mcp.tools.pack import _derivable_source
 
-    assert _derivable_logentry({"neo4j": object()}, "x", "pack-a") is None
-    assert _derivable_logentry({}, "x", "pack-a") is None
-    assert _derivable_logentry({"neo4j": object()}, "x", "") is False
+    assert _derivable_source({"neo4j": object()}, "x", "pack-a") is None
+    assert _derivable_source({}, "x", "pack-a") is None
+    assert _derivable_source({"neo4j": object()}, "x", "") is False
 
 
 def test_468_derived_id_stays_inside_the_node_id_column_after_two_forks():
@@ -2846,3 +2850,169 @@ def test_483_digest_id_commutes_with_the_fork_remap(plain):
             original = remap_id(original, salt)
             expected = remap_id(expected, salt)
         assert derive_text_id(original, digest) == expected
+
+
+# ---------------------------------------------------------------------------
+# #488: a continued Claude session. The first text sits at source_id itself.
+# ---------------------------------------------------------------------------
+
+
+def _claude_payload(sid: str, text: str, turns: int) -> dict[str, Any]:
+    """The shape the Claude session hook sends: Document, Claim and Evidence nodes plus the text.
+
+    The Document and the Claim change with every delivery, as in the hook.
+    """
+    nodes = [
+        {"space": "resource", "node_type": "Document", "node_id": f"resource:{sid}",
+         "properties": {"title": "p", "session_id": "s", "source_id": sid,
+                        "turn_count": turns}},
+        {"space": "claim", "node_type": "Claim", "node_id": f"claim:{sid}",
+         "properties": {"statement": f"{turns} turns", "text": f"{turns} turns"}},
+    ]
+    nodes += [
+        {"space": "evidence", "node_type": "Evidence", "node_id": f"evidence:{sid}:{i}",
+         "properties": {"text": f"turn {i}"}}
+        for i in range(turns)
+    ]
+    return dict(nodes=nodes, text=text, source_id=sid,
+                metadata={"title": "p", "source": "pack_ingest"})
+
+
+def _settled_bm25(stack, timeout: float = 30.0) -> None:
+    """Wait for the debounced BM25 rebuild after the last write.
+
+    The BM25 leg serves the last built index while a rebuild is pending. A
+    query right after a write can miss that write.
+    """
+    import time
+
+    hybrid = stack["hybrid"]
+    deadline = time.monotonic() + timeout
+    while hybrid._bm25_dirty and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not hybrid._bm25_dirty, "BM25 rebuild did not settle"
+
+
+def test_488_claude_session_texts_each_land_and_resends_are_idempotent(stack):
+    sid = "claude/p/488-a"
+    texts = ("wombat 첫 본문", "wombat 첫 본문 numbat 둘째", "wombat 첫 본문 numbat 둘째 quoll 셋째")
+    first = _ingest468(stack, **_claude_payload(sid, texts[0], 1))
+    assert first["status"] == "ok" and first["evidence_node"] == sid, first
+    first_rows = _snapshot(stack, "TextUnit", sid)
+    first_state = _node_state(stack, "TextUnit", sid)
+
+    b = _ingest468(stack, **_claude_payload(sid, texts[1], 2))
+    c = _ingest468(stack, **_claude_payload(sid, texts[2], 3))
+    expected = [sid, sid + _DERIVED, _slot2(sid, texts[2])]
+    assert [b["evidence_node"], c["evidence_node"]] == expected[1:], (b, c)
+    for r in (b, c):
+        # The Document and the Claim changed, so the graph refuses them. The text lands.
+        assert r["text_ingested"] is True, r
+        assert len(r["node_errors"]) == 2, r
+        assert r["retryable"] is False and r["reject_codes"] == ["node_identity_conflict"], r
+    for node_id, text in zip(expected, texts):
+        node = stack["graph"].get_node("TextUnit", node_id)
+        assert node["text"] == text and node["pack_id"] == "pack-a", node
+        assert node.get("source_id") == (None if node_id == sid else sid), node
+    _settled_bm25(stack)
+    for word, node_id in (("wombat", sid), ("numbat", expected[1]), ("quoll", expected[2])):
+        bm25, vec = _legs(stack, word)
+        assert node_id in bm25 and node_id in vec, (word, bm25, vec)
+    states = {i: _node_state(stack, "TextUnit", i) for i in expected}
+
+    # B and C never write at source_id: all three rows of the first text stay.
+    assert _snapshot(stack, "TextUnit", sid) == first_rows
+    again = [_ingest468(stack, **_claude_payload(sid, t, 4)) for t in texts[1:]]
+    assert [r["evidence_node"] for r in again] == expected[1:], again
+    assert _snapshot(stack, "TextUnit", sid) == first_rows
+    # A resend of A is the ordinary idempotent write at source_id (#470).
+    again.append(_ingest468(stack, **_claude_payload(sid, texts[0], 4)))
+    assert again[-1]["evidence_node"] == sid, again[-1]
+    for r in again:
+        assert r["text_ingested"] is True and r["added_nodes"] >= 1, r
+    assert {i: _node_state(stack, "TextUnit", i) for i in expected} == states
+    assert _node_state(stack, "TextUnit", sid) == first_state
+    ids_now = {
+        r["props"]["id"] for r in stack["graph"].export_nodes(pack_id="pack-a")
+        if r["props"]["id"].startswith(sid)
+    }
+    assert ids_now == set(expected), ids_now
+
+
+def test_488_textunit_source_foreign_slot_1_does_not_fall_through(stack):
+    sid = "claude/p/488-b"
+    _ingest468(stack, text="첫 본문", source_id=sid)
+    _seed_node(stack, "TextUnit", sid + _DERIVED, pack_id="pack-b", principal=BOB, text="남의 것")
+    result = _ingest468(stack, text="둘째 본문", source_id=sid)
+    assert result["text_ingested"] is False and result["evidence_node"] is None, result
+    assert result["retryable"] is False and result["reject_codes"] == ["derived_id_conflict"], result
+    assert stack["graph"].get_node("TextUnit", _slot2(sid, "둘째 본문")) is None
+
+
+def test_488_unreadable_textunit_source_check_stays_retryable(stack):
+    sid = "claude/p/488-c"
+    _ingest468(stack, text="첫 본문", source_id=sid)
+    real = stack["graph"].get_nodes_by_id
+    calls = []
+
+    def flaky(node_id):
+        # The ownership probe and the builder identity check read first and
+        # succeed. The derivation check reads last and fails.
+        calls.append(node_id)
+        if len(calls) > 2:
+            raise RuntimeError("read down")
+        return real(node_id)
+
+    with patch.object(stack["graph"], "get_nodes_by_id", side_effect=flaky):
+        result = _ingest468(stack, text="둘째 본문", source_id=sid)
+    assert len(calls) > 2, calls
+    assert result["node_errors"] == [f"{sid}: {_CONFLICT_FIXED}"], result
+    assert result["text_ingested"] is False, result
+    assert result["retryable"] is True and "reject_codes" not in result, result
+    assert stack["graph"].get_node("TextUnit", sid + _DERIVED) is None
+
+
+def test_488_textunit_source_length_edges(stack):
+    from opencrab.pack.fork_remap import SOURCE_NODE_ID_BUDGET
+
+    no_slot_1 = "M" * (SOURCE_NODE_ID_BUDGET - len(_DERIVED) + 1)
+    no_slot_2 = "N" * (SOURCE_NODE_ID_BUDGET - len("#text-") - 16 + 1)
+    for sid in (no_slot_1, no_slot_2):
+        _ingest468(stack, text="첫 본문", source_id=sid)
+        _ingest468(stack, text="둘째 본문", source_id=sid)
+    refused_1 = _ingest468(stack, text="둘째 본문", source_id=no_slot_1)
+    assert refused_1["node_errors"] == [f"{no_slot_1}: {_CONFLICT_FIXED}"], refused_1
+    assert refused_1["reject_codes"] == ["node_identity_conflict"], refused_1
+    # Slot 1 holds the second text. A third text needs slot 2, which does not fit.
+    assert stack["graph"].get_node("TextUnit", no_slot_2 + _DERIVED)["text"] == "둘째 본문"
+    refused_2 = _ingest468(stack, text="셋째 본문", source_id=no_slot_2)
+    assert refused_2["text_ingested"] is False, refused_2
+    assert refused_2["reject_codes"] == ["derived_id_conflict"], refused_2
+
+
+def test_488_textunit_source_text_survives_a_fork_and_a_retry_on_the_fork_target(stack):
+    sid = "claude/p/488-d"
+    meta = {"title": "포크 제목", "source": "pack_ingest"}
+    _ingest468(stack, text="첫 본문", source_id=sid, metadata=meta)
+    _ingest468(stack, text="둘째 본문", source_id=sid, metadata=meta)
+
+    forked = _fork(stack, principal=ALICE, src_pack_id="pack-a")
+    assert forked.get("status") == "ok", forked
+    new_pack = forked["pack_id"]
+    ids = {
+        r["props"]["id"] for r in stack["graph"].export_nodes(pack_id=new_pack)
+        if r["props"]["id"].startswith(sid)
+    }
+    source_copy = next(i for i in ids if "#text" not in i)
+    slot1_copy = derive_text_id(source_copy)
+    assert ids == {source_copy, slot1_copy}, ids
+    before = stack["graph"].get_node("TextUnit", slot1_copy)
+    assert before["source_id"] == source_copy and before["text"] == "둘째 본문"
+
+    from opencrab.mcp.tools import _ingest_into_pack
+
+    with principal_scope(ALICE), \
+         patch("opencrab.mcp.tools._get_context", return_value=mcp_ctx_from(stack)):
+        retry = _ingest_into_pack(new_pack, text="둘째 본문", source_id=source_copy, metadata=meta)
+    assert retry["status"] == "ok" and retry["evidence_node"] == slot1_copy, retry
+    assert stack["graph"].get_node("TextUnit", slot1_copy) == before
