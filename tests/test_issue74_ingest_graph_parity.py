@@ -2097,6 +2097,14 @@ def test_468_derivation_gate_admits_only_a_readable_same_pack_evidence_logentry(
     assert _derivable_logentry(ctx, "x", "pack-a") is expected
 
 
+def test_480_derivation_gate_without_a_read_method_cannot_tell():
+    from opencrab.mcp.tools.pack import _derivable_logentry
+
+    assert _derivable_logentry({"neo4j": object()}, "x", "pack-a") is None
+    assert _derivable_logentry({}, "x", "pack-a") is None
+    assert _derivable_logentry({"neo4j": object()}, "x", "") is False
+
+
 def test_468_derived_id_stays_inside_the_node_id_column_after_two_forks():
     from opencrab.pack.fork_remap import NODE_ID_COLUMN_LIMIT, remap_id
 
@@ -2283,6 +2291,38 @@ def test_480_store_failure_stays_retryable(stack):
     assert result["status"] == "partial", result
     assert result["retryable"] is True, result
     assert "reject_codes" not in result, result
+
+
+def test_480_legacy_store_failure_alone_stays_retryable(stack):
+    # The legacy path reports a failed store only in `stores`, with no node_errors entry.
+    with patch.object(stack["docs"], "upsert_source", side_effect=RuntimeError("doc down")):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-m", text_as_node=False)
+    assert result["status"] == "partial" and result["node_errors"] == [], result
+    assert result["retryable"] is True, result
+    assert "reject_codes" not in result, result
+
+
+def test_480_legacy_store_failure_with_a_final_rejection_stays_retryable(stack):
+    _seed_node(stack, "TextUnit", "480-p1", pack_id="pack-b", principal=BOB, text="남의 것")
+    with patch.object(stack["docs"], "upsert_source", side_effect=RuntimeError("doc down")):
+        result = _ingest468(
+            stack, text="본문", source_id="codex/s/480-m2", text_as_node=False,
+            nodes=[{"space": "evidence", "node_type": "TextUnit", "node_id": "480-p1",
+                    "properties": {"text": "충돌"}}],
+        )
+    assert len(result["node_errors"]) == 1, result
+    assert result["retryable"] is True, result
+
+
+def test_480_reject_codes_list_each_reason_once(stack):
+    _seed_node(stack, "TextUnit", "480-q1", pack_id="pack-b", principal=BOB, text="남의 것")
+    _seed_node(stack, "TextUnit", "480-q2", pack_id="pack-b", principal=BOB, text="남의 것")
+    result = _ingest468(stack, nodes=[
+        {"space": "evidence", "node_type": "TextUnit", "node_id": i, "properties": {"text": "x"}}
+        for i in ("480-q1", "480-q2")
+    ])
+    assert len(result["node_errors"]) == 2, result
+    assert result["reject_codes"] == ["foreign_pack_identity"], result
 
 
 def test_480_final_rejection_plus_store_failure_stays_retryable(stack):
