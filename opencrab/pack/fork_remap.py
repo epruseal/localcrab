@@ -144,8 +144,12 @@ _FORK_SALTS_TAIL = re.compile(
 )
 
 
-def derive_text_id(source_id: str) -> str | None:
+def derive_text_id(source_id: str, digest: str | None = None) -> str | None:
     """Return the deterministic id of the TextUnit that holds text for ``source_id``.
+
+    Without ``digest`` the suffix is ``#text`` (slot 1, #470). With ``digest``
+    the suffix is ``#text-<digest>`` (slot 2, #483). The caller passes a digest
+    of the text, so each distinct text of one source gets its own id.
 
     The text suffix goes before any trailing fork salts. Then
     ``remap_id(derive_text_id(x), s) == derive_text_id(remap_id(x, s))``. A fork
@@ -159,7 +163,7 @@ def derive_text_id(source_id: str) -> str | None:
     """
     tail = _FORK_SALTS_TAIL.search(source_id)
     cut = tail.start() if tail else len(source_id)
-    base = source_id[:cut] + TEXT_ID_SUFFIX
+    base = source_id[:cut] + TEXT_ID_SUFFIX + (f"-{digest}" if digest is not None else "")
     derived = base + source_id[cut:]
     if len(base) > SOURCE_NODE_ID_BUDGET or len(derived) > NODE_ID_COLUMN_LIMIT:
         return None
