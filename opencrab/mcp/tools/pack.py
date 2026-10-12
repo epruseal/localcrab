@@ -22,6 +22,10 @@ from opencrab.common.pack_tags import apply_pack_tag
 from opencrab.common.text import slugify
 from opencrab.pack.fork_remap import derive_text_id
 from opencrab.pack.write_gate import (
+    CONFLICT_UNVERIFIABLE,
+    REJECT_DERIVED_CONFLICT,
+    REJECT_FOREIGN_PACK,
+    REJECT_NODE_CONFLICT,
     derived_conflict_message,
     edge_identity_conflict,
     identity_reject_message,
@@ -197,26 +201,35 @@ def _edge_probe_conflict(ctx: dict[str, Any], from_type: str, from_id: str, rela
 _identity_reject_message = identity_reject_message
 
 
-def _derivable_logentry(ctx: dict[str, Any], node_id: str, pack_id: str) -> bool:
-    """Is ``node_id`` a readable same-pack ``evidence/LogEntry``? (#470)
+def _derivable_logentry(ctx: dict[str, Any], node_id: str, pack_id: str) -> bool | None:
+    """Is ``node_id`` a readable same-pack ``evidence/LogEntry``? (#470, #480)
 
     Only that node may have text stored next to it under a derived id. Any
-    other conflict stays a rejection. A read that fails is "cannot tell" and
-    counts as no.
+    other conflict stays a rejection.
+
+    ``True``: exactly one readable row, a same-pack evidence LogEntry.
+    ``False``: the answer is final. The call has no pack id, or exactly one
+    readable row is another type, space or pack.
+    ``None``: cannot tell. The read method is missing or raised, the result is
+    not a list of dicts, the list is empty or holds several rows, or the row
+    has a property decode error. A resend can succeed after such a result.
     """
     method = getattr(ctx.get("neo4j"), "get_nodes_by_id", None)
-    if method is None or not pack_id:
+    if not pack_id:
         return False
+    if method is None:
+        return None
     try:
         rows = method(node_id)
     except Exception:  # noqa: BLE001 -- cannot tell
-        return False
+        return None
     if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
-        return False
+        return None
     row = rows[0]
+    if row.get("property_decode_error"):
+        return None
     return (
-        not row.get("property_decode_error")
-        and row.get("node_type") == "LogEntry"
+        row.get("node_type") == "LogEntry"
         and row.get("space") == "evidence"
         and row.get("pack_id") == pack_id
     )
@@ -236,8 +249,11 @@ def _store_text_under_derived_id(
     ``"stored"``: the receipt reports no store failures. Optional stores can
     still be unavailable.
     ``"failed"``: ``add_node`` reported a store failure. The graph write may have landed.
-    ``"rejected"``: an identity check, a derived id conflict or an exception in
-    this stage refused the item.
+    ``"rejected"``: an exception in this stage, or an identity check that could
+    not verify ownership, refused the item. A resend can succeed.
+    ``"conflict"``: a foreign pack owns the derived id, or the graph refused it
+    with an identity conflict (#480). Callers treat it as ``"rejected"`` and
+    count it as a final rejection.
     The function reports the result in ``node_errors`` and ``stores["evidence_node"]``.
     It never raises for a per-item failure.
     """
@@ -250,7 +266,7 @@ def _store_text_under_derived_id(
             msg = _identity_reject_message("node", source_id, reason)
             node_errors.append(msg)
             stores["evidence_node"] = msg
-            return "rejected", False
+            return ("rejected" if reason == CONFLICT_UNVERIFIABLE else "conflict"), False
         result = ctx["builder"].add_node(
             space="evidence", node_type="TextUnit", node_id=derived_id,
             properties=props, pack_id=pack_id,
@@ -259,7 +275,7 @@ def _store_text_under_derived_id(
         node_errors.append(derived_conflict_message(source_id, derived_id))
         stores["evidence_node"] = "rejected (derived id conflict)"
         logger.warning("_ingest_into_pack: derived id conflict for %s", source_id)
-        return "rejected", False
+        return "conflict", False
     except ValueError as exc:
         node_errors.append(f"{source_id} (evidence/TextUnit): {exc}")
         stores["evidence_node"] = f"error: {type(exc).__name__}"
@@ -344,6 +360,12 @@ def _ingest_into_pack(
         names the original id. A different node type, space or pack still rejects
         the item. ``text_ingested`` is then False.
 
+        A partial result carries ``retryable`` (#480). It is False when every
+        error is a final rejection (identity conflict, foreign pack): a resend of
+        the same input cannot fix it, and ``reject_codes`` lists the reasons.
+        Any other error, such as a store failure or an unverifiable check,
+        keeps it True.
+
         Collapsing the two into one path would change ``added_nodes`` /
         ``evidence_node`` and the vector shape for existing callers, so it is
         deliberately left alone.
@@ -377,6 +399,9 @@ def _ingest_into_pack(
     # the billing gate (`wrote_anything` below) is driven by that one
     # function alone, not by store_write_failures()-derived counters.
     billable_write = False
+    # #480: one code per item that failed for a final reason. A resend of the
+    # same input cannot fix it. Every other error stays retryable.
+    final_rejections: list[str] = []
 
     for item in nodes or []:
         try:
@@ -411,6 +436,8 @@ def _ingest_into_pack(
                 node_errors.append(
                     _identity_reject_message("node", item_node_id, reason)
                 )
+                if reason != CONFLICT_UNVERIFIABLE:
+                    final_rejections.append(REJECT_FOREIGN_PACK)
                 continue
             props = dict(_clean_meta(item.get("properties") or {}))
             _warn_dropped_alias(apply_pack_tag(props, pack_id), "node", item_node_id)
@@ -441,6 +468,7 @@ def _ingest_into_pack(
             # ontology_add_node and the legacy text branch report it the same
             # way. Log no traceback for it.
             node_errors.append(node_conflict_message(item.get("node_id", "?")))
+            final_rejections.append(REJECT_NODE_CONFLICT)
             logger.warning("_ingest_into_pack: node identity conflict for %s", item.get("node_id", "?"))
         except Exception as exc:
             node_errors.append(f"{item.get('node_id', '?')}: {safe_tool_error('_ingest_into_pack', exc)}")
@@ -507,6 +535,8 @@ def _ingest_into_pack(
                         "edge", f"{item_from_id}->{item_to_id}", reason
                     )
                 )
+                if reason != CONFLICT_UNVERIFIABLE:
+                    final_rejections.append(REJECT_FOREIGN_PACK)
                 continue
 
             props = dict(_clean_meta(item.get("properties") or {}))
@@ -541,6 +571,7 @@ def _ingest_into_pack(
             )
 
     text_ingested = False
+    text_rejected = False
     if text and source_id:
         text = _clean_str(text)
         meta = _clean_meta(metadata or {})
@@ -574,7 +605,6 @@ def _ingest_into_pack(
             # #470: True when an identity check or the derived id refused the text.
             # Such an item is not "ingested", as in the legacy branch below. A store
             # failure does not set it: the write was attempted.
-            text_rejected = False
             try:
                 reason = _node_probe_conflict(
                     ctx, "evidence", "TextUnit", source_id, pack_id
@@ -584,6 +614,8 @@ def _ingest_into_pack(
                     node_errors.append(msg)
                     stores["evidence_node"] = msg
                     text_rejected = True
+                    if reason != CONFLICT_UNVERIFIABLE:
+                        final_rejections.append(REJECT_FOREIGN_PACK)
                 else:
                     evidence_result = ctx["builder"].add_node(
                         space="evidence",
@@ -616,10 +648,8 @@ def _ingest_into_pack(
                 # #468: the id already names a different node. #470: when that node
                 # is a same-pack LogEntry, this function writes the text to a new
                 # TextUnit under a derived id and leaves the LogEntry unchanged.
-                derived_id = (
-                    derive_text_id(source_id)
-                    if _derivable_logentry(ctx, source_id, pack_id) else None
-                )
+                derivable = _derivable_logentry(ctx, source_id, pack_id)
+                derived_id = derive_text_id(source_id) if derivable else None
                 if derived_id is None:
                     # The marker is fixed. store_write_failures() does not read it
                     # as a failure because it has no "error:" or "no match" prefix.
@@ -628,12 +658,18 @@ def _ingest_into_pack(
                     stores["evidence_node"] = "rejected (node identity conflict)"
                     logger.warning("_ingest_into_pack: node identity conflict for %s", source_id)
                     text_rejected = True
+                    # ``None`` means the read could not tell. A derived id too
+                    # long to build, or a definite non-LogEntry, is final.
+                    if derivable is not None:
+                        final_rejections.append(REJECT_NODE_CONFLICT)
                 else:
                     outcome, billed = _store_text_under_derived_id(
                         ctx, pack_id, source_id, derived_id, node_props,
                         node_errors, stores,
                     )
-                    text_rejected = outcome == "rejected"
+                    text_rejected = outcome in ("rejected", "conflict")
+                    if outcome == "conflict":
+                        final_rejections.append(REJECT_DERIVED_CONFLICT)
                     if outcome == "stored":
                         evidence_node = derived_id
                         added_nodes += 1
@@ -656,6 +692,8 @@ def _ingest_into_pack(
             reason = _source_probe_conflict(ctx, source_id, pack_id)
             if reason:
                 node_errors.append(_identity_reject_message("source", source_id, reason))
+                if reason != CONFLICT_UNVERIFIABLE:
+                    final_rejections.append(REJECT_FOREIGN_PACK)
             else:
                 from opencrab.pack.source_writer import write_source
 
@@ -759,6 +797,22 @@ def _ingest_into_pack(
     # accurate top-level signal instead of an unconditional "ok".
     status = "partial" if node_errors or edge_errors or text_stores_failed else "ok"
 
+    # #480: a partial result is retryable unless every error is a final
+    # rejection. A rejected text puts its diagnostic message into
+    # ``stores["evidence_node"]``. That message is not a store failure.
+    result_extra: dict[str, Any] = {}
+    if status == "partial":
+        failure_stores = {
+            k: v for k, v in stores.items() if not (text_rejected and k == "evidence_node")
+        }
+        retryable = (
+            len(node_errors) + len(edge_errors) > len(final_rejections)
+            or bool(store_write_failures(failure_stores))
+        )
+        result_extra["retryable"] = retryable
+        if not retryable:
+            result_extra["reject_codes"] = sorted(set(final_rejections))
+
     return {
         "status": status,
         "pack_id": pack_id,
@@ -769,6 +823,7 @@ def _ingest_into_pack(
         "stores": stores,
         "text_ingested": text_ingested,
         "evidence_node": evidence_node,
+        **result_extra,
     }
 
 

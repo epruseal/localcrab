@@ -482,6 +482,13 @@ def source_identity_conflict(
     ])
 
 
+# #480: codes for items that a resend of the same input cannot fix. The
+# ``reject_codes`` field of a partial ingest result lists them.
+REJECT_NODE_CONFLICT = "node_identity_conflict"
+REJECT_DERIVED_CONFLICT = "derived_id_conflict"
+REJECT_FOREIGN_PACK = "foreign_pack_identity"
+
+
 def node_conflict_message(ident: str) -> str:
     """Report one item the graph rejected because its id already names a
     different node (#468). Fixed wording: it describes only the rejected
