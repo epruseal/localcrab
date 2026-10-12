@@ -361,8 +361,9 @@ def _ingest_into_pack(
         the item. ``text_ingested`` is then False.
 
         A partial result carries ``retryable`` (#480). It is False when every
-        error is a final rejection (identity conflict, foreign pack): a resend of
-        the same input cannot fix it, and ``reject_codes`` lists the reasons.
+        error is a final rejection (node identity conflict, foreign pack): a resend
+        of the same input cannot fix it, and ``reject_codes`` lists the reasons.
+        An edge identity conflict and a grammar rejection are not counted as final.
         Any other error, such as a store failure or an unverifiable check,
         keeps it True. On the legacy text path (``text_as_node`` False) only a
         foreign-pack probe is final. An identity conflict from the source writer
