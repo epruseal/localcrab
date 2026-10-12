@@ -1846,6 +1846,13 @@ def _legs(stack, question: str, pack_id: str = "pack-a"):
 _DERIVED = "#text"
 
 
+def _slot2(source_id: str, text: str) -> str:
+    """The #483 slot 2 id, computed independently of the code under test."""
+    import hashlib
+
+    return source_id + "#text-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
 def test_468_text_over_existing_logentry_is_stored_under_a_derived_id(stack, caplog):
     seeded_row = _seed_logentry(stack, "codex/s/468-a")
     before = _snapshot(stack, "LogEntry", "codex/s/468-a")
@@ -1896,22 +1903,25 @@ def test_468_same_request_twice_is_idempotent(stack):
     assert stack["graph"].get_node_digest("codex/s/468-i" + _DERIVED) == digest
 
 
-def test_468_same_id_with_different_text_is_a_clear_rejection(stack, caplog):
+def test_483_same_id_with_different_text_is_stored_under_a_digest_id(stack, caplog):
+    """#483: a continued session sends a new text for the same id. It is stored."""
     _seed_logentry(stack, "codex/s/468-d")
     _ingest468(stack, text="첫 본문", source_id="codex/s/468-d")
     derived = "codex/s/468-d" + _DERIVED
     kept = stack["graph"].get_node("TextUnit", derived)
     with caplog.at_level("ERROR"):
-        result = _ingest468(stack, text="다른 본문", source_id="codex/s/468-d")
-    assert result["status"] == "partial", result
-    assert result["node_errors"] == [
-        f"codex/s/468-d: derived id {derived} already names a different node or "
-        "different content; this item was not written"
-    ], result
-    assert result["stores"]["evidence_node"] == "rejected (derived id conflict)", result
-    assert result["evidence_node"] is None and result["added_nodes"] == 0, result
-    assert result["text_ingested"] is False, result
+        result = _ingest468(stack, text="quokka 다른 본문", source_id="codex/s/468-d")
+    slot2 = _slot2("codex/s/468-d", "quokka 다른 본문")
+    assert result["status"] == "ok", result
+    assert result["node_errors"] == [], result
+    assert result["evidence_node"] == slot2 and result["added_nodes"] == 1, result
+    assert result["text_ingested"] is True, result
+    assert result["stores"]["evidence_node"] == "ok (derived id for codex/s/468-d)", result
+    node = stack["graph"].get_node("TextUnit", slot2)
+    assert node["text"] == "quokka 다른 본문" and node["source_id"] == "codex/s/468-d"
     assert stack["graph"].get_node("TextUnit", derived) == kept
+    bm25, vec = _legs(stack, "quokka")
+    assert slot2 in bm25 and slot2 in vec, (bm25, vec)
     assert not [r for r in caplog.records if r.exc_info]
 
 
@@ -2280,9 +2290,12 @@ def test_480_continued_session_is_a_final_rejection(stack):
     _ingest468(stack, **_session_payload("2026-10-07T03:21:03Z", "본문1"))
     result = _ingest468(stack, **_session_payload("2026-10-08T03:21:03Z", "본문2"))
     assert result["status"] == "partial", result
-    assert len(result["node_errors"]) == 2, result
+    # #483: only the LogEntry is refused. The new text is stored at slot 2.
+    assert len(result["node_errors"]) == 1, result
     assert result["retryable"] is False, result
-    assert result["reject_codes"] == ["derived_id_conflict", "node_identity_conflict"], result
+    assert result["reject_codes"] == ["node_identity_conflict"], result
+    assert result["text_ingested"] is True, result
+    assert result["evidence_node"] == _slot2("codex/s/480-a", "본문2"), result
 
 
 def test_480_store_failure_stays_retryable(stack):
@@ -2580,3 +2593,254 @@ def test_480_a_plain_builder_value_error_stays_retryable(stack):
     assert len(result["node_errors"]) == 1, result
     assert result["retryable"] is True, result
     assert "reject_codes" not in result, result
+
+
+# ---------------------------------------------------------------------------
+# #483: each text of a continued session is stored as its own TextUnit
+# ---------------------------------------------------------------------------
+
+
+def _node_state(stack, node_type: str, node_id: str):
+    """Graph digest and graph row. An idempotent resend refreshes ``updated_at``
+    of the doc row (#470 behaviour), so the doc row is not compared here."""
+    return (stack["graph"].get_node_digest(node_id, node_type=node_type),
+            stack["graph"].get_node(node_type, node_id))
+
+
+def test_483_three_texts_of_one_session_each_land_and_resends_are_idempotent(stack):
+    sid = "codex/s/483-a"
+    first = _ingest468(stack, **_session_payload("2026-10-07T00:00:00Z", "본문 A", sid))
+    assert first["status"] == "ok" and first["evidence_node"] == sid + _DERIVED, first
+    log_before = _snapshot(stack, "LogEntry", sid), _node_state(stack, "LogEntry", sid)
+    slot1_before = _node_state(stack, "TextUnit", sid + _DERIVED)
+
+    b = _ingest468(stack, **_session_payload("2026-10-08T00:00:00Z", "본문 A 그리고 B", sid))
+    c = _ingest468(stack, **_session_payload("2026-10-09T00:00:00Z", "본문 A 그리고 B 그리고 C", sid))
+    assert b["evidence_node"] == _slot2(sid, "본문 A 그리고 B"), b
+    assert c["evidence_node"] == _slot2(sid, "본문 A 그리고 B 그리고 C"), c
+    for r in (b, c):
+        assert r["text_ingested"] is True and r["added_nodes"] == 1, r
+        assert r["reject_codes"] == ["node_identity_conflict"], r
+    ids = {sid + _DERIVED, b["evidence_node"], c["evidence_node"]}
+    assert len(ids) == 3
+    for i in ids:
+        node = stack["graph"].get_node("TextUnit", i)
+        assert node["source_id"] == sid and node["pack_id"] == "pack-a", node
+        assert stack["vector"].get_by_id(i) is not None, i
+    states = {i: _node_state(stack, "TextUnit", i) for i in ids}
+
+    # Resends of each version find the same node and add nothing.
+    again = [
+        _ingest468(stack, **_session_payload("2026-10-10T00:00:00Z", t, sid))
+        for t in ("본문 A", "본문 A 그리고 B", "본문 A 그리고 B 그리고 C")
+    ]
+    assert [r["evidence_node"] for r in again] == [
+        sid + _DERIVED, b["evidence_node"], c["evidence_node"]]
+    for r in again:
+        assert r["added_nodes"] == 1 and r["text_ingested"] is True, r
+    assert {i: _node_state(stack, "TextUnit", i) for i in ids} == states
+    ids_now = {
+        r["props"]["id"] for r in stack["graph"].export_nodes(pack_id="pack-a")
+        if r["props"]["id"].startswith(sid)
+    }
+    assert ids_now == ids | {sid}, ids_now
+    # The first LogEntry and the slot 1 TextUnit are unchanged.
+    assert (_snapshot(stack, "LogEntry", sid), _node_state(stack, "LogEntry", sid)) == log_before
+    assert _node_state(stack, "TextUnit", sid + _DERIVED) == slot1_before
+
+
+def test_483_first_text_lands_at_slot_1_even_if_it_is_a_later_version(stack):
+    _seed_logentry(stack, "codex/s/483-b")
+    result = _ingest468(stack, text="나중 본문", source_id="codex/s/483-b")
+    assert result["evidence_node"] == "codex/s/483-b" + _DERIVED, result
+    assert stack["graph"].get_node("TextUnit", _slot2("codex/s/483-b", "나중 본문")) is None
+
+
+def test_483_same_text_other_title_after_slot_1_adds_one_digest_node(stack):
+    _seed_logentry(stack, "codex/s/483-c")
+    _ingest468(stack, text="본문 C", source_id="codex/s/483-c", metadata={"title": "t1"})
+    result = _ingest468(stack, text="본문 C", source_id="codex/s/483-c", metadata={"title": "t2"})
+    slot2 = _slot2("codex/s/483-c", "본문 C")
+    assert result["status"] == "ok" and result["evidence_node"] == slot2, result
+    assert stack["graph"].get_node("TextUnit", slot2)["title"] == "t2"
+    assert stack["graph"].get_node("TextUnit", "codex/s/483-c" + _DERIVED)["title"] == "t1"
+
+
+def test_483_same_text_other_title_after_slot_2_is_a_derived_conflict(stack):
+    _seed_logentry(stack, "codex/s/483-d")
+    _ingest468(stack, text="첫 본문", source_id="codex/s/483-d")
+    # Precondition: text B sits at its digest id.
+    first_b = _ingest468(stack, text="본문 B", source_id="codex/s/483-d", metadata={"title": "t1"})
+    slot2 = _slot2("codex/s/483-d", "본문 B")
+    assert first_b["evidence_node"] == slot2, first_b
+    kept = _node_state(stack, "TextUnit", slot2)
+    result = _ingest468(stack, text="본문 B", source_id="codex/s/483-d", metadata={"title": "t2"})
+    assert result["status"] == "partial" and result["text_ingested"] is False, result
+    assert result["node_errors"] == [
+        f"codex/s/483-d: derived id {slot2} already names a different node or "
+        "different content; this item was not written"
+    ], result
+    assert result["stores"]["evidence_node"] == "rejected (derived id conflict)", result
+    assert result["retryable"] is False and result["reject_codes"] == ["derived_id_conflict"]
+    assert _node_state(stack, "TextUnit", slot2) == kept
+
+
+def test_483_squatters_at_both_slots_are_a_final_derived_conflict(stack, caplog):
+    sid = "codex/s/483-e"
+    _seed_logentry(stack, sid)
+    _seed_node(stack, "TextUnit", sid + _DERIVED, text="다른 것")
+    _seed_node(stack, "TextUnit", _slot2(sid, "본문 E"), text="또 다른 것")
+    with caplog.at_level("WARNING"):
+        result, billing = _ingest_with_billing(stack, text="본문 E", source_id=sid)
+    assert result["status"] == "partial" and result["text_ingested"] is False, result
+    # One report, for slot 2 only. Slot 1 reports nothing.
+    assert result["node_errors"] == [
+        f"{sid}: derived id {_slot2(sid, '본문 E')} already names a different node or "
+        "different content; this item was not written"
+    ], result
+    assert result["evidence_node"] is None and result["added_nodes"] == 0, result
+    assert result["retryable"] is False and result["reject_codes"] == ["derived_id_conflict"]
+    assert sum("derived id conflict" in r.getMessage() for r in caplog.records) == 1
+    billing.on_ingest.assert_not_called()
+
+
+def test_483_non_textunit_at_slot_1_falls_to_slot_2(stack):
+    sid = "codex/s/483-f"
+    _seed_logentry(stack, sid)
+    _seed_node(stack, "Evidence", sid + _DERIVED, text="증거")
+    result = _ingest468(stack, text="본문 F", source_id=sid)
+    assert result["status"] == "ok" and result["evidence_node"] == _slot2(sid, "본문 F"), result
+    assert stack["graph"].lookup_node_type(sid + _DERIVED) == "Evidence"
+
+
+def test_483_foreign_pack_at_slot_1_does_not_fall_through(stack):
+    sid = "codex/s/483-g"
+    _seed_logentry(stack, sid)
+    _seed_node(stack, "TextUnit", sid + _DERIVED, pack_id="pack-b", principal=BOB, text="남의 것")
+    result = _ingest468(stack, text="본문 G", source_id=sid)
+    assert result["text_ingested"] is False and result["evidence_node"] is None, result
+    assert result["reject_codes"] == ["derived_id_conflict"], result
+    assert stack["graph"].get_node("TextUnit", _slot2(sid, "본문 G")) is None
+
+
+def test_483_foreign_pack_at_slot_2_is_a_final_derived_conflict(stack):
+    sid = "codex/s/483-h"
+    _seed_logentry(stack, sid)
+    _ingest468(stack, text="첫 본문", source_id=sid)
+    slot2 = _slot2(sid, "본문 H")
+    _seed_node(stack, "TextUnit", slot2, pack_id="pack-b", principal=BOB, text="남의 것")
+    result = _ingest468(stack, text="본문 H", source_id=sid)
+    assert result["node_errors"] == [
+        f"{sid}: identity is already attributed to a different pack"], result
+    assert result["text_ingested"] is False and result["evidence_node"] is None, result
+    assert result["reject_codes"] == ["derived_id_conflict"], result
+
+
+def test_483_slot_2_budget_edge(stack):
+    from opencrab.pack.fork_remap import SOURCE_NODE_ID_BUDGET
+
+    slot2_suffix = len("#text-") + 16
+    fits = "F" * (SOURCE_NODE_ID_BUDGET - slot2_suffix)
+    over = "G" * (SOURCE_NODE_ID_BUDGET - slot2_suffix + 1)
+    for sid in (fits, over):
+        _seed_logentry(stack, sid)
+        _ingest468(stack, text="첫 본문", source_id=sid)
+    ok = _ingest468(stack, text="둘째 본문", source_id=fits)
+    assert ok["status"] == "ok" and ok["evidence_node"] == _slot2(fits, "둘째 본문"), ok
+    assert len(ok["evidence_node"]) == SOURCE_NODE_ID_BUDGET
+    refused = _ingest468(stack, text="둘째 본문", source_id=over)
+    # Slot 1 fits but slot 2 does not: the slot 1 conflict stays visible.
+    assert refused["node_errors"] == [
+        f"{over}: derived id {over}{_DERIVED} already names a different node or "
+        "different content; this item was not written"
+    ], refused
+    assert refused["text_ingested"] is False, refused
+    assert refused["reject_codes"] == ["derived_id_conflict"], refused
+
+
+def test_483_slot_2_store_failure_stays_retryable_and_bills(stack):
+    sid = "codex/s/483-i"
+    _seed_logentry(stack, sid)
+    _ingest468(stack, text="첫 본문", source_id=sid)
+    with patch.object(stack["docs"], "upsert_node_doc", side_effect=RuntimeError("doc down")):
+        result, billing = _ingest_with_billing(stack, text="본문 I", source_id=sid)
+    assert result["status"] == "partial" and result["text_ingested"] is True, result
+    assert result["evidence_node"] is None, result
+    assert len(result["node_errors"]) == 1 and _slot2(sid, "본문 I") in result["node_errors"][0]
+    assert result["retryable"] is True and "reject_codes" not in result, result
+    assert billing.on_ingest.call_count == 1
+
+
+def test_483_slot_2_exception_stays_retryable(stack):
+    sid = "codex/s/483-j"
+    _seed_logentry(stack, sid)
+    _ingest468(stack, text="첫 본문", source_id=sid)
+    builder = stack["builder"]
+    real_add_node = builder.add_node
+
+    def add_node(*args, **kw):
+        if "#text-" in str(kw.get("node_id", "")):
+            raise RuntimeError("registry down")
+        return real_add_node(*args, **kw)
+
+    with patch.object(builder, "add_node", side_effect=add_node):
+        result, billing = _ingest_with_billing(stack, text="본문 J", source_id=sid)
+    assert result["text_ingested"] is False and result["evidence_node"] is None, result
+    assert result["stores"]["evidence_node"] == "error: RuntimeError", result
+    assert result["retryable"] is True and "reject_codes" not in result, result
+    billing.on_ingest.assert_not_called()
+
+
+def test_483_slot_2_write_bills_once(stack):
+    sid = "codex/s/483-k"
+    _seed_logentry(stack, sid)
+    _ingest468(stack, text="첫 본문", source_id=sid)
+    result, billing = _ingest_with_billing(stack, text="본문 K", source_id=sid)
+    assert result["evidence_node"] == _slot2(sid, "본문 K"), result
+    assert billing.on_ingest.call_count == 1
+
+
+def test_483_digest_text_survives_a_fork_and_a_retry_on_the_fork_target(stack):
+    sid = "codex/s/483-m"
+    _seed_logentry(stack, sid)
+    meta = {"title": "포크 제목", "source": "pack_ingest"}
+    _ingest468(stack, text="첫 본문", source_id=sid, metadata=meta)
+    _ingest468(stack, text="둘째 본문", source_id=sid, metadata=meta)
+
+    forked = _fork(stack, principal=ALICE, src_pack_id="pack-a")
+    assert forked.get("status") == "ok", forked
+    new_pack = forked["pack_id"]
+    ids = {
+        r["props"]["id"] for r in stack["graph"].export_nodes(pack_id=new_pack)
+        if r["props"]["id"].startswith(sid)
+    }
+    log_copy = next(i for i in ids if "#text" not in i)
+    digest = _slot2("", "둘째 본문")[len("#text-"):]
+    slot2_copy = derive_text_id(log_copy, digest)
+    assert slot2_copy in ids, ids
+    before = stack["graph"].get_node("TextUnit", slot2_copy)
+    assert before["source_id"] == log_copy
+
+    from opencrab.mcp.tools import _ingest_into_pack
+
+    with principal_scope(ALICE), \
+         patch("opencrab.mcp.tools._get_context", return_value=mcp_ctx_from(stack)):
+        retry = _ingest_into_pack(new_pack, text="둘째 본문", source_id=log_copy, metadata=meta)
+    assert retry["status"] == "ok", retry
+    assert retry["evidence_node"] == slot2_copy, retry
+    assert stack["graph"].get_node("TextUnit", slot2_copy) == before
+
+
+@pytest.mark.parametrize("plain", ["a", "codex/s/1", "x#y", "k~notsalt", "x~0123456789AB"])
+def test_483_digest_id_commutes_with_the_fork_remap(plain):
+    from opencrab.pack.fork_remap import remap_id
+
+    digest = "0123456789abcdef"
+    for salts in ([], ["0123456789ab"], ["0123456789ab", "ba9876543210"]):
+        original = plain
+        expected = plain + "#text-" + digest
+        for salt in salts:
+            original = remap_id(original, salt)
+            expected = remap_id(expected, salt)
+        assert derive_text_id(original, digest) == expected
+

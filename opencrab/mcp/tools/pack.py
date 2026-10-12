@@ -239,6 +239,7 @@ def _derivable_logentry(ctx: dict[str, Any], node_id: str, pack_id: str) -> bool
 def _store_text_under_derived_id(
     ctx: dict[str, Any], pack_id: str, source_id: str, derived_id: str,
     node_props: dict[str, Any], node_errors: list[str], stores: dict[str, Any],
+    *, defer_conflict: bool = False,
 ) -> tuple[str, bool]:
     """Write ``node_props`` as a new evidence/TextUnit at ``derived_id`` (#470).
 
@@ -246,7 +247,7 @@ def _store_text_under_derived_id(
     create-or-verify rule and the doc and vector fan-out do not change. The node
     carries ``source_id`` (the LogEntry id), a key that a pack fork remaps.
 
-    Return ``(outcome, billable)``. The outcome is one of four values.
+    Return ``(outcome, billable)``. The outcome is one of five values.
     ``"stored"``: the receipt reports no store failures. Optional stores can
     still be unavailable.
     ``"failed"``: ``add_node`` reported a store failure. The graph write may have landed.
@@ -255,8 +256,11 @@ def _store_text_under_derived_id(
     ``"conflict"``: a foreign pack owns the derived id, or the graph refused it
     with an identity conflict (#480). Callers treat it as ``"rejected"`` and
     count it as a final rejection.
-    The function reports the result in ``node_errors`` and ``stores["evidence_node"]``.
-    It never raises for a per-item failure.
+    ``"occupied"``: only with ``defer_conflict`` true (#483). The ownership probe
+    passed and the graph refused the id with an identity conflict. The function
+    then reports nothing, so the caller can try the next slot.
+    For the other outcomes the function reports the result in ``node_errors``
+    and ``stores["evidence_node"]``. It never raises for a per-item failure.
     """
     from opencrab.ontology.builder import store_write_failures, store_write_succeeded
 
@@ -273,6 +277,8 @@ def _store_text_under_derived_id(
             properties=props, pack_id=pack_id,
         )
     except NodeIdentityConflict:
+        if defer_conflict:
+            return "occupied", False
         node_errors.append(derived_conflict_message(source_id, derived_id))
         stores["evidence_node"] = "rejected (derived id conflict)"
         logger.warning("_ingest_into_pack: derived id conflict for %s", source_id)
@@ -357,10 +363,12 @@ def _ingest_into_pack(
         With ``text_as_node=True`` an id that already names a LogEntry of the
         same pack does not reject the text (#470). The function stores the text as
         a new TextUnit at ``derive_text_id(source_id)`` and leaves the LogEntry
-        alone. ``evidence_node`` is the derived id and ``stores["evidence_node"]``
-        names the original id. A different node type, space or pack still rejects
-        the item, and so does a conflict on the derived id. ``text_ingested`` is
-        then False.
+        alone. When that id already holds another node or another text, the text
+        goes to ``derive_text_id(source_id, digest)``, where ``digest`` is the
+        first 16 hex of the sha256 of the text (#483). ``evidence_node`` is the id
+        that holds the text and ``stores["evidence_node"]`` names the original id.
+        A different node type, space or pack still rejects the item, and so does
+        a conflict on the final derived id. ``text_ingested`` is then False.
 
         A partial result carries ``retryable`` and, when it is False,
         ``reject_codes`` (#480). The table "pack_ingest partial 결과의 retryable
@@ -673,10 +681,29 @@ def _ingest_into_pack(
                     if derivable is not None:
                         final_rejections.append(REJECT_NODE_CONFLICT)
                 else:
+                    # #483: slot 1 is ``<id>#text``. When it holds another node or
+                    # another text, slot 2 is ``<id>#text-<digest of the text>``,
+                    # so each text of a continued session gets its own TextUnit.
                     outcome, billed = _store_text_under_derived_id(
                         ctx, pack_id, source_id, derived_id, node_props,
-                        node_errors, stores,
+                        node_errors, stores, defer_conflict=True,
                     )
+                    if outcome == "occupied":
+                        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+                        slot2_id = derive_text_id(source_id, digest)
+                        if slot2_id is None:
+                            node_errors.append(derived_conflict_message(source_id, derived_id))
+                            stores["evidence_node"] = "rejected (derived id conflict)"
+                            logger.warning(
+                                "_ingest_into_pack: derived id conflict for %s", source_id
+                            )
+                            outcome = "conflict"
+                        else:
+                            derived_id = slot2_id
+                            outcome, billed = _store_text_under_derived_id(
+                                ctx, pack_id, source_id, derived_id, node_props,
+                                node_errors, stores,
+                            )
                     text_rejected = outcome in ("rejected", "conflict")
                     if outcome == "conflict":
                         final_rejections.append(REJECT_DERIVED_CONFLICT)
