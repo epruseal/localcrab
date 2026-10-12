@@ -2601,8 +2601,11 @@ def test_480_a_plain_builder_value_error_stays_retryable(stack):
 
 
 def _node_state(stack, node_type: str, node_id: str):
-    """Graph digest and graph row. An idempotent resend refreshes ``updated_at``
-    of the doc row (#470 behaviour), so the doc row is not compared here."""
+    """Return the graph digest and the graph row.
+
+    An idempotent resend refreshes ``updated_at`` of the doc row (#470
+    behavior), so this helper does not compare the doc row.
+    """
     return (stack["graph"].get_node_digest(node_id, node_type=node_type),
             stack["graph"].get_node(node_type, node_id))
 
@@ -2843,4 +2846,3 @@ def test_483_digest_id_commutes_with_the_fork_remap(plain):
             original = remap_id(original, salt)
             expected = remap_id(expected, salt)
         assert derive_text_id(original, digest) == expected
-

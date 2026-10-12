@@ -363,9 +363,10 @@ def _ingest_into_pack(
         With ``text_as_node=True`` an id that already names a LogEntry of the
         same pack does not reject the text (#470). The function stores the text as
         a new TextUnit at ``derive_text_id(source_id)`` and leaves the LogEntry
-        alone. When that id already holds another node or another text, the text
-        goes to ``derive_text_id(source_id, digest)``, where ``digest`` is the
-        first 16 hex of the sha256 of the text (#483). ``evidence_node`` is the id
+        alone. When that id already holds another node or another text and the
+        ownership probe passes, the text goes to ``derive_text_id(source_id,
+        digest)``, where ``digest`` is the first 16 hex of the sha256 of the text
+        (#483). A node of another pack at the first id refuses the text. ``evidence_node`` is the id
         that holds the text and ``stores["evidence_node"]`` names the original id.
         A different node type, space or pack still rejects the item, and so does
         a conflict on the final derived id. ``text_ingested`` is then False.
@@ -681,9 +682,10 @@ def _ingest_into_pack(
                     if derivable is not None:
                         final_rejections.append(REJECT_NODE_CONFLICT)
                 else:
-                    # #483: slot 1 is ``<id>#text``. When it holds another node or
-                    # another text, slot 2 is ``<id>#text-<digest of the text>``,
-                    # so each text of a continued session gets its own TextUnit.
+                    # #483: slot 1 is ``<id>#text``. When the graph refuses it after
+                    # the ownership probe passed, slot 2 is ``<id>#text-<digest of
+                    # the text>``, so each text of a continued session gets its own
+                    # TextUnit. A foreign pack at slot 1 stays a final refusal.
                     outcome, billed = _store_text_under_derived_id(
                         ctx, pack_id, source_id, derived_id, node_props,
                         node_errors, stores, defer_conflict=True,
@@ -1168,7 +1170,7 @@ def _rank_packs(query: str, enriched: list[dict[str, Any]]) -> list[dict[str, An
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text. With text_as_node=true, write an evidence/TextUnit node. When source_id names a same-pack LogEntry, use the derived id <source_id>#text before any fork suffix. The response returns it in evidence_node.",
+                    "description": "Optional raw text. With text_as_node=true, write an evidence/TextUnit node. When source_id names a same-pack LogEntry, use the derived id <source_id>#text before any fork suffix. When that id already holds another node or another text and the ownership check passes, use <source_id>#text-<first 16 hex of the sha256 of the text> instead. A node of another pack at <source_id>#text refuses the text. The response returns the id in evidence_node.",
                 },
                 "text_as_node": {
                     "type": "boolean",
@@ -1765,7 +1767,7 @@ def pack_create(
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). Use to append conversation content to a loaded pack. If source_id already names a LogEntry of the same pack, the TextUnit gets the derived id <source_id>#text (before any fork suffix) and the response reports it in evidence_node.",
+                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). Use to append conversation content to a loaded pack. If source_id already names a LogEntry of the same pack, the TextUnit gets the derived id <source_id>#text (before any fork suffix). When that id already holds another node or another text and the ownership check passes, it gets <source_id>#text-<first 16 hex of the sha256 of the text>. A node of another pack at <source_id>#text refuses the text. The response reports the id in evidence_node.",
                 },
                 "text_as_node": {
                     "type": "boolean",

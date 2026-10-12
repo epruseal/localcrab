@@ -55,7 +55,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 | 텍스트 | 노드 식별 충돌이고 대상이 같은 팩의 LogEntry가 아님이 확정, 또는 파생 id를 만들 수 없음 | 최종 | `node_identity_conflict` |
 | 텍스트 | 노드 식별 충돌이고 LogEntry 여부를 읽을 수 없음 | 재시도 | |
 | 텍스트 | 소유권 probe 확인 불능, 저장 실패, 그 밖의 예외 | 재시도 | |
-| 파생 TextUnit | 파생 id의 소유권 probe가 타 팩 귀속을 확인, 또는 마지막으로 시도한 파생 id가 식별 충돌. `#text`가 다른 노드나 다른 본문을 담고 있으면 마지막 파생 id는 본문 digest id다(아래 "이어진 세션의 본문" 절) | 최종 | `derived_id_conflict` |
+| 파생 TextUnit | 파생 id의 소유권 probe가 타 팩 귀속을 확인, 또는 마지막으로 시도한 파생 id가 식별 충돌. `#text`가 소유권 probe를 통과한 다른 노드나 다른 본문을 담고 있으면 마지막 파생 id는 본문 digest id다(아래 "이어진 세션의 본문" 절) | 최종 | `derived_id_conflict` |
 | 파생 TextUnit | probe 확인 불능, 문법 거부, 저장 실패, 그 밖의 예외 | 재시도 | |
 | legacy 텍스트(`text_as_node` false) | 소스 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
 | legacy 텍스트 | source writer가 올린 노드 식별 충돌(compare-and-swap 경쟁일 수 있음), `ValueError`, 그래프 쓰기 불가, 스키마 이전 필요, probe 확인 불능, 저장 실패 | 재시도 | |
@@ -71,7 +71,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 같은 세션을 다시 보내면 LogEntry 쓰기는 계속 `node_identity_conflict`로 거부된다. 본문은 파생 TextUnit 두 슬롯에 차례로 저장한다. 슬롯 규칙의 정본은 `_ingest_into_pack` docstring이다.
 
 - 슬롯 1은 `derive_text_id(source_id)`, 곧 `<id>#text`다. 첫 본문이 여기에 저장된다.
-- 슬롯 1에 다른 노드나 다른 본문이 있으면 슬롯 2 `derive_text_id(source_id, digest)`에 저장한다. `digest`는 정제한 본문의 UTF-8 바이트 sha256 앞 16 hex다.
+- 슬롯 1에 다른 노드나 다른 본문이 있고 소유권 probe가 통과하면 슬롯 2 `derive_text_id(source_id, digest)`에 저장한다. `digest`는 정제한 본문의 UTF-8 바이트 sha256 앞 16 hex다. 슬롯 1을 타 팩 노드가 점유하면 본문은 `derived_id_conflict`로 거부되고 슬롯 2는 시도하지 않는다.
 - 같은 본문을 같은 메타데이터로 다시 보내면 같은 노드를 찾고 새 행을 만들지 않는다. 한 세션의 모든 본문 버전은 같은 `source_id` 속성을 가진다.
 
 그래서 이어진 세션의 재전송 결과는 partial이고, 오류는 LogEntry 거부 하나다. `retryable`은 false이고 `reject_codes`는 `["node_identity_conflict"]`다. 본문은 저장된다. opencrab-dump 훅(#274)은 오류 문구로 영수증을 분류하므로 이 영수증을 영구 거부로 보고 `localcrab-outbox/quarantine/`에 격리한다.
@@ -89,12 +89,13 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
    3. 전량 flush가 사본을 보내게 한다. flush는 `LC_FLUSH_MIN_AGE`보다 새 파일을 건너뛴다.
    4. flush가 사본을 다시 격리한다. 이름은 `<줄기>.<epoch>.<pid>.json`이 될 수 있다. LogEntry 거부가 영구이므로 예상한 결과이며 실패가 아니다.
    5. 저장 확인을 다시 한다. 거짓이면 모든 파일을 보존하고 멈춘다. 서버가 본문을 거부한 것이다(예: 타 팩, 슬롯 id를 점유한 노드).
-   6. 저장 확인이 참이다. 재격리된 사본(2단계를 실행했을 때)과 그 `.reason`을 정확한 이름으로 지운다. 그다음 원본과 그 `.reason`을 정확한 이름으로 지운다.
-5. 재개: 어느 단계에서 멈췄든 먼저 저장 확인을 한다. 그다음 outbox와 격리에서 `reingest483-` 파일을 찾는다.
-   - 저장 확인이 참이면 6단계로 간다.
-   - 저장 확인이 거짓이고 outbox에 사본이 있으면 flush가 아직 보내지 않았거나 재시도 대상 실패로 제자리에 남은 것이다. 다음 flush를 기다린다(3단계).
-   - 저장 확인이 거짓이고 outbox에는 사본이 없고 격리에 사본이 있으면 5단계의 결과다. 모든 파일을 보존하고 멈춘다.
-   - 저장 확인이 거짓이고 사본이 어디에도 없으면 2단계로 간다.
+   6. 저장 확인이 참이고 outbox에 사본이 없다. 격리에 재격리된 사본이 있으면 그 사본과 `.reason`을 정확한 이름으로 지운다. 그다음 원본과 그 `.reason`을 정확한 이름으로 지운다.
+5. 재개: 어느 단계에서 멈췄든 먼저 outbox에서 `reingest483-` 사본을 찾는다.
+   - outbox에 사본이 있으면 flush가 아직 그 항목을 맡고 있다. 저장 확인 결과와 관계없이 다음 flush를 기다린다(3단계). 파일을 지우지 않는다. 재시도 대상 영수증(예: 그래프 쓰기 뒤 문서 저장 실패)을 받은 사본도 outbox에 남는다.
+   - outbox에 사본이 없으면 저장 확인을 한다.
+     - 참이면 6단계로 간다.
+     - 거짓이고 격리에 사본이 있으면 5단계의 결과다. 모든 파일을 보존하고 멈춘다.
+     - 거짓이고 사본이 어디에도 없으면 2단계로 간다.
    같은 파일을 다시 보내도 같은 노드를 찾고 새 행을 만들지 않는다.
 
 서버 쪽 동작의 재현 명령: `pytest tests/test_issue74_ingest_graph_parity.py -k 483`.
