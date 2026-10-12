@@ -2078,11 +2078,11 @@ _GOOD_ROW = {"node_type": "LogEntry", "space": "evidence", "pack_id": "pack-a", 
 
 @pytest.mark.parametrize("rows, error, expected", [
     ([_GOOD_ROW], None, True),
-    (None, RuntimeError("read failed"), False),
-    ("not a list", None, False),
-    ([], None, False),
-    ([_GOOD_ROW, dict(_GOOD_ROW)], None, False),
-    ([{**_GOOD_ROW, "property_decode_error": True}], None, False),
+    (None, RuntimeError("read failed"), None),
+    ("not a list", None, None),
+    ([], None, None),
+    ([_GOOD_ROW, dict(_GOOD_ROW)], None, None),
+    ([{**_GOOD_ROW, "property_decode_error": True}], None, None),
     ([{**_GOOD_ROW, "node_type": "TextUnit"}], None, False),
     ([{**_GOOD_ROW, "space": "concept"}], None, False),
     ([{**_GOOD_ROW, "pack_id": "pack-b"}], None, False),
@@ -2095,6 +2095,14 @@ def test_468_derivation_gate_admits_only_a_readable_same_pack_evidence_logentry(
 
     ctx = {"neo4j": _FakeGraph(rows=rows, error=error)}
     assert _derivable_logentry(ctx, "x", "pack-a") is expected
+
+
+def test_480_derivation_gate_without_a_read_method_cannot_tell():
+    from opencrab.mcp.tools.pack import _derivable_logentry
+
+    assert _derivable_logentry({"neo4j": object()}, "x", "pack-a") is None
+    assert _derivable_logentry({}, "x", "pack-a") is None
+    assert _derivable_logentry({"neo4j": object()}, "x", "") is False
 
 
 def test_468_derived_id_stays_inside_the_node_id_column_after_two_forks():
@@ -2205,7 +2213,9 @@ def test_468_nodes_loop_rejection_is_reported_and_later_items_still_land(stack, 
     assert result["status"] == "partial", result
     assert result["added_nodes"] == 1, result
     assert result["node_errors"] == [f"codex/s/468-b: {_CONFLICT_FIXED}"], result
-    assert "retryable" not in result
+    # #480: the one error is a final rejection, so a resend cannot fix it.
+    assert result["retryable"] is False, result
+    assert result["reject_codes"] == ["node_identity_conflict"], result
     assert stack["graph"].get_node("TextUnit", "codex/s/468-c") is not None
     # 거절된 항목은 기존 행을 건드리지 않고, 재시도마다 ERROR 트레이스백이 쌓이지 않는다.
     assert stack["graph"].get_node("LogEntry", "codex/s/468-b") == seeded
@@ -2241,3 +2251,254 @@ def test_468_clean_ingest_response_is_unchanged(stack):
         "status", "pack_id", "added_nodes", "added_edges", "node_errors",
         "edge_errors", "stores", "text_ingested", "evidence_node",
     }
+
+
+# ---------------------------------------------------------------------------
+# #480: a partial result says whether a resend can fix it
+# ---------------------------------------------------------------------------
+
+
+def _session_payload(ended_at: str, text: str, node_id: str = "codex/s/480-a") -> dict[str, Any]:
+    """The shape the Codex session hook sends: a LogEntry node plus its text."""
+    return dict(
+        nodes=[{"space": "evidence", "node_type": "LogEntry", "node_id": node_id,
+                "properties": {"title": "t", "session_id": "s", "type": "codex-session",
+                               "ended_at": ended_at}}],
+        text=text, source_id=node_id, metadata={"title": "t"},
+    )
+
+
+def test_480_identical_resend_is_ok_and_has_no_retry_fields(stack):
+    first = _ingest468(stack, **_session_payload("2026-10-07T03:21:03Z", "본문1"))
+    second = _ingest468(stack, **_session_payload("2026-10-07T03:21:03Z", "본문1"))
+    for result in (first, second):
+        assert result["status"] == "ok", result
+        assert "retryable" not in result and "reject_codes" not in result, result
+
+
+def test_480_continued_session_is_a_final_rejection(stack):
+    _ingest468(stack, **_session_payload("2026-10-07T03:21:03Z", "본문1"))
+    result = _ingest468(stack, **_session_payload("2026-10-08T03:21:03Z", "본문2"))
+    assert result["status"] == "partial", result
+    assert len(result["node_errors"]) == 2, result
+    assert result["retryable"] is False, result
+    assert result["reject_codes"] == ["derived_id_conflict", "node_identity_conflict"], result
+
+
+def test_480_store_failure_stays_retryable(stack):
+    with patch.object(stack["docs"], "upsert_node_doc", side_effect=RuntimeError("doc down")):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-b")
+    assert result["status"] == "partial", result
+    assert result["retryable"] is True, result
+    assert "reject_codes" not in result, result
+
+
+def test_480_legacy_store_failure_alone_stays_retryable(stack):
+    # The legacy path reports a failed store only in `stores`, with no node_errors entry.
+    with patch.object(stack["docs"], "upsert_source", side_effect=RuntimeError("doc down")):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-m", text_as_node=False)
+    assert result["status"] == "partial" and result["node_errors"] == [], result
+    assert result["retryable"] is True, result
+    assert "reject_codes" not in result, result
+
+
+def test_480_legacy_store_failure_with_a_final_rejection_stays_retryable(stack):
+    _seed_node(stack, "TextUnit", "480-p1", pack_id="pack-b", principal=BOB, text="남의 것")
+    with patch.object(stack["docs"], "upsert_source", side_effect=RuntimeError("doc down")):
+        result = _ingest468(
+            stack, text="본문", source_id="codex/s/480-m2", text_as_node=False,
+            nodes=[{"space": "evidence", "node_type": "TextUnit", "node_id": "480-p1",
+                    "properties": {"text": "충돌"}}],
+        )
+    assert len(result["node_errors"]) == 1, result
+    assert result["retryable"] is True, result
+
+
+def test_480_reject_codes_list_each_reason_once(stack):
+    _seed_node(stack, "TextUnit", "480-q1", pack_id="pack-b", principal=BOB, text="남의 것")
+    _seed_node(stack, "TextUnit", "480-q2", pack_id="pack-b", principal=BOB, text="남의 것")
+    result = _ingest468(stack, nodes=[
+        {"space": "evidence", "node_type": "TextUnit", "node_id": i, "properties": {"text": "x"}}
+        for i in ("480-q1", "480-q2")
+    ])
+    assert len(result["node_errors"]) == 2, result
+    assert result["reject_codes"] == ["foreign_pack_identity"], result
+
+
+def test_480_final_rejection_plus_store_failure_stays_retryable(stack):
+    _seed_logentry(stack, "codex/s/480-c")
+    with patch.object(stack["docs"], "upsert_node_doc", side_effect=RuntimeError("doc down")):
+        result = _ingest468(stack, nodes=[
+            {"space": "evidence", "node_type": "TextUnit", "node_id": "codex/s/480-c",
+             "properties": {"text": "충돌"}},
+            {"space": "evidence", "node_type": "TextUnit", "node_id": "codex/s/480-d",
+             "properties": {"text": "정상"}},
+        ])
+    assert result["status"] == "partial", result
+    assert len(result["node_errors"]) == 2, result
+    assert result["retryable"] is True, result
+
+
+@pytest.mark.parametrize("source_id", ["error", "no match-480", "codex/s/480-e"])
+def test_480_foreign_pack_text_rejection_is_final_whatever_the_id_spelling(stack, source_id):
+    _seed_node(stack, "TextUnit", source_id, pack_id="pack-b", principal=BOB, text="남의 것")
+    result = _ingest468(stack, text="본문", source_id=source_id)
+    assert result["status"] == "partial", result
+    assert result["retryable"] is False, result
+    assert result["reject_codes"] == ["foreign_pack_identity"], result
+
+
+@pytest.mark.parametrize("source_id", ["error", "no match-480", "codex/s/480-f"])
+def test_480_foreign_derived_id_rejection_is_final_whatever_the_id_spelling(stack, source_id):
+    _seed_logentry(stack, source_id)
+    _seed_node(stack, "TextUnit", source_id + _DERIVED, pack_id="pack-b", principal=BOB, text="남의 것")
+    result = _ingest468(stack, text="본문", source_id=source_id)
+    assert result["retryable"] is False, result
+    assert result["reject_codes"] == ["derived_id_conflict"], result
+
+
+def test_480_unreadable_logentry_check_stays_retryable(stack):
+    _seed_logentry(stack, "codex/s/480-g")
+    real = stack["graph"].get_nodes_by_id
+    calls = []
+
+    def flaky(node_id):
+        # The ownership probe and the builder identity check read first and
+        # succeed. The derivation check reads last, after the graph write
+        # refused the id, and that read fails.
+        calls.append(node_id)
+        if len(calls) > 2:
+            raise RuntimeError("read down")
+        return real(node_id)
+
+    with patch.object(stack["graph"], "get_nodes_by_id", side_effect=flaky):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-g")
+    assert len(calls) > 2, calls
+    assert result["status"] == "partial" and result["text_ingested"] is False, result
+    # The fixed conflict message proves that the derivation check ran and returned None.
+    assert result["node_errors"] == [f"codex/s/480-g: {_CONFLICT_FIXED}"], result
+    assert result["retryable"] is True, result
+    assert "reject_codes" not in result, result
+
+
+def test_480_non_logentry_conflict_and_too_long_id_are_final(stack):
+    from opencrab.pack.fork_remap import SOURCE_NODE_ID_BUDGET
+
+    _seed_node(stack, "Evidence", "codex/s/480-h", text="기존")
+    other = _ingest468(stack, text="본문", source_id="codex/s/480-h")
+    long_id = "L" * (SOURCE_NODE_ID_BUDGET - 2)
+    _seed_logentry(stack, long_id)
+    too_long = _ingest468(stack, text="본문", source_id=long_id)
+    for result in (other, too_long):
+        assert result["retryable"] is False, result
+        assert result["reject_codes"] == ["node_identity_conflict"], result
+
+
+def test_480_legacy_text_conflict_stays_retryable(stack):
+    _seed_logentry(stack, "codex/s/480-i")
+    result = _ingest468(stack, text="대화 원문", source_id="codex/s/480-i", text_as_node=False)
+    assert result["status"] == "partial", result
+    assert result["retryable"] is True, result
+
+
+def test_480_foreign_edge_rejection_is_final(stack):
+    _seed_node(stack, "Topic", "480-t1", space="concept")
+    _seed_node(stack, "Topic", "480-t2", space="concept")
+    with principal_scope(ALICE), patch(
+        "opencrab.mcp.tools._get_context", return_value=mcp_ctx_from(stack)
+    ):
+        from opencrab.mcp.tools import _ingest_into_pack
+
+        edge = {"from_space": "concept", "from_id": "480-t1", "relation": "related_to",
+                "to_space": "concept", "to_id": "480-t2"}
+        with patch("opencrab.mcp.tools.pack._edge_probe_conflict", return_value="foreign"):
+            result = _ingest_into_pack("pack-a", edges=[edge])
+    assert result["status"] == "partial", result
+    assert result["retryable"] is False, result
+    assert result["reject_codes"] == ["foreign_pack_identity"], result
+
+
+def test_480_unverifiable_ownership_probe_stays_retryable(stack):
+    with patch("opencrab.mcp.tools.pack._node_probe_conflict", return_value="unverifiable"):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-j")
+    assert result["status"] == "partial" and result["text_ingested"] is False, result
+    assert result["retryable"] is True, result
+    assert "reject_codes" not in result, result
+
+
+# One test per classification site: a foreign probe is final, an unverifiable probe is not.
+
+def _assert_probe_outcome(result, reason):
+    assert result["status"] == "partial", result
+    if reason == "foreign":
+        assert result["retryable"] is False, result
+        assert result["reject_codes"] == ["foreign_pack_identity"], result
+    else:
+        assert result["retryable"] is True, result
+        assert "reject_codes" not in result, result
+
+
+def test_480_node_loop_foreign_pack_is_final_for_real_state(stack):
+    _seed_node(stack, "TextUnit", "480-n1", pack_id="pack-b", principal=BOB, text="남의 것")
+    result = _ingest468(stack, nodes=[
+        {"space": "evidence", "node_type": "TextUnit", "node_id": "480-n1",
+         "properties": {"text": "충돌"}},
+    ])
+    _assert_probe_outcome(result, "foreign")
+
+
+@pytest.mark.parametrize("reason", ["foreign", "unverifiable"])
+def test_480_node_loop_probe_reason_decides_retryable(stack, reason):
+    with patch("opencrab.mcp.tools.pack._node_probe_conflict", return_value=reason):
+        result = _ingest468(stack, nodes=[
+            {"space": "evidence", "node_type": "TextUnit", "node_id": "480-n2",
+             "properties": {"text": "본문"}},
+        ])
+    assert len(result["node_errors"]) == 1, result
+    _assert_probe_outcome(result, reason)
+
+
+@pytest.mark.parametrize("reason", ["foreign", "unverifiable"])
+def test_480_edge_loop_probe_reason_decides_retryable(stack, reason):
+    _seed_node(stack, "Topic", "480-e1", space="concept")
+    _seed_node(stack, "Topic", "480-e2", space="concept")
+    edge = {"from_space": "concept", "from_id": "480-e1", "relation": "related_to",
+            "to_space": "concept", "to_id": "480-e2"}
+    with patch("opencrab.mcp.tools.pack._edge_probe_conflict", return_value=reason):
+        result = _ingest468(stack, edges=[edge])
+    assert len(result["edge_errors"]) == 1, result
+    _assert_probe_outcome(result, reason)
+
+
+@pytest.mark.parametrize("reason", ["foreign", "unverifiable"])
+def test_480_legacy_source_probe_reason_decides_retryable(stack, reason):
+    with patch("opencrab.mcp.tools.pack._source_probe_conflict", return_value=reason):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-l1", text_as_node=False)
+    assert len(result["node_errors"]) == 1, result
+    assert result["text_ingested"] is False, result
+    _assert_probe_outcome(result, reason)
+
+
+@pytest.mark.parametrize("reason", ["foreign", "unverifiable"])
+def test_480_derived_id_probe_reason_decides_retryable(stack, reason):
+    import opencrab.mcp.tools.pack as pack_module
+
+    _seed_logentry(stack, "codex/s/480-d1")
+    real = pack_module._node_probe_conflict
+
+    def probe(ctx, space, node_type, node_id, pack_id):
+        # The text probe passes. Only the probe of the derived id answers `reason`.
+        if node_id.endswith(_DERIVED):
+            return reason
+        return real(ctx, space, node_type, node_id, pack_id)
+
+    with patch("opencrab.mcp.tools.pack._node_probe_conflict", side_effect=probe):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-d1")
+    assert result["text_ingested"] is False, result
+    assert result["stores"]["evidence_node"].startswith("codex/s/480-d1:"), result
+    if reason == "foreign":
+        assert result["retryable"] is False, result
+        assert result["reject_codes"] == ["derived_id_conflict"], result
+    else:
+        assert result["retryable"] is True, result
+        assert "reject_codes" not in result, result

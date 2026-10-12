@@ -32,9 +32,35 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 
 ## legacy 경로 계약 (호환 계층)
 
-`initialize`/`notifications/initialized` handshake, `ping`, modern 표식이 없는 `tools/list`·`tools/call`, JSON-RPC 배치 전부 종전 그대로 동작한다. 응답 봉투도 바이트 호환이다(modern 필드를 섞지 않는다). 예외는 `pack_ingest`가 최상위 `status: "partial"`을 반환할 때다. 이 결과에는 outbox 재시도를 위해 `isError: true`를 추가한다. content receipt는 그대로 둔다. #136 의 변경은 정확히 하나였다: **initialize 가 미지 버전을 무검증 echo 하지 않는다.** 지원 legacy 버전은 그대로 echo, 버전 부재는 종전 fallback `2024-11-05`, 미지·modern 전용 버전은 서버가 서빙하는 최신 legacy(`2025-11-25`)를 제시하고 클라이언트가 진행 여부를 판단한다(legacy 협상 규칙).
+`initialize`/`notifications/initialized` handshake, `ping`, modern 표식이 없는 `tools/list`, `tools/call`, JSON-RPC 배치 전부 종전 그대로 동작한다. 응답 봉투도 바이트 호환이다(modern 필드를 섞지 않는다). 예외는 `pack_ingest`가 최상위 `status: "partial"`을 반환할 때다. 이 결과에는 outbox 재시도를 위해 `isError: true`를 추가한다. 기존 content receipt 필드는 그대로 두고 새 필드만 더한다. 이 결과의 `retryable`과 `reject_codes` 규칙은 아래 "pack_ingest partial 결과의 retryable 표"가 정한다. #136 의 변경은 정확히 하나였다: **initialize 가 미지 버전을 무검증 echo 하지 않는다.** 지원 legacy 버전은 그대로 echo, 버전 부재는 종전 fallback `2024-11-05`, 미지 및 modern 전용 버전은 서버가 서빙하는 최신 legacy(`2025-11-25`)를 제시하고 클라이언트가 진행 여부를 판단한다(legacy 협상 규칙).
 
 **`tools/call` 형상 검증(#251)**: legacy 도 modern 과 **같은** 공유 검증기(`validate_tools_call_params`)를 dispatch 이전에 통과한다 — 비문자열 `name`, truthy 비객체 `arguments`, 비객체 `params` 는 -32602 다. 전에는 이 형상들이 dispatch 안에서 터져 내부 TypeError 가 JSON-RPC **성공 봉투**에 실려 나가거나(-32601 로 갈리거나) -32603 이 됐다. 도구를 실행시키던 입력은 하나도 바뀌지 않았다. 남은 era 차이는 정확히 하나: legacy 는 present + **falsy** 비객체 `arguments`(`null`/`[]`/`0`/`0.0`/`false`/`""`)를 종전대로 `{}` 로 정규화해 **도구를 실행한다**(modern 은 -32602). 그 형상은 오늘 성공하는 호출이므로 D절 제거 시점까지 유지한다 — `docs/mcp-legacy-transition.md` §3.
+
+## pack_ingest partial 결과의 retryable 표
+
+`pack_ingest`의 partial 결과는 content에 `retryable`(불리언)을 싣는다. `isError`는 이 규칙과 무관하게 모든 partial에서 true다. 이 표가 `retryable`과 `reject_codes`를 정하는 유일한 문서이며, 다른 문서와 코드 주석은 이 표를 가리킨다.
+
+규칙: 모든 오류가 아래 "최종" 행에 속하고 저장 실패가 없으면 `retryable`은 false다. 하나라도 "재시도" 행의 오류가 있으면 true다. `retryable`이 false일 때만 `reject_codes`가 있고, 최종 행의 코드를 정렬해 중복 없이 담는다. `ok` 결과에는 두 필드가 없다. `pack_create` 응답에도 두 필드가 없다.
+
+| 경로 | 오류 | 분류 | 코드 |
+|---|---|---|---|
+| 노드 루프 | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
+| 노드 루프 | 그래프가 노드 식별 충돌로 거부 | 최종 | `node_identity_conflict` |
+| 노드 루프 | probe 확인 불능, 문법 거부, 저장 실패, 그 밖의 예외 | 재시도 | |
+| 엣지 루프 | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
+| 엣지 루프 | probe 확인 불능, 문법 거부, 끝점 미해결, 엣지 식별 충돌, 저장 실패, 그 밖의 예외 | 재시도 | |
+| 텍스트(`text_as_node` true) | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
+| 텍스트 | 노드 식별 충돌이고 대상이 같은 팩의 LogEntry가 아님이 확정, 또는 파생 id를 만들 수 없음 | 최종 | `node_identity_conflict` |
+| 텍스트 | 노드 식별 충돌이고 LogEntry 여부를 읽을 수 없음 | 재시도 | |
+| 텍스트 | 소유권 probe 확인 불능, 저장 실패, 그 밖의 예외 | 재시도 | |
+| 파생 TextUnit | 파생 id의 소유권 probe가 타 팩 귀속을 확인, 또는 파생 id가 식별 충돌 | 최종 | `derived_id_conflict` |
+| 파생 TextUnit | probe 확인 불능, 문법 거부, 저장 실패, 그 밖의 예외 | 재시도 | |
+| legacy 텍스트(`text_as_node` false) | 소스 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
+| legacy 텍스트 | source writer가 올린 노드 식별 충돌(compare-and-swap 경쟁일 수 있음), `ValueError`, 그래프 쓰기 불가, 스키마 이전 필요, probe 확인 불능, 저장 실패 | 재시도 | |
+
+표에 없는 예외(예: legacy 텍스트 경로에서 위 예외 밖의 예외)는 `pack_ingest` 도구 오류로 전파되어 partial 결과를 만들지 않는다.
+
+최종 거부의 의미: 외부에서 데이터를 고치지 않는 한 같은 입력을 다시 보내도 성공할 수 없다. 클라이언트는 `retryable: false`를 읽어 재시도를 멈출 수 있다(#480).
 
 ## 클라이언트 호환성 매트릭스
 
