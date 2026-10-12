@@ -2374,3 +2374,11 @@ def test_480_foreign_edge_rejection_is_final(stack):
     assert result["status"] == "partial", result
     assert result["retryable"] is False, result
     assert result["reject_codes"] == ["foreign_pack_identity"], result
+
+
+def test_480_unverifiable_ownership_probe_stays_retryable(stack):
+    with patch("opencrab.mcp.tools.pack._node_probe_conflict", return_value="unverifiable"):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-j")
+    assert result["status"] == "partial" and result["text_ingested"] is False, result
+    assert result["retryable"] is True, result
+    assert "reject_codes" not in result, result

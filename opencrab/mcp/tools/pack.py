@@ -245,7 +245,7 @@ def _store_text_under_derived_id(
     create-or-verify rule and the doc and vector fan-out do not change. The node
     carries ``source_id`` (the LogEntry id), a key that a pack fork remaps.
 
-    Return ``(outcome, billable)``. The outcome is one of three values.
+    Return ``(outcome, billable)``. The outcome is one of four values.
     ``"stored"``: the receipt reports no store failures. Optional stores can
     still be unavailable.
     ``"failed"``: ``add_node`` reported a store failure. The graph write may have landed.
