@@ -1102,6 +1102,34 @@ class TestPackCreate:
         assert result["node_errors"] == ingest["node_errors"]
         assert "retryable" not in result and "reject_codes" not in result, result
 
+    def test_480_clean_response_is_unchanged(self):
+        """A pack_create call without ingest errors keeps its full response shape."""
+        from opencrab.stores.sql_store import SQLStore
+
+        builder = MagicMock()
+        builder.add_node.return_value = {"stores": {"graph": "ok", "docs": "ok", "sql": "ok"}}
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
+        ingest = {
+            "status": "ok", "pack_id": "p480c", "added_nodes": 0, "added_edges": 0,
+            "node_errors": [], "edge_errors": [], "stores": {}, "text_ingested": False,
+            "evidence_node": None,
+        }
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+            patch("opencrab.mcp.tools.pack._ingest_into_pack", return_value=ingest),
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="P480C", pack_id="p480c")
+        assert result == {
+            "status": "ok", "pack_id": "p480c", "title": "P480C",
+            "anchor_node": "dataset:p480c", **{k: v for k, v in ingest.items()
+                                                if k not in ("status", "pack_id")},
+        }
+
     def test_normal_with_text_materialises_evidence_node(self):
         from opencrab.stores.sql_store import SQLStore
 
