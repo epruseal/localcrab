@@ -369,8 +369,8 @@ def _ingest_into_pack(
         carve-out.
 
         With ``text_as_node=True`` the write at ``source_id`` can meet a graph
-        identity conflict. When the node at that id is an evidence LogEntry or
-        an evidence TextUnit of the same pack, the conflict does not by itself
+        identity conflict. The node at that id can be an evidence LogEntry or an
+        evidence TextUnit of the same pack. Then the conflict does not by itself
         reject the text (#470, #488). The function leaves that node alone and
         tries two derived TextUnit ids in order (#483). A Codex session puts a
         LogEntry at the id. A Claude session puts its first text, a TextUnit, at

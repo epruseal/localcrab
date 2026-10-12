@@ -89,9 +89,9 @@ Claude 훅이 이어진 세션을 보내면 세션 Document와 Claim의 속성�
    1. 저장 확인을 한다. 참이면 본문을 잃지 않았다. 6단계로 간다.
    2. 파일을 outbox에 `reingest483-<원래 이름>`으로 복사한다. 접두는 사본과 그 재격리본을 찾기 쉽게 한다. 원본은 격리에 둔다.
    3. 전량 flush가 사본을 보내게 한다. flush는 `LC_FLUSH_MIN_AGE`보다 새 파일을 건너뛴다.
-   4. flush 뒤 사본의 위치는 영수증이 정한다. 어느 경우도 실패가 아니다.
+   4. flush 뒤 사본의 위치는 영수증이 정한다. 어느 경우도 flush의 실패가 아니다.
       - `ok`: flush가 사본을 지운다.
-      - `partial`이고 `retryable: false`: flush가 사본을 다시 격리한다. 이름은 `<줄기>.<epoch>.<pid>.json`이 될 수 있다. Codex payload는 LogEntry 거부가 그 원인이다. Claude payload는 Document, Claim, 턴 Evidence의 식별 충돌이나 낡은 훅 형식의 문법 거부가 그 원인이다.
+      - `partial`이고 `retryable: false`: flush가 사본을 다시 격리한다. 이름은 `<줄기>.<epoch>.<pid>.json`이 될 수 있다. 어떤 오류가 `retryable: false`를 만드는지는 위 retryable 표가 정한다. 예를 들어 본문 밖의 거부(Codex LogEntry, Claude Document, Claim, 턴 Evidence의 식별 충돌이나 문법 거부)도, 본문 자체의 거부(슬롯 id 길이 경계, 슬롯을 점유한 타 팩 노드)도 이 영수증을 만든다. 본문 자체가 거부되면 5단계의 저장 확인이 거짓이 되고 운영자는 멈춘다.
       - `partial`이고 `retryable: true`(예: 저장 실패): 사본이 outbox에 남는다. 5번 재개 절차대로 다음 flush를 기다린다.
    5. 저장 확인을 다시 한다. 거짓이면 모든 파일을 보존하고 멈춘다. 서버가 본문을 거부한 것이다(예: 타 팩, 슬롯 id를 점유한 노드).
    6. 저장 확인이 참이고 outbox에 사본이 없다. 격리에 재격리된 사본이 있으면 그 사본과 `.reason`을 정확한 이름으로 지운다. 그다음 원본과 그 `.reason`을 정확한 이름으로 지운다.
