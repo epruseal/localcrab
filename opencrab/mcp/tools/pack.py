@@ -365,8 +365,8 @@ def _ingest_into_pack(
         the same input cannot fix it, and ``reject_codes`` lists the reasons.
         Any other error, such as a store failure or an unverifiable check,
         keeps it True. On the legacy text path (``text_as_node`` False) only a
-        foreign-pack probe is final: an identity conflict from the source writer
-        can come from a lost compare-and-swap race, so it stays retryable.
+        foreign-pack probe is final. An identity conflict from the source writer
+        can come from a lost compare-and-swap race. It stays retryable.
         ``pack_create`` drops both keys from its own response.
 
         Collapsing the two into one path would change ``added_nodes`` /
