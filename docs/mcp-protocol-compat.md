@@ -52,10 +52,10 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 | 엣지 루프 | 문법 거부(관계 확인) | 최종 | `grammar_rejected` |
 | 엣지 루프 | probe 확인 불능, 끝점 미해결, 엣지 식별 충돌, 저장 실패, 그 밖의 예외 | 재시도 | |
 | 텍스트(`text_as_node` true) | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
-| 텍스트 | 노드 식별 충돌이고 대상이 같은 팩의 LogEntry가 아님이 확정, 또는 파생 id를 만들 수 없음 | 최종 | `node_identity_conflict` |
+| 텍스트 | 노드 식별 충돌이고 대상이 같은 팩의 LogEntry가 아님이 확정, 또는 첫 파생 id(`#text`)를 만들 수 없음 | 최종 | `node_identity_conflict` |
 | 텍스트 | 노드 식별 충돌이고 LogEntry 여부를 읽을 수 없음 | 재시도 | |
 | 텍스트 | 소유권 probe 확인 불능, 저장 실패, 그 밖의 예외 | 재시도 | |
-| 파생 TextUnit | 파생 id의 소유권 probe가 타 팩 귀속을 확인, 또는 마지막으로 시도한 파생 id가 식별 충돌. `#text`가 소유권 probe를 통과한 다른 노드나 다른 본문을 담고 있으면 마지막 파생 id는 본문 digest id다(아래 "이어진 세션의 본문" 절) | 최종 | `derived_id_conflict` |
+| 파생 TextUnit | 파생 id의 소유권 probe가 타 팩 귀속을 확인, 또는 마지막으로 시도한 파생 id가 식별 충돌. `#text`가 소유권 probe를 통과한 다른 노드나 다른 본문을 담고 있으면 마지막 파생 id는 본문 digest id다. 단, digest id가 id 길이 예산을 넘으면 digest id는 시도하지 않고 `#text` 충돌을 이 코드로 보고한다(아래 "이어진 세션의 본문" 절) | 최종 | `derived_id_conflict` |
 | 파생 TextUnit | probe 확인 불능, 문법 거부, 저장 실패, 그 밖의 예외 | 재시도 | |
 | legacy 텍스트(`text_as_node` false) | 소스 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
 | legacy 텍스트 | source writer가 올린 노드 식별 충돌(compare-and-swap 경쟁일 수 있음), `ValueError`, 그래프 쓰기 불가, 스키마 이전 필요, probe 확인 불능, 저장 실패 | 재시도 | |
@@ -71,10 +71,10 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 같은 세션을 다시 보내면 LogEntry 쓰기는 계속 `node_identity_conflict`로 거부된다. 본문은 파생 TextUnit 두 슬롯에 차례로 저장한다. 슬롯 규칙의 정본은 `_ingest_into_pack` docstring이다.
 
 - 슬롯 1은 `derive_text_id(source_id)`, 곧 `<id>#text`다. 첫 본문이 여기에 저장된다.
-- 슬롯 1에 다른 노드나 다른 본문이 있고 소유권 probe가 통과하면 슬롯 2 `derive_text_id(source_id, digest)`에 저장한다. `digest`는 정제한 본문의 UTF-8 바이트 sha256 앞 16 hex다. 슬롯 1을 타 팩 노드가 점유하면 본문은 `derived_id_conflict`로 거부되고 슬롯 2는 시도하지 않는다.
+- 슬롯 1에 다른 노드나 다른 본문이 있고 소유권 probe가 통과하면 슬롯 2 `derive_text_id(source_id, digest)`에 저장한다. `digest`는 정제한 본문의 UTF-8 바이트 sha256 앞 16 hex다. 슬롯 1을 타 팩 노드가 점유하면 본문은 `derived_id_conflict`로 거부되고 슬롯 2는 시도하지 않는다. 슬롯 2 id가 id 길이 예산을 넘어 만들어지지 않을 때도 슬롯 2는 시도하지 않고 본문은 `derived_id_conflict`로 거부된다. 경계는 docstring이 정한다.
 - 같은 본문을 같은 메타데이터로 다시 보내면 같은 노드를 찾고 새 행을 만들지 않는다. 한 세션의 모든 본문 버전은 같은 `source_id` 속성을 가진다.
 
-그래서 이어진 세션의 재전송 결과는 partial이고, 오류는 LogEntry 거부 하나다. `retryable`은 false이고 `reject_codes`는 `["node_identity_conflict"]`다. 본문은 저장된다. opencrab-dump 훅(#274)은 오류 문구로 영수증을 분류하므로 이 영수증을 영구 거부로 보고 `localcrab-outbox/quarantine/`에 격리한다.
+그래서 본문이 슬롯 1이나 슬롯 2에 저장되면 이어진 세션의 재전송 결과는 partial이고, 오류는 LogEntry 거부 하나다. `retryable`은 false이고 `reject_codes`는 `["node_identity_conflict"]`다. 본문이 거부되면 위 retryable 표의 파생 TextUnit 행이 코드를 정한다. opencrab-dump 훅(#274)은 오류 문구로 영수증을 분류하므로 이 영수증을 영구 거부로 보고 `localcrab-outbox/quarantine/`에 격리한다.
 
 ### 이 변경 전에 격리된 payload의 재적재
 

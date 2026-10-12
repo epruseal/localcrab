@@ -367,7 +367,10 @@ def _ingest_into_pack(
         ownership probe passed. Then the text goes to
         ``derive_text_id(source_id, digest)`` (#483). ``digest`` is the first 16
         hex of the sha256 of the text. A node of another pack at the first id
-        refuses the text. ``evidence_node`` is the id
+        refuses the text. The second id can be too long to build (the
+        ``SOURCE_NODE_ID_BUDGET`` and ``NODE_ID_COLUMN_LIMIT`` checks of
+        ``derive_text_id``). Then the function does not try it. It reports the
+        conflict on the first id as ``derived_id_conflict``. ``evidence_node`` is the id
         that holds the text and ``stores["evidence_node"]`` names the original id.
         A different node type, space or pack still rejects the item, and so does
         a conflict on the final derived id. ``text_ingested`` is then False.
@@ -1172,7 +1175,7 @@ def _rank_packs(query: str, enriched: list[dict[str, Any]]) -> list[dict[str, An
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text. With text_as_node=true, write an evidence/TextUnit node. When source_id names a same-pack LogEntry, use the derived id <source_id>#text before any fork suffix. That id can already hold another node or another text after the ownership check passed. Then use <source_id>#text-<digest> instead, where the digest is the first 16 hex of the sha256 of the text. A node of another pack at <source_id>#text refuses the text. The response returns the id in evidence_node.",
+                    "description": "Optional raw text. With text_as_node=true, write an evidence/TextUnit node. When source_id names a same-pack LogEntry, use the derived id <source_id>#text before any fork suffix. That id can already hold another node or another text after the ownership check passed. Then use <source_id>#text-<digest> instead, where the digest is the first 16 hex of the sha256 of the text. A node of another pack at <source_id>#text refuses the text. When <source_id>#text-<digest> would exceed the id length limit, the server does not try it and refuses the text with derived_id_conflict. The response returns the id in evidence_node.",
                 },
                 "text_as_node": {
                     "type": "boolean",
@@ -1769,7 +1772,7 @@ def pack_create(
                 },
                 "text": {
                     "type": "string",
-                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). Use to append conversation content to a loaded pack. If source_id already names a LogEntry of the same pack, the TextUnit gets the derived id <source_id>#text (before any fork suffix). That id can already hold another node or another text after the ownership check passed. Then the TextUnit gets <source_id>#text-<digest>, where the digest is the first 16 hex of the sha256 of the text. A node of another pack at <source_id>#text refuses the text. The response reports the id in evidence_node.",
+                    "description": "Optional raw text. Materialised as a 9-space evidence/TextUnit graph node by default (text_as_node=true). Use to append conversation content to a loaded pack. If source_id already names a LogEntry of the same pack, the TextUnit gets the derived id <source_id>#text (before any fork suffix). That id can already hold another node or another text after the ownership check passed. Then the TextUnit gets <source_id>#text-<digest>, where the digest is the first 16 hex of the sha256 of the text. A node of another pack at <source_id>#text refuses the text. When <source_id>#text-<digest> would exceed the id length limit, the server does not try it and refuses the text with derived_id_conflict. The response reports the id in evidence_node.",
                 },
                 "text_as_node": {
                     "type": "boolean",
