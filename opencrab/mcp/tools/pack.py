@@ -368,11 +368,16 @@ def _ingest_into_pack(
         a node id through a fork remap -- ``add_node`` above has no such
         carve-out.
 
-        With ``text_as_node=True`` an id that already names an evidence LogEntry
-        or an evidence TextUnit of the same pack does not by itself reject the text
-        (#470, #488). The function leaves that node alone and tries two derived
-        TextUnit ids in order (#483). A Codex session puts a LogEntry at the id. A
-        Claude session puts its first text, a TextUnit, at the id.
+        With ``text_as_node=True`` the write at ``source_id`` can meet a graph
+        identity conflict. When the node at that id is an evidence LogEntry or
+        an evidence TextUnit of the same pack, the conflict does not by itself
+        reject the text (#470, #488). The function leaves that node alone and
+        tries two derived TextUnit ids in order (#483). A Codex session puts a
+        LogEntry at the id. A Claude session puts its first text, a TextUnit, at
+        the id.
+
+        A TextUnit with the same text and metadata does not conflict. The write
+        is idempotent and ``evidence_node`` is ``source_id``.
 
         Slot 1 is ``derive_text_id(source_id)``. When that id is too long to
         build, the function rejects the item with ``node_identity_conflict``.

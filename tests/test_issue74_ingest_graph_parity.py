@@ -2858,7 +2858,7 @@ def test_483_digest_id_commutes_with_the_fork_remap(plain):
 
 
 def _claude_payload(sid: str, text: str, turns: int) -> dict[str, Any]:
-    """The shape the Claude session hook sends: Document, Claim and Evidence nodes plus the text.
+    """Build the payload that the Claude session hook sends: Document, Claim, Evidence and the text.
 
     The Document and the Claim change with every delivery, as in the hook.
     """

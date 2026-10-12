@@ -74,20 +74,25 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 - 슬롯 1에 다른 노드나 다른 본문이 있고 소유권 probe가 통과하면 슬롯 2 `derive_text_id(source_id, digest)`에 저장을 시도한다. `digest`는 정제한 본문의 UTF-8 바이트 sha256 앞 16 hex다. 슬롯 1을 타 팩 노드가 점유하면 본문은 `derived_id_conflict`로 거부되고 슬롯 2는 시도하지 않는다. 슬롯 2 id가 id 길이 예산을 넘어 만들어지지 않을 때도 슬롯 2는 시도하지 않고 본문은 `derived_id_conflict`로 거부된다. 경계는 docstring이 정한다.
 - 같은 본문을 같은 메타데이터로 다시 보내면 같은 노드를 찾고 새 행을 만들지 않는다. 파생 슬롯의 본문은 `source_id` 속성으로 출처를 가리킨다. `source_id` 자체에 저장된 첫 본문은 그 속성이 없고 노드 id가 곧 출처다.
 
-훅의 재전송처럼 요청에 LogEntry 재기록이 들어 있다고 하자. 본문이 슬롯 1이나 슬롯 2에 저장되고 다른 오류가 없으면 결과는 partial이고 오류는 LogEntry 거부 하나다. 이때 `retryable`은 false이고 `reject_codes`는 `["node_identity_conflict"]`다. 본문이 거부되거나 다른 오류가 있으면 위 retryable 표가 각 오류의 코드를 정한다. Claude 훅이 이어진 세션을 보내면 세션 Document와 Claim의 속성이 바뀐다. 일부 턴 Evidence도 바뀔 수 있다. 그 노드들의 식별 충돌도 최종 거부다. opencrab-dump 훅은 `retryable: false` 영수증을 영구 거부로 보고 `localcrab-outbox/quarantine/`에 격리한다. 본문이 저장됐어도 격리한다.
+훅의 재전송처럼 요청에 LogEntry 재기록이 들어 있다고 하자. 본문이 슬롯 1이나 슬롯 2에 저장되고 다른 오류가 없으면 결과는 partial이고 오류는 LogEntry 거부 하나다. 이때 `retryable`은 false이고 `reject_codes`는 `["node_identity_conflict"]`다. 본문이 거부되거나 다른 오류가 있으면 위 retryable 표가 각 오류의 코드를 정한다.
+
+Claude 훅이 이어진 세션을 보내면 세션 Document와 Claim의 속성이 바뀐다. 일부 턴 Evidence도 바뀔 수 있다. 그 노드들의 식별 충돌도 최종 거부다. opencrab-dump 훅은 `retryable: false` 영수증을 영구 거부로 보고 `localcrab-outbox/quarantine/`에 격리한다. 본문이 저장됐어도 격리한다.
 
 ### 이 변경 전에 격리된 payload의 재적재
 
 격리되었다고 해서 본문을 잃은 것은 아니다. 같은 본문에 `ended_at`만 늦은 재전송도 격리된다. 이 변경 전에는 새 본문을 담은 재전송이 그 본문을 잃었다. `.reason` 파일에는 일반 영구 거부 표지만 있으므로 재전송이 필요한지는 서버 상태로 판정한다. 라이브 재적재는 리드가 수행한다.
 
 1. 전제: 이 변경을 담은 서버를 배포했다. 훅은 #274를 머지한 판이다.
-2. 대상: 세션 payload만 다룬다. `pack_ingest` 인자에 비어 있지 않은 `text`와 `source_id`가 있고 엣지가 없다. Codex 세션 payload는 노드가 하나이고, 그 노드는 `node_id`가 `source_id`와 같은 evidence/LogEntry다. Claude 세션 payload는 `source_id`가 `claude/`로 시작하고, 노드는 resource/Document, claim/Claim, evidence/Evidence뿐이다. 그 밖의 격리 파일은 모두 그대로 둔다. 이 절차는 본문 저장만 판정하고 다른 거부 항목(예: 낡은 훅 형식의 문법 거부)은 판정하지 않는다.
+2. 대상: 세션 payload만 다룬다. `pack_ingest` 인자에 비어 있지 않은 `text`와 `source_id`가 있고 엣지가 없다. Codex 세션 payload는 노드가 하나다. 그 노드는 `node_id`가 `source_id`와 같은 evidence/LogEntry다. Claude 세션 payload는 `source_id`가 `claude/`로 시작한다. 그 노드는 resource/Document, claim/Claim, evidence/Evidence뿐이다. 그 밖의 격리 파일은 모두 그대로 둔다. 이 절차는 본문 저장만 판정하고 다른 거부 항목(예: 낡은 훅 형식의 문법 거부)은 판정하지 않는다.
 3. 저장 확인(재전송 전후에 쓴다): 두 슬롯 id를 서버 함수 `derive_text_id(source_id)`와 `derive_text_id(source_id, digest)`로 계산한다. `digest`는 서버가 적용하는 `_clean_str`을 거친 본문의 UTF-8 바이트 sha256 앞 16 hex다. fork salt가 id 끝에 남으므로 문자열 연결로 id를 만들지 않는다. 후보 id는 이 두 슬롯 id와 `source_id` 자체다. 후보 가운데 하나가 일치하는 노드를 담으면 본문은 저장된 것이다. 일치하는 노드는 evidence/TextUnit이다. 그 `pack_id`는 payload의 팩과 같다. 그 `text`는 정제한 payload 본문과 같다. 슬롯 id의 노드는 `source_id` 속성이 payload의 `source_id`와 같아야 한다. `source_id` 자체의 노드는 id 일치로 출처를 확인한다.
 4. 절차(운영자, 대상 하나씩, opencrab-dump 훅 README 절차를 따른다):
    1. 저장 확인을 한다. 참이면 본문을 잃지 않았다. 6단계로 간다.
    2. 파일을 outbox에 `reingest483-<원래 이름>`으로 복사한다. 접두는 사본과 그 재격리본을 찾기 쉽게 한다. 원본은 격리에 둔다.
    3. 전량 flush가 사본을 보내게 한다. flush는 `LC_FLUSH_MIN_AGE`보다 새 파일을 건너뛴다.
-   4. flush가 사본을 다시 격리한다. 이름은 `<줄기>.<epoch>.<pid>.json`이 될 수 있다. LogEntry 거부가 영구이므로 예상한 결과이며 실패가 아니다.
+   4. flush 뒤 사본의 위치는 영수증이 정한다. 어느 경우도 실패가 아니다.
+      - `ok`: flush가 사본을 지운다.
+      - `partial`이고 `retryable: false`: flush가 사본을 다시 격리한다. 이름은 `<줄기>.<epoch>.<pid>.json`이 될 수 있다. Codex payload는 LogEntry 거부가 그 원인이다. Claude payload는 Document, Claim, 턴 Evidence의 식별 충돌이나 낡은 훅 형식의 문법 거부가 그 원인이다.
+      - `partial`이고 `retryable: true`(예: 저장 실패): 사본이 outbox에 남는다. 5번 재개 절차대로 다음 flush를 기다린다.
    5. 저장 확인을 다시 한다. 거짓이면 모든 파일을 보존하고 멈춘다. 서버가 본문을 거부한 것이다(예: 타 팩, 슬롯 id를 점유한 노드).
    6. 저장 확인이 참이고 outbox에 사본이 없다. 격리에 재격리된 사본이 있으면 그 사본과 `.reason`을 정확한 이름으로 지운다. 그다음 원본과 그 `.reason`을 정확한 이름으로 지운다.
 5. 재개: 어느 단계에서 멈췄든 먼저 outbox에서 `reingest483-` 사본을 찾는다.
