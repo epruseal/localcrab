@@ -46,9 +46,11 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 |---|---|---|---|
 | 노드 루프 | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
 | 노드 루프 | 그래프가 노드 식별 충돌로 거부 | 최종 | `node_identity_conflict` |
-| 노드 루프 | probe 확인 불능, 문법 거부, 저장 실패, 그 밖의 예외 | 재시도 | |
+| 노드 루프 | 문법 거부(노드 유형 확인, 또는 속성 검증: 필수 속성, null 허용, enum, 타입) | 최종 | `grammar_rejected` |
+| 노드 루프 | probe 확인 불능, 저장 실패, 문법 검증을 실행하지 못한 예외, 그 밖의 예외 | 재시도 | |
 | 엣지 루프 | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
-| 엣지 루프 | probe 확인 불능, 문법 거부, 끝점 미해결, 엣지 식별 충돌, 저장 실패, 그 밖의 예외 | 재시도 | |
+| 엣지 루프 | 문법 거부(관계 확인) | 최종 | `grammar_rejected` |
+| 엣지 루프 | probe 확인 불능, 끝점 미해결, 엣지 식별 충돌, 저장 실패, 그 밖의 예외 | 재시도 | |
 | 텍스트(`text_as_node` true) | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
 | 텍스트 | 노드 식별 충돌이고 대상이 같은 팩의 LogEntry가 아님이 확정, 또는 파생 id를 만들 수 없음 | 최종 | `node_identity_conflict` |
 | 텍스트 | 노드 식별 충돌이고 LogEntry 여부를 읽을 수 없음 | 재시도 | |
@@ -57,6 +59,8 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 | 파생 TextUnit | probe 확인 불능, 문법 거부, 저장 실패, 그 밖의 예외 | 재시도 | |
 | legacy 텍스트(`text_as_node` false) | 소스 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
 | legacy 텍스트 | source writer가 올린 노드 식별 충돌(compare-and-swap 경쟁일 수 있음), `ValueError`, 그래프 쓰기 불가, 스키마 이전 필요, probe 확인 불능, 저장 실패 | 재시도 | |
+
+텍스트 경로(직접, 파생, legacy)의 문법 거부는 아직 최종 거부로 세지 않는다. 표의 해당 행은 재시도다.
 
 표에 없는 예외(예: legacy 텍스트 경로에서 위 예외 밖의 예외)는 `pack_ingest` 도구 오류로 전파되어 partial 결과를 만들지 않는다.
 
