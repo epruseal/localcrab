@@ -46,7 +46,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 |---|---|---|---|
 | 노드 루프 | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
 | 노드 루프 | 그래프가 노드 식별 충돌로 거부 | 최종 | `node_identity_conflict` |
-| 노드 루프 | 문법 거부(노드 유형 확인 또는 필수 속성 확인) | 최종 | `grammar_rejected` |
+| 노드 루프 | 문법 거부(노드 유형 확인, 또는 속성 검증: 필수 속성, null 허용, enum, 타입) | 최종 | `grammar_rejected` |
 | 노드 루프 | probe 확인 불능, 저장 실패, 문법 검증을 실행하지 못한 예외, 그 밖의 예외 | 재시도 | |
 | 엣지 루프 | 소유권 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
 | 엣지 루프 | 문법 거부(관계 확인) | 최종 | `grammar_rejected` |

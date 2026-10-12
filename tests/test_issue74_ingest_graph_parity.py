@@ -2515,7 +2515,7 @@ def _grammar_nodes():
                          "properties": {}},
         "document-without-title": {"space": "resource", "node_type": "Document",
                                    "node_id": "480-g2", "properties": {"pack_id": "pack-a"}},
-        "claim-without-statement": {"space": "evidence", "node_type": "Claim",
+        "claim-without-statement": {"space": "claim", "node_type": "Claim",
                                     "node_id": "480-g3", "properties": {"pack_id": "pack-a"}},
     }
 
