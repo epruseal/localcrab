@@ -400,7 +400,9 @@ def _ingest_into_pack(
     # function alone, not by store_write_failures()-derived counters.
     billable_write = False
     # #480: one code per item that failed for a final reason. A resend of the
-    # same input cannot fix it. Every other error stays retryable.
+    # same input cannot fix it. Every other error in a partial result stays
+    # retryable. Errors outside the table in docs/mcp-protocol-compat.md
+    # propagate and make no partial result.
     final_rejections: list[str] = []
 
     for item in nodes or []:
