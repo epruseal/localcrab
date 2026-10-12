@@ -91,6 +91,14 @@ def _merge_duplicate(existing: dict[str, Any], item: dict[str, Any]) -> None:
 
     existing["score"] = max(float(existing.get("score") or 0.0), float(item.get("score") or 0.0))
 
+    # #482: the fold key of opencrab/ontology/query.py (_FOLD_BODIES) is the
+    # set of stored bodies a node collected, so join both sets. The text
+    # join below does not change the key.
+    if item.get("_fold_bodies"):
+        existing["_fold_bodies"] = (
+            existing.get("_fold_bodies", frozenset()) | item["_fold_bodies"]
+        )
+
     old_text = existing.get("text") or ""
     new_text = item.get("text") or ""
     if new_text and new_text not in old_text:

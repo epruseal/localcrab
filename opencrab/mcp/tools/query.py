@@ -105,7 +105,10 @@ def ontology_query(
     Run a hybrid vector + BM25 + graph query against the ontology.
 
     Pipeline: vector similarity → BM25 keyword → graph expansion → RRF
-    reranking. No policy-aware (ReBAC) filter runs here: HybridQuery's
+    reranking. Results with the same pack and the same stored bodies are
+    folded into one; the folded results stay in
+    ``metadata.folded_duplicates`` (docs/ARCHITECTURE.md, "질의 결과의 동일
+    본문 접기"). No policy-aware (ReBAC) filter runs here: HybridQuery's
     ``subject_id`` param drives ``_policy_filter``, which is fail-closed
     (ReBACEngine.check returns granted=False for any unpolicied node), so
     wiring the caller's principal into it would silently drop every result
@@ -220,7 +223,18 @@ def ontology_query(
             # #147: the FULL readable scope, not effective_pack_ids. See
             # enrich()'s docstring -- canonical identity must not change
             # depending on which packs a particular query searched.
-            enrich_canonical(ctx.get("neo4j"), result_dicts, pack_ids=sorted(scope))
+            # #482: folded members get the same enrichment. folded_count,
+            # not the metadata key, marks a fold, so a caller-written
+            # "folded_duplicates" value is never touched.
+            members = [
+                member
+                for result, result_dict in zip(results, result_dicts)
+                if result.folded_count
+                for member in result_dict["metadata"]["folded_duplicates"]["members"]
+            ]
+            enrich_canonical(
+                ctx.get("neo4j"), result_dicts + members, pack_ids=sorted(scope)
+            )
         response: dict[str, Any] = {
             "question": question,
             "spaces_filter": spaces,
