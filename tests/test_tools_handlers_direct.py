@@ -1071,6 +1071,37 @@ class TestPackCreate:
         assert result["anchor_errors"] == ["docs: error: mongo down"]
 
 
+    def test_480_response_carries_no_retry_fields_even_with_anchor_errors(self):
+        """retryable and reject_codes belong to pack_ingest. The anchor errors of
+        pack_create are not part of them, so the response drops both keys."""
+        from opencrab.stores.sql_store import SQLStore
+
+        builder = MagicMock()
+        builder.add_node.return_value = {
+            "stores": {"graph": "ok", "docs": "error: mongo down", "sql": "ok"}
+        }
+        sql = SQLStore("sqlite:///:memory:")
+        from tests._pack_fixtures import ensure_test_user
+        ensure_test_user(sql, "test-user")
+        ingest = {
+            "status": "partial", "pack_id": "p480", "added_nodes": 0, "added_edges": 0,
+            "node_errors": ["n: identity is already attributed to a different pack"],
+            "edge_errors": [], "stores": {}, "text_ingested": False, "evidence_node": None,
+            "retryable": False, "reject_codes": ["foreign_pack_identity"],
+        }
+        with (
+            patch("opencrab.mcp.tools._get_context") as mock_ctx,
+            patch("opencrab.mcp.tools.content_pack_list") as mock_list,
+            patch("opencrab.mcp.tools.pack._ingest_into_pack", return_value=ingest),
+        ):
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
+            mock_list.return_value = {"packs": []}
+            result = pack_create(title="P480", pack_id="p480")
+        assert result["status"] == "partial"
+        assert result["anchor_errors"] == ["docs: error: mongo down"]
+        assert result["node_errors"] == ingest["node_errors"]
+        assert "retryable" not in result and "reject_codes" not in result, result
+
     def test_normal_with_text_materialises_evidence_node(self):
         from opencrab.stores.sql_store import SQLStore
 

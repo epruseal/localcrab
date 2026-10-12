@@ -364,7 +364,10 @@ def _ingest_into_pack(
         error is a final rejection (identity conflict, foreign pack): a resend of
         the same input cannot fix it, and ``reject_codes`` lists the reasons.
         Any other error, such as a store failure or an unverifiable check,
-        keeps it True.
+        keeps it True. On the legacy text path (``text_as_node`` False) only a
+        foreign-pack probe is final: an identity conflict from the source writer
+        can come from a lost compare-and-swap race, so it stays retryable.
+        ``pack_create`` drops both keys from its own response.
 
         Collapsing the two into one path would change ``added_nodes`` /
         ``evidence_node`` and the vector shape for existing callers, so it is
@@ -1655,6 +1658,12 @@ def pack_create(
         subject_id=subject_id,
     )
 
+    # #480: retryable and reject_codes belong to the pack_ingest contract. The
+    # anchor errors below are not part of them, so pack_create does not repeat
+    # the two keys.
+    ingest_result = {
+        k: v for k, v in ingest_result.items() if k not in ("retryable", "reject_codes")
+    }
     result = {
         "status": "ok",
         "pack_id": slug,

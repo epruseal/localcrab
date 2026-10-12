@@ -2335,6 +2335,8 @@ def test_480_unreadable_logentry_check_stays_retryable(stack):
         result = _ingest468(stack, text="본문", source_id="codex/s/480-g")
     assert len(calls) > 2, calls
     assert result["status"] == "partial" and result["text_ingested"] is False, result
+    # The fixed conflict message proves that the derivation check ran and returned None.
+    assert result["node_errors"] == [f"codex/s/480-g: {_CONFLICT_FIXED}"], result
     assert result["retryable"] is True, result
     assert "reject_codes" not in result, result
 
@@ -2382,3 +2384,81 @@ def test_480_unverifiable_ownership_probe_stays_retryable(stack):
     assert result["status"] == "partial" and result["text_ingested"] is False, result
     assert result["retryable"] is True, result
     assert "reject_codes" not in result, result
+
+
+# One test per classification site: a foreign probe is final, an unverifiable probe is not.
+
+def _assert_probe_outcome(result, reason):
+    assert result["status"] == "partial", result
+    if reason == "foreign":
+        assert result["retryable"] is False, result
+        assert result["reject_codes"] == ["foreign_pack_identity"], result
+    else:
+        assert result["retryable"] is True, result
+        assert "reject_codes" not in result, result
+
+
+def test_480_node_loop_foreign_pack_is_final_for_real_state(stack):
+    _seed_node(stack, "TextUnit", "480-n1", pack_id="pack-b", principal=BOB, text="남의 것")
+    result = _ingest468(stack, nodes=[
+        {"space": "evidence", "node_type": "TextUnit", "node_id": "480-n1",
+         "properties": {"text": "충돌"}},
+    ])
+    _assert_probe_outcome(result, "foreign")
+
+
+@pytest.mark.parametrize("reason", ["foreign", "unverifiable"])
+def test_480_node_loop_probe_reason_decides_retryable(stack, reason):
+    with patch("opencrab.mcp.tools.pack._node_probe_conflict", return_value=reason):
+        result = _ingest468(stack, nodes=[
+            {"space": "evidence", "node_type": "TextUnit", "node_id": "480-n2",
+             "properties": {"text": "본문"}},
+        ])
+    assert len(result["node_errors"]) == 1, result
+    _assert_probe_outcome(result, reason)
+
+
+@pytest.mark.parametrize("reason", ["foreign", "unverifiable"])
+def test_480_edge_loop_probe_reason_decides_retryable(stack, reason):
+    _seed_node(stack, "Topic", "480-e1", space="concept")
+    _seed_node(stack, "Topic", "480-e2", space="concept")
+    edge = {"from_space": "concept", "from_id": "480-e1", "relation": "related_to",
+            "to_space": "concept", "to_id": "480-e2"}
+    with patch("opencrab.mcp.tools.pack._edge_probe_conflict", return_value=reason):
+        result = _ingest468(stack, edges=[edge])
+    assert len(result["edge_errors"]) == 1, result
+    _assert_probe_outcome(result, reason)
+
+
+@pytest.mark.parametrize("reason", ["foreign", "unverifiable"])
+def test_480_legacy_source_probe_reason_decides_retryable(stack, reason):
+    with patch("opencrab.mcp.tools.pack._source_probe_conflict", return_value=reason):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-l1", text_as_node=False)
+    assert len(result["node_errors"]) == 1, result
+    assert result["text_ingested"] is False, result
+    _assert_probe_outcome(result, reason)
+
+
+@pytest.mark.parametrize("reason", ["foreign", "unverifiable"])
+def test_480_derived_id_probe_reason_decides_retryable(stack, reason):
+    import opencrab.mcp.tools.pack as pack_module
+
+    _seed_logentry(stack, "codex/s/480-d1")
+    real = pack_module._node_probe_conflict
+
+    def probe(ctx, space, node_type, node_id, pack_id):
+        # The text probe passes. Only the probe of the derived id answers `reason`.
+        if node_id.endswith(_DERIVED):
+            return reason
+        return real(ctx, space, node_type, node_id, pack_id)
+
+    with patch("opencrab.mcp.tools.pack._node_probe_conflict", side_effect=probe):
+        result = _ingest468(stack, text="본문", source_id="codex/s/480-d1")
+    assert result["text_ingested"] is False, result
+    assert result["stores"]["evidence_node"].startswith("codex/s/480-d1:"), result
+    if reason == "foreign":
+        assert result["retryable"] is False, result
+        assert result["reject_codes"] == ["derived_id_conflict"], result
+    else:
+        assert result["retryable"] is True, result
+        assert "reject_codes" not in result, result
