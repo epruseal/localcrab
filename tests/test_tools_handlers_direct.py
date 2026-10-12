@@ -1116,6 +1116,12 @@ class TestPackCreate:
             "node_errors": [], "edge_errors": [], "stores": {}, "text_ingested": False,
             "evidence_node": None,
         }
+        # Fix the expectation before the call: the handler must not change the dict it gets.
+        expected = {
+            "status": "ok", "pack_id": "p480c", "title": "P480C",
+            "anchor_node": "dataset:p480c", **{k: v for k, v in ingest.items()
+                                                if k not in ("status", "pack_id")},
+        }
         with (
             patch("opencrab.mcp.tools._get_context") as mock_ctx,
             patch("opencrab.mcp.tools.content_pack_list") as mock_list,
@@ -1124,11 +1130,7 @@ class TestPackCreate:
             mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
             mock_list.return_value = {"packs": []}
             result = pack_create(title="P480C", pack_id="p480c")
-        assert result == {
-            "status": "ok", "pack_id": "p480c", "title": "P480C",
-            "anchor_node": "dataset:p480c", **{k: v for k, v in ingest.items()
-                                                if k not in ("status", "pack_id")},
-        }
+        assert result == expected
 
     def test_normal_with_text_materialises_evidence_node(self):
         from opencrab.stores.sql_store import SQLStore
