@@ -358,17 +358,13 @@ def _ingest_into_pack(
         a new TextUnit at ``derive_text_id(source_id)`` and leaves the LogEntry
         alone. ``evidence_node`` is the derived id and ``stores["evidence_node"]``
         names the original id. A different node type, space or pack still rejects
-        the item. ``text_ingested`` is then False.
+        the item, and so does a conflict on the derived id. ``text_ingested`` is
+        then False.
 
-        A partial result carries ``retryable`` (#480). It is False when every
-        error is a final rejection (node identity conflict, foreign pack): a resend
-        of the same input cannot fix it, and ``reject_codes`` lists the reasons.
-        An edge identity conflict and a grammar rejection are not counted as final.
-        Any other error, such as a store failure or an unverifiable check,
-        keeps it True. On the legacy text path (``text_as_node`` False) only a
-        foreign-pack probe is final. An identity conflict from the source writer
-        can come from a lost compare-and-swap race. It stays retryable.
-        ``pack_create`` drops both keys from its own response.
+        A partial result carries ``retryable`` and, when it is False,
+        ``reject_codes`` (#480). The table "pack_ingest partial 결과의 retryable
+        표" in docs/mcp-protocol-compat.md defines both. ``pack_create`` drops
+        both keys from its own response.
 
         Collapsing the two into one path would change ``added_nodes`` /
         ``evidence_node`` and the vector shape for existing callers, so it is

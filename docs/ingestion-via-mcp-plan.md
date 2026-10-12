@@ -92,7 +92,7 @@ VECTOR_BACKEND 명시됨?
 **호출 채널**
 - 전송: 현재 Streamable HTTP MCP (`opencrab/cli.py serve --transport http`, 엔드포인트 `http://{host}:{port}/mcp`). 기본 포트는 config의 `mcp_http_port`(:8765).
 - **Stateless 프로토콜**: 이 HTTP 전송은 의도적으로 **무상태**다 (`http_app.py` 모듈 docstring, `mcp_post`). `initialize`/`notifications/initialized` 핸드셰이크 없이도 각 POST가 독립적으로 `tools/call`을 처리한다(`server.py` `_dispatch`). 따라서 로더는 세션 관리 없이 httpx로 `{"jsonrpc":"2.0","method":"tools/call","params":{"name":...,"arguments":...},"id":1}`를 바로 POST하면 된다. **JSON-RPC 배열(배치)도 수용**되어 한 요청에 여러 `tools/call`을 담을 수 있다(`http_app.py`).
-- **응답 형식**: 결과는 MCP content wrapper `{"content":[{"type":"text","text":<json 문자열>}]}`로 감싸진다(`server.py`). 또한 도구 내부 예외는 `{"error":...}`로 감싸져 **HTTP 200이어도 본문에 error가 들어올 수 있다**. `pack_ingest`류는 `node_errors`/`edge_errors` 리스트를 반환한다. → 로더는 content를 파싱해 `error`/부분 실패를 검사·재시도해야 한다. 단 partial 결과에 `retryable: false`가 있으면 같은 입력의 재시도로는 풀리지 않는 거부이므로 재시도하지 않는다.
+- **응답 형식**: 결과는 MCP content wrapper `{"content":[{"type":"text","text":<json 문자열>}]}`로 감싸진다(`server.py`). 또한 도구 내부 예외는 `{"error":...}`로 감싸져 **HTTP 200이어도 본문에 error가 들어올 수 있다**. `pack_ingest`류는 `node_errors`/`edge_errors` 리스트를 반환한다. → 로더는 content를 파싱해 `error`/부분 실패를 검사·재시도해야 한다. 재시도 여부는 partial 결과의 `retryable`을 따른다(`docs/mcp-protocol-compat.md`의 "pack_ingest partial 결과의 retryable 표").
 - **기존 MCP 클라이언트 재사용**: 대화 reingest hook의 `lc_call`(`hooks/claude/localcrab-lib.sh`)이 MCP 호출 + 3회 재시도 + outbox 재시도 큐를 이미 구현한다(§1.5 ②). 로더 클라이언트는 이 재시도·부분실패·큐 패턴을 참고/공유해 중복 구현을 피한다.
 - 인증(#145 이후): **사용자별 토큰**. `opencrab init` → `opencrab user add` → `opencrab token issue <user_id>` 로 발급하고 `Authorization: Bearer <token>` 로 제시한다. 서버는 `opencrab.auth.verify_token` 으로 `users`/`api_tokens` 를 조회해 검증한다. **무인증 모드와 공유 비밀 방식은 삭제됐다** — 관련 환경변수가 남아 있으면 기동을 거부한다. 헤더를 못 보내는 클라이언트용으로 `--allow-query-token`(기본 꺼짐)이 있다.
   - **인증 경로**: 무인증 인스턴스는 더 이상 존재하지 않는다. 로컬이든 원격이든 로더는 발급받은 토큰을 `Authorization: Bearer <token>` 헤더로 전달한다. 로컬 동일 호스트라면 stdio 전송이 더 단순하다 — 그쪽은 OS 프로세스 경계가 신뢰 근거이고 로컬 사용자로 자동 바인딩된다.
@@ -216,7 +216,7 @@ VECTOR_BACKEND 명시됨?
 - **쓰기 공존:** 적재 중 산발적 write 도구(예: `ontology_add_node`)를 호출해 배치 사이에 정상 처리되는지(과도한 블록 없음) 확인. purge와 읽기(`find_neighbors`/`ontology_query`) 동시 실행 시 데드락·정합성 확인(`tests/test_store_concurrency.py` 패턴).
 - **데이터 정합성:** 동일 팩을 (a) 직접 모드, (b) MCP 모드로 각각 적재 후 노드/엣지/청크 수 및 샘플 내용이 일치하는지 비교. `id_map` 기반 엣지 연결이 누락 없이 재현되는지 확인.
 - **purge 후 재적재 정합성:** 직접 모드 `--fresh` 결과와 MCP `pack_purge`+ingest 결과의 노드/엣지/청크 수·샘플이 일치하는지 비교.
-- **응답 부분실패 검출:** content wrapper(`{"content":[{"text":…}]}`) 파싱 후 `error`/`node_errors`/`edge_errors`를 로더가 검출·재시도하는지 확인(HTTP 200이어도 본문 error 가능).
+- **응답 부분실패 검출:** content wrapper(`{"content":[{"text":…}]}`) 파싱 후 `error`/`node_errors`/`edge_errors`를 로더가 검출·재시도하는지 확인(HTTP 200이어도 본문 error 가능). 재시도 여부는 partial 결과의 `retryable`을 따른다(`docs/mcp-protocol-compat.md`의 "pack_ingest partial 결과의 retryable 표").
 - **대량 적재 처리량:** 적응형 배치(큰 배치) vs 고정 256, JSON-RPC 배치 배열 유무별 적재 시간 측정. 다수 팩 동시 로드 시나리오에서 직접 모드 대비 회귀 폭 기록.
 - **락 안전:** chroma 백엔드일 때 MCP 모드 적재 중 `chroma.lock(LOCK_EX)`를 잡지 않음을 확인(로더가 chroma 미접근). sqlite-vec/pg 백엔드일 때는 `ChromaStore` 자체가 만들어지지 않아 아무도 SH를 잡지 않으므로(#140) 로더의 무조건 flock과 충돌하지 않음을 확인.
 - **백업 복구 리허설:** §5 단계 0 백업본으로 복원 시 적재 전 상태로 되돌아가는지 1회 확인.
