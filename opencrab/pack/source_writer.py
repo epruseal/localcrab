@@ -47,6 +47,7 @@ from opencrab.common.graph_identity import (
     GraphWriteUnavailable,
 )
 from opencrab.common.pack_tags import canonicalize_pack_alias
+from opencrab.ontology.builder import SKIPPED_GRAPH_WRITE_FAILED
 from opencrab.pack.fork_remap import SOURCE_NODE_ID_BUDGET
 from opencrab.pack.write_gate import (
     SOURCE_STAMPED,
@@ -79,7 +80,7 @@ _SOURCE_NODE_TYPE = "TextUnit"
 # what both of them mean.
 _GRAPH_SKIPPED_FORK = "skipped (raw copy)"
 _GRAPH_SKIPPED_LONG_ID = "skipped (id exceeds the node id limit after fork remap)"
-_SKIPPED_GRAPH_FAILED = "skipped (graph write failed)"
+_SKIPPED_GRAPH_FAILED = SKIPPED_GRAPH_WRITE_FAILED
 
 
 def _docs_available(docs: Any) -> bool:

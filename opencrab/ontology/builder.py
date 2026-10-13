@@ -5,7 +5,9 @@ High-level API for adding nodes and edges to the multi-store ontology.
 Validates against the MetaOntology grammar before writing to any store.
 Writes to the graph, document, SQL-registry and (optionally) vector stores in
 a best-effort fan-out pattern — individual store failures are logged but do
-not abort the operation. The ``stores`` map in the response keys results by
+not abort the operation. The graph is the exception: it is the system of
+record, so a graph write that did not land stops the other legs (#495, see
+``OntologyBuilder.add_node``). The ``stores`` map in the response keys results by
 role (``graph``/``docs``/``sql``/``vector``), not by backend product, so the
 status is meaningful regardless of the local/docker backend in use.
 """
@@ -23,6 +25,7 @@ from opencrab.common.graph_identity import (
     GraphSchemaMigrationRequired,
     GraphWriteUnavailable,
     NodeIdentityConflict,
+    prepare_node,
 )
 from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.common.timefmt import now_iso
@@ -43,6 +46,14 @@ from opencrab.stores.neo4j_store import Neo4jStore
 from opencrab.stores.sql_store import SQLStore
 
 logger = logging.getLogger(__name__)
+
+# #495: receipt statuses for the legs after a graph write that did not land.
+# SKIPPED: the graph positively does not hold this write. UNKNOWN: the graph
+# could not be asked. UNKNOWN keeps the "error: " prefix on purpose, so that
+# store_write_failures() lists the missing legs for a caller that later
+# confirms the graph through its own re-probe (pack_create's anchor path).
+SKIPPED_GRAPH_WRITE_FAILED = "skipped (graph write failed)"
+GRAPH_STATE_UNKNOWN = "error: graph state unknown"
 
 
 def _safe_store_status(exc: Exception) -> str:
@@ -168,6 +179,29 @@ class OntologyBuilder:
         instead and sets this to False only on its own node-copy call
         (never on the anchor write, which needs a fresh embedding for its
         own title/description).
+
+        Graph failure (#495). When the graph leg does not return "ok", the
+        builder asks the graph whether it holds exactly this write
+        (``get_node_digest`` against the ``prepare_node`` digest):
+
+        - held (the commit landed, then the call raised): the doc, audit,
+          registry and vector legs run as usual; ``stores["graph"]`` keeps
+          its "error: ..." status.
+        - not held: those four legs read ``SKIPPED_GRAPH_WRITE_FAILED`` and
+          nothing else is written.
+        - unknown (the read raised, or the store has no digest read): those
+          four legs read ``GRAPH_STATE_UNKNOWN`` and nothing else is written.
+
+        Accepted window (lead ruling on #495): a reclassify that commits,
+        then raises, and whose digest read also fails, leaves the graph on
+        the new type and the doc row on the old one. The receipt carries
+        ``GRAPH_STATE_UNKNOWN``. ``scripts/reconcile_doc_graph_nodes.py``
+        diagnosis lists the id as ``node_type_mismatch``. To recover, resend
+        the write with the CURRENT graph digest as
+        ``_expected_current_digest``: the graph accepts it idempotently and
+        the doc leg runs. A resend with the old digest is refused by the
+        CAS check and writes nothing. A pack loader rerun reads the digest
+        again, so it recovers the same way.
 
         Parameters
         ----------
@@ -321,8 +355,8 @@ class OntologyBuilder:
 
         # Graph is the system of record. When it is down, refuse the whole
         # write instead of fanning out to the optional stores (#146 follow-up):
-        # a doc/vector row with no graph node is invisible to every pack-scoped
-        # read and has to be reconciled by hand later. Returned as a receipt
+        # a doc/vector row with no graph node is invisible to graph reads
+        # (BM25 still finds the doc row) and has to be reconciled by hand. Returned as a receipt
         # rather than raised so the #158 contract ("callers read the receipt")
         # keeps holding.
         if self._neo4j is None or not self._neo4j.available:
@@ -377,6 +411,17 @@ class OntologyBuilder:
                 output["stores"]["graph"] = _safe_store_status(exc)
         else:
             output["stores"]["graph"] = "unavailable"
+
+        # #495: a graph write that did not land stops the other legs, unless
+        # the graph holds this exact write anyway (ambiguous commit). See the
+        # "Graph failure" section of this method's docstring.
+        if output["stores"]["graph"] != "ok":
+            held = self._graph_holds_node(node_type, node_id, props, space)
+            if held is not True:
+                leg = SKIPPED_GRAPH_WRITE_FAILED if held is False else GRAPH_STATE_UNKNOWN
+                for key in ("docs", "audit", "sql", "vector"):
+                    output["stores"][key] = leg
+                return output
 
         # --- MongoDB write ---
         # #375: the doc-row write (upsert_node_doc) and the audit log write
@@ -468,6 +513,36 @@ class OntologyBuilder:
 
         logger.info("Node added: %s/%s (%s)", space, node_id, node_type)
         return output
+
+    def _graph_holds_node(
+        self, node_type: str, node_id: str, props: dict[str, Any], space: str
+    ) -> bool | None:
+        """#495: does the graph hold exactly this node write? True/False, or
+        None when the graph cannot be asked. Both qualified stores compute
+        their stored digest with ``prepare_node``, so the comparison is exact."""
+        getter = getattr(self._neo4j, "get_node_digest", None)
+        if getter is None or not callable(getter):
+            return None
+        try:
+            expected = prepare_node(node_type, node_id, props, space)[3]
+            return getter(node_id, node_type=node_type) == expected
+        except Exception as exc:  # noqa: BLE001 -- unknown is the answer
+            logger.warning("graph digest read failed for %s: %s", node_id, exc)
+            return None
+
+    def _graph_holds_edge(
+        self, from_type: str, from_id: str, relation: str, to_type: str, to_id: str
+    ) -> bool | None:
+        """#495: does the graph hold this edge? True/False, or None when the
+        graph cannot be asked."""
+        getter = getattr(self._neo4j, "get_edge", None)
+        if getter is None or not callable(getter):
+            return None
+        try:
+            return getter(from_type, from_id, relation, to_type, to_id) is not None
+        except Exception as exc:  # noqa: BLE001 -- unknown is the answer
+            logger.warning("graph edge read failed for %s -[%s]-> %s: %s", from_id, relation, to_id, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Edges
@@ -711,10 +786,26 @@ class OntologyBuilder:
             output["stores"]["graph"] = "unavailable"
 
         # --- PostgreSQL registry ---
-        # Skipped when the graph write was refused, so the registry cannot end
-        # up listing an edge the graph does not hold.
+        # Skipped when the graph does not hold the edge, so the registry cannot
+        # end up listing an edge the graph does not hold (#495: this used to
+        # check only `missing`, so a graph error or "no match" still wrote it).
+        # The registry row has no properties, so existence is the exact test.
+        registry_skip: str | None = None
         if missing:
-            output["stores"]["sql"] = "skipped (missing node)"
+            registry_skip = "skipped (missing node)"
+        elif output["stores"]["graph"] != "ok":
+            graph_status = output["stores"]["graph"]
+            held = (
+                self._graph_holds_edge(from_type, from_id, relation, to_type, to_id)
+                if isinstance(graph_status, str) and graph_status.startswith("error:")
+                else False
+            )
+            if held is not True:
+                registry_skip = (
+                    SKIPPED_GRAPH_WRITE_FAILED if held is False else GRAPH_STATE_UNKNOWN
+                )
+        if registry_skip is not None:
+            output["stores"]["sql"] = registry_skip
         elif self._sql is not None and self._sql.available:
             try:
                 self._sql.register_edge(from_space, from_id, relation, to_space, to_id)

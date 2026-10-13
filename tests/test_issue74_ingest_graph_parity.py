@@ -708,26 +708,26 @@ def test_declared_graph_write_exceptions_leave_no_registry_residue(stack, exc):
     assert not _sql_registry_has(stack, "src-declared-reject")
 
 
-def test_generic_runtime_error_from_graph_write_leaves_doc_and_sql_residue(stack):
+def test_generic_runtime_error_from_graph_write_leaves_no_doc_or_sql_residue(stack):
     """선언되지 않은 `RuntimeError` 는 `add_node` 의 두 번째(흡수) except 절로 빠진다.
 
-    흡수되면 `add_node` 는 예외 없이 mongo/sql 을 계속 쓰고 dict 를 정상
-    반환하므로, `_graph_leg` 가 그 `docs`/`sql` 키를 영수증에 병합한다. 이
-    잔여(고아 doc_nodes 행 + sql 레지스트리 행)가 실제로 남는지 확인한다 —
-    앞의 세 타입과 대칭되는, "흡수되면 잔여가 남는다"는 반대쪽 판정이다.
+    #495 이전에는 흡수된 뒤에도 mongo/sql 을 계속 써서 고아 doc_nodes 행과
+    sql 레지스트리 행이 남았다. 이제 그래프가 이 쓰기를 갖지 않으면(digest
+    조회 결과 None) 나머지 다리를 건너뛴다. `_graph_leg` 는 그 `docs`/`sql`
+    상태를 영수증에 병합한다.
     """
     receipt = _write(stack, source_id="src-generic-reject",
                      graph=_GraphThatRejectsTheWrite(RuntimeError("boom, unrelated failure")))
 
     assert receipt["stores"]["graph"].startswith("error:"), receipt["stores"]
-    assert receipt["stores"]["docs"].startswith("ok"), receipt["stores"]
-    assert receipt["stores"]["sql"] == "ok", receipt["stores"]
+    assert receipt["stores"]["docs"] == "skipped (graph write failed)", receipt["stores"]
+    assert receipt["stores"]["sql"] == "skipped (graph write failed)", receipt["stores"]
     assert receipt["stores"]["documents"] == "skipped (graph write failed)"
     assert receipt["stores"]["chromadb"] == "skipped (graph write failed)"
     assert stack["docs"].get_source("src-generic-reject") is None
     assert stack["vector"].get_by_id("src-generic-reject") is None
-    assert stack["docs"].get_node_doc("evidence", "src-generic-reject") is not None
-    assert _sql_registry_has(stack, "src-generic-reject")
+    assert stack["docs"].get_node_doc("evidence", "src-generic-reject") is None
+    assert not _sql_registry_has(stack, "src-generic-reject")
 
 
 def test_a_probe_exception_on_a_normal_length_id_leaves_all_four_axes_empty(stack):
@@ -1561,11 +1561,11 @@ def test_14c_long_id_carve_out_but_documents_and_chromadb_succeed_bills(stack):
 
 
 def test_14d_residue_only_ok_under_docs_sql_keys_does_not_bill(stack):
-    """(d) 그래프가 흡수형 `RuntimeError` 로 실패해도 doc_nodes/sql 레지스트리에
+    """(d) 그래프가 흡수형 `RuntimeError` 로 실패하면 청구하지 않는다.
 
-    잔여(`docs`/`sql` 키의 "ok")가 남는다. 그 잔여는 `documents`/`chromadb`
-    키가 아니므로 `legacy_text_landed` 를 절대 참으로 만들면 안 된다 — 잔여만
-    보고 청구하면 실패한 적재에 과금하는 결함이 된다.
+    #495 이전에는 doc_nodes/sql 레지스트리에 잔여(`docs`/`sql` 키의 "ok")가
+    남았다. 지금은 그 다리를 건너뛴다. 어느 쪽이든 `documents`/`chromadb`
+    키가 성공이 아니므로 `legacy_text_landed` 는 참이 되면 안 된다.
     """
     from unittest.mock import MagicMock
 
@@ -1593,8 +1593,8 @@ def test_14d_residue_only_ok_under_docs_sql_keys_does_not_bill(stack):
             "pack-a", text="본문", source_id="src-14d", text_as_node=False,
         )
 
-    assert result["stores"].get("docs", "").startswith("ok"), result["stores"]
-    assert result["stores"].get("sql") == "ok", result["stores"]
+    assert result["stores"].get("docs") == "skipped (graph write failed)", result["stores"]
+    assert result["stores"].get("sql") == "skipped (graph write failed)", result["stores"]
     assert result["stores"]["documents"] == "skipped (graph write failed)", result["stores"]
     assert result["stores"]["chromadb"] == "skipped (graph write failed)", result["stores"]
     billing.on_ingest.assert_not_called()

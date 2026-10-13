@@ -507,10 +507,12 @@ class _AvailableGraphStub:
     """Minimal stand-in for Neo4jStore that reports available -- so
     add_edge/add_node's #148-point-6 "graph unavailable -> refuse the whole
     write" early exit does not fire before the mongo-specific branch under
-    test in this class ever runs. Deliberately has no upsert_node/
-    upsert_edge methods: the resulting AttributeError is caught by
-    add_node/add_edge's own try/except and reported as "graph": "error: ..."
-    -- irrelevant to what this class is testing (the docs/mongo marker).
+    test in this class ever runs. ``upsert_node`` succeeds: since #495 a
+    graph write that did not land stops the doc leg, so the docs/mongo
+    marker this class tests is only reached after a landed graph write.
+    Deliberately has no upsert_edge method: the resulting AttributeError is
+    caught by add_edge's own try/except and reported as "graph": "error: ..."
+    -- irrelevant to the edge audit marker this class tests.
 
     #162: ``lookup_node_type`` IS implemented here (returning a fixed type
     for any id), unlike the other write methods above. Since that fix,
@@ -532,6 +534,9 @@ class _AvailableGraphStub:
 
     def get_edge(self, *args):  # noqa: ARG002
         return None
+
+    def upsert_node(self, node_type, node_id, properties, space_id):  # noqa: ARG002
+        return dict(properties)
 
     def lookup_node_type(self, node_id):  # noqa: ARG002
         return "StubType"
