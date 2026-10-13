@@ -27,7 +27,8 @@ COLL = "vectors_kure"
 DIM = 32
 OLD = "2020-01-01T00:00:00+00:00"
 DB_FILES = ("graph.db", "doc_store.db", "vectors.db", "opencrab.db")
-PK_INPUT = ["ctl1", "p1a", "p1b", "p2a", "p2b", "p3a", "pp", "x6", "x7"]
+PK_INPUT = ["ctl1", "p1a", "p1b", "p2a", "p2b", "p3a", "pp", "x6", "x7", "z8", "z8b"]
+P3_CONTROLS = ("x6", "x7", "z8", "z8b")
 
 
 def _open_stores(root: Path) -> rp.Stores:
@@ -116,6 +117,15 @@ class World:
         # TextUnit (not P2), and both types invalid (not P1)
         node("evidence", "LogEntry", "Evidence", "x6", {"text": "keep me"})
         node("evidence", "TextEvidence", "BogusDoc", "x7", {"text": "keep me too"})
+        # P3 boundary controls for the "one doc row, in the graph space" rule:
+        # two doc rows (not P1), and one TextUnit row outside the graph space (not P2)
+        node("evidence", "TextEvidence", "Evidence", "z8", {"text": "two rows"})
+        d.upsert_node_doc("concept", "Concept", "z8", {"pack_id": "pk", "text": "second row"})
+        g.upsert_node("LogEntry", "z8b", {"pack_id": "pk", "session_id": "z8b"}, "evidence")
+        d.upsert_node_doc("concept", "TextUnit", "z8b", {"pack_id": "pk", "text": "other space"})
+        q.register_node("concept", "TextUnit", "z8b")
+        v.upsert_texts(texts=["z8b TextUnit other space"], ids=["z8b"],
+                       metadatas=[{"pack_id": "pk", "source": "pk", "node_id": "z8b", "space": "concept"}])
         # P4 delete proposals (absent from the covering input, older than the reload)
         node("concept", None, "Concept", "d1", {"name": "d1"}, graph=False, vec=False)
         node("concept", None, "Concept", "d2", {"name": "d2"}, graph=False, vec=False)
@@ -250,7 +260,7 @@ def test_t1_dry_run_classes_proposals_and_no_file_change(world, monkeypatch):
     classes = {k: v["class"] for k, v in cands.items()}
     assert classes == {"p1a": "P1", "p1b": "P1", "p2a": "P2", "p2b": "P2", "p3a": "P3",
                        "d1": "P4", "d2": "P4", "h1": "P4", "n1": "P4", "dd": "P4", "c1": "P4",
-                       "pp": "P4", "e1": "P4", "v1": "P4", "x6": "P3", "x7": "P3"}
+                       "pp": "P4", "e1": "P4", "v1": "P4", "x6": "P3", "x7": "P3", "z8": "P3", "z8b": "P3"}
     # T9: only covered, absent, older, one-row rows get the delete proposal
     proposed = {json.loads(x)["node_id"] for x in world.proposed().read_text().splitlines()}
     assert proposed == {"d1", "d2"}
@@ -264,10 +274,10 @@ def test_t1_dry_run_classes_proposals_and_no_file_change(world, monkeypatch):
     # F5: promote evidence stays in the summary, not in the proposed approval file
     assert cands["pp"]["proposal"] == "promote"
     summary = json.loads((rd / "summary.json").read_text())
-    assert summary["by_class"] == {"P1": 2, "P2": 2, "P3": 3, "P4": 9}
+    assert summary["by_class"] == {"P1": 2, "P2": 2, "P3": 5, "P4": 9}
     assert {"node_id": "pp", "proposal": "promote"}.items() <= next(
         p for p in summary["p4"] if p["node_id"] == "pp").items()
-    assert sorted(p["node_id"] for p in summary["p3"]) == ["p3a", "x6", "x7"]
+    assert sorted(p["node_id"] for p in summary["p3"]) == ["p3a", "x6", "x7", "z8", "z8b"]
 
 
 def test_t1_non_empty_wal_refuses(world):
@@ -279,8 +289,21 @@ def test_t1_non_empty_wal_refuses(world):
 # --- T2, T3, T11 -----------------------------------------------------------
 
 
+def _p3_control_rows(world: World) -> dict:
+    """Every row of the P3 boundary controls in the four stores."""
+    ids = "','".join(P3_CONTROLS)
+    return {
+        "graph": world.q("graph.db", f"SELECT * FROM graph_nodes WHERE node_id IN ('{ids}') ORDER BY node_id"),
+        "docs": world.q("doc_store.db", f"SELECT * FROM doc_nodes WHERE node_id IN ('{ids}') ORDER BY node_id, space"),
+        "registry": world.q("opencrab.db",
+                            f"SELECT * FROM ontology_nodes WHERE node_id IN ('{ids}') ORDER BY node_id, space"),
+        "vectors": [world.vector_doc(i) for i in P3_CONTROLS],
+    }
+
+
 def test_t2_t3_t11_apply_reaches_targets_and_rerun_changes_nothing(world):
     world.dry()
+    p3_before = _p3_control_rows(world)
     res = world.apply("run", world.proposed(), scan=rp.holders)
     assert all(o == "done" for (_, o) in res), res
     q = world.q
@@ -303,6 +326,7 @@ def test_t2_t3_t11_apply_reaches_targets_and_rerun_changes_nothing(world):
     # untouched: P3, hold rows, controls
     assert q("graph.db", "SELECT node_type FROM graph_nodes WHERE node_id='p3a'") == [("Entity",)]
     # P3 boundary controls keep every store as it was
+    assert _p3_control_rows(world) == p3_before
     assert q("graph.db", "SELECT node_id, node_type FROM graph_nodes WHERE node_id IN ('x6','x7') ORDER BY 1") == [
         ("x6", "LogEntry"), ("x7", "TextEvidence")]
     assert [(n, t, json.loads(p)["text"]) for n, t, p in q(
