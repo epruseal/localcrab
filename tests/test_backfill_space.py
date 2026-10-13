@@ -1866,20 +1866,40 @@ def _assert_all_closed(conns):
             conn.execute("SELECT 1")
 
 
-def test_resolver_connection_closes_when_its_scan_fails(world, tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("exc_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_resolver_connection_closes_when_its_scan_fails(
+    world, tmp_path, capsys, monkeypatch, exc_type
+):
     _many(world, 2)
     seen = _track_resolver_connections(monkeypatch)
     real_scan = bf._scan_apply_state
 
     def scan(paths, state, allow):
         if seen and state is seen[-1]:
-            raise RuntimeError("injected resolver scan failure")
+            raise _raise(exc_type)
         return real_scan(paths, state, allow)
 
     monkeypatch.setattr(bf, "_scan_apply_state", scan)
     code, raised, rep = _apply_catching(capsys, tmp_path)
-    assert code == 1 and raised is None and "resolver scan" in rep["reconcile_error"]
+    _assert_kept_report(code, raised, rep, exc_type)
     _assert_all_closed(seen)
+
+
+def test_digest_change_keeps_resolver_state(world, tmp_path, capsys, monkeypatch):
+    _many(world, 2)
+    real_digest, calls = bf._vector_bit_digest, {"n": 0}
+
+    def digest(paths):
+        calls["n"] += 1
+        value = real_digest(paths)
+        return value if calls["n"] == 1 else f"changed-{value}"
+
+    monkeypatch.setattr(bf, "_vector_bit_digest", digest)
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 1 and not rep["reconcile"]["ok"]
+    assert "embedding_bit changed during apply" in rep["reconcile"]["problems"]
+    kept = Path(rep["reconcile"]["resolver_state"])
+    assert kept.parent == Path(rep["backup_set"]) and kept.is_dir()
 
 
 def test_resolver_connection_closes_when_reconcile_fails(world, tmp_path, capsys, monkeypatch):
