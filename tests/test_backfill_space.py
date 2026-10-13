@@ -1111,6 +1111,9 @@ def test_unserializable_row_does_not_block_its_batch(world, tmp_path, capsys, mo
     assert rep["skipped_unserializable_ids"]["doc"] == ["n0"]
     assert rep["reconcile"]["ok"]
     assert world.space("doc", "n0") is None and world.space("doc", "n1") == "concept"
+    # Not clean (exit 1) although reconcile is ok: the resolver state stays and is named.
+    kept = Path(rep["reconcile"]["resolver_state"])
+    assert kept.parent == Path(rep["backup_set"]) and (kept / "apply-state.db").is_file()
 
 
 def test_lone_surrogate_metadata_is_held(world, tmp_path, capsys):
@@ -1715,3 +1718,254 @@ def test_a_row_count_mismatch_fails_loudly_and_rolls_back(world, tmp_path, capsy
     rep = json.loads(capsys.readouterr().out)
     assert code == 1 and rep["error_type"] == "AssertionError"
     assert world.space("doc", "n0") is None
+
+
+# ---------------------------------------------------------------------------
+# #481: the reconcile resolver state inside the backup set
+# ---------------------------------------------------------------------------
+
+_RESOLVER = "current-resolver-"
+
+
+def _resolver_dirs(set_dir: Path) -> list[Path]:
+    return sorted(p for p in set_dir.iterdir() if p.name.startswith(_RESOLVER))
+
+
+def _apply_catching(capsys, tmp_path):
+    dest = tmp_path / "bk"
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        code = bf.main(["--apply", "--backup-to", str(dest)])
+        raised = None
+    except BaseException as exc:  # noqa: BLE001 - the test inspects the interrupt
+        code, raised = None, exc
+    out = capsys.readouterr().out
+    return code, raised, json.loads(out)
+
+
+def _assert_lock_free(env):
+    probe = textwrap.dedent(f"""
+        from opencrab.locking import write_lock
+        with write_lock({str(env)!r}, timeout=0.5):
+            print('acquired')
+    """)
+    assert subprocess.check_output([sys.executable, "-c", probe], text=True).strip() == "acquired"
+
+
+def _assert_kept_report(code, raised, rep, exc_type):
+    if exc_type is RuntimeError:
+        assert code == 1 and raised is None and rep["exit"] == 1
+    else:
+        assert type(raised) is exc_type and "exit" not in rep
+        assert rep["reraised"] == exc_type.__name__
+        if exc_type is SystemExit:
+            assert raised.code == 0
+    assert exc_type.__name__ in rep["reconcile_error"]
+    kept = Path(rep["resolver_state"])
+    assert kept.parent == Path(rep["backup_set"]) and kept.name.startswith(_RESOLVER)
+    assert rep["resolver_state_present"] is True and kept.is_dir()
+    assert "resolver_state_preexisting" not in rep
+    return kept
+
+
+def _raise(exc_type):
+    return exc_type(0) if exc_type is SystemExit else exc_type("injected")
+
+
+def test_clean_apply_removes_only_the_resolver_state(world, tmp_path, capsys):
+    _many(world, 3)
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 0 and rep["reconcile"]["ok"], rep
+    set_dir = Path(rep["backup_set"])
+    assert _resolver_dirs(set_dir) == []
+    assert "resolver_state" not in rep["reconcile"]
+    for name in ("apply-state.db", "doc_store.db", "vectors.db", "graph.db"):
+        assert (set_dir / name).is_file(), name
+
+
+def _tree(root: Path) -> dict[str, bytes]:
+    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_reconcile_mismatch_keeps_resolver_state_and_a_rerun_leaves_it(
+    world, tmp_path, capsys, monkeypatch
+):
+    _many(world, 1)
+    world.graph("h", "concept", {"pack_id": "zzz"})
+    world.doc("h", {"pack_id": PACK})  # hold_pack_disagrees
+    orig = bf._write_state_one_batch
+
+    def wrapped(conn, store, batch, paths, res, allow, stats):
+        done = orig(conn, store, batch, paths, res, allow, stats)
+        if store == "doc":
+            conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id='h'", ('{"x": 1}',))
+        return done
+
+    monkeypatch.setattr(bf, "_write_state_one_batch", wrapped)
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 1 and not rep["reconcile"]["ok"]
+    first_set = Path(rep["backup_set"])
+    kept = Path(rep["reconcile"]["resolver_state"])
+    assert kept.parent == first_set and (kept / "apply-state.db").is_file()
+    assert _resolver_dirs(first_set) == [kept]
+    before = _tree(first_set)
+    monkeypatch.setattr(bf, "_write_state_one_batch", orig)
+    code, rep2 = _apply(capsys, world, tmp_path)
+    assert code == 0 and rep2["reconcile"]["ok"], rep2
+    assert Path(rep2["backup_set"]) != first_set
+    assert _resolver_dirs(Path(rep2["backup_set"])) == []
+    assert _tree(first_set) == before
+
+
+@pytest.mark.parametrize("exc_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("place", ["classify", "digest"])
+def test_error_after_the_write_phase_keeps_and_names_resolver_state(
+    world, env, tmp_path, capsys, monkeypatch, place, exc_type
+):
+    _many(world, 2)
+    if place == "classify":
+
+        def stream(*a, **k):
+            raise _raise(exc_type)
+
+        monkeypatch.setattr(bf, "_stream_apply_state", stream)
+    else:
+        real_digest, calls = bf._vector_bit_digest, {"n": 0}
+
+        def digest(paths):
+            calls["n"] += 1
+            if calls["n"] == 2:  # the check after reconcile
+                raise _raise(exc_type)
+            return real_digest(paths)
+
+        monkeypatch.setattr(bf, "_vector_bit_digest", digest)
+    code, raised, rep = _apply_catching(capsys, tmp_path)
+    kept = _assert_kept_report(code, raised, rep, exc_type)
+    assert (kept / "apply-state.db").is_file()
+    assert "reconcile" not in rep and rep["write"]["committed"]["doc"] == 2
+    _assert_lock_free(env)
+
+
+def _track_resolver_connections(monkeypatch):
+    real, seen = bf._apply_state_db, []
+
+    def tracked(backup_dir):
+        conn = real(backup_dir)
+        if Path(backup_dir).name.startswith(_RESOLVER):
+            seen.append(conn)
+        return conn
+
+    monkeypatch.setattr(bf, "_apply_state_db", tracked)
+    return seen
+
+
+def _assert_all_closed(conns):
+    assert conns
+    for conn in conns:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_resolver_connection_closes_when_its_scan_fails(world, tmp_path, capsys, monkeypatch):
+    _many(world, 2)
+    seen = _track_resolver_connections(monkeypatch)
+    real_scan = bf._scan_apply_state
+
+    def scan(paths, state, allow):
+        if seen and state is seen[-1]:
+            raise RuntimeError("injected resolver scan failure")
+        return real_scan(paths, state, allow)
+
+    monkeypatch.setattr(bf, "_scan_apply_state", scan)
+    code, raised, rep = _apply_catching(capsys, tmp_path)
+    assert code == 1 and raised is None and "resolver scan" in rep["reconcile_error"]
+    _assert_all_closed(seen)
+
+
+def test_resolver_connection_closes_when_reconcile_fails(world, tmp_path, capsys, monkeypatch):
+    _many(world, 2)
+    seen = _track_resolver_connections(monkeypatch)
+
+    def stream(*a, **k):
+        raise RuntimeError("injected classification failure")
+
+    monkeypatch.setattr(bf, "_stream_apply_state", stream)
+    code, raised, rep = _apply_catching(capsys, tmp_path)
+    assert code == 1 and raised is None and "classification" in rep["reconcile_error"]
+    _assert_all_closed(seen)
+
+
+def test_resolver_name_collision_fails_before_reconcile_and_deletes_nothing(
+    world, tmp_path, capsys, monkeypatch
+):
+    _many(world, 2)
+    fixed = "00000000-0000-4000-8000-000000000481"
+    monkeypatch.setattr(bf, "uuid", SimpleNamespace(uuid4=lambda: fixed))
+    real_write = bf._write_state_batches
+
+    def write(paths, state, *a):
+        stats = real_write(paths, state, *a)
+        set_dir = Path(state.execute("PRAGMA database_list").fetchone()[2]).parent
+        (set_dir / f"{_RESOLVER}{fixed}").mkdir()
+        (set_dir / f"{_RESOLVER}{fixed}" / "sentinel").write_text("keep")
+        return stats
+
+    monkeypatch.setattr(bf, "_write_state_batches", write)
+    called = []
+    monkeypatch.setattr(bf, "reconcile_state", lambda *a: called.append(a))
+    code, raised, rep = _apply_catching(capsys, tmp_path)
+    assert code == 1 and raised is None and called == []
+    assert "FileExistsError" in rep["reconcile_error"] and "reconcile" not in rep
+    other = Path(rep["backup_set"]) / f"{_RESOLVER}{fixed}"
+    assert rep["resolver_state"] == str(other)
+    assert rep["resolver_state_present"] is True and rep["resolver_state_preexisting"] is True
+    assert (other / "sentinel").read_text() == "keep"
+
+
+def test_resolver_removal_failure_keeps_exit_zero_and_names_it(
+    world, tmp_path, capsys, monkeypatch
+):
+    _many(world, 2)
+
+    def rmtree(path):
+        raise OSError("injected removal failure")
+
+    monkeypatch.setattr(bf, "shutil", SimpleNamespace(rmtree=rmtree))
+    code, rep = _apply(capsys, world, tmp_path)
+    assert code == 0 and rep["reconcile"]["ok"]
+    kept = Path(rep["reconcile"]["resolver_state"])
+    assert kept.parent == Path(rep["backup_set"]) and kept.is_dir()
+    assert "OSError" in rep["reconcile"]["resolver_cleanup_error"]
+
+
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit])
+def test_interrupt_during_resolver_removal_reraises_and_names_it(
+    world, env, tmp_path, capsys, monkeypatch, exc_type
+):
+    _many(world, 2)
+
+    def rmtree(path):
+        raise _raise(exc_type)
+
+    monkeypatch.setattr(bf, "shutil", SimpleNamespace(rmtree=rmtree))
+    code, raised, rep = _apply_catching(capsys, tmp_path)
+    _assert_kept_report(code, raised, rep, exc_type)
+    _assert_lock_free(env)
+
+
+def test_interrupt_right_after_resolver_creation_names_it(
+    world, env, tmp_path, capsys, monkeypatch
+):
+    _many(world, 2)
+    real_mkdir = Path.mkdir
+
+    def mkdir(self, *a, **k):
+        real_mkdir(self, *a, **k)
+        if self.name.startswith(_RESOLVER):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    code, raised, rep = _apply_catching(capsys, tmp_path)
+    kept = _assert_kept_report(code, raised, rep, KeyboardInterrupt)
+    assert list(kept.iterdir()) == []
+    _assert_lock_free(env)

@@ -62,6 +62,21 @@ Apply state:
   a source COMMIT can fail, so the report marks that commit state unknown and
   keeps the backup and state file for inspection. A fresh run takes a new
   backup and state file. It does not resume a prior state file automatically.
+  Reconcile builds a temporary resolver state in ``current-resolver-<uuid>``
+  under the same backup set. A clean run (every reconcile check passes and no
+  row was skipped as unserializable) removes that directory before the report
+  is printed. If the removal fails, the exit stays 0 and
+  ``reconcile.resolver_state`` and ``reconcile.resolver_cleanup_error`` name
+  the leftover. A run that is not clean keeps the directory and names it in
+  ``reconcile.resolver_state``. An error or an interrupt after the write phase
+  keeps the directory. Its report has ``reconcile_error`` and the top-level
+  ``resolver_state`` with ``resolver_state_present``. A name collision also
+  sets ``resolver_state_preexisting``, fails before reconcile, and never
+  deletes that entry. An interrupt keeps its own process status.
+  An interrupt during this report bookkeeping can make a resolver mark wrong.
+  It can also stop the tool before it prints any report. In both cases the
+  tool deletes nothing outside a clean run. It deletes only the resolver
+  directory of this run.
 
 Apply sequence:
   1. Take ``write.lock`` for the whole run.
@@ -1648,12 +1663,14 @@ def _write_apply_report(
     out.write("}")
 
 
-def _fresh_resolver_state(paths: Paths, parent: Path, allow: bool) -> sqlite3.Connection:
-    """Build a current resolver snapshot for failure or reconcile classification."""
-    fresh_dir = parent / f"current-resolver-{uuid.uuid4()}"
-    fresh_dir.mkdir(mode=0o700)
+def _fresh_resolver_state(paths: Paths, fresh_dir: Path, allow: bool) -> sqlite3.Connection:
+    """Build a current resolver snapshot in an existing directory for reconcile."""
     fresh = _apply_state_db(fresh_dir)
-    _scan_apply_state(paths, fresh, allow)
+    try:
+        _scan_apply_state(paths, fresh, allow)
+    except BaseException:
+        fresh.close()
+        raise
     return fresh
 
 
@@ -1693,69 +1710,76 @@ def reconcile_state(
     state: sqlite3.Connection,
     stats: dict[str, Any],
     allow_pack_missing: bool,
+    fresh_dir: Path,
 ) -> dict[str, Any]:
-    """Reconcile with state outcome cursors instead of outcome Python lists."""
-    state_path = Path(state.execute("PRAGMA database_list").fetchone()[2])
-    fresh = _fresh_resolver_state(paths, state_path.parent, allow_pack_missing)
-    # Fresh scan populated occurrence rows for its own held snapshot. Reconcile
-    # needs a new current-stream sequence that starts at zero for every key.
-    fresh.execute("DELETE FROM held_occurrence")
-    fresh.commit()
-    problems: list[str] = []
-    totals = {"doc": 0, "vector": 0}
-    no_valid_after = {"doc": 0, "vector": 0}
-    seen_held = {"doc": 0, "vector": 0}
-    for store, rid, cls, _space in _stream_apply_state(paths, fresh, allow_pack_missing):
-        totals[store] += 1
-        if cls != "skip_valid":
-            no_valid_after[store] += 1
-        if not cls.startswith("apply") and cls != "skip_valid":
-            key_type, key_value = _resolver_key(rid)
-            occurrence = _next_held_occurrence(fresh, store, key_type, key_value)
-            expected = state.execute(
-                "SELECT class FROM held WHERE store=? AND key_type=? AND key_value=? AND occurrence=?",
-                (store, key_type, key_value, occurrence),
-            ).fetchone()
-            if expected is None or expected[0] != cls:
-                problem = f"{store}: hold class counts changed (a held id changed class)"
-                if problem not in problems:
-                    problems.append(problem)
-            else:
-                seen_held[store] += 1
-    for store in ("doc", "vector"):
-        n = stats["committed"][store]
-        before_total = _state_map(state, store, "total").get("all", 0)
-        before_classes = _state_map(state, store, "class")
-        before_no_valid = sum(value for key, value in before_classes.items() if key != "skip_valid")
-        if totals[store] != before_total:
-            problems.append(f"{store}: total rows changed")
-        if no_valid_after[store] != before_no_valid - n:
-            problems.append(f"{store}: no-valid-space count is not before minus committed")
-        expected_count = state.execute(
-            "SELECT count(*) FROM held WHERE store=?", (store,)
-        ).fetchone()[0]
-        if seen_held[store] != expected_count:
-            problems.append(f"{store}: hold class counts changed (a held id changed class)")
-    dconn = _open(paths.doc, "ro", False)
-    vconn = _open(paths.vector, "ro", True)
+    """Reconcile with state outcome cursors instead of outcome Python lists.
+
+    ``fresh_dir`` is the existing, empty resolver directory of this run.
+    """
+    fresh = _fresh_resolver_state(paths, fresh_dir, allow_pack_missing)
     try:
-        for store, conn, sql in (
-            ("doc", dconn, "SELECT metadata FROM doc_sources WHERE source_id = ?"),
-            ("vector", vconn, f"SELECT metadata FROM {paths.collection} WHERE node_id = ?"),
-        ):  # noqa: S608
-            for raw_type, raw_value, space in _state_outcomes(state, store, "committed"):
-                rid = _raw_value(raw_type, raw_value)
-                row = conn.execute(
-                    sql.replace(" = ?", " IS NULL") if rid is None else sql,
-                    () if rid is None else (rid,),
+        # Fresh scan populated occurrence rows for its own held snapshot. Reconcile
+        # needs a new current-stream sequence that starts at zero for every key.
+        fresh.execute("DELETE FROM held_occurrence")
+        fresh.commit()
+        problems: list[str] = []
+        totals = {"doc": 0, "vector": 0}
+        no_valid_after = {"doc": 0, "vector": 0}
+        seen_held = {"doc": 0, "vector": 0}
+        for store, rid, cls, _space in _stream_apply_state(paths, fresh, allow_pack_missing):
+            totals[store] += 1
+            if cls != "skip_valid":
+                no_valid_after[store] += 1
+            if not cls.startswith("apply") and cls != "skip_valid":
+                key_type, key_value = _resolver_key(rid)
+                occurrence = _next_held_occurrence(fresh, store, key_type, key_value)
+                expected = state.execute(
+                    "SELECT class FROM held WHERE store=? AND key_type=? AND key_value=? AND occurrence=?",
+                    (store, key_type, key_value, occurrence),
                 ).fetchone()
-                meta = parse_meta(row[0]) if row else None
-                if not isinstance(meta, dict) or meta.get("space") != space:
-                    problems.append(f"{store}: {rid} does not hold {space}")
-                    break
+                if expected is None or expected[0] != cls:
+                    problem = f"{store}: hold class counts changed (a held id changed class)"
+                    if problem not in problems:
+                        problems.append(problem)
+                else:
+                    seen_held[store] += 1
+        for store in ("doc", "vector"):
+            n = stats["committed"][store]
+            before_total = _state_map(state, store, "total").get("all", 0)
+            before_classes = _state_map(state, store, "class")
+            before_no_valid = sum(
+                value for key, value in before_classes.items() if key != "skip_valid"
+            )
+            if totals[store] != before_total:
+                problems.append(f"{store}: total rows changed")
+            if no_valid_after[store] != before_no_valid - n:
+                problems.append(f"{store}: no-valid-space count is not before minus committed")
+            expected_count = state.execute(
+                "SELECT count(*) FROM held WHERE store=?", (store,)
+            ).fetchone()[0]
+            if seen_held[store] != expected_count:
+                problems.append(f"{store}: hold class counts changed (a held id changed class)")
+        dconn = _open(paths.doc, "ro", False)
+        vconn = _open(paths.vector, "ro", True)
+        try:
+            for store, conn, sql in (
+                ("doc", dconn, "SELECT metadata FROM doc_sources WHERE source_id = ?"),
+                ("vector", vconn, f"SELECT metadata FROM {paths.collection} WHERE node_id = ?"),
+            ):  # noqa: S608
+                for raw_type, raw_value, space in _state_outcomes(state, store, "committed"):
+                    rid = _raw_value(raw_type, raw_value)
+                    row = conn.execute(
+                        sql.replace(" = ?", " IS NULL") if rid is None else sql,
+                        () if rid is None else (rid,),
+                    ).fetchone()
+                    meta = parse_meta(row[0]) if row else None
+                    if not isinstance(meta, dict) or meta.get("space") != space:
+                        problems.append(f"{store}: {rid} does not hold {space}")
+                        break
+        finally:
+            dconn.close()
+            vconn.close()
     finally:
-        dconn.close()
-        vconn.close()
         fresh.close()
     return {"ok": not problems, "problems": problems}
 
@@ -1888,13 +1912,37 @@ def run_apply(
                 return 1, out
             exc.backfill_report = out
             raise
-        rec = reconcile_state(paths, state, stats, args.allow_pack_missing)
-        if pre_bit != _vector_bit_digest(paths):
-            rec["ok"] = False
-            rec["problems"].append("embedding_bit changed during apply")
-        clean = rec["ok"] and not any(stats["skipped_unserializable"].values())
-        out.update({"write": stats, "reconcile": rec, "list_ids": args.list_ids})
-        return (0 if clean else 1), out
+        # The resolver directory is temporary. A clean run removes it. Any other
+        # outcome keeps it for inspection and names it in the report.
+        resolver_dir = backup.set_dir / f"current-resolver-{uuid.uuid4()}"
+        try:
+            resolver_dir.mkdir(mode=0o700)
+            rec = reconcile_state(paths, state, stats, args.allow_pack_missing, resolver_dir)
+            if pre_bit != _vector_bit_digest(paths):
+                rec["ok"] = False
+                rec["problems"].append("embedding_bit changed during apply")
+            clean = rec["ok"] and not any(stats["skipped_unserializable"].values())
+            if clean:
+                try:
+                    shutil.rmtree(resolver_dir)
+                except OSError as exc:
+                    rec["resolver_state"] = str(resolver_dir)
+                    rec["resolver_cleanup_error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                rec["resolver_state"] = str(resolver_dir)
+            out.update({"write": stats, "reconcile": rec, "list_ids": args.list_ids})
+            return (0 if clean else 1), out
+        except BaseException as exc:
+            out["write"] = stats
+            out["reconcile_error"] = f"{type(exc).__name__}: {exc}"
+            out["resolver_state"] = str(resolver_dir)
+            out["resolver_state_present"] = os.path.lexists(resolver_dir)
+            if isinstance(exc, FileExistsError) and exc.filename == str(resolver_dir):
+                out["resolver_state_preexisting"] = True
+            if isinstance(exc, Exception):
+                return 1, out
+            exc.backfill_report = out
+            raise
     finally:
         if "state" in locals():
             state.close()
