@@ -172,9 +172,11 @@ def anchor_verdict(probes: Mapping[str, str]) -> str:
     - ``unverifiable`` -- the graph could not be asked. Fail-closed: not
       knowing must never read as either "landed" or "did not land".
     - ``optional-only`` -- the graph positively does not hold it but a doc or
-      vector row does. Reachable because ``OntologyBuilder.add_node`` keeps
-      writing to the optional stores after the graph write raises (it only
-      skips them when the graph store is *unavailable*).
+      vector row does. ``OntologyBuilder.add_node`` writes the optional
+      stores after a graph failure only when the graph holds that exact
+      write (#495, see its docstring). This verdict stays reachable through
+      rows written before #495, a graph row removed later, or a race
+      between the builder's digest read and this probe.
     - ``absent`` -- every store that answered said no, and none of the
       remaining ones could hold it either.
 
