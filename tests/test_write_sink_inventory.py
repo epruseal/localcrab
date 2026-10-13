@@ -97,6 +97,12 @@ ALLOWED: dict[tuple[str, str], str] = {
         "additive insert-if-absent (SQL: ON CONFLICT DO NOTHING; Mongo: "
         "unique-index insert) that never overwrites an existing doc row"
     ),
+    ("scripts/repair_store_mismatch_499.py", "execute_leg"): (
+        "one-off repair tool (#499) run offline: --apply gated, the guard holds "
+        "write.lock and refuses while another process holds the stores, P4 "
+        "deletes need an operator approval line, and every write is a "
+        "compare-and-set against the recorded candidate state"
+    ),
     ("scripts/bench_graph_backends.py", "ingest_to_store"): "developer benchmark",
     ("scripts/seed_ontology.py", "seed"): "operator seeding tool, binds a principal",
     ("scripts/import_obsidian_vault.py", "_import_vault_unlocked"): (
