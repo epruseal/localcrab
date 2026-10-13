@@ -330,6 +330,39 @@ def test_t8_edge_error_but_held_writes_registry():
     assert _registry_rows(sql, "ontology_edges") == 1
 
 
+@pytest.mark.parametrize("commit, sql_status, rows", [
+    (True, "ok", 1),
+    (False, SKIPPED_GRAPH_WRITE_FAILED, 0),
+])
+def test_t8b_edge_probe_wiring_with_real_local_graph(tmp_path, commit, sql_status, rows):
+    """The edge probe passes the resolved node types and the endpoints in
+    order. A real store keys get_edge on (from_type, from_id, relation,
+    to_type, to_id), so a swapped endpoint or a space in a type slot reads
+    "absent" and drops the registry row of a committed edge."""
+    from opencrab.stores.local_graph_store import LocalGraphStore
+
+    real = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
+
+    class EdgeFault:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def upsert_edge(self, *args, **kwargs):
+            if commit:
+                real.upsert_edge(*args, **kwargs)
+            raise sqlite3.OperationalError("dropped")
+
+    sql, pack_id = _sql_and_pack()
+    builder = OntologyBuilder(EdgeFault(), _Docs(), sql, None)
+    for nid in ("e-from", "e-to"):
+        assert builder.add_node("resource", "Document", nid, properties={"title": nid},
+                                pack_id=pack_id)["stores"]["graph"] == "ok"
+    result = builder.add_edge("resource", "e-from", "cites", "resource", "e-to", pack_id=pack_id)
+    assert result["stores"]["graph"] == "error: OperationalError"
+    assert result["stores"]["sql"] == sql_status
+    assert _registry_rows(sql, "ontology_edges") == rows
+
+
 def test_t9_edge_control_success_writes_registry():
     builder, sql, pack_id = _edge_builder(_Graph())
     result = _edge(builder, pack_id)
