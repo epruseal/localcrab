@@ -466,3 +466,20 @@ def test_t10_resume_requires_a_matching_manifest(world):
     (rd2 / "manifest.json").write_text(json.dumps(m))
     with pytest.raises(rp.RepairRefusedError, match="does not match"):
         world.apply("run2", None, scan=_no_scan)
+
+
+def test_t5_graph_cas_rejects_a_write_between_check_and_reclassify(world, monkeypatch):
+    """The CAS on the recorded digest still guards the window after the
+    snapshot check: a type change there makes the reclassify fail."""
+    world.dry()
+    real = rp.execute_leg
+
+    def racing(stores, reader, node_id, leg, recorded):
+        if node_id == "p1a":
+            _exec(world.root / "graph.db", ("UPDATE graph_nodes SET node_type='Quote' WHERE node_id='p1a'",))
+        return real(stores, reader, node_id, leg, recorded)
+
+    monkeypatch.setattr(rp, "execute_leg", racing)
+    world.apply("dry", None, scan=_no_scan)
+    assert world.q("graph.db", "SELECT node_type FROM graph_nodes WHERE node_id='p1a'") == [("Quote",)]
+    assert any(p["node_id"] == "p1a" and p["outcome"] == "error" for p in _progress(world.root.parent / "dry"))
