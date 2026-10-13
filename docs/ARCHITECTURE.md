@@ -11,6 +11,7 @@
 7. [SQLite 버전 요구사항](#7-sqlite-버전-요구사항)
 8. [임베딩 백엔드 (EMBEDDING_BACKEND)](#8-임베딩-백엔드-embedding_backend)
 9. [그래프/문서 노드 키 집합 정합성 (#317)](#9-그래프문서-노드-키-집합-정합성-317)
+10. [질의 결과의 동일 본문 접기 (#482)](#10-질의-결과의-동일-본문-접기-482)
 
 ---
 
@@ -847,3 +848,60 @@ python scripts/reconcile_doc_graph_nodes.py --apply --backup-to /path/to/backup 
 `tests/test_kuzu_graph_store.py`/`tests/test_neo4j_helpers.py`가 새 읽기
 메서드 3종의 백엔드별 거부 동작을 `inspect_graph_identity()`와 동일하게
 검증한다.
+
+## 10. 질의 결과의 동일 본문 접기 (#482)
+
+이 절은 `HybridQuery.query()`의 동일 본문 접기 계약의 정본이다. 코드의
+docstring은 이 절을 가리킨다.
+
+같은 짧은 본문이 서로 다른 노드로 여러 번 적재되면 그 결과들이 limit 슬롯을
+채운다. 결과마다 본문이 같으므로 호출자는 정보를 더 얻지 못한다. #482에서는
+대화 덤프가 시스템 폴링 턴을 노드마다 적재해 이 상태가 생겼다. 서버는 어느
+반복이 잡음인지 판정할 수 없으므로 노드를 합치지 않는다. 대신 질의 결과에서
+접는다.
+
+### 규칙
+
+- 접기 키는 결과가 모은 저장 본문의 집합과 그 결과의 pack_id(`scope_pack_id`)다.
+  저장 본문은 스토어에 저장된 본문을 그대로 돌려주는 leg의 text다. 어느 leg가
+  여기에 드는지는 `opencrab/ontology/query.py`에서 `_tag_fold_bodies`를 부르는
+  자리가 정한다. 현재는 벡터 leg와 FTS leg다. BM25 leg와 그래프 leg의 text는
+  검색용으로 합성한 문자열이라 키가 되지 않는다. 키는 병합이 끝난 결과가 모은 본문
+  집합이다. 그래서 BM25나 그래프 leg에서 온 결과도 같은 node_id의 벡터나 FTS 결과와
+  병합되면 그 본문 키를 받아 접힐 수 있다. 병합이 끝난 뒤 본문 키가 없는 결과는
+  접히지 않는다.
+- 한 노드가 병합 동안 저장 본문 여럿을 모으면 키는 그 집합 전체다. rerank 병합과
+  flat 병합은 같은 node_id의 저장 본문을 합집합으로 합친다. 두 결과는 pack_id가
+  같고 저장 본문 집합이 정확히 같을 때만 접힌다.
+- 접기는 정책 필터 단계 뒤, limit 적용 앞에서 한 번 돈다. 정책 필터는 `subject_id`가
+  주어지고 ReBAC 엔진이 붙어 있을 때만 돈다. 그때 접힌 결과는 모두 정책 필터를 통과한
+  결과다.
+- 대표는 최종 점수 순서에서 그룹의 첫 결과다. 나머지는 대표의
+  `metadata.folded_duplicates`에 남는다. 값은 `count`와 `members`다. `members`의
+  각 항목은 그 결과가 접히지 않았다면 받았을 결과 항목(`QueryResult.to_dict()`의
+  키와 값)이다.
+- 대표 후보 metadata에 folded_duplicates가 이미 있는 그룹은 기존 값 보존을 위해
+  접지 않는다.
+- `QueryResult.folded_count`는 접힌 결과 수다. `to_dict()`에는 나가지 않는다.
+  호출자는 이 값으로 접기 블록과 호출자가 쓴 같은 이름의 metadata 값을 구별한다.
+- 효과의 범위: 접기는 후보를 더 조회하지 않는다. 같은 본문이 어느 leg의 후보 상한을
+  채우면 그 leg는 상한 밖의 다른 본문을 가져오지 않는다. 다른 leg가 가져온 결과는
+  그대로 후보가 된다.
+
+### 응답 호환성
+
+| 응답 표면 | 바뀌는 것 | 그대로인 것 |
+| --- | --- | --- |
+| MCP `ontology_query` | 같은 pack, 같은 저장 본문의 결과가 한 건으로 줄어 `total`과 결과 수가 줄 수 있다. 대표 `metadata.folded_duplicates`가 생긴다. `include_canonical_ids`가 참이면 `members` 항목도 `canonical` 보강을 받는다. | 결과 항목의 최상위 키와 점수 규칙 |
+| CLI `query --json-output` | 같다(결과 수, 대표 metadata). | 결과 항목의 최상위 키와 점수 규칙 |
+| CLI `query --json-envelope` | 같다(결과 수, 대표 metadata). | 결과 항목의 최상위 키와 점수 규칙 |
+| REST `/api/query` | 같다(결과 수, 대표 metadata). | 결과 항목의 최상위 키와 점수 규칙 |
+
+예외: 대표 후보 metadata에 folded_duplicates가 이미 있는 그룹은 기존 값 보존을
+위해 접지 않는다.
+
+### 재현 명령
+
+```bash
+.venv/bin/pytest tests/test_query_duplicate_fold.py -q
+```

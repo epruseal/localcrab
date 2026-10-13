@@ -78,6 +78,12 @@ class QueryResult:
     # None for a reranked result -- the reranker does not preserve a single
     # per-leg raw score once it has cross-encoded every candidate together.
     raw_score: float | None = None
+    # #482: the number of results folded into this one (see
+    # docs/ARCHITECTURE.md, "질의 결과의 동일 본문 접기"). Not in to_dict():
+    # the serialized form carries the fold in metadata["folded_duplicates"]
+    # and keeps its top-level keys. Callers use this field to tell a fold
+    # block from a caller-written metadata key of the same name.
+    folded_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -224,6 +230,66 @@ def _ordered_unique(values: list[str | None], limit: int) -> list[str]:
         output.append(value)
         if len(output) >= limit:
             break
+    return output
+
+
+# #482: internal item keys of the duplicate-body fold. They never reach a
+# QueryResult. The contract is in docs/ARCHITECTURE.md, "질의 결과의 동일
+# 본문 접기".
+_FOLD_BODIES = "_fold_bodies"
+_FOLDED_MEMBERS = "_folded_members"
+_FOLD_METADATA_KEY = "folded_duplicates"
+
+
+def _tag_fold_bodies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark each item of a leg that returns a stored body (vector, FTS).
+
+    The key is the stored body itself, not the text that a later merge
+    builds. An item with no non-empty str text gets no key here. It can
+    still get a key when a merge joins it with a tagged item of the same
+    node_id.
+    """
+    for item in items:
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            item[_FOLD_BODIES] = frozenset((text,))
+    return items
+
+
+def _fold_identical_bodies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold results with the same pack and the same set of stored bodies.
+
+    ``items`` is in final score order, so the first item of a group is its
+    representative. The other items of the group move, unchanged, to the
+    representative's ``_folded_members`` list. A group is not folded when
+    its representative's metadata already has ``folded_duplicates``, so a
+    caller-written value is never overwritten. Items without stored-body
+    keys stay as they are. The input dicts are not changed.
+    """
+    groups: dict[tuple[str | None, frozenset[str]], list[int]] = {}
+    keys: list[tuple[str | None, frozenset[str]] | None] = []
+    for index, item in enumerate(items):
+        bodies = item.get(_FOLD_BODIES)
+        key = (scope_pack_id(item), bodies) if bodies else None
+        keys.append(key)
+        if key is not None:
+            groups.setdefault(key, []).append(index)
+
+    output: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        key = keys[index]
+        group = groups.get(key) if key is not None else None
+        folds = (
+            group is not None
+            and len(group) > 1
+            and _FOLD_METADATA_KEY not in (items[group[0]].get("metadata") or {})
+        )
+        if not folds:
+            output.append(item)
+        elif index == group[0]:
+            representative = dict(item)
+            representative[_FOLDED_MEMBERS] = [items[i] for i in group[1:]]
+            output.append(representative)
     return output
 
 
@@ -674,7 +740,10 @@ class HybridQuery:
         QueryOutcome — ``.results`` (list[QueryResult], descending score) plus
         ``.warnings`` (list[str]). Acts like the old bare list[QueryResult] for
         iteration/len/indexing (see QueryOutcome docstring), so existing callers
-        that only care about results are unaffected.
+        that only care about results are unaffected. Results with the same
+        pack and the same stored bodies can be folded into one. The rules
+        and the exceptions are in docs/ARCHITECTURE.md, "질의 결과의 동일
+        본문 접기".
         """
         result_lists: list[list[dict[str, Any]]] = []
         include_unpackaged = False
@@ -742,7 +811,7 @@ class HybridQuery:
             pack_ids=pack_ids, include_unpackaged=include_unpackaged,
         )
         if vector_hits:
-            result_lists.append([r.to_dict() for r in vector_hits])
+            result_lists.append(_tag_fold_bodies([r.to_dict() for r in vector_hits]))
 
         # --- Stage 2: BM25 keyword search ---
         bm25_hits: list[dict[str, Any]] = []
@@ -763,7 +832,7 @@ class HybridQuery:
                 pack_ids=pack_ids, include_unpackaged=include_unpackaged,
             )
             if fts_hits:
-                result_lists.append(fts_hits)
+                result_lists.append(_tag_fold_bodies(fts_hits))
 
         # --- Stage 3: Graph expansion from vector/BM25/FTS anchor nodes ---
         anchor_ids = _ordered_unique(
@@ -807,14 +876,22 @@ class HybridQuery:
             #     the first leg's (normalized) score is kept and later
             #     occurrences are dropped. This dedup rule predates this
             #     change and is unchanged here.
-            seen: set[str | None] = set()
+            #     #482: the dropped occurrence's stored bodies still join the
+            #     kept item's fold key (a union), so a node is folded only
+            #     with nodes that collected the same set of stored bodies.
+            seen: dict[str | None, dict[str, Any]] = {}
             merged = []
             for lst in result_lists:
                 leg_max = max((item.get("score") or 0.0) for item in lst) if lst else 0.0
                 for item in lst:
-                    if item.get("node_id") in seen:
+                    kept = seen.get(item.get("node_id"))
+                    if kept is not None:
+                        if item.get(_FOLD_BODIES):
+                            kept[_FOLD_BODIES] = (
+                                kept.get(_FOLD_BODIES, frozenset()) | item[_FOLD_BODIES]
+                            )
                         continue
-                    seen.add(item.get("node_id"))
+                    seen[item.get("node_id")] = item
                     item["raw_score"] = item.get("score", 0.0)
                     item["score"] = (item["raw_score"] / leg_max) if leg_max > 0 else 0.0
                     merged.append(item)
@@ -824,9 +901,13 @@ class HybridQuery:
         if subject_id and self._rebac is not None:
             merged = self._policy_filter(merged, subject_id)
 
-        # Convert back to QueryResult
-        results = []
-        for item in merged[:limit]:
+        # --- Stage 6: Fold results with identical stored bodies (#482) ---
+        # After the policy filter step. When that filter runs (subject_id and a
+        # ReBAC engine are set), every folded member already passed it.
+        # Contract: docs/ARCHITECTURE.md, "질의 결과의 동일 본문 접기".
+        merged = _fold_identical_bodies(merged)
+
+        def to_result(item: dict[str, Any]) -> QueryResult:
             metadata = dict(item.get("metadata") or {})
             if "pack_id" not in metadata:
                 # #147: scope_pack_id, not infer_pack_id. Every result here
@@ -836,7 +917,13 @@ class HybridQuery:
                 pid = scope_pack_id(item)
                 if pid:
                     metadata["pack_id"] = pid
-            results.append(QueryResult(
+            members = item.get(_FOLDED_MEMBERS) or []
+            if members:
+                metadata[_FOLD_METADATA_KEY] = {
+                    "count": len(members),
+                    "members": [to_result(member).to_dict() for member in members],
+                }
+            return QueryResult(
                 source=item.get("source", "hybrid"),
                 node_id=item.get("node_id"),
                 score=item.get("rerank_score") or item.get("score", 0.0),
@@ -847,7 +934,11 @@ class HybridQuery:
                 # item dict. A reranked item has no single per-leg raw
                 # score, so this is None for use_rerank=True results.
                 raw_score=item.get("raw_score"),
-            ))
+                folded_count=len(members),
+            )
+
+        # Convert back to QueryResult
+        results = [to_result(item) for item in merged[:limit]]
         return QueryOutcome(results=results, warnings=warnings)
 
     def _bm25_probe_fingerprint(self) -> tuple[int, str] | None:
