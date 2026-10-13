@@ -399,6 +399,16 @@ def _ingest_into_pack(
         So does a conflict on the final derived id. ``text_ingested`` is then
         False.
 
+        A node item of the same request can have the id ``source_id``. That
+        node can fail to land in the graph with a retryable error. Then the
+        function does not store the text, for either value of this flag (#484).
+
+        A text at that id blocks the node: the resend gets a final identity
+        conflict. The text error goes to ``node_errors``. ``stores["evidence_node"]``
+        is ``"deferred (node with this id not written)"``. When another item
+        with that id landed in the graph, the function stores the text as usual.
+        A resend that writes the node stores the text by the rules above.
+
         A partial result carries ``retryable`` and, when it is False,
         ``reject_codes`` (#480). The table "pack_ingest partial 결과의 retryable
         표" in docs/mcp-protocol-compat.md defines both. ``pack_create`` drops
@@ -442,8 +452,14 @@ def _ingest_into_pack(
     # retryable. Errors outside the table in docs/mcp-protocol-compat.md
     # propagate and make no partial result.
     final_rejections: list[str] = []
+    # #484: node ids of this request that landed in the graph, and node ids
+    # whose graph write failed for a retryable reason. The text must not take
+    # an id that a node of this request still needs.
+    landed_ids: set[str] = set()
+    unsettled_ids: set[str] = set()
 
     for item in nodes or []:
+        item_node_id = ""
         try:
             item_space = _clean_str(item.get("space", ""))
             item_node_type = _clean_str(item.get("node_type", ""))
@@ -479,6 +495,8 @@ def _ingest_into_pack(
                 )
                 if reason != CONFLICT_UNVERIFIABLE:
                     final_rejections.append(REJECT_FOREIGN_PACK)
+                else:
+                    unsettled_ids.add(item_node_id)
                 continue
             props = dict(_clean_meta(item.get("properties") or {}))
             _warn_dropped_alias(apply_pack_tag(props, pack_id), "node", item_node_id)
@@ -503,6 +521,9 @@ def _ingest_into_pack(
                 added_nodes += 1
             if store_write_succeeded(node_stores or {}, "graph"):
                 billable_write = True
+                landed_ids.add(item_node_id)
+            else:
+                unsettled_ids.add(item_node_id)
         except NodeIdentityConflict:
             # #468: global node identity rejects an id that already names a
             # different node. This is an intended per-item rejection.
@@ -518,6 +539,7 @@ def _ingest_into_pack(
             final_rejections.append(REJECT_GRAMMAR)
         except Exception as exc:
             node_errors.append(f"{item.get('node_id', '?')}: {safe_tool_error('_ingest_into_pack', exc)}")
+            unsettled_ids.add(item_node_id)
 
     for item in edges or []:
         try:
@@ -619,7 +641,17 @@ def _ingest_into_pack(
 
     text_ingested = False
     text_rejected = False
-    if text and source_id:
+    if text and source_id and source_id in unsettled_ids - landed_ids:
+        # #484: a node of this request with this id did not reach the graph,
+        # and a resend can write it. Storing the text now would take the id and
+        # make that resend a final identity conflict. The text waits for the
+        # resend. See the docstring.
+        node_errors.append(
+            f"{source_id} (evidence/TextUnit): not written because the node with "
+            "this id in the same request was not written; resend the request"
+        )
+        stores["evidence_node"] = "deferred (node with this id not written)"
+    elif text and source_id:
         text = _clean_str(text)
         meta = _clean_meta(metadata or {})
         _warn_dropped_alias(apply_pack_tag(meta, pack_id), "source", source_id)

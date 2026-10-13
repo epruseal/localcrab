@@ -59,6 +59,7 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 | 파생 TextUnit | probe 확인 불능, 문법 거부, 저장 실패, 그 밖의 예외 | 재시도 | |
 | legacy 텍스트(`text_as_node` false) | 소스 probe가 타 팩 귀속을 확인 | 최종 | `foreign_pack_identity` |
 | legacy 텍스트 | source writer가 올린 노드 식별 충돌(compare-and-swap 경쟁일 수 있음), `ValueError`, 그래프 쓰기 불가, 스키마 이전 필요, probe 확인 불능, 저장 실패 | 재시도 | |
+| 텍스트(두 분기) | 같은 요청의 `source_id`와 같은 id 노드가 노드 루프의 재시도 오류로 그래프에 쓰이지 않아 본문을 보류(#484, 규칙의 정본은 `_ingest_into_pack` docstring) | 재시도 | |
 
 텍스트 경로(직접, 파생, legacy)의 문법 거부는 아직 최종 거부로 세지 않는다. 표의 해당 행은 재시도다.
 
