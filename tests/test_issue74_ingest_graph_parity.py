@@ -3016,3 +3016,194 @@ def test_488_textunit_source_text_survives_a_fork_and_a_retry_on_the_fork_target
         retry = _ingest_into_pack(new_pack, text="둘째 본문", source_id=source_copy, metadata=meta)
     assert retry["status"] == "ok" and retry["evidence_node"] == slot1_copy, retry
     assert stack["graph"].get_node("TextUnit", slot1_copy) == before
+
+
+# ---------------------------------------------------------------------------
+# #484: a node of the same request that a transient error kept out of the graph
+# keeps its id. The text waits for a resend and does not take that id.
+# ---------------------------------------------------------------------------
+
+_DEFERRED = "deferred (node with this id not written)"
+
+
+def _flaky_logentry(stack, shape: str, times: int = 1):
+    """Make the first ``times`` LogEntry writes fail with a retryable error.
+
+    ``receipt``: the graph upsert raises, and the builder reports
+    ``graph: error: ...``. ``raise``: the builder raises GraphWriteUnavailable.
+    ``probe``: the ownership probe of the node cannot verify. ``commit``: the
+    graph upsert commits and then raises.
+    """
+    import opencrab.mcp.tools.pack as pack_mod
+
+    calls = {"n": 0}
+
+    def first_logentry(node_type):
+        if node_type == "LogEntry" and calls["n"] < times:
+            calls["n"] += 1
+            return True
+        return False
+
+    if shape == "probe":
+        real_probe = pack_mod._node_probe_conflict
+
+        def probe(ctx, space, node_type, node_id, pack_id):
+            if first_logentry(node_type):
+                return "unverifiable"
+            return real_probe(ctx, space, node_type, node_id, pack_id)
+
+        return patch.object(pack_mod, "_node_probe_conflict", side_effect=probe)
+    graph = stack["graph"]
+    real_upsert = graph.upsert_node
+    exc = GraphWriteUnavailable("graph down") if shape == "raise" else RuntimeError("graph busy")
+
+    def upsert(*args, **kw):
+        if first_logentry(kw.get("node_type")):
+            if shape == "commit":
+                real_upsert(*args, **kw)
+            raise exc
+        return real_upsert(*args, **kw)
+
+    return patch.object(graph, "upsert_node", side_effect=upsert)
+
+
+def _rel(value, sid: str):
+    """``value`` with the ``sid`` prefix cut off, so two sessions compare equal."""
+    return value[len(sid):] if isinstance(value, str) and value.startswith(sid) else value
+
+
+def _shape(stack, sid: str) -> dict[str, Any]:
+    """Graph nodes whose id starts with ``sid``: id suffix -> (type, property keys, text, source)."""
+    out = {}
+    for row in stack["graph"].export_nodes(pack_id="pack-a"):
+        node_id = row["props"]["id"]
+        if not node_id.startswith(sid):
+            continue
+        for node_type in ("LogEntry", "TextUnit"):
+            node = stack["graph"].get_node(node_type, node_id)
+            if node is not None:
+                out[_rel(node_id, sid)] = (
+                    node_type, frozenset(node), node.get("text"), _rel(node.get("source_id"), sid),
+                )
+    return out
+
+
+@pytest.mark.parametrize("failure", ["receipt", "raise", "probe", "commit"])
+def test_484_transient_node_failure_then_resend_converges(stack, failure):
+    sid, clean_sid = "codex/s/484-a", "codex/s/clean-484-a"
+    with _flaky_logentry(stack, failure):
+        first = _ingest468(stack, **_session_payload("2026-10-13T00:00:00Z", "본문 484", sid))
+
+    assert first["status"] == "partial", first
+    assert first["retryable"] is True and "reject_codes" not in first, first
+    assert first["text_ingested"] is False and first["evidence_node"] is None, first
+    assert first["added_nodes"] == 0, first
+    assert first["stores"]["evidence_node"] == _DEFERRED, first
+    assert len(first["node_errors"]) == 2, first
+    assert first["node_errors"][1].startswith(f"{sid} (evidence/TextUnit): "), first
+    # The text took no id: the original id and slot 1 hold no TextUnit anywhere.
+    assert stack["graph"].get_node("TextUnit", sid) is None
+    if failure != "commit":
+        assert stack["graph"].get_node("LogEntry", sid) is None
+    assert stack["graph"].get_node("TextUnit", sid + _DERIVED) is None
+    doc = stack["docs"].get_node_doc("evidence", sid)
+    assert doc is None or doc["node_type"] == "LogEntry", doc
+    assert stack["docs"].get_source(sid) is None
+
+    second = _ingest468(stack, **_session_payload("2026-10-13T00:00:00Z", "본문 484", sid))
+    assert second["status"] == "ok", second
+    assert second["evidence_node"] == sid + _DERIVED, second
+    assert stack["graph"].get_node("LogEntry", sid) is not None
+    assert stack["docs"].get_node_doc("evidence", sid)["node_type"] == "LogEntry"
+    assert stack["vector"].get_by_id(sid + _DERIVED) is not None
+
+    # The state equals the state of a request that never failed.
+    clean = _ingest468(stack, **_session_payload("2026-10-13T00:00:00Z", "본문 484", clean_sid))
+    assert clean["status"] == "ok", clean
+    clean_shape = _shape(stack, clean_sid)
+    assert set(clean_shape) == {"", _DERIVED}, clean_shape
+    assert _shape(stack, sid) == clean_shape
+
+
+def test_484_legacy_branch_converges_like_a_clean_request(stack):
+    sid, clean_sid = "codex/s/484-l", "codex/s/clean-484-l"
+    payload = dict(text_as_node=False)
+    with _flaky_logentry(stack, "receipt"):
+        first = _ingest468(stack, **_session_payload("2026-10-13T00:00:00Z", "본문 484", sid), **payload)
+    assert first["retryable"] is True and first["text_ingested"] is False, first
+    assert first["stores"]["evidence_node"] == _DEFERRED, first
+    assert stack["graph"].get_node("TextUnit", sid) is None
+    assert stack["docs"].get_source(sid) is None
+
+    second = _ingest468(stack, **_session_payload("2026-10-13T00:00:00Z", "본문 484", sid), **payload)
+    clean = _ingest468(stack, **_session_payload("2026-10-13T00:00:00Z", "본문 484", clean_sid), **payload)
+    for key in ("status", "added_nodes", "text_ingested", "evidence_node", "retryable", "reject_codes"):
+        assert _rel(second.get(key), sid) == _rel(clean.get(key), clean_sid), (key, second, clean)
+    assert stack["graph"].get_node("LogEntry", sid) is not None
+    assert _shape(stack, sid) == _shape(stack, clean_sid)
+    assert (stack["docs"].get_source(sid) is None) == (stack["docs"].get_source(clean_sid) is None)
+
+
+def test_484_graph_landed_with_doc_failure_does_not_defer(stack):
+    sid = "codex/s/484-d"
+    docs = stack["docs"]
+    real = docs.upsert_node_doc
+
+    def upsert_node_doc(space, node_type, node_id, props):
+        if node_type == "LogEntry":
+            raise RuntimeError("doc down")
+        return real(space, node_type, node_id, props)
+
+    with patch.object(docs, "upsert_node_doc", side_effect=upsert_node_doc):
+        first = _ingest468(stack, **_session_payload("2026-10-13T00:00:00Z", "본문 484", sid))
+    assert first["status"] == "partial" and first["retryable"] is True, first
+    assert first["evidence_node"] == sid + _DERIVED, first
+    assert first["stores"]["evidence_node"] == f"ok (derived id for {sid})", first
+    assert stack["graph"].get_node("LogEntry", sid) is not None
+
+
+def test_484_failure_of_another_node_does_not_defer(stack):
+    sid = "codex/s/484-o"
+    graph = stack["graph"]
+    real = graph.upsert_node
+
+    def upsert(*args, **kw):
+        if kw.get("node_type") == "Topic":
+            raise RuntimeError("graph busy")
+        return real(*args, **kw)
+
+    with patch.object(graph, "upsert_node", side_effect=upsert):
+        result = _ingest468(
+            stack, text="본문 484", source_id=sid,
+            nodes=[{"space": "concept", "node_type": "Topic", "node_id": "t-484-o",
+                    "properties": {}}],
+        )
+    assert result["status"] == "partial" and result["retryable"] is True, result
+    assert result["evidence_node"] == sid and result["text_ingested"] is True, result
+    assert stack["graph"].get_node("TextUnit", sid) is not None
+
+
+def test_484_repeated_failure_keeps_deferring_until_the_node_lands(stack):
+    sid = "codex/s/484-r"
+    payload = _session_payload("2026-10-13T00:00:00Z", "본문 484", sid)
+    with _flaky_logentry(stack, "receipt", times=2):
+        first = _ingest468(stack, **payload)
+        second = _ingest468(stack, **payload)
+    for result in (first, second):
+        assert result["retryable"] is True and result["text_ingested"] is False, result
+        assert result["stores"]["evidence_node"] == _DEFERRED, result
+        assert stack["graph"].get_node("TextUnit", sid) is None
+    third = _ingest468(stack, **payload)
+    assert third["status"] == "ok" and third["evidence_node"] == sid + _DERIVED, third
+    assert stack["graph"].get_node("LogEntry", sid) is not None
+
+
+def test_484_same_id_failed_then_landed_in_one_request_does_not_defer(stack):
+    sid = "codex/s/484-t"
+    payload = _session_payload("2026-10-13T00:00:00Z", "본문 484", sid)
+    payload["nodes"] = payload["nodes"] * 2
+    with _flaky_logentry(stack, "receipt"):
+        result = _ingest468(stack, **payload)
+    assert result["status"] == "partial" and result["retryable"] is True, result
+    assert result["evidence_node"] == sid + _DERIVED and result["text_ingested"] is True, result
+    assert stack["graph"].get_node("LogEntry", sid) is not None
