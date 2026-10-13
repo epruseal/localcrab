@@ -284,3 +284,85 @@ def test_mcp_enriches_members_and_leaves_caller_metadata_alone():
     assert by_id["u"]["metadata"]["folded_duplicates"] == {
         "count": 7, "members": [{"node_id": "not-a-member"}],
     }
+
+
+# ---------------------------------------------------------------------------
+# #482 follow-up: the rerank cap applies after the policy filter and the
+# fold, so copies of one body cannot use up the capped slots.
+# ---------------------------------------------------------------------------
+
+
+def test_reranker_top_k_none_returns_every_merged_result_in_score_order():
+    from opencrab.ontology.reranker import Reranker
+
+    items = [{"source": "bm25", "node_id": f"n{i:03d}", "score": float(200 - i),
+              "text": f"doc {i}", "metadata": {}} for i in range(200)]
+    full = Reranker().rerank("doc", [items], top_k=None)
+    assert {i["node_id"] for i in full} == {i["node_id"] for i in items}
+    scores = [i["rerank_score"] for i in full]
+    assert scores == sorted(scores, reverse=True)
+    cut = Reranker().rerank("doc", [items], top_k=80)
+    assert [i["node_id"] for i in cut] == [i["node_id"] for i in full[:80]]
+
+
+@pytest.fixture()
+def stack_factory(tmp_path):
+    from opencrab.stores.local_graph_store import LocalGraphStore
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    def build(copies: int, real: int) -> HybridQuery:
+        root = tmp_path / f"s{copies}-{real}"
+        root.mkdir()
+        vec = build_vector_store("sqlite-vec", root)
+        doc = LocalSQLDocStore(str(root / "doc.db"))
+        graph = LocalGraphStore(str(root / "graph.db"))
+        ids = [f"evidence:turn:{i:03d}" for i in range(copies)]
+        ids += [f"evidence:real:{i:03d}" for i in range(real)]
+        # The real documents share words with the copies, so the FTS leg
+        # returns them after the copies.
+        texts = [DUP] * copies + [f"heartbeat reply note {i} about topic{i}" for i in range(real)]
+        metas = [{"pack_id": PACK, "space": "evidence"} for _ in ids]
+        vec.add_texts(texts, metas, ids)
+        for sid, text, meta in zip(ids, texts, metas):
+            doc.upsert_source(sid, text, dict(meta, node_id=sid))
+        hq = HybridQuery(vec, graph)
+        hq._doc_store = doc
+        return hq
+
+    return build
+
+
+@pytest.mark.parametrize(("copies", "real", "limit"), [(50, 10, 10), (90, 20, 20)])
+def test_copies_beyond_the_rerank_cap_do_not_shrink_the_result(stack_factory, copies, real, limit):
+    # rerank_limit is smaller than the copy count, so a cut before the fold
+    # leaves only the copies and the fold reduces them to one result.
+    hq = stack_factory(copies, real)
+    assert query_mod._profile_for_query(DUP, limit, 1).rerank_limit < copies
+    out = hq.query(DUP, pack_ids=[PACK], spaces=["evidence"], limit=limit, use_rerank=True)
+    texts = [r.text for r in out]
+    assert len(out) == limit, texts
+    assert texts.count(DUP) == 1
+    assert sum(1 for r in out if r.node_id.startswith("evidence:real:")) == limit - 1
+
+
+def test_policy_filter_sees_candidates_beyond_the_rerank_cap():
+    limit = 5
+    cap = query_mod._profile_for_query("question", limit, 1).rerank_limit
+    vector = [_vec(f"s{i:02d}", "S", 1.0 - i / 100) for i in range(cap + 5)]
+    hq = _hq_with_legs(vector=vector)
+    allowed = vector[-1]["node_id"]
+    hq._rebac = MagicMock()
+    hq._rebac.check = lambda subject_id, permission, resource_id: SimpleNamespace(
+        granted=resource_id == allowed
+    )
+    out = hq.query("question", pack_ids=[PACK], use_rerank=True, limit=limit, subject_id="u1")
+    assert [r.node_id for r in out] == [allowed]
+
+
+def test_rerank_path_keeps_its_result_cap():
+    limit = 100
+    cap = query_mod._profile_for_query("question", limit, 1).rerank_limit
+    assert cap < limit
+    bm25 = [_bm(f"b{i:03d}", f"distinct {i}", float(200 - i)) for i in range(cap + 40)]
+    out = _hq_with_legs(bm25=bm25).query("question", pack_ids=[PACK], use_rerank=True, limit=limit)
+    assert len(out) == cap

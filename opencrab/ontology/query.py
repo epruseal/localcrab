@@ -853,8 +853,12 @@ class HybridQuery:
         # --- Stage 4: Rerank ---
         if use_rerank and result_lists:
             reranker = _get_reranker()()
-            merged = reranker.rerank(question, result_lists, top_k=profile.rerank_limit)
+            # #482: no cut here. The rerank cap applies after the policy
+            # filter and the fold below, so it counts folded results.
+            merged = reranker.rerank(question, result_lists, top_k=None)
+            rerank_cap: int | None = profile.rerank_limit
         else:
+            rerank_cap = None
             # Flat merge without reranking. #61: each leg's raw score comes
             # from a different scale (vector similarity, BM25, FTS5 rank,
             # graph edge weight), so sorting the concatenated lists by raw
@@ -906,6 +910,8 @@ class HybridQuery:
         # ReBAC engine are set), every folded member already passed it.
         # Contract: docs/ARCHITECTURE.md, "질의 결과의 동일 본문 접기".
         merged = _fold_identical_bodies(merged)
+        if rerank_cap is not None:
+            merged = merged[:rerank_cap]
 
         def to_result(item: dict[str, Any]) -> QueryResult:
             metadata = dict(item.get("metadata") or {})
