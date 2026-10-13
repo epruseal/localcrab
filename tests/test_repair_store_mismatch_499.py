@@ -1,0 +1,656 @@
+"""scripts/repair_store_mismatch_499.py (#499).
+
+Every store is a real LocalGraphStore, LocalSQLDocStore, SQLStore (sqlite)
+and SqliteVecStore under a pytest tmp_path, with a deterministic embedding
+function. The live data directory is never opened.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+
+import repair_store_mismatch_499 as rp  # noqa: E402
+
+from tests._vec_helpers import MockEF  # noqa: E402
+
+COLL = "vectors_kure"
+DIM = 32
+OLD = "2020-01-01T00:00:00+00:00"
+DB_FILES = ("graph.db", "doc_store.db", "vectors.db", "opencrab.db")
+PK_INPUT = ["ctl1", "p1a", "p1b", "p2a", "p2b", "p3a", "pp", "x6", "x7", "z8", "z8b"]
+P3_CONTROLS = ("x6", "x7", "z8", "z8b")
+
+
+def _open_stores(root: Path) -> rp.Stores:
+    from opencrab.stores.local_graph_store import LocalGraphStore
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+    from opencrab.stores.sql_store import SQLStore
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+    return rp.Stores(
+        LocalGraphStore(str(root / "graph.db")),
+        LocalSQLDocStore(str(root / "doc_store.db")),
+        SQLStore(f"sqlite:///{root / 'opencrab.db'}"),
+        SqliteVecStore(db_path=str(root / "vectors.db"), embedding_function=MockEF(DIM), dim=DIM,
+                       collection_name=COLL),
+    )
+
+
+def _close(stores: rp.Stores) -> None:
+    for s in (stores.graph, stores.docs, stores.vec):
+        s.close()
+    stores.sql.close()
+
+
+def _exec(path: Path, *statements: tuple) -> None:
+    """Run statements in one committed transaction and close the connection
+    (a leaked connection would delete the -wal and -shm files at a random
+    later time)."""
+    c = sqlite3.connect(path)
+    try:
+        with c:
+            for st in statements:
+                c.execute(*st)
+    finally:
+        c.close()
+
+
+def _checkpoint(root: Path) -> None:
+    for name in DB_FILES:
+        c = sqlite3.connect(root / name)
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+
+
+class World:
+    """Ids of every class plus controls, in one pack input root.
+
+    Pack ``pk`` has an input file that covers its live graph. Pack ``pk2``
+    has an input that misses a live graph node. Pack ``nopack`` has no input.
+    """
+
+    def __init__(self, tmp: Path) -> None:
+        self.root = tmp / "data"
+        self.root.mkdir()
+        self.inputs = tmp / "inputs"
+        s = _open_stores(self.root)
+        g, d, q, v = s.graph, s.docs, s.sql, s.vec
+
+        def node(space, gtype, dtype, nid, props, *, graph=True, doc=True, reg=None, vec=True):
+            props = {"pack_id": "pk", **props}
+            if graph:
+                g.upsert_node(gtype, nid, props, space)
+            if doc:
+                d.upsert_node_doc(space, dtype, nid, props)
+            q.register_node(space, reg or dtype, nid)
+            if vec:
+                v.upsert_texts(texts=[f"{nid} {dtype} text"], ids=[nid],
+                               metadatas=[{"pack_id": props["pack_id"], "source": props["pack_id"],
+                                           "node_id": nid, "space": space}])
+
+        # controls
+        node("concept", "Concept", "Concept", "ctl1", {"name": "control"})
+        # P1: graph type invalid in the space, doc type valid
+        node("evidence", "TextEvidence", "Evidence", "p1a", {"text": "a", "original_type": "TextEvidence"})
+        node("evidence", "TextEvidence", "Evidence", "p1b", {"text": "b"})
+        g.upsert_edge("TextEvidence", "p1a", "supports", "Concept", "ctl1", {})
+        # P2: graph LogEntry, doc TextUnit with other properties
+        for nid in ("p2a", "p2b"):
+            g.upsert_node("LogEntry", nid, {"pack_id": "pk", "session_id": nid, "project": "x"}, "evidence")
+            d.upsert_node_doc("evidence", "TextUnit", nid, {"pack_id": "pk", "text": "old body"})
+            q.register_node("evidence", "TextUnit", nid)
+            v.upsert_texts(texts=[f"{nid} TextUnit old body"], ids=[nid],
+                           metadatas=[{"pack_id": "pk", "source": "pk", "node_id": nid, "space": "evidence"}])
+        # P3: both valid
+        node("concept", "Entity", "Concept", "p3a", {"name": "e"})
+        # P3 boundary controls: graph LogEntry with a doc type other than
+        # TextUnit (not P2), and both types invalid (not P1)
+        node("evidence", "LogEntry", "Evidence", "x6", {"text": "keep me"})
+        node("evidence", "TextEvidence", "BogusDoc", "x7", {"text": "keep me too"})
+        # P3 boundary controls for the "one doc row, in the graph space" rule:
+        # two doc rows (not P1), and one TextUnit row outside the graph space (not P2)
+        node("evidence", "TextEvidence", "Evidence", "z8", {"text": "two rows"})
+        d.upsert_node_doc("concept", "Concept", "z8", {"pack_id": "pk", "text": "second row"})
+        g.upsert_node("LogEntry", "z8b", {"pack_id": "pk", "session_id": "z8b"}, "evidence")
+        d.upsert_node_doc("concept", "TextUnit", "z8b", {"pack_id": "pk", "text": "other space"})
+        q.register_node("concept", "TextUnit", "z8b")
+        v.upsert_texts(texts=["z8b TextUnit other space"], ids=["z8b"],
+                       metadatas=[{"pack_id": "pk", "source": "pk", "node_id": "z8b", "space": "concept"}])
+        # P4 delete proposals (absent from the covering input, older than the reload)
+        node("concept", None, "Concept", "d1", {"name": "d1"}, graph=False, vec=False)
+        node("concept", None, "Concept", "d2", {"name": "d2"}, graph=False, vec=False)
+        q.register_edge("concept", "d1", "rel", "concept", "d2")      # shared by two deletes
+        q.register_edge("concept", "d2", "rel", "concept", "h1")      # shared with a hold row
+        # P4 hold rows
+        node("concept", None, "Concept", "h1", {"pack_id": "nopack", "name": "h1"}, graph=False, vec=False)
+        node("concept", None, "Concept", "n1", {"name": "newer"}, graph=False, vec=False)
+        node("concept", None, "Concept", "dd", {"name": "two rows"}, graph=False, vec=False)
+        d.upsert_node_doc("evidence", "Evidence", "dd", {"pack_id": "pk", "text": "second space"})
+        # P4 present in the covering input with the same space and type: promote evidence only
+        node("concept", None, "Concept", "pp", {"name": "pp"}, graph=False, vec=False)
+        # P4 rows that would qualify but have a graph edge or a vector row
+        node("concept", None, "Concept", "e1", {"name": "e1"}, graph=False, vec=False)
+        node("concept", None, "Concept", "v1", {"name": "v1"}, graph=False, vec=True)
+        # pack pk2: input misses a live graph node
+        g.upsert_node("Concept", "g2", {"pack_id": "pk2"}, "concept")
+        d.upsert_node_doc("concept", "Concept", "g2", {"pack_id": "pk2"})
+        d.upsert_node_doc("concept", "Concept", "c1", {"pack_id": "pk2", "name": "c1"})
+        _close(s)
+
+        _exec(self.root / "doc_store.db",
+              ("UPDATE doc_nodes SET updated_at=? WHERE node_id IN ('d1','d2','dd','h1','c1','e1','v1')", (OLD,)))
+        _exec(self.root / "graph.db",
+              ("INSERT INTO graph_edges (from_type, from_id, relation, to_type, to_id, properties) "
+               "VALUES ('Concept','ctl1','rel','Concept','e1','{\"from_id\":\"ctl1\",\"relation\":\"rel\",\"to_id\":\"e1\"}')",))
+        _checkpoint(self.root)
+        self.write_input("pk", PK_INPUT)
+        self.write_input("pk2", ["other"])
+
+    def write_input(self, pack: str, ids: list[str]) -> None:
+        p = self.inputs / pack
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "nodes.jsonl").write_text(
+            "".join(json.dumps({"id": i, "space": "concept", "node_type": "Concept"}) + "\n" for i in ids),
+            encoding="utf-8")
+
+    # --- helpers -------------------------------------------------------
+    def stores(self) -> rp.Stores:
+        return _open_stores(self.root)
+
+    def dry(self, run: str = "dry") -> Path:
+        rd = self.root.parent / run
+        rp.dry_run(self.root, rd, self.inputs, COLL)
+        return rd
+
+    def apply(self, run: str, approved: Path | None = None, **kw) -> object:
+        opened: list[rp.Stores] = []
+
+        def factory() -> rp.Stores:
+            opened.append(self.stores())
+            return opened[-1]
+
+        try:
+            return rp.apply(self.root, self.root.parent / run, self.inputs, approved,
+                            stores_factory=factory, vector_table=COLL, **kw)
+        finally:
+            for s in opened:
+                _close(s)
+
+    def proposed(self, run: str = "dry") -> Path:
+        return self.root.parent / run / "proposed-approval.jsonl"
+
+    def q(self, db: str, sql: str, params: tuple = ()) -> list:
+        c = sqlite3.connect(self.root / db)
+        try:
+            return c.execute(sql, params).fetchall()
+        finally:
+            c.close()
+
+    def file_state(self) -> dict:
+        out = {}
+        for name in DB_FILES:
+            for suf in ("", "-wal", "-shm"):
+                p = self.root / f"{name}{suf}"
+                out[p.name] = hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+        return out
+
+    def dump(self) -> dict:
+        out = {}
+        for name in DB_FILES:
+            c = sqlite3.connect(self.root / name)
+            for (t, sql) in c.execute("SELECT name, sql FROM sqlite_master WHERE type='table'"):
+                if t.startswith("sqlite_") or (sql or "").upper().startswith("CREATE VIRTUAL"):
+                    continue
+                out[f"{name}:{t}"] = sorted(map(repr, c.execute(f'SELECT * FROM "{t}"')))
+            c.close()
+        return out
+
+    def vector_doc(self, nid: str) -> str | None:
+        import sqlite_vec
+
+        c = sqlite3.connect(self.root / "vectors.db")
+        c.enable_load_extension(True)
+        sqlite_vec.load(c)
+        try:
+            r = c.execute(f"SELECT document FROM {COLL} WHERE node_id=?", (nid,)).fetchone()
+            return r[0] if r else None
+        finally:
+            c.close()
+
+
+def _progress(run: Path) -> list[dict]:
+    return [json.loads(x) for x in (run / "progress.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.fixture
+def world(tmp_path: Path) -> World:
+    return World(tmp_path)
+
+
+def _no_scan(_d: Path) -> tuple[list[int], int]:
+    return [], 0
+
+
+# --- T1, T9 ----------------------------------------------------------------
+
+
+def test_t1_dry_run_classes_proposals_and_no_file_change(world, monkeypatch):
+    from opencrab.stores import local_graph_store, local_sql_doc_store, sql_store, sqlite_vec_store
+
+    def boom(*a, **k):
+        raise AssertionError("dry run must not construct a store class")
+
+    for mod, cls in ((local_graph_store, "LocalGraphStore"), (local_sql_doc_store, "LocalSQLDocStore"),
+                     (sql_store, "SQLStore"), (sqlite_vec_store, "SqliteVecStore")):
+        monkeypatch.setattr(getattr(mod, cls), "__init__", boom)
+    before = world.file_state()
+    rd = world.dry()
+    assert world.file_state() == before
+    cands = {r["node_id"]: r for r in map(json.loads, (rd / "candidates.jsonl").read_text().splitlines())}
+    classes = {k: v["class"] for k, v in cands.items()}
+    assert classes == {"p1a": "P1", "p1b": "P1", "p2a": "P2", "p2b": "P2", "p3a": "P3",
+                       "d1": "P4", "d2": "P4", "h1": "P4", "n1": "P4", "dd": "P4", "c1": "P4",
+                       "pp": "P4", "e1": "P4", "v1": "P4", "x6": "P3", "x7": "P3", "z8": "P3", "z8b": "P3"}
+    # T9: only covered, absent, older, one-row rows get the delete proposal
+    proposed = {json.loads(x)["node_id"] for x in world.proposed().read_text().splitlines()}
+    assert proposed == {"d1", "d2"}
+    assert cands["dd"]["evidence"]["doc_rows"] == 2 and cands["dd"]["proposal"] is None
+    assert cands["c1"]["evidence"]["covers_graph"] is False
+    assert cands["h1"]["evidence"]["input"] is None
+    assert cands["n1"]["evidence"]["older_than_reload"] is False
+    # F1: a graph edge or a vector row keeps a row out of the delete proposal
+    assert cands["e1"]["proposal"] is None and cands["e1"]["evidence"]["graph_edges"] == 1
+    assert cands["v1"]["proposal"] is None and cands["v1"]["evidence"]["vector"] is True
+    # F5: promote evidence stays in the summary, not in the proposed approval file
+    assert cands["pp"]["proposal"] == "promote"
+    summary = json.loads((rd / "summary.json").read_text())
+    assert summary["by_class"] == {"P1": 2, "P2": 2, "P3": 5, "P4": 9}
+    assert {"node_id": "pp", "proposal": "promote"}.items() <= next(
+        p for p in summary["p4"] if p["node_id"] == "pp").items()
+    assert sorted(p["node_id"] for p in summary["p3"]) == ["p3a", "x6", "x7", "z8", "z8b"]
+
+
+def test_t1_non_empty_wal_refuses(world):
+    (world.root / "graph.db-wal").write_bytes(b"x" * 64)
+    with pytest.raises(rp.RepairRefusedError, match="not empty"):
+        world.dry()
+
+
+# --- T2, T3, T11 -----------------------------------------------------------
+
+
+def _p3_control_rows(world: World) -> dict:
+    """Every row of the P3 boundary controls in the four stores."""
+    ids = "','".join(P3_CONTROLS)
+    return {
+        "graph": world.q("graph.db", f"SELECT * FROM graph_nodes WHERE node_id IN ('{ids}') ORDER BY node_id"),
+        "docs": world.q("doc_store.db", f"SELECT * FROM doc_nodes WHERE node_id IN ('{ids}') ORDER BY node_id, space"),
+        "registry": world.q("opencrab.db",
+                            f"SELECT * FROM ontology_nodes WHERE node_id IN ('{ids}') ORDER BY node_id, space"),
+        "vectors": [world.vector_doc(i) for i in P3_CONTROLS],
+    }
+
+
+def test_t2_t3_t11_apply_reaches_targets_and_rerun_changes_nothing(world):
+    world.dry()
+    p3_before = _p3_control_rows(world)
+    res = world.apply("run", world.proposed(), scan=rp.holders)
+    assert all(o == "done" for (_, o) in res), res
+    q = world.q
+    # P1: graph type follows the doc; properties and edge type column follow
+    assert q("graph.db", "SELECT node_type FROM graph_nodes WHERE node_id IN ('p1a','p1b') ORDER BY 1") == [
+        ("Evidence",), ("Evidence",)]
+    assert q("graph.db", "SELECT from_type FROM graph_edges WHERE from_id='p1a'") == [("Evidence",)]
+    assert json.loads(q("graph.db", "SELECT properties FROM graph_nodes WHERE node_id='p1a'")[0][0])[
+        "original_type"] == "TextEvidence"
+    # P2: doc, registry and vector take the graph type and properties
+    dt, dp = q("doc_store.db", "SELECT node_type, properties FROM doc_nodes WHERE node_id='p2a'")[0]
+    assert dt == "LogEntry" and json.loads(dp) == {"pack_id": "pk", "session_id": "p2a", "project": "x"}
+    assert q("opencrab.db", "SELECT node_type FROM ontology_nodes WHERE node_id='p2a'") == [("LogEntry",)]
+    assert "LogEntry" in world.vector_doc("p2a")
+    # P4 delete: doc, registry node and registry edge rows gone
+    for nid in ("d1", "d2"):
+        assert q("doc_store.db", "SELECT 1 FROM doc_nodes WHERE node_id=?", (nid,)) == []
+        assert q("opencrab.db", "SELECT 1 FROM ontology_nodes WHERE node_id=?", (nid,)) == []
+    assert q("opencrab.db", "SELECT count(*) FROM ontology_edges") == [(0,)]
+    # untouched: P3, hold rows, controls
+    assert q("graph.db", "SELECT node_type FROM graph_nodes WHERE node_id='p3a'") == [("Entity",)]
+    # P3 boundary controls keep every store as it was
+    assert _p3_control_rows(world) == p3_before
+    assert q("graph.db", "SELECT node_id, node_type FROM graph_nodes WHERE node_id IN ('x6','x7') ORDER BY 1") == [
+        ("x6", "LogEntry"), ("x7", "TextEvidence")]
+    assert [(n, t, json.loads(p)["text"]) for n, t, p in q(
+        "doc_store.db", "SELECT node_id, node_type, properties FROM doc_nodes WHERE node_id IN ('x6','x7') ORDER BY 1")
+    ] == [("x6", "Evidence", "keep me"), ("x7", "BogusDoc", "keep me too")]
+    assert q("opencrab.db", "SELECT node_id, node_type FROM ontology_nodes WHERE node_id IN ('x6','x7') ORDER BY 1") == [
+        ("x6", "Evidence"), ("x7", "BogusDoc")]
+    for nid in ("h1", "n1", "dd", "c1", "ctl1", "pp", "e1", "v1"):
+        assert q("doc_store.db", "SELECT 1 FROM doc_nodes WHERE node_id=?", (nid,)) != []
+    assert q("opencrab.db", "SELECT 1 FROM ontology_nodes WHERE node_id='h1'") == [(1,)]
+    # T11: the shared edge row is deleted once; the other id reads "done (already)"
+    shared = [p for p in _progress(world.root.parent / "run") if p["leg"].startswith("regedge:")
+              and p["node_id"] in ("d1", "d2")]
+    by_key: dict[str, list[str]] = {}
+    for p in shared:
+        by_key.setdefault(p["leg"], []).append(p["outcome"])
+    assert sorted(map(sorted, by_key.values())) == [["done"], ["done", "done (already)"]]
+    # T3: rerun on the same run dir changes no row
+    before = world.dump()
+    n_first = len(_progress(world.root.parent / "run"))
+    res2 = world.apply("run", world.proposed(), scan=rp.holders)
+    assert all(o == "done" for (_, o) in res2), res2
+    assert world.dump() == before
+    second = _progress(world.root.parent / "run")[n_first:]
+    assert second and all(p["outcome"] == "done (already)" for p in second)
+
+
+# --- T4 --------------------------------------------------------------------
+
+
+def test_t4_resume_after_crash_and_after_lost_commit(world, monkeypatch):
+    world.dry()
+    real = rp.execute_leg
+    writes: list[tuple[str, str]] = []
+
+    def crashing(stores, reader, node_id, leg, recorded):
+        if (node_id, leg["op"]) in (("p2a", "vector_upsert"), ("d1", "reg_delete")):
+            raise RuntimeError("injected crash")
+        writes.append((node_id, leg["key"]))
+        return real(stores, reader, node_id, leg, recorded)
+
+    monkeypatch.setattr(rp, "execute_leg", crashing)
+    res = world.apply("run", world.proposed(), scan=_no_scan)
+    assert res[("P2", "error")] == 1 and res[("P4", "error")] >= 1
+    assert world.q("doc_store.db", "SELECT node_type FROM doc_nodes WHERE node_id='p2a'") == [("LogEntry",)]
+
+    def counting(stores, reader, node_id, leg, recorded):
+        writes.append((node_id, leg["key"]))
+        return real(stores, reader, node_id, leg, recorded)
+
+    writes.clear()
+    monkeypatch.setattr(rp, "execute_leg", counting)
+    res = world.apply("run", world.proposed(), scan=_no_scan)
+    assert all(o == "done" for (_, o) in res), res
+    assert ("p2a", "doc:evidence") not in writes and ("p2a", "vector") in writes
+    assert ("d1", "doc:concept") not in writes and ("d1", "reg:concept") in writes
+    assert not any(n in ("p1a", "p1b") for n, _ in writes)
+    # lost commit: one store goes back to the recorded value, a later leg survives
+    _exec(world.root / "opencrab.db", ("UPDATE ontology_nodes SET node_type='TextUnit' WHERE node_id='p2a'",))
+    writes.clear()
+    res = world.apply("run", world.proposed(), scan=_no_scan)
+    assert all(o == "done" for (_, o) in res), res
+    assert writes == [("p2a", "reg:evidence")]
+    assert world.q("opencrab.db", "SELECT node_type FROM ontology_nodes WHERE node_id='p2a'") == [("LogEntry",)]
+
+
+# --- T5 --------------------------------------------------------------------
+
+
+def test_t5_snapshot_check(tmp_path):
+    world = World(tmp_path)
+    rd = world.dry("run")
+    _exec(world.root / "graph.db",
+          ("UPDATE graph_nodes SET properties=json_set(properties,'$.text','changed') WHERE node_id='p1b'",),
+          ("UPDATE graph_nodes SET properties=json_set(properties,'$.project','y') WHERE node_id='p2b'",))
+    _exec(world.root / "doc_store.db",
+          ("UPDATE doc_nodes SET updated_at='2021-01-01T00:00:00+00:00' WHERE node_id='d1'",),
+          ("INSERT INTO doc_nodes (space,node_id,node_type,properties,updated_at) "
+           "VALUES ('concept','p2a','Concept','{}','2021-01-01')",))
+    _exec(world.root / "opencrab.db",
+          ("UPDATE ontology_edges SET relation='changed' WHERE from_id='d2' AND to_id='h1'",))
+    before = world.dump()
+    res = world.apply("run", world.proposed("run"), scan=_no_scan)
+    outcomes = {p["node_id"]: p["outcome"] for p in _progress(rd) if p["outcome"] == "conflict"}
+    assert {"p1b", "p2a", "p2b", "d1", "d2"} <= set(outcomes)
+    assert res[("P1", "done")] == 1  # p1a still runs
+    after = world.dump()
+    for key in ("graph.db:graph_nodes",):
+        changed = {r for r in after[key] if "'p1b'" in r or "'p2b'" in r}
+        assert changed == {r for r in before[key] if "'p1b'" in r or "'p2b'" in r}
+    assert world.q("doc_store.db", "SELECT updated_at FROM doc_nodes WHERE node_id='d1'") == [
+        ("2021-01-01T00:00:00+00:00",)]
+    assert world.q("opencrab.db", "SELECT relation FROM ontology_edges WHERE from_id='d2'") == [("changed",)]
+    assert world.q("doc_store.db", "SELECT node_type FROM doc_nodes WHERE node_id='p2a' ORDER BY space") == [
+        ("Concept",), ("TextUnit",)]
+
+
+# --- T6 --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lines", [
+    [{"node_id": "p3a", "action": "delete"}],
+    [{"node_id": "h1", "action": "delete"}],
+    [{"node_id": "dd", "action": "delete"}],
+    [{"node_id": "d1", "action": "promote"}],
+    [{"node_id": "d1", "action": "delete"}, {"node_id": "d1", "action": "delete"}],
+    [{"node_id": "p1a", "action": "delete"}],
+    [{"node_id": "not-a-candidate", "action": "delete"}],
+])
+def test_t6_approval_refusals_write_nothing(world, lines):
+    world.dry()
+    path = world.root.parent / "approved.jsonl"
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    before = world.dump()
+    with pytest.raises(rp.RepairRefusedError, match="approval line"):
+        world.apply("run", path, scan=_no_scan)
+    assert world.dump() == before
+
+
+# --- T7 --------------------------------------------------------------------
+
+
+def test_t7_guard_refuses_when_another_process_holds_a_file(world):
+    proc = subprocess.Popen([sys.executable, "-c",
+                             "import sys,time; f=open(sys.argv[1],'rb'); print('ok',flush=True); time.sleep(60)",
+                             str(world.root / "graph.db")], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "ok"
+        before = world.dump()
+        with pytest.raises(rp.RepairRefusedError) as exc:
+            world.apply("run", None)
+        assert exc.value.code == rp.EXIT_GUARD
+        assert world.dump() == before
+        code = rp.main(["--local-data-dir", str(world.root), "--run-dir", str(world.root.parent / "g"),
+                        "--pack-input-root", str(world.inputs), "--check-guard"])
+        assert code == rp.EXIT_GUARD
+        world.dry()  # a dry run still works
+    finally:
+        proc.kill()
+        proc.wait()
+    assert rp.main(["--local-data-dir", str(world.root), "--run-dir", str(world.root.parent / "g"),
+                    "--pack-input-root", str(world.inputs), "--check-guard"]) == rp.EXIT_OK
+
+
+# --- T8 --------------------------------------------------------------------
+
+
+def test_t8_graph_node_after_selection_keeps_the_doc_row(world):
+    world.dry()
+    s = world.stores()
+    s.graph.upsert_node("Concept", "d1", {"pack_id": "pk", "name": "d1"}, "concept")
+    _close(s)
+    # resume on the dry-run dir: no new selection, the recorded state applies
+    world.apply("dry", world.proposed(), scan=_no_scan)
+    assert world.q("doc_store.db", "SELECT 1 FROM doc_nodes WHERE node_id='d1'") == [(1,)]
+    assert any(p["node_id"] == "d1" and p["outcome"] == "conflict" for p in _progress(world.root.parent / "dry"))
+
+
+def test_t8_input_change_after_first_p4_write_stops_later_writes(world, monkeypatch):
+    world.dry()
+    real = rp.execute_leg
+    state = {"done": False}
+
+    def changing(stores, reader, node_id, leg, recorded):
+        out = real(stores, reader, node_id, leg, recorded)
+        if leg["op"] == "doc_delete" and not state["done"]:
+            state["done"] = True
+            time.sleep(0.01)
+            world.write_input("pk", [*PK_INPUT, "new"])
+            state["mark"] = len(_progress(world.root.parent / "run"))
+        return out
+
+    monkeypatch.setattr(rp, "execute_leg", changing)
+    world.apply("run", world.proposed(), scan=_no_scan)
+    left = world.q("doc_store.db", "SELECT node_id FROM doc_nodes WHERE node_id IN ('d1','d2')")
+    assert len(left) == 1
+    first = ({"d1", "d2"} - {r[0] for r in left}).pop()
+    # the rest of that id stops too: its registry node row and edge rows stay
+    assert world.q("opencrab.db", "SELECT count(*) FROM ontology_nodes WHERE node_id=?", (first,)) == [(1,)]
+    assert world.q("opencrab.db", "SELECT count(*) FROM ontology_edges WHERE from_id=? OR to_id=?",
+                   (first, first))[0][0] >= 1
+    progress = _progress(world.root.parent / "run")
+    # the line at the mark is the triggering leg's own "done"; nothing of the pack is done after it
+    assert progress[state["mark"]]["outcome"] == "done" and progress[state["mark"]]["node_id"] == first
+    later = [p for p in progress[state["mark"] + 1:] if p["node_id"] in ("d1", "d2")]
+    assert later and all(p["outcome"] != "done" for p in later)
+    assert "pack input file changed" in [p["detail"] for p in later]
+
+
+# --- T10 -------------------------------------------------------------------
+
+
+def test_t10_resume_requires_a_matching_manifest(world):
+    rd = world.dry("run")
+    (rd / "manifest.json").unlink()
+    with pytest.raises(rp.RepairRefusedError, match="without a manifest"):
+        world.apply("run", None, scan=_no_scan)
+    rd2 = world.dry("run2")
+    m = json.loads((rd2 / "manifest.json").read_text())
+    m["candidates_sha256"] = "0" * 64
+    (rd2 / "manifest.json").write_text(json.dumps(m))
+    with pytest.raises(rp.RepairRefusedError, match="does not match"):
+        world.apply("run2", None, scan=_no_scan)
+
+
+def test_t5_graph_cas_rejects_a_write_between_check_and_reclassify(world, monkeypatch):
+    """The CAS on the recorded digest still guards the window after the
+    snapshot check: a type change there makes the reclassify fail."""
+    world.dry()
+    real = rp.execute_leg
+
+    def racing(stores, reader, node_id, leg, recorded):
+        if node_id == "p1a":
+            _exec(world.root / "graph.db", ("UPDATE graph_nodes SET node_type='Quote' WHERE node_id='p1a'",))
+        return real(stores, reader, node_id, leg, recorded)
+
+    monkeypatch.setattr(rp, "execute_leg", racing)
+    world.apply("dry", None, scan=_no_scan)
+    assert world.q("graph.db", "SELECT node_type FROM graph_nodes WHERE node_id='p1a'") == [("Quote",)]
+    assert any(p["node_id"] == "p1a" and p["outcome"] == "error" for p in _progress(world.root.parent / "dry"))
+
+
+# --- fix design 1b: T5b, T8b, T12, T7 schema ---------------------------------
+
+
+def test_t5b_row_in_a_new_space_inside_a_batch_is_seen(world, monkeypatch):
+    world.dry()
+    real = rp.execute_leg
+    state = {"first": None}
+
+    def adding(stores, reader, node_id, leg, recorded):
+        out = real(stores, reader, node_id, leg, recorded)
+        if node_id in ("d1", "d2") and state["first"] is None:
+            state["first"] = node_id
+            other = "d2" if node_id == "d1" else "d1"
+            _exec(world.root / "doc_store.db",
+                  ("INSERT INTO doc_nodes (space,node_id,node_type,properties,updated_at) "
+                   "VALUES ('zzspace',?,'Concept','{}','2021-01-01')", (other,)))
+            state["other"] = other
+        return out
+
+    monkeypatch.setattr(rp, "execute_leg", adding)
+    world.apply("run", world.proposed(), scan=_no_scan, batch=1000)
+    other = state["other"]
+    assert world.q("doc_store.db", "SELECT space FROM doc_nodes WHERE node_id=? ORDER BY space", (other,)) == [
+        ("concept",), ("zzspace",)]
+    assert any(p["node_id"] == other and p["outcome"] == "conflict" for p in _progress(world.root.parent / "run"))
+
+
+def _force_proposal(run: Path, ids: set[str]) -> None:
+    lines = [json.loads(x) for x in (run / "candidates.jsonl").read_text().splitlines()]
+    for r in lines:
+        if r["node_id"] in ids:
+            r["proposal"] = "delete"
+    body = "".join(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in lines).encode()
+    (run / "candidates.jsonl").write_bytes(body)
+    (run / "manifest.json").write_text(json.dumps({"candidates_sha256": hashlib.sha256(body).hexdigest(),
+                                                   "lines": len(lines)}))
+
+
+def test_t8b_rows_with_a_graph_edge_or_a_vector_are_never_deleted(world):
+    rd = world.dry()
+    path = world.root.parent / "approved.jsonl"
+    for nid in ("e1", "v1"):
+        path.write_text(json.dumps({"node_id": nid, "action": "delete"}) + "\n")
+        with pytest.raises(rp.RepairRefusedError, match="delete proposal"):
+            world.apply("dry", path, scan=_no_scan)
+    # even when the candidate file says "delete", the fixed invariant refuses
+    _force_proposal(rd, {"e1", "v1"})
+    path.write_text("".join(json.dumps({"node_id": n, "action": "delete"}) + "\n" for n in ("e1", "v1")))
+    res = world.apply("dry", path, scan=_no_scan)
+    assert res[("P4", "conflict")] == 2
+    for nid in ("e1", "v1"):
+        assert world.q("doc_store.db", "SELECT 1 FROM doc_nodes WHERE node_id=?", (nid,)) == [(1,)]
+        assert world.q("opencrab.db", "SELECT 1 FROM ontology_nodes WHERE node_id=?", (nid,)) == [(1,)]
+
+
+@pytest.mark.parametrize("env", [{"VECTOR_BACKEND": "chroma"}, {"VECTOR_DB_FILE": "other-vectors.db"}])
+def test_t12_vector_settings_are_checked_before_any_store_exists(world, monkeypatch, env):
+    from opencrab.config import Settings
+    from opencrab.stores import local_graph_store, local_sql_doc_store, sql_store, sqlite_vec_store
+
+    def boom(*a, **k):
+        raise AssertionError("a store constructor ran before the settings check")
+
+    for mod, cls in ((local_graph_store, "LocalGraphStore"), (local_sql_doc_store, "LocalSQLDocStore"),
+                     (sql_store, "SQLStore"), (sqlite_vec_store, "SqliteVecStore")):
+        monkeypatch.setattr(getattr(mod, cls), "__init__", boom)
+    settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(world.root), EMBEDDING_BACKEND="openai",
+                        **{"VECTOR_BACKEND": "sqlite-vec", **env})
+    with pytest.raises(rp.RepairRefusedError):
+        rp.build_stores(world.root, settings)
+    assert not (world.root / "other-vectors.db").exists()
+
+
+def test_t7_check_guard_refuses_a_graph_without_the_target_schema(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    sqlite3.connect(data / "graph.db").close()
+    code = rp.main(["--local-data-dir", str(data), "--run-dir", str(tmp_path / "g"),
+                    "--pack-input-root", str(tmp_path), "--check-guard"])
+    assert code == rp.EXIT_GUARD
+
+
+# --- exec channel round 1: approval gate (E1, E2) ----------------------------
+
+
+@pytest.mark.parametrize("approved_ids", [[], ["d1"]])
+def test_t6b_rows_without_an_approval_line_are_not_written(world, approved_ids):
+    """Without a line in the approval file a P4 row keeps every row: no
+    approval file at all, and a partial approval (d1 only)."""
+    world.dry()
+    path = None
+    if approved_ids:
+        path = world.root.parent / "approved.jsonl"
+        path.write_text("".join(json.dumps({"node_id": n, "action": "delete"}) + "\n" for n in approved_ids))
+    edges_before = world.q("opencrab.db", "SELECT from_id, to_id FROM ontology_edges ORDER BY 1, 2")
+    world.apply("run", path, scan=_no_scan)
+    for nid in {"d1", "d2"} - set(approved_ids):
+        assert world.q("doc_store.db", "SELECT 1 FROM doc_nodes WHERE node_id=?", (nid,)) == [(1,)]
+        assert world.q("opencrab.db", "SELECT 1 FROM ontology_nodes WHERE node_id=?", (nid,)) == [(1,)]
+        assert not [p for p in _progress(world.root.parent / "run") if p["node_id"] == nid]
+    if not approved_ids:
+        assert world.q("opencrab.db", "SELECT from_id, to_id FROM ontology_edges ORDER BY 1, 2") == edges_before
+    else:
+        # d2's own edge to the hold row h1 stays; only the row shared with d1 goes
+        assert world.q("opencrab.db", "SELECT from_id, to_id FROM ontology_edges ORDER BY 1, 2") == [("d2", "h1")]
