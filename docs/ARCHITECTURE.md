@@ -888,8 +888,9 @@ docstring은 이 절을 가리킨다.
   호출자는 이 값으로 접기 블록과 호출자가 쓴 같은 이름의 metadata 값을 구별한다.
 - 효과의 범위: 접기는 후보를 더 조회하지 않는다. 결과는 각 leg가 가져온 후보에서만
   나온다. 같은 본문이 어느 leg의 후보 상한을 채우면 그 leg는 상한 밖의 다른 본문을
-  가져오지 않는다. 결과 수의 상한은 limit과, rerank 경로에서는 `rerank_limit`이다.
-  어느 상한이 걸리는지는 `HybridQuery.query`와 `_profile_for_query`가 정한다.
+  가져오지 않는다. limit이 0 이상이면 결과 수는 limit을 넘지 않는다. rerank 경로의 결과 수는
+  `rerank_limit`도 넘지 않는다. 어느 상한이 걸리는지는 `HybridQuery.query`와
+  `_profile_for_query`가 정한다.
 
 ### 응답 호환성
 

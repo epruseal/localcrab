@@ -288,7 +288,9 @@ def test_mcp_enriches_members_and_leaves_caller_metadata_alone():
 
 # ---------------------------------------------------------------------------
 # #482 follow-up: the rerank cap applies after the policy filter and the
-# fold, so copies of one body cannot use up the capped slots.
+# fold, so copies in a group that the fold folds cannot use up the capped
+# slots. A group that the fold leaves unfolded (see the metadata exception
+# in docs/ARCHITECTURE.md section 10) still takes one slot per copy.
 # ---------------------------------------------------------------------------
 
 
