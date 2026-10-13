@@ -9,20 +9,21 @@ services stopped; the guard refuses otherwise.
 Classes (selection):
 
 - P1: one doc row in the graph space; the graph type fails the grammar in that
-  space and the doc type passes. The graph node is reclassified to the doc
-  type (properties and space stay). Runs without approval.
+  space and the doc type passes. The tool reclassifies the graph node to the
+  doc type (properties and space stay). Runs without approval.
 - P2: one doc row in the graph space; graph ``LogEntry``, doc ``TextUnit``.
-  The graph wins: doc row, registry row and vector are rewritten from the
-  graph. Runs without approval.
+  The graph wins: the tool rewrites the doc row, registry row and vector
+  from the graph. Runs without approval.
 - P3: every other type mismatch. Report only: the summary lists metadata per
   id for a later decision. The tool has no write path for P3.
 - P4: every doc row without a graph node. The dry run compares each row with
   its pack input (``<pack input root>/<pack_id>/nodes.jsonl``) and proposes
-  ``delete`` only when all of these hold: the id has one doc row; the input
-  holds every graph node of the pack except its anchor; the id is absent
-  from the input; the row is older than every in-input doc row of the pack.
-  The tool does not decide: only rows with that proposal AND a line in the
-  approval file are deleted. The other P4 rows ("hold") are report only.
+  ``delete`` only when all of these hold: the id has one doc row, no graph
+  edge and no vector row; the input holds every graph node of the pack except
+  its anchor; the id is absent from the input; the row is older than every
+  in-input doc row of the pack. The tool does not decide: it deletes only rows
+  with that proposal AND a line in the approval file. The other P4 rows
+  ("hold") are report only.
 
 State model: the candidate file records, per id, a snapshot of every store
 component (as digests, no property values) and the target of each planned
@@ -234,16 +235,22 @@ class Reader:
         self.vector_table = vector_table
         self.refresh_spaces()
 
+    def _distinct(self, table: str, column: str) -> list[str]:
+        """Distinct values of the leading column of a unique index, one index
+        probe per value (loose index scan). The doc and registry tables have
+        no ``node_id`` index; their unique keys lead with the space, so a
+        lookup by (space IN all, node_id) needs the current space list."""
+        sql = (
+            f"WITH RECURSIVE s(x) AS (SELECT min({column}) FROM {table} "
+            f"UNION ALL SELECT (SELECT min({column}) FROM {table} WHERE {column} > s.x) "
+            f"FROM s WHERE s.x IS NOT NULL) SELECT x FROM s WHERE x IS NOT NULL"
+        )
+        return [r[0] for r in self.conn.execute(sql)]
+
     def refresh_spaces(self) -> None:
-        # The doc and registry tables have no node_id index; their unique
-        # keys lead with the space, so a lookup by (space IN all, node_id)
-        # uses the index. The space set is read again per batch.
-        doc = {r[0] for r in self.conn.execute("SELECT DISTINCT space FROM doc_nodes")}
-        reg = {r[0] for r in self.conn.execute("SELECT DISTINCT space FROM o.ontology_nodes")}
-        reg_e = {r[0] for r in self.conn.execute("SELECT DISTINCT from_space FROM o.ontology_edges")}
-        self.doc_spaces = sorted(doc)
-        self.reg_spaces = sorted(reg)
-        self.reg_edge_spaces = sorted(reg_e)
+        self.doc_spaces = self._distinct("doc_nodes", "space")
+        self.reg_spaces = self._distinct("o.ontology_nodes", "space")
+        self.reg_edge_spaces = self._distinct("o.ontology_edges", "from_space")
 
     @staticmethod
     def _in(values: list[str]) -> str:
@@ -262,6 +269,16 @@ class Reader:
         ).fetchall()
 
     def snapshot(self, node_id: str, *, with_reg_edges: bool) -> dict[str, Any]:
+        """Every component of one id, read in one read transaction with the
+        space lists read again, so a row in a new space is seen."""
+        self.conn.execute("BEGIN")
+        try:
+            self.refresh_spaces()
+            return self._snapshot(node_id, with_reg_edges=with_reg_edges)
+        finally:
+            self.conn.execute("COMMIT")
+
+    def _snapshot(self, node_id: str, *, with_reg_edges: bool) -> dict[str, Any]:
         c = self.conn
         snap: dict[str, Any] = {}
         g = self.graph_row(node_id)
@@ -464,10 +481,11 @@ class PackInputs:
         return info
 
 
-def p4_proposal(node_id: str, rows: dict[str, tuple], inputs: PackInputs) -> tuple[str | None, dict[str, Any]]:
+def p4_proposal(node_id: str, rows: dict[str, tuple], inputs: PackInputs,
+                snap_edges: int = 0, has_vector: bool = False) -> tuple[str | None, dict[str, Any]]:
     from opencrab.pack.normalize import transform_node
 
-    evidence: dict[str, Any] = {"doc_rows": len(rows)}
+    evidence: dict[str, Any] = {"doc_rows": len(rows), "graph_edges": snap_edges, "vector": has_vector}
     if len(rows) != 1:
         return None, evidence
     (space, (_, node_type, raw, updated)), = rows.items()
@@ -481,6 +499,8 @@ def p4_proposal(node_id: str, rows: dict[str, tuple], inputs: PackInputs) -> tup
                      "input": info["input"], "covers_graph": info["covers_graph"],
                      "in_input_min_updated": info["in_input_min_updated"]})
     if info["input"] is None or not info["covers_graph"]:
+        return None, evidence
+    if snap_edges or has_vector:
         return None, evidence
     in_input = node_id in info["rows"]
     evidence["in_input"] = in_input
@@ -528,7 +548,7 @@ def select(reader: Reader, inputs: PackInputs) -> list[dict[str, Any]]:
     for (node_id,) in c.execute(DOC_ONLY_SQL).fetchall():
         rows = {r[0]: r for r in reader.doc_rows(node_id)}
         snap = reader.snapshot(node_id, with_reg_edges=True)
-        proposal, evidence = p4_proposal(node_id, rows, inputs)
+        proposal, evidence = p4_proposal(node_id, rows, inputs, snap["graph_edges"], "vector" in snap)
         out.append({"node_id": node_id, "class": P4, "recorded": snap, "legs": plan_p4_delete(snap),
                     "proposal": proposal, "evidence": evidence})
     return out
@@ -731,6 +751,21 @@ def _lock_holders(inodes: set[tuple[int, int, int]], me: int) -> set[int]:
     return out
 
 
+def graph_schema_state_ro(data_dir: Path) -> str:
+    """The graph schema state, read on a ``mode=ro`` connection with the
+    store's own classification (it uses no instance state, writes nothing)."""
+    from opencrab.stores.local_graph_store import LocalGraphStore
+
+    path = data_dir / "graph.db"
+    if not path.is_file():
+        return "missing"
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        return LocalGraphStore._classify_schema(None, conn)
+    finally:
+        conn.close()
+
+
 def check_holders(data_dir: Path, scan: Callable[[Path], tuple[list[int], int]] = holders) -> None:
     found, _ = scan(data_dir)
     if found:
@@ -757,6 +792,11 @@ def build_stores(data_dir: Path, settings: Any) -> Stores:
     from opencrab.stores.sql_store import SQLStore
     from opencrab.stores.sqlite_vec_store import SqliteVecStore
 
+    # Checked before any constructor runs: the vector store constructor runs DDL.
+    if settings.vector_backend_resolved != "sqlite-vec" or settings.embedding_backend != "openai":
+        raise RepairRefusedError("the vector backend must be sqlite-vec (VECTOR_BACKEND, EMBEDDING_BACKEND)")
+    if (Path(settings.local_data_dir) / settings.vector_db_file).resolve() != (data_dir / "vectors.db").resolve():
+        raise RepairRefusedError("the vector store does not use <data dir>/vectors.db")
     vec = make_vector_store(settings)
     if not isinstance(vec, SqliteVecStore):
         raise RepairRefusedError("the vector backend must be sqlite-vec (VECTOR_BACKEND, EMBEDDING_BACKEND)")
@@ -830,6 +870,18 @@ def _registry_delete(stores: Stores, sql: str, params: dict[str, Any]) -> None:
         conn.execute(text(sql), params)
 
 
+def p4_invariant(snap: dict[str, Any]) -> str | None:
+    """A P4 delete needs no graph node, no graph edge and no vector row of the
+    id, whatever the candidate recorded."""
+    if snap.get("graph") is not None:
+        return "a graph node exists"
+    if snap.get("graph_edges"):
+        return "a graph edge names the id"
+    if "vector" in snap:
+        return "a vector row exists"
+    return None
+
+
 def run_id(stores: Stores, reader: Reader, rec: dict[str, Any], legs: list[dict[str, Any]],
            progress: Progress, before_write: Callable[[], str | None] = lambda: None) -> str:
     """Bring one id to its targets. Returns ``done``, ``conflict`` or ``error``.
@@ -842,6 +894,11 @@ def run_id(stores: Stores, reader: Reader, rec: dict[str, Any], legs: list[dict[
     with_edges = rec["class"] == P4
     for leg in legs:
         snap = reader.snapshot(node_id, with_reg_edges=with_edges)
+        if rec["class"] == P4:
+            broken = p4_invariant(snap)
+            if broken is not None:
+                progress.write(node_id, leg["key"], "conflict", broken)
+                return "conflict"
         bad = check_snapshot(snap, recorded, targets)
         if bad is not None:
             progress.write(node_id, leg["key"], "conflict", f"component {bad} changed")
@@ -890,7 +947,6 @@ def apply_candidates(stores: Stores, reader: Reader, cands: list[dict[str, Any]]
     for n, rec in enumerate(order):
         if n % max(1, batch) == 0:
             between_batches()
-            reader.refresh_spaces()
         check = (lambda r=rec: None if _p4_input_unchanged(r, input_root) else "pack input file changed") \
             if rec["class"] == P4 else (lambda: None)
         results[(rec["class"], run_id(stores, reader, rec, rec["legs"], progress, check))] += 1
@@ -918,7 +974,7 @@ def dry_run(data_dir: Path, run_dir: Path, input_root: Path, vector_table: str) 
     _publish(run_dir / "summary.json", json.dumps(summary, ensure_ascii=False, indent=1, sort_keys=True).encode("utf-8"))
     proposed = "".join(
         json.dumps({"node_id": r["node_id"], "action": r["proposal"]}, ensure_ascii=False) + "\n"
-        for r in cands if r["class"] == P4 and r.get("proposal"))
+        for r in cands if r["class"] == P4 and r.get("proposal") == "delete")
     _publish(run_dir / "proposed-approval.jsonl", proposed.encode("utf-8"))
     return summary
 
@@ -987,8 +1043,9 @@ def main(argv: list[str] | None = None) -> int:
 
             with write_lock(str(data_dir), timeout=10.0, purpose="repair_store_mismatch_499 check"):
                 found, foreign = holders(data_dir)
-            print(json.dumps({"holders": found, "fd_tables_not_readable": foreign}))
-            return EXIT_GUARD if found else EXIT_OK
+                state = graph_schema_state_ro(data_dir)
+            print(json.dumps({"holders": found, "fd_tables_not_readable": foreign, "graph_schema": state}))
+            return EXIT_GUARD if found or state != "target" else EXIT_OK
         if not args.apply:
             summary = dry_run(data_dir, run_dir, input_root, vector_table)
             print(json.dumps({"by_class": summary["by_class"], "p4_proposals": summary["p4_proposals"]}))

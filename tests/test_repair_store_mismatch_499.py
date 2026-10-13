@@ -27,6 +27,7 @@ COLL = "vectors_kure"
 DIM = 32
 OLD = "2020-01-01T00:00:00+00:00"
 DB_FILES = ("graph.db", "doc_store.db", "vectors.db", "opencrab.db")
+PK_INPUT = ["ctl1", "p1a", "p1b", "p2a", "p2b", "p3a", "pp"]
 
 
 def _open_stores(root: Path) -> rp.Stores:
@@ -121,6 +122,11 @@ class World:
         node("concept", None, "Concept", "n1", {"name": "newer"}, graph=False, vec=False)
         node("concept", None, "Concept", "dd", {"name": "two rows"}, graph=False, vec=False)
         d.upsert_node_doc("evidence", "Evidence", "dd", {"pack_id": "pk", "text": "second space"})
+        # P4 present in the covering input with the same space and type: promote evidence only
+        node("concept", None, "Concept", "pp", {"name": "pp"}, graph=False, vec=False)
+        # P4 rows that would qualify but have a graph edge or a vector row
+        node("concept", None, "Concept", "e1", {"name": "e1"}, graph=False, vec=False)
+        node("concept", None, "Concept", "v1", {"name": "v1"}, graph=False, vec=True)
         # pack pk2: input misses a live graph node
         g.upsert_node("Concept", "g2", {"pack_id": "pk2"}, "concept")
         d.upsert_node_doc("concept", "Concept", "g2", {"pack_id": "pk2"})
@@ -128,9 +134,12 @@ class World:
         _close(s)
 
         _exec(self.root / "doc_store.db",
-              ("UPDATE doc_nodes SET updated_at=? WHERE node_id IN ('d1','d2','dd','h1','c1')", (OLD,)))
+              ("UPDATE doc_nodes SET updated_at=? WHERE node_id IN ('d1','d2','dd','h1','c1','e1','v1')", (OLD,)))
+        _exec(self.root / "graph.db",
+              ("INSERT INTO graph_edges (from_type, from_id, relation, to_type, to_id, properties) "
+               "VALUES ('Concept','ctl1','rel','Concept','e1','{\"from_id\":\"ctl1\",\"relation\":\"rel\",\"to_id\":\"e1\"}')",))
         _checkpoint(self.root)
-        self.write_input("pk", ["ctl1", "p1a", "p1b", "p2a", "p2b", "p3a"])
+        self.write_input("pk", PK_INPUT)
         self.write_input("pk2", ["other"])
 
     def write_input(self, pack: str, ids: list[str]) -> None:
@@ -236,7 +245,8 @@ def test_t1_dry_run_classes_proposals_and_no_file_change(world, monkeypatch):
     cands = {r["node_id"]: r for r in map(json.loads, (rd / "candidates.jsonl").read_text().splitlines())}
     classes = {k: v["class"] for k, v in cands.items()}
     assert classes == {"p1a": "P1", "p1b": "P1", "p2a": "P2", "p2b": "P2", "p3a": "P3",
-                       "d1": "P4", "d2": "P4", "h1": "P4", "n1": "P4", "dd": "P4", "c1": "P4"}
+                       "d1": "P4", "d2": "P4", "h1": "P4", "n1": "P4", "dd": "P4", "c1": "P4",
+                       "pp": "P4", "e1": "P4", "v1": "P4"}
     # T9: only covered, absent, older, one-row rows get the delete proposal
     proposed = {json.loads(x)["node_id"] for x in world.proposed().read_text().splitlines()}
     assert proposed == {"d1", "d2"}
@@ -244,8 +254,15 @@ def test_t1_dry_run_classes_proposals_and_no_file_change(world, monkeypatch):
     assert cands["c1"]["evidence"]["covers_graph"] is False
     assert cands["h1"]["evidence"]["input"] is None
     assert cands["n1"]["evidence"]["older_than_reload"] is False
+    # F1: a graph edge or a vector row keeps a row out of the delete proposal
+    assert cands["e1"]["proposal"] is None and cands["e1"]["evidence"]["graph_edges"] == 1
+    assert cands["v1"]["proposal"] is None and cands["v1"]["evidence"]["vector"] is True
+    # F5: promote evidence stays in the summary, not in the proposed approval file
+    assert cands["pp"]["proposal"] == "promote"
     summary = json.loads((rd / "summary.json").read_text())
-    assert summary["by_class"] == {"P1": 2, "P2": 2, "P3": 1, "P4": 6}
+    assert summary["by_class"] == {"P1": 2, "P2": 2, "P3": 1, "P4": 9}
+    assert {"node_id": "pp", "proposal": "promote"}.items() <= next(
+        p for p in summary["p4"] if p["node_id"] == "pp").items()
     assert [p["node_id"] for p in summary["p3"]] == ["p3a"]
 
 
@@ -281,7 +298,7 @@ def test_t2_t3_t11_apply_reaches_targets_and_rerun_changes_nothing(world):
     assert q("opencrab.db", "SELECT count(*) FROM ontology_edges") == [(0,)]
     # untouched: P3, hold rows, controls
     assert q("graph.db", "SELECT node_type FROM graph_nodes WHERE node_id='p3a'") == [("Entity",)]
-    for nid in ("h1", "n1", "dd", "c1", "ctl1"):
+    for nid in ("h1", "n1", "dd", "c1", "ctl1", "pp", "e1", "v1"):
         assert q("doc_store.db", "SELECT 1 FROM doc_nodes WHERE node_id=?", (nid,)) != []
     assert q("opencrab.db", "SELECT 1 FROM ontology_nodes WHERE node_id='h1'") == [(1,)]
     # T11: the shared edge row is deleted once; the other id reads "done (already)"
@@ -441,15 +458,25 @@ def test_t8_input_change_after_first_p4_write_stops_later_writes(world, monkeypa
         if leg["op"] == "doc_delete" and not state["done"]:
             state["done"] = True
             time.sleep(0.01)
-            world.write_input("pk", ["ctl1", "p1a", "p1b", "p2a", "p2b", "p3a", "new"])
+            world.write_input("pk", [*PK_INPUT, "new"])
+            state["mark"] = len(_progress(world.root.parent / "run"))
         return out
 
     monkeypatch.setattr(rp, "execute_leg", changing)
     world.apply("run", world.proposed(), scan=_no_scan)
     left = world.q("doc_store.db", "SELECT node_id FROM doc_nodes WHERE node_id IN ('d1','d2')")
     assert len(left) == 1
-    reasons = [p["detail"] for p in _progress(world.root.parent / "run") if p["outcome"] == "conflict"]
-    assert "pack input file changed" in reasons
+    first = ({"d1", "d2"} - {r[0] for r in left}).pop()
+    # the rest of that id stops too: its registry node row and edge rows stay
+    assert world.q("opencrab.db", "SELECT count(*) FROM ontology_nodes WHERE node_id=?", (first,)) == [(1,)]
+    assert world.q("opencrab.db", "SELECT count(*) FROM ontology_edges WHERE from_id=? OR to_id=?",
+                   (first, first))[0][0] >= 1
+    progress = _progress(world.root.parent / "run")
+    # the line at the mark is the triggering leg's own "done"; nothing of the pack is done after it
+    assert progress[state["mark"]]["outcome"] == "done" and progress[state["mark"]]["node_id"] == first
+    later = [p for p in progress[state["mark"] + 1:] if p["node_id"] in ("d1", "d2")]
+    assert later and all(p["outcome"] != "done" for p in later)
+    assert "pack input file changed" in [p["detail"] for p in later]
 
 
 # --- T10 -------------------------------------------------------------------
@@ -483,3 +510,85 @@ def test_t5_graph_cas_rejects_a_write_between_check_and_reclassify(world, monkey
     world.apply("dry", None, scan=_no_scan)
     assert world.q("graph.db", "SELECT node_type FROM graph_nodes WHERE node_id='p1a'") == [("Quote",)]
     assert any(p["node_id"] == "p1a" and p["outcome"] == "error" for p in _progress(world.root.parent / "dry"))
+
+
+# --- fix design 1b: T5b, T8b, T12, T7 schema ---------------------------------
+
+
+def test_t5b_row_in_a_new_space_inside_a_batch_is_seen(world, monkeypatch):
+    world.dry()
+    real = rp.execute_leg
+    state = {"first": None}
+
+    def adding(stores, reader, node_id, leg, recorded):
+        out = real(stores, reader, node_id, leg, recorded)
+        if node_id in ("d1", "d2") and state["first"] is None:
+            state["first"] = node_id
+            other = "d2" if node_id == "d1" else "d1"
+            _exec(world.root / "doc_store.db",
+                  ("INSERT INTO doc_nodes (space,node_id,node_type,properties,updated_at) "
+                   "VALUES ('zzspace',?,'Concept','{}','2021-01-01')", (other,)))
+            state["other"] = other
+        return out
+
+    monkeypatch.setattr(rp, "execute_leg", adding)
+    world.apply("run", world.proposed(), scan=_no_scan, batch=1000)
+    other = state["other"]
+    assert world.q("doc_store.db", "SELECT space FROM doc_nodes WHERE node_id=? ORDER BY space", (other,)) == [
+        ("concept",), ("zzspace",)]
+    assert any(p["node_id"] == other and p["outcome"] == "conflict" for p in _progress(world.root.parent / "run"))
+
+
+def _force_proposal(run: Path, ids: set[str]) -> None:
+    lines = [json.loads(x) for x in (run / "candidates.jsonl").read_text().splitlines()]
+    for r in lines:
+        if r["node_id"] in ids:
+            r["proposal"] = "delete"
+    body = "".join(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in lines).encode()
+    (run / "candidates.jsonl").write_bytes(body)
+    (run / "manifest.json").write_text(json.dumps({"candidates_sha256": hashlib.sha256(body).hexdigest(),
+                                                   "lines": len(lines)}))
+
+
+def test_t8b_rows_with_a_graph_edge_or_a_vector_are_never_deleted(world):
+    rd = world.dry()
+    path = world.root.parent / "approved.jsonl"
+    for nid in ("e1", "v1"):
+        path.write_text(json.dumps({"node_id": nid, "action": "delete"}) + "\n")
+        with pytest.raises(rp.RepairRefusedError, match="delete proposal"):
+            world.apply("dry", path, scan=_no_scan)
+    # even when the candidate file says "delete", the fixed invariant refuses
+    _force_proposal(rd, {"e1", "v1"})
+    path.write_text("".join(json.dumps({"node_id": n, "action": "delete"}) + "\n" for n in ("e1", "v1")))
+    res = world.apply("dry", path, scan=_no_scan)
+    assert res[("P4", "conflict")] == 2
+    for nid in ("e1", "v1"):
+        assert world.q("doc_store.db", "SELECT 1 FROM doc_nodes WHERE node_id=?", (nid,)) == [(1,)]
+        assert world.q("opencrab.db", "SELECT 1 FROM ontology_nodes WHERE node_id=?", (nid,)) == [(1,)]
+
+
+@pytest.mark.parametrize("env", [{"VECTOR_BACKEND": "chroma"}, {"VECTOR_DB_FILE": "other-vectors.db"}])
+def test_t12_vector_settings_are_checked_before_any_store_exists(world, monkeypatch, env):
+    from opencrab.config import Settings
+    from opencrab.stores import local_graph_store, local_sql_doc_store, sql_store, sqlite_vec_store
+
+    def boom(*a, **k):
+        raise AssertionError("a store constructor ran before the settings check")
+
+    for mod, cls in ((local_graph_store, "LocalGraphStore"), (local_sql_doc_store, "LocalSQLDocStore"),
+                     (sql_store, "SQLStore"), (sqlite_vec_store, "SqliteVecStore")):
+        monkeypatch.setattr(getattr(mod, cls), "__init__", boom)
+    settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(world.root), EMBEDDING_BACKEND="openai",
+                        **{"VECTOR_BACKEND": "sqlite-vec", **env})
+    with pytest.raises(rp.RepairRefusedError):
+        rp.build_stores(world.root, settings)
+    assert not (world.root / "other-vectors.db").exists()
+
+
+def test_t7_check_guard_refuses_a_graph_without_the_target_schema(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    sqlite3.connect(data / "graph.db").close()
+    code = rp.main(["--local-data-dir", str(data), "--run-dir", str(tmp_path / "g"),
+                    "--pack-input-root", str(tmp_path), "--check-guard"])
+    assert code == rp.EXIT_GUARD
