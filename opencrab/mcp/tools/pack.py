@@ -399,15 +399,14 @@ def _ingest_into_pack(
         So does a conflict on the final derived id. ``text_ingested`` is then
         False.
 
-        A node item of the same request can have the id ``source_id``. When
-        that node did not land in the graph and its error is retryable, the
+        A node item of the same request can have the id ``source_id``. That
+        node can fail to land in the graph with a retryable error. Then the
         function does not store the text, for either value of this flag (#484).
-        The text would take the id, and a resend of the node would then meet a
-        final identity conflict. The text error goes to ``node_errors``, and
-        ``stores["evidence_node"]`` is ``"deferred (node with this id not
-        written)"``. When another item with that id landed in the graph, the
-        text is stored as usual. A resend that writes the node then stores the
-        text by the rules above.
+        A text at that id blocks the node: the resend gets a final identity
+        conflict. The text error goes to ``node_errors``. ``stores["evidence_node"]``
+        is ``"deferred (node with this id not written)"``. When another item
+        with that id landed in the graph, the function stores the text as usual.
+        A resend that writes the node stores the text by the rules above.
 
         A partial result carries ``retryable`` and, when it is False,
         ``reject_codes`` (#480). The table "pack_ingest partial 결과의 retryable
