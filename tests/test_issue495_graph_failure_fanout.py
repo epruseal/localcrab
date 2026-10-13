@@ -336,9 +336,9 @@ def test_t8_edge_error_but_held_writes_registry():
 ])
 def test_t8b_edge_probe_wiring_with_real_local_graph(tmp_path, commit, sql_status, rows):
     """The edge probe passes the resolved node types and the endpoints in
-    order. A real store keys get_edge on (from_type, from_id, relation,
-    to_type, to_id), so a swapped endpoint or a space in a type slot reads
-    "absent" and drops the registry row of a committed edge."""
+    order. A real store keys get_edge on the endpoint ids and their types.
+    With a swapped endpoint or a space in a type slot, the probe reads
+    "absent". The builder then drops the registry row of a committed edge."""
     from opencrab.stores.local_graph_store import LocalGraphStore
 
     real = LocalGraphStore(db_path=str(tmp_path / "graph.db"))
