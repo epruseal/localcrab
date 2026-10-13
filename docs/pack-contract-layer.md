@@ -41,6 +41,7 @@ JSONL text writers open their output with `newline="\n"`. This preserves LF as t
 | `export_pack_graph_from_neo4j.py` | graph export | `newline="\n"` |
 | `build_nemotron_personas_korea_pack.py` | staged graph, evidence, and ingest files | `newline="\n"` |
 | `reconcile_doc_graph_nodes.py` `RecordWriter` | reconciliation run record | `newline="\n"` |
+| `repair_store_mismatch_499.py` `Progress` and `publish_run` | repair progress record, candidate file | `newline="\n"`; `publish_run` writes encoded bytes, so no text translation applies |
 
 This table excludes JSONL readers, test fixtures, logs, and writers for non-JSONL files.
 

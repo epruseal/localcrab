@@ -849,6 +849,12 @@ python scripts/reconcile_doc_graph_nodes.py --apply --backup-to /path/to/backup 
 메서드 3종의 백엔드별 거부 동작을 `inspect_graph_identity()`와 동일하게
 검증한다.
 
+**유형 불일치와 문서 전용 행의 일회성 정리(#499)**: 그래프와 노드 문서 저장소의
+유형이 어긋난 id와 그래프 노드 없는 문서 행의 기존분은
+`scripts/repair_store_mismatch_499.py`가 정리한다. 이 도구는 서비스를 멈춘 상태에서만
+쓰기를 한다. 기본 실행은 쓰기 없는 선택과 보고이고, 문서 전용 행은 승인 파일에 든
+삭제만 처리한다. 분류, 상태 검사, 재개 규칙의 정본은 그 모듈의 docstring이다.
+
 ## 10. 질의 결과의 동일 본문 접기 (#482)
 
 이 절은 `HybridQuery.query()`의 동일 본문 접기 계약의 정본이다. 코드의
