@@ -150,7 +150,7 @@ class Reranker:
         self,
         query: str,
         result_lists: list[list[dict[str, Any]]],
-        top_k: int = 10,
+        top_k: int | None = 10,
         use_bm25_cross: bool = True,
     ) -> list[dict[str, Any]]:
         """
@@ -164,7 +164,9 @@ class Reranker:
             One list per source (e.g. [vector_results, bm25_results, graph_results]).
             Each item must have 'node_id' and optionally 'score', 'text'.
         top_k:
-            Number of results to return.
+            Number of results to return. None returns every merged result,
+            in score order (#482: the query pipeline applies its cap after
+            the duplicate-body fold).
         use_bm25_cross:
             If True, supplement RRF with a BM25 cross-score over result texts.
 
