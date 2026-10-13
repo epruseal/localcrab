@@ -151,10 +151,22 @@ def test_member_keeps_every_field_it_had_unfolded(rerank):
     assert rep_dict == by_id[rep.node_id]
 
 
+_X_BODY_ORDERS = {
+    "vector_S_then_T": dict(vector=[_vec("a", "S", 0.9), _vec("x", "S", 0.8), _vec("x", "T", 0.7)]),
+    "vector_T_then_S": dict(vector=[_vec("a", "S", 0.9), _vec("x", "T", 0.8), _vec("x", "S", 0.7)]),
+    "vector_T_then_fts_S": dict(
+        vector=[_vec("a", "S", 0.9), _vec("x", "T", 0.8)],
+        fts=[dict(_vec("x", "S", 2.0), source="keyword")],
+    ),
+}
+
+
+@pytest.mark.parametrize("order", sorted(_X_BODY_ORDERS))
 @pytest.mark.parametrize("rerank", [True, False])
-def test_node_with_another_stored_body_is_not_folded(rerank):
-    # x owns two chunks S and T; a owns only S.
-    legs = dict(vector=[_vec("a", "S", 0.9), _vec("x", "S", 0.8), _vec("x", "T", 0.7)])
+def test_node_with_another_stored_body_is_not_folded(rerank, order):
+    # x owns two stored bodies S and T; a owns only S. The order of x's
+    # bodies must not matter: the key is the union of both.
+    legs = _X_BODY_ORDERS[order]
     folded = _run(_hq_with_legs(**legs), rerank)
     unfolded = _run(_hq_with_legs(**legs), rerank, fold=False)
     assert [r.to_dict() for r in folded] == [r.to_dict() for r in unfolded]

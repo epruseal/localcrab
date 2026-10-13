@@ -245,8 +245,9 @@ def _tag_fold_bodies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Mark each item of a leg that returns a stored body (vector, FTS).
 
     The key is the stored body itself, not the text that a later merge
-    builds. An item with no non-empty str text gets no key and is never
-    folded.
+    builds. An item with no non-empty str text gets no key here. It can
+    still get a key when a merge joins it with a tagged item of the same
+    node_id.
     """
     for item in items:
         text = item.get("text")
@@ -740,8 +741,9 @@ class HybridQuery:
         ``.warnings`` (list[str]). Acts like the old bare list[QueryResult] for
         iteration/len/indexing (see QueryOutcome docstring), so existing callers
         that only care about results are unaffected. Results with the same
-        pack and the same stored bodies are folded into one; see
-        docs/ARCHITECTURE.md, "질의 결과의 동일 본문 접기".
+        pack and the same stored bodies can be folded into one. The rules
+        and the exceptions are in docs/ARCHITECTURE.md, "질의 결과의 동일
+        본문 접기".
         """
         result_lists: list[list[dict[str, Any]]] = []
         include_unpackaged = False
@@ -900,7 +902,8 @@ class HybridQuery:
             merged = self._policy_filter(merged, subject_id)
 
         # --- Stage 6: Fold results with identical stored bodies (#482) ---
-        # After the policy filter, so every folded member already passed it.
+        # After the policy filter step. When that filter runs (subject_id and a
+        # ReBAC engine are set), every folded member already passed it.
         # Contract: docs/ARCHITECTURE.md, "질의 결과의 동일 본문 접기".
         merged = _fold_identical_bodies(merged)
 

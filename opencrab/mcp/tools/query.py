@@ -105,10 +105,10 @@ def ontology_query(
     Run a hybrid vector + BM25 + graph query against the ontology.
 
     Pipeline: vector similarity → BM25 keyword → graph expansion → RRF
-    reranking. Results with the same pack and the same stored bodies are
-    folded into one; the folded results stay in
-    ``metadata.folded_duplicates`` (docs/ARCHITECTURE.md, "질의 결과의 동일
-    본문 접기"). No policy-aware (ReBAC) filter runs here: HybridQuery's
+    reranking. Results with the same pack and the same stored bodies can
+    be folded into one result; ``metadata.folded_duplicates`` keeps the
+    others. The rules and the exceptions are in docs/ARCHITECTURE.md,
+    "질의 결과의 동일 본문 접기". No policy-aware (ReBAC) filter runs here: HybridQuery's
     ``subject_id`` param drives ``_policy_filter``, which is fail-closed
     (ReBACEngine.check returns granted=False for any unpolicied node), so
     wiring the caller's principal into it would silently drop every result
