@@ -402,6 +402,7 @@ def _ingest_into_pack(
         A node item of the same request can have the id ``source_id``. That
         node can fail to land in the graph with a retryable error. Then the
         function does not store the text, for either value of this flag (#484).
+
         A text at that id blocks the node: the resend gets a final identity
         conflict. The text error goes to ``node_errors``. ``stores["evidence_node"]``
         is ``"deferred (node with this id not written)"``. When another item
