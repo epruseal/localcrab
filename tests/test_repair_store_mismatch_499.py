@@ -27,7 +27,7 @@ COLL = "vectors_kure"
 DIM = 32
 OLD = "2020-01-01T00:00:00+00:00"
 DB_FILES = ("graph.db", "doc_store.db", "vectors.db", "opencrab.db")
-PK_INPUT = ["ctl1", "p1a", "p1b", "p2a", "p2b", "p3a", "pp"]
+PK_INPUT = ["ctl1", "p1a", "p1b", "p2a", "p2b", "p3a", "pp", "x6", "x7"]
 
 
 def _open_stores(root: Path) -> rp.Stores:
@@ -112,6 +112,10 @@ class World:
                            metadatas=[{"pack_id": "pk", "source": "pk", "node_id": nid, "space": "evidence"}])
         # P3: both valid
         node("concept", "Entity", "Concept", "p3a", {"name": "e"})
+        # P3 boundary controls: graph LogEntry with a doc type other than
+        # TextUnit (not P2), and both types invalid (not P1)
+        node("evidence", "LogEntry", "Evidence", "x6", {"text": "keep me"})
+        node("evidence", "TextEvidence", "BogusDoc", "x7", {"text": "keep me too"})
         # P4 delete proposals (absent from the covering input, older than the reload)
         node("concept", None, "Concept", "d1", {"name": "d1"}, graph=False, vec=False)
         node("concept", None, "Concept", "d2", {"name": "d2"}, graph=False, vec=False)
@@ -246,7 +250,7 @@ def test_t1_dry_run_classes_proposals_and_no_file_change(world, monkeypatch):
     classes = {k: v["class"] for k, v in cands.items()}
     assert classes == {"p1a": "P1", "p1b": "P1", "p2a": "P2", "p2b": "P2", "p3a": "P3",
                        "d1": "P4", "d2": "P4", "h1": "P4", "n1": "P4", "dd": "P4", "c1": "P4",
-                       "pp": "P4", "e1": "P4", "v1": "P4"}
+                       "pp": "P4", "e1": "P4", "v1": "P4", "x6": "P3", "x7": "P3"}
     # T9: only covered, absent, older, one-row rows get the delete proposal
     proposed = {json.loads(x)["node_id"] for x in world.proposed().read_text().splitlines()}
     assert proposed == {"d1", "d2"}
@@ -260,10 +264,10 @@ def test_t1_dry_run_classes_proposals_and_no_file_change(world, monkeypatch):
     # F5: promote evidence stays in the summary, not in the proposed approval file
     assert cands["pp"]["proposal"] == "promote"
     summary = json.loads((rd / "summary.json").read_text())
-    assert summary["by_class"] == {"P1": 2, "P2": 2, "P3": 1, "P4": 9}
+    assert summary["by_class"] == {"P1": 2, "P2": 2, "P3": 3, "P4": 9}
     assert {"node_id": "pp", "proposal": "promote"}.items() <= next(
         p for p in summary["p4"] if p["node_id"] == "pp").items()
-    assert [p["node_id"] for p in summary["p3"]] == ["p3a"]
+    assert sorted(p["node_id"] for p in summary["p3"]) == ["p3a", "x6", "x7"]
 
 
 def test_t1_non_empty_wal_refuses(world):
@@ -298,6 +302,14 @@ def test_t2_t3_t11_apply_reaches_targets_and_rerun_changes_nothing(world):
     assert q("opencrab.db", "SELECT count(*) FROM ontology_edges") == [(0,)]
     # untouched: P3, hold rows, controls
     assert q("graph.db", "SELECT node_type FROM graph_nodes WHERE node_id='p3a'") == [("Entity",)]
+    # P3 boundary controls keep every store as it was
+    assert q("graph.db", "SELECT node_id, node_type FROM graph_nodes WHERE node_id IN ('x6','x7') ORDER BY 1") == [
+        ("x6", "LogEntry"), ("x7", "TextEvidence")]
+    assert [(n, t, json.loads(p)["text"]) for n, t, p in q(
+        "doc_store.db", "SELECT node_id, node_type, properties FROM doc_nodes WHERE node_id IN ('x6','x7') ORDER BY 1")
+    ] == [("x6", "Evidence", "keep me"), ("x7", "BogusDoc", "keep me too")]
+    assert q("opencrab.db", "SELECT node_id, node_type FROM ontology_nodes WHERE node_id IN ('x6','x7') ORDER BY 1") == [
+        ("x6", "Evidence"), ("x7", "BogusDoc")]
     for nid in ("h1", "n1", "dd", "c1", "ctl1", "pp", "e1", "v1"):
         assert q("doc_store.db", "SELECT 1 FROM doc_nodes WHERE node_id=?", (nid,)) != []
     assert q("opencrab.db", "SELECT 1 FROM ontology_nodes WHERE node_id='h1'") == [(1,)]
@@ -398,6 +410,7 @@ def test_t5_snapshot_check(tmp_path):
     [{"node_id": "d1", "action": "promote"}],
     [{"node_id": "d1", "action": "delete"}, {"node_id": "d1", "action": "delete"}],
     [{"node_id": "p1a", "action": "delete"}],
+    [{"node_id": "not-a-candidate", "action": "delete"}],
 ])
 def test_t6_approval_refusals_write_nothing(world, lines):
     world.dry()
@@ -592,3 +605,28 @@ def test_t7_check_guard_refuses_a_graph_without_the_target_schema(tmp_path):
     code = rp.main(["--local-data-dir", str(data), "--run-dir", str(tmp_path / "g"),
                     "--pack-input-root", str(tmp_path), "--check-guard"])
     assert code == rp.EXIT_GUARD
+
+
+# --- exec channel round 1: approval gate (E1, E2) ----------------------------
+
+
+@pytest.mark.parametrize("approved_ids", [[], ["d1"]])
+def test_t6b_rows_without_an_approval_line_are_not_written(world, approved_ids):
+    """Without a line in the approval file a P4 row keeps every row: no
+    approval file at all, and a partial approval (d1 only)."""
+    world.dry()
+    path = None
+    if approved_ids:
+        path = world.root.parent / "approved.jsonl"
+        path.write_text("".join(json.dumps({"node_id": n, "action": "delete"}) + "\n" for n in approved_ids))
+    edges_before = world.q("opencrab.db", "SELECT from_id, to_id FROM ontology_edges ORDER BY 1, 2")
+    world.apply("run", path, scan=_no_scan)
+    for nid in {"d1", "d2"} - set(approved_ids):
+        assert world.q("doc_store.db", "SELECT 1 FROM doc_nodes WHERE node_id=?", (nid,)) == [(1,)]
+        assert world.q("opencrab.db", "SELECT 1 FROM ontology_nodes WHERE node_id=?", (nid,)) == [(1,)]
+        assert not [p for p in _progress(world.root.parent / "run") if p["node_id"] == nid]
+    if not approved_ids:
+        assert world.q("opencrab.db", "SELECT from_id, to_id FROM ontology_edges ORDER BY 1, 2") == edges_before
+    else:
+        # d2's own edge to the hold row h1 stays; only the row shared with d1 goes
+        assert world.q("opencrab.db", "SELECT from_id, to_id FROM ontology_edges ORDER BY 1, 2") == [("d2", "h1")]
