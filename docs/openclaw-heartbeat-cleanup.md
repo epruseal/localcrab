@@ -11,7 +11,7 @@
 - source, FTS, evidence-space `doc_nodes`, `Evidence` graph node, sqlite-vec row가 각각 정확히 하나다.
 - graph, doc node, vector metadata의 `pack_id`도 문자열 `openclaw`다.
 
-본문 중간에 heartbeat 단어가 있는 일반 대화는 선택하지 않는다. `metadata.source`는 대체 판정에 쓰지 않는다. `Document`, `Claim`, `Community`, foundation node는 삭제하지 않는다. `opencrab.db`의 registry 행은 후보별과 전체 집계만 보고한다. 이 도구는 registry를 삭제하거나 수정하지 않는다.
+본문 중간에 heartbeat 단어가 있는 일반 대화는 선택하지 않는다. `metadata.source`는 대체 판정에 쓰지 않는다. `Document`, `Claim`, `Community`, foundation node는 삭제하지 않는다. `opencrab.db`의 registry는 후보 node와 edge, pre-existing orphan, expected-after orphan, apply 뒤 actual-after를 읽기 전용 report로 기록한다. 이 도구는 registry를 삭제하거나 수정하지 않는다.
 
 ## 사전 중지와 cold 상태
 
@@ -61,11 +61,11 @@ python scripts/cleanup_openclaw_heartbeat_493.py \
   --backup-dir <new-backup-dir>
 ```
 
-도구는 SQLite backup API로 네 파일 사본을 만들고, mode `0600`, `integrity_check`, SHA-256, receipt directory fsync를 확인한다. receipt는 backup set ID, 네 파일 hash, manifest digest, data-directory store set identity를 묶는다. 재개 전에도 도구가 backup hash와 integrity를 다시 확인한다.
+도구는 SQLite backup API로 네 파일 사본을 만들고, mode `0600`, `integrity_check`, SHA-256, receipt directory fsync를 확인한다. receipt는 backup set ID, 네 파일 hash, manifest digest, canonical data directory identity를 묶는다. 첫 apply는 후보와 보호 집합이 frozen full snapshot과 일치할 때만 backup을 만든다. 재개 전에도 도구가 backup hash, integrity, canonical data directory identity를 다시 확인한다.
 
-도구는 후보마다 vector, graph와 incident edge, source와 FTS와 evidence doc 순서로 삭제한다. 각 축은 `BEGIN IMMEDIATE` 안에서 recorded raw value, owner, node, edge set을 다시 대조한 뒤 조건부 DELETE rowcount를 확인한다. 축 완료 기록은 매 줄 fsync한다. DB target state가 progress journal보다 우선한다.
+도구는 후보마다 vector, graph와 incident edge, source와 FTS와 evidence doc 순서로 삭제한다. 후보끼리 공유한 graph edge는 component target로 한 번만 삭제한다. 각 축은 `BEGIN IMMEDIATE` 안에서 recorded raw value, owner, node, edge set을 다시 대조한 뒤 조건부 DELETE rowcount를 확인한다. 축 완료 기록은 매 줄 fsync한다. DB target state가 progress journal보다 우선한다.
 
-`Claim`은 승인 후보 전체를 뺀 뒤에도 `supports`가 남아야 한다. 남는 근거가 없는 Claim이 하나라도 있으면 apply 전체를 거부한다. 비후보 Evidence, Document, Claim의 digest가 바뀌면 중단한다.
+`Claim`은 승인 후보 전체를 뺀 뒤에도 `supports`가 남아야 한다. 남는 근거가 없는 Claim이 하나라도 있으면 apply 전체를 거부한다. 비후보 Evidence, Document, Claim과 비후보 edge의 digest가 바뀌면 중단한다.
 
 ## Apply 뒤 대사
 
@@ -88,7 +88,7 @@ apply는 `absent` 외 상태를 거부한다. rollback은 `complete tombstone`�
 
 tombstone과 completion은 temporary `O_CREAT|O_EXCL` 생성, 파일 fsync, Linux `renameat2(RENAME_NOREPLACE)`, run directory fsync, readback 순서로만 발행한다. final marker는 덮어쓰지 않는다.
 
-rollback은 네 DB를 같은 backup set에서 함께 복원한다. 각 파일의 replacement와 fsync, WAL/SHM/journal sidecar 제거, data directory fsync를 수행한다. 중단 뒤에도 complete tombstone과 exact receipt가 있으면 네 파일 전체 복원을 다시 시작한다. 네 DB integrity와 receipt hash가 일치한 뒤 completion marker를 발행한다. rollback 중에는 서비스를 시작하지 않는다.
+rollback은 네 DB를 같은 backup set에서 함께 복원한다. 각 파일은 receipt-bound unique restore attempt metadata를 먼저 발행한 뒤 replacement와 file fsync를 수행한다. WAL/SHM/journal sidecar를 제거할 때마다 data directory fsync를 수행한다. binding mismatch artifact는 보존하고 fail-closed로 처리한다. 중단 뒤 exact binding과 complete tombstone이 있으면 새 unique attempt로 네 파일 전체 복원을 다시 시작한다. 네 DB integrity와 receipt hash가 일치한 뒤 completion marker를 발행한다. completion verification-only도 성공 전에 run directory fsync를 다시 수행한다. rollback 중에는 서비스를 시작하지 않는다.
 
 ## 금지와 회수
 

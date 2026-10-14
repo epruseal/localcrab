@@ -161,6 +161,7 @@ def test_apply_deletes_only_candidate_axes_and_preserves_normal_conversation(wor
         assert conn.execute(f"SELECT node_id FROM {TABLE} ORDER BY node_id").fetchall() == [("evidence:turn:fallback",), ("evidence:turn:normal",)]
     assert (run / "receipt.json").is_file()
     assert (run / "progress.jsonl").is_file()
+    assert _load(run / "registry-after.json")["mode"] == "report-only"
 
 
 def test_last_claim_support_blocks_manifest(world: Path, tmp_path: Path):
@@ -182,7 +183,7 @@ def test_nonempty_wal_refuses_before_immutable_read(world: Path, tmp_path: Path)
 def test_marker_uses_exclusive_temporary_and_no_replace(world: Path, tmp_path: Path, monkeypatch):
     run = tmp_path / "run"
     run.mkdir()
-    receipt = {"manifest_sha256": "m", "backup_set_id": "b", "store_set_sha256": "s", "files": {}}
+    receipt = {"manifest_sha256": "m", "backup_set_id": "b", "store_set_sha256": "s", "data_dir": {"path": "p", "device": 1, "inode": 2}, "files": {}}
     payload = cleanup._marker_payload("tombstone", receipt)
     cleanup.publish_marker(run, "rollback-tombstone.json", payload)
     assert cleanup.marker_state(run)[0] == "complete tombstone"
@@ -208,9 +209,183 @@ def test_incomplete_marker_fails_closed_for_apply_and_rollback(world: Path, tmp_
 def test_publish_marker_preserves_evidence_after_directory_fsync_failure(tmp_path: Path, monkeypatch):
     run = tmp_path / "run"
     run.mkdir()
-    receipt = {"manifest_sha256": "m", "backup_set_id": "b", "store_set_sha256": "s", "files": {}}
+    receipt = {"manifest_sha256": "m", "backup_set_id": "b", "store_set_sha256": "s", "data_dir": {"path": "p", "device": 1, "inode": 2}, "files": {}}
     monkeypatch.setattr(cleanup, "_fsync_dir", lambda _: (_ for _ in ()).throw(OSError("fsync")))
     with pytest.raises(OSError, match="fsync"):
         cleanup.publish_marker(run, "rollback-tombstone.json", cleanup._marker_payload("tombstone", receipt))
     assert (run / "rollback-tombstone.json").is_file()
     assert cleanup.marker_state(run)[0] == "complete tombstone"
+
+
+def test_restore_attempt_keeps_partial_artifact_and_uses_unique_replacement(tmp_path: Path):
+    data = tmp_path / "data"
+    data.mkdir()
+    source = tmp_path / "backup.db"
+    destination = data / "graph.db"
+    source.write_bytes(b"backup")
+    destination.write_bytes(b"old")
+    run = tmp_path / "run"
+    run.mkdir()
+    receipt = {"manifest_sha256": "m", "backup_set_id": "b", "store_set_sha256": "s", "data_dir": cleanup._data_dir_identity(data), "files": {}}
+    old_artifact = data / ".graph.db.restore-old"
+    old_artifact.write_bytes(b"partial")
+    cleanup._restore_file(source, destination, run, receipt)
+    assert old_artifact.read_bytes() == b"partial"
+    assert destination.read_bytes() == b"backup"
+    metadata = list((run / "restore-attempts").glob("graph.db.*.json"))
+    assert len(metadata) == 1
+    assert _load(metadata[0])["file"] == "graph.db"
+
+
+def test_first_apply_refuses_changed_snapshot_before_backup(world: Path, tmp_path: Path):
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("DELETE FROM doc_sources_fts WHERE source_id='evidence:turn:heartbeat'")
+    backup = tmp_path / "backup"
+    with pytest.raises(cleanup.CleanupRefusedError, match="full frozen snapshot"):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=lambda _: ([], 0))
+    assert not backup.exists()
+    assert not (run / "receipt.json").exists()
+
+
+def test_receipt_rejects_other_data_directory(world: Path, tmp_path: Path):
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    backup = tmp_path / "backup"
+    receipt = cleanup._backup_receipt(world, run, backup, manifest)
+    other = tmp_path / "other"
+    other.mkdir()
+    _schema(other)
+    with pytest.raises(cleanup.CleanupRefusedError, match="data directory"):
+        cleanup._load_receipt(run, backup, manifest, other)
+    assert receipt["data_dir"] == cleanup._data_dir_identity(world)
+
+
+def test_marker_dangling_symlink_fails_closed(tmp_path: Path):
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "rollback-tombstone.json").symlink_to(run / "missing")
+    assert cleanup.marker_state(run)[0] == "incomplete artifact"
+
+
+def test_shared_candidate_edge_is_declared_target_on_second_node(world: Path, tmp_path: Path):
+    second = "evidence:turn:second"
+    _add(world, second, "Q: Read HEARTBEAT.md if it exists now")
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", "evidence:turn:heartbeat", "rel", "Evidence", second, "{}"))
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    cleanup.apply(world, run, TABLE, approval, tmp_path / "backup", scan=lambda _: ([], 0))
+    with _db(world / "graph.db") as conn:
+        assert conn.execute("SELECT node_id FROM graph_nodes WHERE node_id=?", (second,)).fetchone() is None
+        assert conn.execute("SELECT * FROM graph_edges").fetchall() == []
+
+
+def test_restore_attempt_binding_mismatch_refuses(world: Path, tmp_path: Path):
+    run = tmp_path / "run"
+    run.mkdir()
+    root = run / "restore-attempts"
+    root.mkdir()
+    receipt = {"manifest_sha256": "m", "backup_set_id": "b", "store_set_sha256": "s", "data_dir": cleanup._data_dir_identity(world), "files": {}}
+    (root / "graph.db.bad.json").write_text(json.dumps({"receipt_sha256": "other", "backup_set_id": "b", "data_dir": cleanup._data_dir_identity(world), "file": "graph.db", "attempt": "bad"}), encoding="utf-8")
+    with pytest.raises(cleanup.CleanupRefusedError, match="binding mismatch"):
+        cleanup._validate_attempts(run, receipt, world)
+
+
+def test_sidecar_removal_fsyncs_each_namespace_change(tmp_path: Path, monkeypatch):
+    db = tmp_path / "graph.db"
+    db.write_bytes(b"db")
+    for suffix in ("-wal", "-shm", "-journal"):
+        db.with_name(db.name + suffix).write_bytes(b"sidecar")
+    calls: list[Path] = []
+    monkeypatch.setattr(cleanup, "_fsync_dir", lambda path: calls.append(path))
+    cleanup._remove_sidecars(db)
+    assert calls == [tmp_path, tmp_path, tmp_path]
+    assert all(not db.with_name(db.name + suffix).exists() for suffix in ("-wal", "-shm", "-journal"))
+
+
+def test_marker_missing_binding_fields_is_incomplete(tmp_path: Path):
+    run = tmp_path / "run"
+    run.mkdir()
+    body = {"kind": "tombstone", "payload_sha256": ""}
+    body["payload_sha256"] = cleanup._sha(cleanup._canon({"kind": "tombstone"}))
+    (run / "rollback-tombstone.json").write_text(json.dumps(body), encoding="utf-8")
+    assert cleanup.marker_state(run)[0] == "incomplete artifact"
+
+
+def test_apply_rechecks_claim_support_and_protected_edges(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    other = "evidence:turn:normal"
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_nodes VALUES (?,?,?,?)", ("Claim", "claim:keep", "claim", "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", candidate, "supports", "Claim", "claim:keep", "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", other, "supports", "Claim", "claim:keep", "{}"))
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    with _db(world / "graph.db") as conn:
+        conn.execute("DELETE FROM graph_edges WHERE from_id=? AND relation='supports'", (other,))
+    with pytest.raises(cleanup.CleanupRefusedError, match="full frozen snapshot"):
+        cleanup.apply(world, run, TABLE, approval, tmp_path / "backup", scan=lambda _: ([], 0))
+
+
+def test_claim_guard_rejects_candidate_only_support(world: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_nodes VALUES (?,?,?,?)", ("Claim", "claim:only", "claim", "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", candidate, "supports", "Claim", "claim:only", "{}"))
+    candidates, _ = cleanup.select(world, TABLE)
+    assert cleanup._claim_guard(world, candidates) == ["claim:only"]
+
+
+def test_document_partial_resume_deletes_fts_and_doc_without_source(world: Path):
+    record = cleanup._select_candidate(world, TABLE, ("evidence:turn:heartbeat", HEARTBEAT, json.dumps({"pack_id": "openclaw", "node_id": "evidence:turn:heartbeat"})))
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("DELETE FROM doc_sources WHERE source_id=?", (record["id"],))
+    cleanup._delete_document(world, record)
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute("SELECT source_id FROM doc_sources_fts WHERE source_id=?", (record["id"],)).fetchall() == []
+        assert conn.execute("SELECT node_id FROM doc_nodes WHERE node_id=?", (record["id"],)).fetchall() == []
+
+
+def test_registry_report_separates_existing_and_expected_orphans(world: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "rel", "evidence", "missing"))
+    report = cleanup._registry_report(world, {candidate})
+    assert report["preexisting_orphans"]
+    assert report["expected_after_orphans"]
+    assert report["candidate_edges"]
+
+
+def test_runbook_states_new_run_path_contract():
+    runbook = (Path(__file__).parent.parent / "docs" / "openclaw-heartbeat-cleanup.md").read_text(encoding="utf-8")
+    assert "새 run directory" in runbook
+    assert "--run-dir <new-run-dir>" in runbook
+
+
+def test_restore_attempt_names_are_unique(tmp_path: Path):
+    data = tmp_path / "data"
+    data.mkdir()
+    source = tmp_path / "backup.db"
+    source.write_bytes(b"backup")
+    destination = data / "graph.db"
+    destination.write_bytes(b"old")
+    run = tmp_path / "run"
+    run.mkdir()
+    receipt = {"manifest_sha256": "m", "backup_set_id": "b", "store_set_sha256": "s", "data_dir": cleanup._data_dir_identity(data), "files": {}}
+    cleanup._restore_file(source, destination, run, receipt)
+    cleanup._restore_file(source, destination, run, receipt)
+    names = sorted(path.name for path in (run / "restore-attempts").glob("graph.db.*.json"))
+    assert len(names) == 2
+    assert names[0] != names[1]
