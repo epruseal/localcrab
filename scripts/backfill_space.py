@@ -60,8 +60,9 @@ Apply state:
   Apply creates an owner-only ``apply-state.db`` under the new backup set.
   It keeps resolver, plan, outcome and report state there. A state write after
   a source COMMIT can fail, so the report marks that commit state unknown and
-  keeps the backup and state file for inspection. A fresh run takes a new
-  backup and state file. It does not resume a prior state file automatically.
+  keeps the backup and state file for inspection. Failed writes keep and report
+  their ``failure-rescan-<uuid>`` state under the backup set. A fresh run takes
+  a new backup and state file. It does not resume a prior state file automatically.
   Reconcile builds a temporary resolver state in ``current-resolver-<uuid>``
   under the same backup set. A clean run (every reconcile check passes and no
   row was skipped as unserializable) removes that directory before the report
@@ -1784,45 +1785,10 @@ def reconcile_state(
     return {"ok": not problems, "problems": problems}
 
 
-def reconcile(
-    paths: Paths, before: dict[str, Any], stats: dict[str, Any], allow_pack_missing: bool
+def _state_rescan_summary(
+    paths: Paths, state: sqlite3.Connection, allow: bool, fresh_dir: Path
 ) -> dict[str, Any]:
-    """Rescan and compare with the pre-write scan. Returns {"ok", "problems"}."""
-    after = scan(paths, allow_pack_missing)
-    problems: list[str] = []
-    for store in ("doc", "vector"):
-        n = len(stats["committed"][store])
-        if after["total"][store] != before["total"][store]:
-            problems.append(f"{store}: total rows changed")
-        if no_valid(after, store) != no_valid(before, store) - n:
-            problems.append(f"{store}: no-valid-space count is not before minus committed")
-        if after["held_map"][store] != before["held_map"][store]:
-            problems.append(f"{store}: hold class counts changed (a held id changed class)")
-    # Every committed id now holds its planned space (full check).
-    dconn = _open(paths.doc, "ro", False)
-    vconn = _open(paths.vector, "ro", True)
-    try:
-        for store, conn, sql in (
-            ("doc", dconn, "SELECT metadata FROM doc_sources WHERE source_id = ?"),
-            ("vector", vconn, f"SELECT metadata FROM {paths.collection} WHERE node_id = ?"),
-        ):  # noqa: S608
-            for rid, space in stats["committed"][store]:
-                row = conn.execute(sql, (rid,)).fetchone()
-                meta = parse_meta(row[0]) if row else None
-                if not isinstance(meta, dict) or meta.get("space") != space:
-                    problems.append(f"{store}: {rid} does not hold {space}")
-                    break
-    finally:
-        dconn.close()
-        vconn.close()
-    return {"ok": not problems, "problems": problems}
-
-
-def _state_rescan_summary(paths: Paths, state: sqlite3.Connection, allow: bool) -> dict[str, Any]:
-    """Build a bounded failure summary with a fresh current-source resolver."""
-    state_path = Path(state.execute("PRAGMA database_list").fetchone()[2])
-    fresh_dir = state_path.parent / f"failure-rescan-{uuid.uuid4()}"
-    fresh_dir.mkdir(mode=0o700)
+    """Build a bounded failure summary in the existing resolver directory."""
     fresh = _apply_state_db(fresh_dir)
     try:
         _scan_apply_state(paths, fresh, allow)
@@ -1868,7 +1834,11 @@ def _failure_report(
     try:
         if state is None:
             raise RuntimeError("apply state is unavailable for failure rescan")
-        out["rescan"] = _state_rescan_summary(paths, state, args.allow_pack_missing)
+        state_path = Path(state.execute("PRAGMA database_list").fetchone()[2])
+        fresh_dir = state_path.parent / f"failure-rescan-{uuid.uuid4()}"
+        out["rescan_state"] = str(fresh_dir)
+        fresh_dir.mkdir(mode=0o700)
+        out["rescan"] = _state_rescan_summary(paths, state, args.allow_pack_missing, fresh_dir)
     except BaseException as rescan_exc:
         out["rescan_error"] = f"{type(rescan_exc).__name__}: {rescan_exc}"
     return out
