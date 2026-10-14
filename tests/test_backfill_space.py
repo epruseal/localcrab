@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import sqlite3
 import struct
@@ -142,7 +143,7 @@ def _run(capsys, *argv, **kw):
     if "--apply" not in argv and "--dry-run-scratch" not in argv:
         scratch = kw.pop("dry_run_scratch", None)
         if scratch is None:
-            scratch = Path.cwd()
+            scratch = Path(os.environ["LOCAL_DATA_DIR"]).parent
         argv = (*argv, "--dry-run-scratch", str(scratch))
     code = bf.main(list(argv), **kw)
     out = capsys.readouterr().out
@@ -323,6 +324,24 @@ def test_dry_run_changes_no_content_and_reports(world, capsys, monkeypatch):
     assert rep["vector"]["classes"]["hold_pack_disagrees"] == 1
     assert rep["vector"]["classes"]["hold_orphan"] == 1
     assert rep["vector"]["planned_space_distribution"]
+
+
+def test_dry_run_default_scratch_stays_under_pytest_tmp_path(world, capsys, tmp_path, monkeypatch):
+    created = []
+    cwd_children = set(Path.cwd().glob("backfill-space-*"))
+    mkdir = Path.mkdir
+
+    def track(self, *args, **kwargs):
+        result = mkdir(self, *args, **kwargs)
+        if self.name.startswith("backfill-space-"):
+            created.append(self)
+        return result
+
+    monkeypatch.setattr(Path, "mkdir", track)
+    code, _ = _run(capsys)
+    assert code == 0
+    assert len(created) == 1 and created[0].parent == tmp_path
+    assert set(Path.cwd().glob("backfill-space-*")) == cwd_children
 
 
 @pytest.mark.parametrize(
@@ -1215,6 +1234,12 @@ def test_dry_run_snapshots_the_configured_vector_file(tmp_path, monkeypatch, cap
     get_settings.cache_clear()
 
 
+def _assert_backup_files(report):
+    backup = Path(report["backup_set"])
+    for name in ("apply-state.db", "doc_store.db", "vectors.db", "graph.db"):
+        assert (backup / name).is_file(), name
+
+
 def _db_counts(world):
     d = world.dump()
     return {
@@ -1259,6 +1284,9 @@ def test_failure_report_comes_from_a_rescan_and_rerun_finishes(world, tmp_path, 
     else:
         assert code == 1 and raised is None
     assert rep["error_type"] == exc_type.__name__ and rep["commit_state_unknown"] is True
+    rescan = Path(rep["rescan_state"])
+    assert rescan.parent == Path(rep["backup_set"]) and (rescan / "apply-state.db").is_file()
+    _assert_backup_files(rep)
     counts = _db_counts(world)
     assert (rep["rescan"]["doc"]["valid_space"], rep["rescan"]["doc"]["no_valid_space"]) == counts[
         "doc"
@@ -1301,13 +1329,35 @@ def test_failure_rescan_uses_current_graph_resolver(world, tmp_path, capsys):
 def test_failure_report_records_a_rescan_failure(world, tmp_path, capsys, monkeypatch):
     _failure_world(world)
 
-    def flaky(paths, state, allow):
+    def flaky(paths, state, allow, fresh_dir):
         raise OSError("rescan broke")
 
     monkeypatch.setattr(bf, "_state_rescan_summary", flaky)
     code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
     assert code == 1 and rep["error_type"] == "RuntimeError"
+    rescan = Path(rep["rescan_state"])
+    assert rescan.parent == Path(rep["backup_set"]) and rescan.is_dir()
+    _assert_backup_files(rep)
     assert "rescan" not in rep and "OSError" in rep["rescan_error"]
+
+
+def test_failure_report_names_rescan_state_when_mkdir_interrupts_after_creation(
+    world, tmp_path, capsys, monkeypatch
+):
+    _failure_world(world)
+    mkdir = Path.mkdir
+
+    def interrupt_after_mkdir(self, *args, **kwargs):
+        mkdir(self, *args, **kwargs)
+        if self.name.startswith("failure-rescan-"):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(Path, "mkdir", interrupt_after_mkdir)
+    code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
+    assert code == 1 and raised is None and "KeyboardInterrupt" in rep["rescan_error"]
+    rescan = Path(rep["rescan_state"])
+    assert rescan.parent == Path(rep["backup_set"]) and rescan.is_dir()
+    _assert_backup_files(rep)
 
 
 @pytest.mark.parametrize("exc_type", [RuntimeError, KeyboardInterrupt])
@@ -1592,11 +1642,11 @@ def test_secondary_interrupts_never_hide_the_original_error(
 
     calls = {"n": 0}
 
-    def scanner(paths, state, allow):
+    def scanner(paths, state, allow, fresh_dir):
         calls["n"] += 1
         if place == "rescan":
             raise sec(3) if sec is SystemExit else sec()
-        return real_rescan(paths, state, allow)
+        return real_rescan(paths, state, allow, fresh_dir)
 
     monkeypatch.setattr(bf, "_open", opener)
     monkeypatch.setattr(bf, "_state_rescan_summary", scanner)
@@ -1665,7 +1715,7 @@ def test_rescan_runs_under_the_write_lock(world, env, tmp_path, capsys, monkeypa
     real_rescan = bf._state_rescan_summary
     seen = []
 
-    def scanner(paths, state, allow):
+    def scanner(paths, state, allow, fresh_dir):
         probe = textwrap.dedent(f"""
             from opencrab.locking import write_lock
             try:
@@ -1675,7 +1725,7 @@ def test_rescan_runs_under_the_write_lock(world, env, tmp_path, capsys, monkeypa
                 print('busy')
         """)
         seen.append(subprocess.check_output([sys.executable, "-c", probe], text=True).strip())
-        return real_rescan(paths, state, allow)
+        return real_rescan(paths, state, allow, fresh_dir)
 
     monkeypatch.setattr(bf, "_state_rescan_summary", scanner)
     code, raised, rep = _run_failing(capsys, world, tmp_path, RuntimeError)
@@ -1808,6 +1858,7 @@ def test_reconcile_mismatch_keeps_resolver_state_and_a_rerun_leaves_it(
     kept = Path(rep["reconcile"]["resolver_state"])
     assert kept.parent == first_set and (kept / "apply-state.db").is_file()
     assert _resolver_dirs(first_set) == [kept]
+    _assert_backup_files(rep)
     before = _tree(first_set)
     monkeypatch.setattr(bf, "_write_state_one_batch", orig)
     code, rep2 = _apply(capsys, world, tmp_path)
