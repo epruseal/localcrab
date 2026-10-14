@@ -449,8 +449,8 @@ def test_cli_resume_after_graph_commit_uses_receipt_component_intent(world: Path
         f"sys.path.insert(0, {str(Path(__file__).parent.parent / 'scripts')!r})\n"
         "import cleanup_openclaw_heartbeat_493 as cleanup\n"
         "original = cleanup._delete_graph\n"
-        "def stop(data, record):\n"
-        "    original(data, record, after_commit=lambda: (_ for _ in ()).throw(SystemExit(77)))\n"
+        "def stop(data, record, candidates, receipt, manifest):\n"
+        "    original(data, record, candidates, receipt, manifest, after_commit=lambda: (_ for _ in ()).throw(SystemExit(77)))\n"
         "cleanup._delete_graph = stop\n"
         f"cleanup.apply(Path({str(world)!r}), Path({str(run)!r}), {TABLE!r}, Path({str(approval)!r}), Path({str(backup)!r}), scan=lambda _: ([], 0))\n",
         encoding="utf-8",
@@ -506,3 +506,50 @@ def test_cli_prepare_then_rollback_entrypoint(world: Path, tmp_path: Path):
     restored = subprocess.run([sys.executable, str(runner)], cwd=tmp_path, text=True, capture_output=True, env=env)
     assert restored.returncode == 0, restored.stderr
     assert cleanup.marker_state(run)[0] == "complete tombstone plus completion"
+
+
+def test_component_helper_rejects_changed_shared_edge(world: Path, tmp_path: Path):
+    first, second = "evidence:turn:heartbeat", "evidence:turn:second-rds"
+    _add(world, second, "Q: Read HEARTBEAT.md if it exists rds")
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", first, "rel", "Evidence", second, "{}"))
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, manifest = cleanup._load_run(run)
+    backup = tmp_path / "backup"
+    receipt = cleanup._backup_receipt(world, run, backup, manifest)
+    cleanup._publish_component_intents(run, receipt, candidates, manifest)
+    receipt = cleanup._load_receipt(run, backup, manifest, world)
+    with _db(world / "graph.db") as conn:
+        conn.execute("UPDATE graph_edges SET properties='{" + '"changed":true' + "}' WHERE from_id=? AND to_id=?", (first, second))
+    conn = sqlite3.connect(world / "graph.db")
+    try:
+        with pytest.raises(cleanup.CleanupRefusedError, match="component edge R/D/S conflict"):
+            cleanup._validate_component_edges(conn, candidates, receipt, manifest)
+    finally:
+        conn.close()
+
+
+def test_abc_component_resume_b_transaction_uses_rds(world: Path, tmp_path: Path):
+    a, b, c = "evidence:turn:heartbeat", "evidence:turn:abc-b", "evidence:turn:abc-c"
+    _add(world, b, "Q: Read HEARTBEAT.md if it exists abc b")
+    _add(world, c, "Q: Read HEARTBEAT.md if it exists abc c")
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", a, "ab", "Evidence", b, "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", b, "bc", "Evidence", c, "{}"))
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, manifest = cleanup._load_run(run)
+    by_id = {item["id"]: item for item in candidates}
+    assert {edge["relation"] for edge in by_id[b]["edges"]} == {"ab", "bc"}
+    backup = tmp_path / "backup"
+    receipt = cleanup._backup_receipt(world, run, backup, manifest)
+    cleanup._publish_component_intents(run, receipt, candidates, manifest)
+    receipt = cleanup._load_receipt(run, backup, manifest, world)
+    cleanup._delete_graph(world, by_id[a], candidates, receipt, manifest)
+    with _db(world / "graph.db") as conn:
+        actual_b = conn.execute("SELECT relation FROM graph_edges WHERE from_id=? OR to_id=?", (b, b)).fetchall()
+    assert actual_b == [("bc",)]
+    cleanup._delete_graph(world, by_id[b], candidates, receipt, manifest)
+    with _db(world / "graph.db") as conn:
+        assert conn.execute("SELECT node_id FROM graph_nodes WHERE node_id IN (?,?)", (b, c)).fetchall() == [(c,)]

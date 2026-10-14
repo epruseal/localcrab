@@ -494,7 +494,7 @@ def _component_intents(candidates: list[dict[str, Any]], manifest: dict[str, Any
             if key in seen:
                 continue
             seen.add(key)
-            intents.append({"component_edge": edge, "endpoints": sorted((edge["from_id"], edge["to_id"])), "manifest": _sha(_canon(manifest))})
+            intents.append({"component_edge": edge, "endpoints": sorted((edge["from_id"], edge["to_id"])), "approved_absent": True, "manifest": _sha(_canon(manifest))})
     return intents
 
 
@@ -650,16 +650,39 @@ def _full_snapshot_matches(data_dir: Path, vector_table: str, candidates: list[d
     return all(_candidate_snapshot(data_dir, vector_table, record["id"], immutable=False) == record["snapshot"] for record in candidates)
 
 
-def _shared_edges_absent(data_dir: Path, vector_table: str, record: dict[str, Any], candidates: list[dict[str, Any]], receipt: dict[str, Any]) -> bool:
-    """resume은 durable receipt intent가 승인한 component edge absence만 허용한다."""
-    if not record["edges"] or "component_intents" not in receipt:
-        return False
-    ids = {candidate["id"] for candidate in candidates}
-    approved = {_sha(_canon(item["component_edge"])) for item in receipt["component_intents"]}
-    current = _candidate_snapshot(data_dir, vector_table, record["id"], immutable=False)
-    if current["edges"] != _edge_digest([]):
-        return False
-    return all(edge["from_id"] in ids and edge["to_id"] in ids and _sha(_canon(edge)) in approved for edge in record["edges"])
+def _component_edges(candidates: list[dict[str, Any]], receipt: dict[str, Any], manifest: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    """Frozen candidates와 immutable receipt에서 authoritative R/D를 재계산한다."""
+    binding = _sha(_canon(manifest))
+    ids = {record["id"] for record in candidates}
+    recorded = {
+        _sha(_canon(edge)): edge
+        for record in candidates
+        for edge in record["edges"]
+        if edge["from_id"] in ids and edge["to_id"] in ids
+    }
+    intents = receipt.get("component_intents")
+    if not isinstance(intents, list):
+        raise CleanupRefusedError("receipt has no component intent")
+    approved: set[str] = set()
+    for item in intents:
+        if not isinstance(item, dict) or item.get("manifest") != binding or item.get("endpoints") != sorted(item["component_edge"][key] for key in ("from_id", "to_id")) or item.get("approved_absent") is not True:
+            raise CleanupRefusedError("component intent binding mismatch")
+        key = _sha(_canon(item["component_edge"]))
+        if key not in recorded:
+            raise CleanupRefusedError("component intent row mismatch")
+        approved.add(key)
+    return recorded, approved
+
+
+def _validate_component_edges(conn: sqlite3.Connection, candidates: list[dict[str, Any]], receipt: dict[str, Any], manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """같은 R/D/S helper를 caller와 graph transaction에서 사용한다."""
+    recorded, approved = _component_edges(candidates, receipt, manifest)
+    ids = {record["id"] for record in candidates}
+    actual_rows = [_edge_record(row) for row in conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id IN ({}) AND to_id IN ({}) ORDER BY from_id,relation,to_id".format(",".join("?" for _ in ids), ",".join("?" for _ in ids)), (*ids, *ids))]
+    actual = {_sha(_canon(edge)): edge for edge in actual_rows}
+    if not set(recorded) - approved <= set(actual) <= set(recorded):
+        raise CleanupRefusedError("component edge R/D/S conflict")
+    return actual_rows
 
 
 def _current_protection_digest(data_dir: Path, vector_table: str, candidates: list[dict[str, Any]]) -> str:
@@ -689,17 +712,14 @@ def _delete_vector(data_dir: Path, vector_table: str, record: dict[str, Any]) ->
         conn.close()
 
 
-def _delete_graph(data_dir: Path, record: dict[str, Any], after_commit: Callable[[], None] | None = None) -> None:
+def _delete_graph(data_dir: Path, record: dict[str, Any], candidates: list[dict[str, Any]], receipt: dict[str, Any], manifest: dict[str, Any], after_commit: Callable[[], None] | None = None) -> None:
     conn = _rw(data_dir / "graph.db")
     try:
         conn.execute("BEGIN IMMEDIATE")
         node = conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (record["id"],)).fetchone()
         if node is None or node[0] != "Evidence" or node[2] != EVIDENCE_SPACE or _props_digest(node[3]) != record["graph"]["properties"]:
             raise CleanupRefusedError(f"{record['id']}: graph CAS conflict")
-        current_edges = [_edge_record(row) for row in conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id=? OR to_id=? ORDER BY from_id,relation,to_id", (record["id"], record["id"]))]
-        expected = _edge_digest(record["edges"])
-        if _edge_digest(current_edges) not in {expected, _edge_digest([])}:
-            raise CleanupRefusedError(f"{record['id']}: graph edge CAS conflict")
+        _validate_component_edges(conn, candidates, receipt, manifest)
         for edge in record["edges"]:
             row = conn.execute("SELECT properties FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?", (edge["from_id"], edge["relation"], edge["to_id"])).fetchone()
             if row is None:
@@ -775,20 +795,37 @@ def _done_axes(snapshot: dict[str, Any]) -> set[str]:
     return done
 
 
-def _apply_records(data_dir: Path, run_dir: Path, vector_table: str, candidates: list[dict[str, Any]], protected_digest: str, receipt: dict[str, Any]) -> None:
+def _apply_records(data_dir: Path, run_dir: Path, vector_table: str, candidates: list[dict[str, Any]], protected_digest: str, receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
     for record in candidates:
         for axis, action in (("vector", _delete_vector), ("graph", _delete_graph), ("document", _delete_document)):
             current = _candidate_snapshot(data_dir, vector_table, record["id"], immutable=False)
             done = _done_axes(current)
-            shared_absent = _shared_edges_absent(data_dir, vector_table, record, candidates, receipt)
-            if not _allowed(current, record["snapshot"], done, shared_edges_absent=shared_absent):
+            graph_conn = _rw(data_dir / "graph.db")
+            try:
+                _validate_component_edges(graph_conn, candidates, receipt, manifest)
+            finally:
+                graph_conn.close()
+            # The R/D/S helper owns component edges. Generic axis CAS compares every other component.
+            current["edges"] = record["snapshot"]["edges"]
+            if not _allowed(current, record["snapshot"], done):
                 raise CleanupRefusedError(f"{record['id']}: snapshot conflict before {axis}")
             target_axes = {"vector"} if axis == "vector" else {"graph", "edges"} if axis == "graph" else {"source", "fts", "doc"}
             if not target_axes <= done:
-                action(data_dir, vector_table, record) if axis == "vector" else action(data_dir, record)
+                if axis == "vector":
+                    action(data_dir, vector_table, record)
+                elif axis == "graph":
+                    action(data_dir, record, candidates, receipt, manifest)
+                else:
+                    action(data_dir, record)
             after = _candidate_snapshot(data_dir, vector_table, record["id"], immutable=False)
             done = _done_axes(after)
-            if not target_axes <= done or not _allowed(after, record["snapshot"], done, shared_edges_absent=shared_absent):
+            graph_conn = _rw(data_dir / "graph.db")
+            try:
+                _validate_component_edges(graph_conn, candidates, receipt, manifest)
+            finally:
+                graph_conn.close()
+            after["edges"] = record["snapshot"]["edges"]
+            if not target_axes <= done or not _allowed(after, record["snapshot"], done):
                 raise CleanupRefusedError(f"{record['id']}: snapshot conflict after {axis}")
             if _current_protection_digest(data_dir, vector_table, candidates) != protected_digest:
                 raise CleanupRefusedError(f"{record['id']}: protected set changed")
@@ -826,7 +863,7 @@ def apply(data_dir: Path, run_dir: Path, vector_table: str, approved_manifest: P
             raise CleanupRefusedError("Claim support changed after frozen manifest")
         _publish_component_intents(run_dir, receipt, candidates, manifest)
         receipt = _load_receipt(run_dir, backup_dir, manifest, data_dir)
-        _apply_records(data_dir, run_dir, vector_table, candidates, protected_digest, receipt)
+        _apply_records(data_dir, run_dir, vector_table, candidates, protected_digest, receipt, manifest)
         registry_after = _registry_report(data_dir, {candidate["id"] for candidate in candidates})
         _publish(run_dir / "registry-after.json", _canon(registry_after))
         _publish(run_dir / "apply-complete.json", _canon({"manifest_sha256": _sha(_canon(manifest)), "backup_set_id": receipt["backup_set_id"], "registry_after": registry_after}))
