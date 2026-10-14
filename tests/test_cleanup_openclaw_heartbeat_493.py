@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -389,3 +391,118 @@ def test_restore_attempt_names_are_unique(tmp_path: Path):
     names = sorted(path.name for path in (run / "restore-attempts").glob("graph.db.*.json"))
     assert len(names) == 2
     assert names[0] != names[1]
+
+
+def test_cli_dry_run_uses_fresh_process(world: Path, tmp_path: Path):
+    script = Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py"
+    run = tmp_path / "cli-run"
+    result = subprocess.run(
+        [sys.executable, str(script), "--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert _load(run / "manifest.json")["vector_table"] == TABLE
+
+
+def test_attempt_successor_publishes_directory_after_fsync(tmp_path: Path):
+    data = tmp_path / "data"
+    data.mkdir()
+    run = tmp_path / "run"
+    run.mkdir()
+    receipt = {"manifest_sha256": "m", "backup_set_id": "b", "store_set_sha256": "s", "data_dir": cleanup._data_dir_identity(data), "files": {}}
+    payload = cleanup._publish_attempt_successor(run, receipt)
+    assert (run / f"{cleanup.ATTEMPT_PREFIX}{payload['attempt']}.json").is_file()
+    assert (run / "restore-attempts" / payload["directory"]).is_dir()
+    assert cleanup._published_attempts(run, receipt)[0]["attempt"] == payload["attempt"]
+
+
+def test_published_attempt_missing_directory_fails_closed(tmp_path: Path):
+    data = tmp_path / "data"
+    data.mkdir()
+    run = tmp_path / "run"
+    run.mkdir()
+    receipt = {"manifest_sha256": "m", "backup_set_id": "b", "store_set_sha256": "s", "data_dir": cleanup._data_dir_identity(data), "files": {}}
+    payload = cleanup._publish_attempt_successor(run, receipt)
+    (run / "restore-attempts" / payload["directory"]).rmdir()
+    with pytest.raises(cleanup.CleanupRefusedError, match="directory is missing"):
+        cleanup._published_attempts(run, receipt)
+
+
+def test_cli_resume_after_graph_commit_uses_receipt_component_intent(world: Path, tmp_path: Path):
+    first, second = "evidence:turn:heartbeat", "evidence:turn:second-cli"
+    _add(world, second, "Q: Read HEARTBEAT.md if it exists cli")
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", first, "rel", "Evidence", second, "{}"))
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    _, manifest = cleanup._load_run(run)
+    backup = tmp_path / "backup"
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    interrupted = tmp_path / "interrupt.py"
+    interrupted.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(Path(__file__).parent.parent / 'scripts')!r})\n"
+        "import cleanup_openclaw_heartbeat_493 as cleanup\n"
+        "original = cleanup._delete_graph\n"
+        "def stop(data, record):\n"
+        "    original(data, record, after_commit=lambda: (_ for _ in ()).throw(SystemExit(77)))\n"
+        "cleanup._delete_graph = stop\n"
+        f"cleanup.apply(Path({str(world)!r}), Path({str(run)!r}), {TABLE!r}, Path({str(approval)!r}), Path({str(backup)!r}), scan=lambda _: ([], 0))\n",
+        encoding="utf-8",
+    )
+    interrupted_result = subprocess.run(
+        [sys.executable, str(interrupted)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert interrupted_result.returncode == 77
+    runner = tmp_path / "resume.py"
+    runner.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(Path(__file__).parent.parent / 'scripts')!r})\n"
+        "import cleanup_openclaw_heartbeat_493 as cleanup\n"
+        f"cleanup.apply(Path({str(world)!r}), Path({str(run)!r}), {TABLE!r}, Path({str(approval)!r}), Path({str(backup)!r}), scan=lambda _: ([], 0))\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, str(runner)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    with _db(world / "graph.db") as conn:
+        assert conn.execute("SELECT node_id FROM graph_nodes WHERE node_id IN (?,?)", (first, second)).fetchall() == []
+
+
+def test_cli_prepare_then_rollback_entrypoint(world: Path, tmp_path: Path):
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    _, manifest = cleanup._load_run(run)
+    backup = tmp_path / "backup"
+    cleanup._backup_receipt(world, run, backup, manifest)
+    runner = tmp_path / "rollback.py"
+    runner.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(Path(__file__).parent.parent / 'scripts')!r})\n"
+        "import cleanup_openclaw_heartbeat_493 as cleanup\n"
+        "import repair_store_mismatch_499 as repair\n"
+        "repair.holders = lambda _: ([], 0)\n"
+        f"cleanup.prepare_rollback(Path({str(world)!r}), Path({str(run)!r}), Path({str(backup)!r}))\n"
+        f"cleanup.rollback(Path({str(world)!r}), Path({str(run)!r}), Path({str(backup)!r}))\n",
+        encoding="utf-8",
+    )
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    restored = subprocess.run([sys.executable, str(runner)], cwd=tmp_path, text=True, capture_output=True, env=env)
+    assert restored.returncode == 0, restored.stderr
+    assert cleanup.marker_state(run)[0] == "complete tombstone plus completion"

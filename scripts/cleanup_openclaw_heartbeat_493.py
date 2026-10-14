@@ -31,6 +31,7 @@ DB_FILES = ("graph.db", "doc_store.db", "vectors.db", "opencrab.db")
 PREFIXES = ("Q: [OpenClaw heartbeat poll]", "Q: Read HEARTBEAT.md if it exists")
 EVIDENCE_SPACE = "evidence"
 MARKERS = ("rollback-tombstone.json", "rollback-complete.json")
+ATTEMPT_PREFIX = "rollback-attempt-"
 AT_FDCWD = -100
 RENAME_NOREPLACE = 1
 
@@ -481,6 +482,30 @@ def _load_approval(path: Path | None, manifest: dict[str, Any]) -> None:
         raise CleanupRefusedError("approval does not bind this exact manifest")
 
 
+def _component_intents(candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    ids = {record["id"] for record in candidates}
+    seen: set[str] = set()
+    intents: list[dict[str, Any]] = []
+    for record in candidates:
+        for edge in record["edges"]:
+            if edge["from_id"] not in ids or edge["to_id"] not in ids:
+                continue
+            key = _sha(_canon(edge))
+            if key in seen:
+                continue
+            seen.add(key)
+            intents.append({"component_edge": edge, "endpoints": sorted((edge["from_id"], edge["to_id"])), "manifest": _sha(_canon(manifest))})
+    return intents
+
+
+def _publish_component_intents(run_dir: Path, receipt: dict[str, Any], candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> None:
+    """기존 run receipt에 graph write 전 component intent를 durable하게 붙인다."""
+    if "component_intents" in receipt:
+        return
+    updated = {**receipt, "component_intents": _component_intents(candidates, manifest)}
+    _publish(run_dir / "receipt.json", _canon(updated))
+
+
 def _backup_receipt(data_dir: Path, run_dir: Path, backup_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     if backup_dir.exists() or run_dir in backup_dir.parents or backup_dir in run_dir.parents:
         raise CleanupRefusedError("backup directory must be new and outside run directory")
@@ -542,6 +567,8 @@ def _marker_payload(kind: str, receipt: dict[str, Any]) -> dict[str, Any]:
 def _read_marker(path: Path, kind: str) -> dict[str, Any]:
     data = _json_object(path.read_text(encoding="utf-8"), path.name)
     required = {"kind", "manifest_sha256", "backup_set_id", "store_set_sha256", "data_dir", "receipt_sha256", "payload_sha256"}
+    if kind == "attempt-published":
+        required |= {"attempt", "directory"}
     proof = {key: value for key, value in data.items() if key != "payload_sha256"}
     if set(data) != required or data.get("kind") != kind or data.get("payload_sha256") != _sha(_canon(proof)):
         raise CleanupRefusedError(f"{path.name} digest is invalid")
@@ -623,15 +650,16 @@ def _full_snapshot_matches(data_dir: Path, vector_table: str, candidates: list[d
     return all(_candidate_snapshot(data_dir, vector_table, record["id"], immutable=False) == record["snapshot"] for record in candidates)
 
 
-def _shared_edges_absent(data_dir: Path, vector_table: str, record: dict[str, Any], candidates: list[dict[str, Any]]) -> bool:
-    """다른 후보 graph target가 삭제한 후보-후보 edge만 resume target로 허용한다."""
-    if not record["edges"]:
+def _shared_edges_absent(data_dir: Path, vector_table: str, record: dict[str, Any], candidates: list[dict[str, Any]], receipt: dict[str, Any]) -> bool:
+    """resume은 durable receipt intent가 승인한 component edge absence만 허용한다."""
+    if not record["edges"] or "component_intents" not in receipt:
         return False
     ids = {candidate["id"] for candidate in candidates}
+    approved = {_sha(_canon(item["component_edge"])) for item in receipt["component_intents"]}
     current = _candidate_snapshot(data_dir, vector_table, record["id"], immutable=False)
     if current["edges"] != _edge_digest([]):
         return False
-    return all(edge["from_id"] in ids and edge["to_id"] in ids for edge in record["edges"])
+    return all(edge["from_id"] in ids and edge["to_id"] in ids and _sha(_canon(edge)) in approved for edge in record["edges"])
 
 
 def _current_protection_digest(data_dir: Path, vector_table: str, candidates: list[dict[str, Any]]) -> str:
@@ -661,7 +689,7 @@ def _delete_vector(data_dir: Path, vector_table: str, record: dict[str, Any]) ->
         conn.close()
 
 
-def _delete_graph(data_dir: Path, record: dict[str, Any]) -> None:
+def _delete_graph(data_dir: Path, record: dict[str, Any], after_commit: Callable[[], None] | None = None) -> None:
     conn = _rw(data_dir / "graph.db")
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -685,6 +713,8 @@ def _delete_graph(data_dir: Path, record: dict[str, Any]) -> None:
         if deleted != 1:
             raise CleanupRefusedError(f"{record['id']}: graph delete rowcount")
         conn.commit()
+        if after_commit is not None:
+            after_commit()
     except Exception:
         conn.rollback()
         raise
@@ -745,12 +775,12 @@ def _done_axes(snapshot: dict[str, Any]) -> set[str]:
     return done
 
 
-def _apply_records(data_dir: Path, run_dir: Path, vector_table: str, candidates: list[dict[str, Any]], protected_digest: str) -> None:
+def _apply_records(data_dir: Path, run_dir: Path, vector_table: str, candidates: list[dict[str, Any]], protected_digest: str, receipt: dict[str, Any]) -> None:
     for record in candidates:
         for axis, action in (("vector", _delete_vector), ("graph", _delete_graph), ("document", _delete_document)):
             current = _candidate_snapshot(data_dir, vector_table, record["id"], immutable=False)
             done = _done_axes(current)
-            shared_absent = _shared_edges_absent(data_dir, vector_table, record, candidates)
+            shared_absent = _shared_edges_absent(data_dir, vector_table, record, candidates, receipt)
             if not _allowed(current, record["snapshot"], done, shared_edges_absent=shared_absent):
                 raise CleanupRefusedError(f"{record['id']}: snapshot conflict before {axis}")
             target_axes = {"vector"} if axis == "vector" else {"graph", "edges"} if axis == "graph" else {"source", "fts", "doc"}
@@ -794,16 +824,36 @@ def apply(data_dir: Path, run_dir: Path, vector_table: str, approved_manifest: P
             raise CleanupRefusedError("protected set changed after frozen manifest")
         if _claim_guard(data_dir, candidates):
             raise CleanupRefusedError("Claim support changed after frozen manifest")
-        _apply_records(data_dir, run_dir, vector_table, candidates, protected_digest)
+        _publish_component_intents(run_dir, receipt, candidates, manifest)
+        receipt = _load_receipt(run_dir, backup_dir, manifest, data_dir)
+        _apply_records(data_dir, run_dir, vector_table, candidates, protected_digest, receipt)
         registry_after = _registry_report(data_dir, {candidate["id"] for candidate in candidates})
         _publish(run_dir / "registry-after.json", _canon(registry_after))
         _publish(run_dir / "apply-complete.json", _canon({"manifest_sha256": _sha(_canon(manifest)), "backup_set_id": receipt["backup_set_id"], "registry_after": registry_after}))
 
 
-def _attempt_dir(run_dir: Path) -> Path:
-    path = run_dir / "restore-attempts"
-    path.mkdir(mode=0o700, exist_ok=True)
+def _attempt_dir(run_dir: Path, attempt: str | None = None) -> Path:
+    root = run_dir / "restore-attempts"
+    if not root.exists():
+        root.mkdir(mode=0o700)
+        _fsync_dir(run_dir)
+    if attempt is None:
+        return root
+    path = root / attempt
+    path.mkdir(mode=0o700)
+    _fsync_dir(root)
+    _fsync_dir(run_dir)
     return path
+
+
+def _publish_attempt_successor(run_dir: Path, receipt: dict[str, Any]) -> dict[str, Any]:
+    """prepared tombstone 뒤 immutable attempt binding을 no-replace로 발행한다."""
+    attempt = uuid.uuid4().hex
+    directory = _attempt_dir(run_dir, attempt)
+    payload = {**_marker_payload("attempt-published", receipt), "attempt": attempt, "directory": directory.name}
+    payload["payload_sha256"] = _sha(_canon({key: value for key, value in payload.items() if key != "payload_sha256"}))
+    publish_marker(run_dir, f"{ATTEMPT_PREFIX}{attempt}.json", payload)
+    return payload
 
 
 def _attempt_metadata(run_dir: Path, receipt: dict[str, Any], data_dir: Path, name: str, attempt: str) -> dict[str, Any]:
@@ -814,6 +864,21 @@ def _attempt_metadata(run_dir: Path, receipt: dict[str, Any], data_dir: Path, na
         "file": name,
         "attempt": attempt,
     }
+
+
+def _published_attempts(run_dir: Path, receipt: dict[str, Any]) -> list[dict[str, Any]]:
+    expected = _marker_payload("attempt-published", receipt)
+    out: list[dict[str, Any]] = []
+    for path in run_dir.glob(f"{ATTEMPT_PREFIX}*.json"):
+        marker = _read_marker(path, "attempt-published")
+        for key in ("manifest_sha256", "backup_set_id", "store_set_sha256", "data_dir", "receipt_sha256"):
+            if marker[key] != expected[key]:
+                raise CleanupRefusedError("attempt successor does not bind receipt")
+        directory = run_dir / "restore-attempts" / marker["directory"]
+        if not directory.is_dir():
+            raise CleanupRefusedError("published attempt directory is missing")
+        out.append(marker)
+    return out
 
 
 def _validate_attempts(run_dir: Path, receipt: dict[str, Any], data_dir: Path) -> None:
@@ -894,6 +959,7 @@ def rollback(data_dir: Path, run_dir: Path, backup_dir: Path) -> None:
         state, tombstone, completion = marker_state(run_dir)
         if receipt["data_dir"] != _data_dir_identity(data_dir) or tombstone != expected_tombstone or (completion is not None and completion != expected_completion):
             raise CleanupRefusedError("rollback marker changed before lock")
+        published = _published_attempts(run_dir, receipt)
         _validate_attempts(run_dir, receipt, data_dir)
         if state == "complete tombstone plus completion":
             for name in DB_FILES:
@@ -903,6 +969,11 @@ def rollback(data_dir: Path, run_dir: Path, backup_dir: Path) -> None:
                     raise CleanupRefusedError("completed rollback data differs from receipt")
             _fsync_dir(run_dir)
             return
+        if not published:
+            _publish_attempt_successor(run_dir, receipt)
+            published = _published_attempts(run_dir, receipt)
+        if not published:
+            raise CleanupRefusedError("attempt successor was not published")
         for name in DB_FILES:
             _restore_file(backup_dir / name, data_dir / name, run_dir, receipt)
         for name in DB_FILES:
