@@ -25,7 +25,7 @@
 
 ## Dry-run과 승인
 
-새 run directory를 만들고 dry-run을 실행한다.
+존재하지 않는 새 run path를 지정하고 dry-run을 실행한다. 도구가 그 directory를 만든다. 비어 있는 기존 directory도 지정하면 안 된다.
 
 ```bash
 python scripts/cleanup_openclaw_heartbeat_493.py \
@@ -75,7 +75,7 @@ python scripts/cleanup_openclaw_heartbeat_493.py \
 
 ## Rollback
 
-rollback 전에 서비스를 다시 중지하고 holder와 cold 상태를 확인한다. 리드는 먼저 `--prepare-rollback --backup-dir <backup-dir>`를 실행해 final tombstone을 발행한다. 이 단계는 write lock, holder, receipt, manifest, backup set, data-directory store set identity를 대조한다. 이후 `--rollback --backup-dir <backup-dir>`만 네 DB 복원을 시작한다.
+rollback 전에 서비스를 다시 중지하고 holder와 cold 상태를 확인한다. 리드는 먼저 `--prepare-rollback --backup-dir <backup-dir>`를 실행해 final tombstone을 발행한다. 이 단계는 write lock, holder, receipt, manifest, backup set, 현재 data directory identity를 대조한다. 이 단계는 현재 DB file store-set identity를 다시 계산하지 않는다. 이후 `--rollback --backup-dir <backup-dir>`만 네 DB 복원을 시작한다.
 
 rollback marker 상태는 네 가지다.
 
@@ -88,7 +88,7 @@ apply는 `absent` 외 상태를 거부한다. rollback은 `complete tombstone`�
 
 tombstone과 completion은 temporary `O_CREAT|O_EXCL` 생성, 파일 fsync, Linux `renameat2(RENAME_NOREPLACE)`, run directory fsync, readback 순서로만 발행한다. final marker는 덮어쓰지 않는다.
 
-rollback은 네 DB를 같은 backup set에서 함께 복원한다. 각 파일은 receipt-bound unique restore attempt metadata를 먼저 발행한 뒤 replacement와 file fsync를 수행한다. WAL/SHM/journal sidecar를 제거할 때마다 data directory fsync를 수행한다. binding mismatch artifact는 보존하고 fail-closed로 처리한다. 중단 뒤 exact binding과 complete tombstone이 있으면 새 unique attempt로 네 파일 전체 복원을 다시 시작한다. 네 DB integrity와 receipt hash가 일치한 뒤 completion marker를 발행한다. completion verification-only도 성공 전에 run directory fsync를 다시 수행한다. rollback 중에는 서비스를 시작하지 않는다.
+rollback은 네 DB를 같은 backup set에서 함께 복원한다. 도구는 먼저 하나의 successor UUID directory와 그 successor marker를 fsync해 발행한다. 각 파일의 metadata와 replacement는 그 directory와 UUID에만 결합한다. WAL, SHM, journal sidecar를 제거할 때마다 data directory fsync를 수행한다. binding mismatch artifact는 보존하고 fail-closed로 처리한다. 중단 뒤 exact binding과 complete tombstone이 있으면 도구는 이전 artifact를 보존하고 새 unique attempt로 네 파일 전체 복원을 다시 시작한다. 네 DB integrity와 receipt hash가 일치한 뒤 completion marker를 발행한다. completion verification-only도 성공 전에 run directory fsync를 다시 수행한다. rollback 중에는 서비스를 시작하지 않는다.
 
 ## 금지와 회수
 

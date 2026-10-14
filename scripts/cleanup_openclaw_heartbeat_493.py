@@ -104,12 +104,16 @@ def _file_sha(path: Path) -> str:
     return h.hexdigest()
 
 
-def _fsync_dir(path: Path) -> None:
+def _fsync_file(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _fsync_dir(path: Path) -> None:
+    _fsync_file(path)
 
 
 def _write_fsync(path: Path, data: bytes, *, exclusive: bool = False) -> None:
@@ -451,6 +455,7 @@ def dry_run(data_dir: Path, run_dir: Path, vector_table: str) -> dict[str, Any]:
         "snapshot_sha256": _store_set_digest(data_dir),
         "store_set_sha256": _store_set_digest(data_dir),
         "vector_table": vector_table,
+        "protected": detail["protected"],
         "protected_sha256": protected_digest,
     }
     _publish(run_dir / "report.json", _canon({**detail["report"], "protected_sha256": protected_digest}))
@@ -482,31 +487,50 @@ def _load_approval(path: Path | None, manifest: dict[str, Any]) -> None:
         raise CleanupRefusedError("approval does not bind this exact manifest")
 
 
-def _component_intents(candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> list[dict[str, Any]]:
+def _component_intents(candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> dict[str, Any]:
+    """Initial receipt에 넣을 immutable component, boundary intent를 만든다."""
     ids = {record["id"] for record in candidates}
-    seen: set[str] = set()
-    intents: list[dict[str, Any]] = []
+    component: dict[str, dict[str, Any]] = {}
+    boundary: dict[str, dict[str, Any]] = {}
     for record in candidates:
         for edge in record["edges"]:
-            if edge["from_id"] not in ids or edge["to_id"] not in ids:
-                continue
             key = _sha(_canon(edge))
-            if key in seen:
-                continue
-            seen.add(key)
-            intents.append({"component_edge": edge, "endpoints": sorted((edge["from_id"], edge["to_id"])), "approved_absent": True, "manifest": _sha(_canon(manifest))})
-    return intents
+            if edge["from_id"] in ids and edge["to_id"] in ids:
+                component[key] = {"edge": edge, "endpoints": sorted((edge["from_id"], edge["to_id"])), "approved_absent": True}
+            else:
+                boundary[key] = {"edge": edge, "candidate": record["id"], "deletion_target": True}
+    body = {
+        "manifest": _sha(_canon(manifest)),
+        "component": list(component.values()),
+        "boundary": list(boundary.values()),
+        "component_ids": sorted(component),
+        "component_count": len(component),
+    }
+    canonical = _canon(body).decode("utf-8")
+    return {**body, "canonical": canonical, "digest": _sha(canonical)}
 
 
-def _publish_component_intents(run_dir: Path, receipt: dict[str, Any], candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> None:
-    """기존 run receipt에 graph write 전 component intent를 durable하게 붙인다."""
-    if "component_intents" in receipt:
-        return
-    updated = {**receipt, "component_intents": _component_intents(candidates, manifest)}
-    _publish(run_dir / "receipt.json", _canon(updated))
+def _strict_equal(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(_strict_equal(actual[key], value) for key, value in expected.items())
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(_strict_equal(item, value) for item, value in zip(actual, expected))
+    return actual == expected
 
 
-def _backup_receipt(data_dir: Path, run_dir: Path, backup_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+def _validate_intent(receipt: dict[str, Any], candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> dict[str, Any]:
+    intent = receipt.get("component_intent")
+    expected = _component_intents(candidates, manifest)
+    if not isinstance(intent, dict) or not _strict_equal(intent, expected):
+        raise CleanupRefusedError("receipt component intent mismatch")
+    if intent["digest"] != _sha(intent["canonical"]):
+        raise CleanupRefusedError("receipt component intent digest mismatch")
+    return intent
+
+
+def _backup_receipt(data_dir: Path, run_dir: Path, backup_dir: Path, manifest: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
     if backup_dir.exists() or run_dir in backup_dir.parents or backup_dir in run_dir.parents:
         raise CleanupRefusedError("backup directory must be new and outside run directory")
     backup_dir.mkdir(mode=0o700, parents=True)
@@ -517,8 +541,10 @@ def _backup_receipt(data_dir: Path, run_dir: Path, backup_dir: Path, manifest: d
             backup_sqlite(data_dir / name, target, deadline=time.monotonic() + 60)
             os.chmod(target, 0o600)
             verify_sqlite(target)
+            _fsync_file(target)
             files[name] = {"sha256": _file_sha(target), "mode": target.stat().st_mode & 0o777}
         _fsync_dir(backup_dir)
+        _fsync_dir(backup_dir.parent)
     except Exception:
         raise
     receipt = {
@@ -527,12 +553,13 @@ def _backup_receipt(data_dir: Path, run_dir: Path, backup_dir: Path, manifest: d
         "manifest_sha256": _sha(_canon(manifest)),
         "store_set_sha256": manifest["store_set_sha256"],
         "data_dir": _data_dir_identity(data_dir),
+        "component_intent": _component_intents(candidates, manifest),
     }
     _publish(run_dir / "receipt.json", _canon(receipt))
     return receipt
 
 
-def _load_receipt(run_dir: Path, backup_dir: Path, manifest: dict[str, Any], data_dir: Path | None = None) -> dict[str, Any]:
+def _load_receipt(run_dir: Path, backup_dir: Path, manifest: dict[str, Any], candidates: list[dict[str, Any]], data_dir: Path | None = None) -> dict[str, Any]:
     path = run_dir / "receipt.json"
     if not path.is_file():
         raise CleanupRefusedError("verified four-store backup receipt is required")
@@ -541,6 +568,7 @@ def _load_receipt(run_dir: Path, backup_dir: Path, manifest: dict[str, Any], dat
         raise CleanupRefusedError("receipt does not bind manifest and store set")
     if data_dir is not None and receipt.get("data_dir") != _data_dir_identity(data_dir):
         raise CleanupRefusedError("receipt does not bind this data directory")
+    _validate_intent(receipt, candidates, manifest)
     files = receipt.get("files")
     if not isinstance(files, dict) or set(files) != set(DB_FILES):
         raise CleanupRefusedError("receipt does not hold four backups")
@@ -652,7 +680,7 @@ def _full_snapshot_matches(data_dir: Path, vector_table: str, candidates: list[d
 
 def _component_edges(candidates: list[dict[str, Any]], receipt: dict[str, Any], manifest: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], set[str]]:
     """Frozen candidates와 immutable receipt에서 authoritative R/D를 재계산한다."""
-    binding = _sha(_canon(manifest))
+    intent = _validate_intent(receipt, candidates, manifest)
     ids = {record["id"] for record in candidates}
     recorded = {
         _sha(_canon(edge)): edge
@@ -660,17 +688,7 @@ def _component_edges(candidates: list[dict[str, Any]], receipt: dict[str, Any], 
         for edge in record["edges"]
         if edge["from_id"] in ids and edge["to_id"] in ids
     }
-    intents = receipt.get("component_intents")
-    if not isinstance(intents, list):
-        raise CleanupRefusedError("receipt has no component intent")
-    approved: set[str] = set()
-    for item in intents:
-        if not isinstance(item, dict) or item.get("manifest") != binding or item.get("endpoints") != sorted(item["component_edge"][key] for key in ("from_id", "to_id")) or item.get("approved_absent") is not True:
-            raise CleanupRefusedError("component intent binding mismatch")
-        key = _sha(_canon(item["component_edge"]))
-        if key not in recorded:
-            raise CleanupRefusedError("component intent row mismatch")
-        approved.add(key)
+    approved = {_sha(_canon(item["edge"])) for item in intent["component"]}
     return recorded, approved
 
 
@@ -678,11 +696,126 @@ def _validate_component_edges(conn: sqlite3.Connection, candidates: list[dict[st
     """같은 R/D/S helper를 caller와 graph transaction에서 사용한다."""
     recorded, approved = _component_edges(candidates, receipt, manifest)
     ids = {record["id"] for record in candidates}
-    actual_rows = [_edge_record(row) for row in conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id IN ({}) AND to_id IN ({}) ORDER BY from_id,relation,to_id".format(",".join("?" for _ in ids), ",".join("?" for _ in ids)), (*ids, *ids))]
+    placeholders = ",".join("?" for _ in ids)
+    actual_rows = [_edge_record(row) for row in conn.execute(f"SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id IN ({placeholders}) AND to_id IN ({placeholders}) ORDER BY from_id,relation,to_id", (*ids, *ids))]
     actual = {_sha(_canon(edge)): edge for edge in actual_rows}
     if not set(recorded) - approved <= set(actual) <= set(recorded):
         raise CleanupRefusedError("component edge R/D/S conflict")
     return actual_rows
+
+
+def _boundary_edges(candidates: list[dict[str, Any]], receipt: dict[str, Any], manifest: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    """Frozen boundary rows와 immutable deletion target을 반환한다."""
+    intent = _validate_intent(receipt, candidates, manifest)
+    recorded = {_sha(_canon(item["edge"])): item["edge"] for item in intent["boundary"]}
+    approved = {_sha(_canon(item["edge"])) for item in intent["boundary"] if item["deletion_target"] is True}
+    return recorded, approved
+
+
+def _validate_boundary_edges(conn: sqlite3.Connection, candidates: list[dict[str, Any]], receipt: dict[str, Any], manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """Candidate boundary rows의 exact identity와 approved absence를 확인한다."""
+    recorded, approved = _boundary_edges(candidates, receipt, manifest)
+    ids = {record["id"] for record in candidates}
+    placeholders = ",".join("?" for _ in ids)
+    actual_rows = [_edge_record(row) for row in conn.execute(f"SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE (from_id IN ({placeholders}) AND to_id NOT IN ({placeholders})) OR (from_id NOT IN ({placeholders}) AND to_id IN ({placeholders})) ORDER BY from_id,relation,to_id", (*ids, *ids, *ids, *ids))]
+    actual = {_sha(_canon(edge)): edge for edge in actual_rows}
+    if not set(recorded) - approved <= set(actual) <= set(recorded):
+        raise CleanupRefusedError("boundary edge R/D/S conflict")
+    return actual_rows
+
+
+def _validate_graph_intent(conn: sqlite3.Connection, candidates: list[dict[str, Any]], receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
+    """Component와 boundary의 immutable graph intent를 함께 확인한다."""
+    _validate_component_edges(conn, candidates, receipt, manifest)
+    _validate_boundary_edges(conn, candidates, receipt, manifest)
+
+
+def _protected_graph(conn: sqlite3.Connection, candidate_ids: set[str], excluded_edges: set[str] | None = None, excluded_nodes: set[str] | None = None) -> dict[str, Any]:
+    """같은 graph transaction에서 protected graph projection을 만든다."""
+    excluded_edges = excluded_edges or set()
+    excluded_nodes = excluded_nodes or set()
+    nodes: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
+    for node_type, node_id, space, raw in conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes ORDER BY node_id"):
+        if node_id in excluded_nodes:
+            continue
+        item = {"id": node_id, "type": node_type, "space": space, "properties": _props_digest(raw)}
+        if node_type in {"Document", "Claim"}:
+            nodes.append(item)
+        elif node_type == "Evidence" and node_id not in candidate_ids:
+            evidence.append(item)
+    edges = []
+    for row in conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges ORDER BY from_id,relation,to_id"):
+        edge = _edge_record(row)
+        if _sha(_canon(edge)) in excluded_edges:
+            continue
+        if edge["from_id"] not in candidate_ids and edge["to_id"] not in candidate_ids:
+            edges.append(edge)
+    return {"nodes": nodes, "evidence": evidence, "edges": edges}
+
+
+def _validate_projected_protection(conn: sqlite3.Connection, candidates: list[dict[str, Any]], manifest: dict[str, Any], planned_edges: set[str], planned_nodes: set[str]) -> None:
+    """Planned graph write 전 protected projection과 affected Claim support를 검사한다."""
+    expected = manifest.get("protected")
+    if not isinstance(expected, dict):
+        raise CleanupRefusedError("manifest has no protected graph state")
+    candidate_ids = {record["id"] for record in candidates}
+    current = _protected_graph(conn, candidate_ids, planned_edges, planned_nodes)
+    expected_graph = {
+        "nodes": expected.get("nodes"),
+        "evidence": [item.get("graph") for item in expected.get("evidence", [])],
+        "edges": expected.get("edges"),
+    }
+    if not _strict_equal(current, expected_graph):
+        raise CleanupRefusedError("projected protected graph state changed")
+    claim_rows = {
+        node_id: (space, _props_digest(raw))
+        for node_type, node_id, space, raw in conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_type='Claim'")
+    }
+    frozen_claims = {
+        item["id"]: (item["space"], item["properties"])
+        for item in expected_graph["nodes"]
+        if item["type"] == "Claim"
+    }
+    affected_claims = {
+        edge["to_id"]
+        for record in candidates
+        for edge in record["edges"]
+        if _sha(_canon(edge)) in planned_edges and edge["relation"] == "supports" and edge["to_id"] in claim_rows and claim_rows[edge["to_id"]] == frozen_claims.get(edge["to_id"])
+    }
+    expected_edges = expected_graph["edges"]
+    for claim in affected_claims:
+        expected_supports = {
+            _sha(_canon(edge))
+            for edge in expected_edges
+            if edge["relation"] == "supports" and edge["to_id"] == claim
+        }
+        current_supports = set()
+        projected_supports = set()
+        for row in conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE relation='supports' AND to_id=?", (claim,)):
+            edge = _edge_record(row)
+            key = _sha(_canon(edge))
+            if edge["from_id"] not in candidate_ids:
+                current_supports.add(key)
+                if key not in planned_edges:
+                    projected_supports.add(key)
+        if current_supports != expected_supports or not projected_supports:
+            raise CleanupRefusedError("planned graph delete removes final Claim support")
+
+
+def _validate_all_candidate_claims(data_dir: Path, candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> None:
+    """모든 candidate graph target의 Claim support 유실을 첫 axis write 전에 막는다."""
+    conn = _ro(data_dir / "graph.db", True)
+    try:
+        planned_edges = {
+            _sha(_canon(edge))
+            for record in candidates
+            for edge in record["edges"]
+        }
+        planned_nodes = {record["id"] for record in candidates}
+        _validate_projected_protection(conn, candidates, manifest, planned_edges, planned_nodes)
+    finally:
+        conn.close()
 
 
 def _current_protection_digest(data_dir: Path, vector_table: str, candidates: list[dict[str, Any]]) -> str:
@@ -719,19 +852,45 @@ def _delete_graph(data_dir: Path, record: dict[str, Any], candidates: list[dict[
         node = conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (record["id"],)).fetchone()
         if node is None or node[0] != "Evidence" or node[2] != EVIDENCE_SPACE or _props_digest(node[3]) != record["graph"]["properties"]:
             raise CleanupRefusedError(f"{record['id']}: graph CAS conflict")
-        _validate_component_edges(conn, candidates, receipt, manifest)
+        component_before = {_sha(_canon(edge)) for edge in _validate_component_edges(conn, candidates, receipt, manifest)}
+        boundary_before = {_sha(_canon(edge)) for edge in _validate_boundary_edges(conn, candidates, receipt, manifest)}
+        _, component_targets = _component_edges(candidates, receipt, manifest)
+        _, boundary_targets = _boundary_edges(candidates, receipt, manifest)
+        deleted_component: set[str] = set()
+        deleted_boundary: set[str] = set()
+        planned: list[tuple[dict[str, Any], Any]] = []
         for edge in record["edges"]:
+            key = _sha(_canon(edge))
+            if key in component_targets:
+                deleted_component.add(key)
+            elif key in boundary_targets:
+                deleted_boundary.add(key)
+            else:
+                raise CleanupRefusedError(f"{record['id']}: graph edge is not an immutable deletion target")
             row = conn.execute("SELECT properties FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?", (edge["from_id"], edge["relation"], edge["to_id"])).fetchone()
             if row is None:
                 continue
             if _props_digest(row[0]) != edge["properties"]:
                 raise CleanupRefusedError(f"{record['id']}: graph edge CAS conflict")
-            result = conn.execute("DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=? AND from_type=? AND to_type=? AND properties IS ?", (edge["from_id"], edge["relation"], edge["to_id"], edge["from_type"], edge["to_type"], row[0])).rowcount
+            planned.append((edge, row[0]))
+        component_lower = component_before - component_targets
+        boundary_lower = boundary_before - boundary_targets
+        component_projected = component_before - deleted_component
+        boundary_projected = boundary_before - deleted_boundary
+        if not (component_lower <= component_projected <= component_before) or not (boundary_lower <= boundary_projected <= boundary_before):
+            raise CleanupRefusedError(f"{record['id']}: graph planned post-state conflict")
+        _validate_projected_protection(conn, candidates, manifest, deleted_component | deleted_boundary, {record["id"]})
+        for edge, raw in planned:
+            result = conn.execute("DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=? AND from_type=? AND to_type=? AND properties IS ?", (edge["from_id"], edge["relation"], edge["to_id"], edge["from_type"], edge["to_type"], raw)).rowcount
             if result != 1:
                 raise CleanupRefusedError(f"{record['id']}: graph edge delete rowcount")
         deleted = conn.execute("DELETE FROM graph_nodes WHERE node_id=? AND node_type='Evidence' AND space_id=? AND properties IS ?", (record["id"], EVIDENCE_SPACE, node[3])).rowcount
         if deleted != 1:
             raise CleanupRefusedError(f"{record['id']}: graph delete rowcount")
+        component_after = {_sha(_canon(edge)) for edge in _validate_component_edges(conn, candidates, receipt, manifest)}
+        boundary_after = {_sha(_canon(edge)) for edge in _validate_boundary_edges(conn, candidates, receipt, manifest)}
+        if component_after != component_before - deleted_component or boundary_after != boundary_before - deleted_boundary:
+            raise CleanupRefusedError(f"{record['id']}: graph planned post-state conflict")
         conn.commit()
         if after_commit is not None:
             after_commit()
@@ -790,8 +949,9 @@ def _done_axes(snapshot: dict[str, Any]) -> set[str]:
         done.add("vector")
     if snapshot["graph"] == [] and snapshot["edges"] == _edge_digest([]):
         done |= {"graph", "edges"}
-    if snapshot["source"] == [] and snapshot["fts"] == [] and snapshot["doc"] == []:
-        done |= {"source", "fts", "doc"}
+    for axis in ("source", "fts", "doc"):
+        if snapshot[axis] == []:
+            done.add(axis)
     return done
 
 
@@ -802,7 +962,7 @@ def _apply_records(data_dir: Path, run_dir: Path, vector_table: str, candidates:
             done = _done_axes(current)
             graph_conn = _rw(data_dir / "graph.db")
             try:
-                _validate_component_edges(graph_conn, candidates, receipt, manifest)
+                _validate_graph_intent(graph_conn, candidates, receipt, manifest)
             finally:
                 graph_conn.close()
             # The R/D/S helper owns component edges. Generic axis CAS compares every other component.
@@ -821,7 +981,7 @@ def _apply_records(data_dir: Path, run_dir: Path, vector_table: str, candidates:
             done = _done_axes(after)
             graph_conn = _rw(data_dir / "graph.db")
             try:
-                _validate_component_edges(graph_conn, candidates, receipt, manifest)
+                _validate_graph_intent(graph_conn, candidates, receipt, manifest)
             finally:
                 graph_conn.close()
             after["edges"] = record["snapshot"]["edges"]
@@ -855,14 +1015,14 @@ def apply(data_dir: Path, run_dir: Path, vector_table: str, approved_manifest: P
         protected_digest = manifest["protected_sha256"]
         if not receipt_path.exists() and not _full_snapshot_matches(data_dir, vector_table, candidates, protected_digest):
             raise CleanupRefusedError("first apply requires the full frozen snapshot")
-        receipt = _load_receipt(run_dir, backup_dir, manifest, data_dir) if receipt_path.exists() else _backup_receipt(data_dir, run_dir, backup_dir, manifest)
-        _load_receipt(run_dir, backup_dir, manifest, data_dir)
+        receipt = _load_receipt(run_dir, backup_dir, manifest, candidates, data_dir) if receipt_path.exists() else _backup_receipt(data_dir, run_dir, backup_dir, manifest, candidates)
+        _load_receipt(run_dir, backup_dir, manifest, candidates, data_dir)
         if _current_protection_digest(data_dir, vector_table, candidates) != protected_digest:
             raise CleanupRefusedError("protected set changed after frozen manifest")
         if _claim_guard(data_dir, candidates):
             raise CleanupRefusedError("Claim support changed after frozen manifest")
-        _publish_component_intents(run_dir, receipt, candidates, manifest)
-        receipt = _load_receipt(run_dir, backup_dir, manifest, data_dir)
+        receipt = _load_receipt(run_dir, backup_dir, manifest, candidates, data_dir)
+        _validate_all_candidate_claims(data_dir, candidates, manifest)
         _apply_records(data_dir, run_dir, vector_table, candidates, protected_digest, receipt, manifest)
         registry_after = _registry_report(data_dir, {candidate["id"] for candidate in candidates})
         _publish(run_dir / "registry-after.json", _canon(registry_after))
@@ -893,13 +1053,14 @@ def _publish_attempt_successor(run_dir: Path, receipt: dict[str, Any]) -> dict[s
     return payload
 
 
-def _attempt_metadata(run_dir: Path, receipt: dict[str, Any], data_dir: Path, name: str, attempt: str) -> dict[str, Any]:
+def _attempt_metadata(receipt: dict[str, Any], data_dir: Path, name: str, attempt: str) -> dict[str, Any]:
     return {
         "receipt_sha256": _sha(_canon(receipt)),
         "backup_set_id": receipt["backup_set_id"],
         "data_dir": _data_dir_identity(data_dir),
         "file": name,
         "attempt": attempt,
+        "replacement": f".{name}.restore-{attempt}",
     }
 
 
@@ -911,24 +1072,63 @@ def _published_attempts(run_dir: Path, receipt: dict[str, Any]) -> list[dict[str
         for key in ("manifest_sha256", "backup_set_id", "store_set_sha256", "data_dir", "receipt_sha256"):
             if marker[key] != expected[key]:
                 raise CleanupRefusedError("attempt successor does not bind receipt")
+        if marker["directory"] != marker["attempt"]:
+            raise CleanupRefusedError("attempt successor directory does not match UUID")
         directory = run_dir / "restore-attempts" / marker["directory"]
         if not directory.is_dir():
             raise CleanupRefusedError("published attempt directory is missing")
         out.append(marker)
-    return out
+    return sorted(out, key=lambda marker: marker["attempt"])
 
 
 def _validate_attempts(run_dir: Path, receipt: dict[str, Any], data_dir: Path) -> None:
-    """과거 restore artifact는 exact binding일 때만 증거로 남긴다."""
+    """모든 restore artifact를 발행된 UUID, metadata, replacement 이름으로 함께 검증한다."""
     root = run_dir / "restore-attempts"
+    published = {marker["attempt"]: marker for marker in _published_attempts(run_dir, receipt)}
     if not root.exists():
-        return
-    expected_base = {"receipt_sha256": _sha(_canon(receipt)), "backup_set_id": receipt["backup_set_id"], "data_dir": _data_dir_identity(data_dir)}
-    for path in root.glob("*.json"):
-        metadata = _json_object(path.read_text(encoding="utf-8"), path.name)
-        required = {"receipt_sha256", "backup_set_id", "data_dir", "file", "attempt"}
-        if set(metadata) != required or any(metadata[key] != value for key, value in expected_base.items()) or metadata["file"] not in DB_FILES or not isinstance(metadata["attempt"], str):
+        if published:
+            raise CleanupRefusedError("published attempt directory is missing")
+        root_entries: list[Path] = []
+    else:
+        root_entries = list(root.iterdir())
+    expected_base = {
+        "receipt_sha256": _sha(_canon(receipt)),
+        "backup_set_id": receipt["backup_set_id"],
+        "data_dir": _data_dir_identity(data_dir),
+    }
+    metadata_by_attempt: dict[tuple[str, str], dict[str, Any]] = {}
+    for directory in root_entries:
+        if not directory.is_dir() or directory.name not in published:
             raise CleanupRefusedError("restore artifact binding mismatch")
+        for path in directory.iterdir():
+            if not path.is_file() or path.suffix != ".json":
+                raise CleanupRefusedError("restore artifact binding mismatch")
+            metadata = _json_object(path.read_text(encoding="utf-8"), path.name)
+            required = {"receipt_sha256", "backup_set_id", "data_dir", "file", "attempt", "replacement"}
+            if (
+                set(metadata) != required
+                or any(metadata[key] != value for key, value in expected_base.items())
+                or metadata["file"] not in DB_FILES
+                or metadata["attempt"] != directory.name
+                or metadata["replacement"] != f".{metadata['file']}.restore-{directory.name}"
+                or path.name != f"{metadata['file']}.json"
+                or (directory.name, metadata["file"]) in metadata_by_attempt
+            ):
+                raise CleanupRefusedError("restore artifact binding mismatch")
+            metadata_by_attempt[(directory.name, metadata["file"])] = metadata
+    for name in DB_FILES:
+        destination = data_dir / name
+        for sidecar in (destination.with_name(destination.name + suffix) for suffix in ("-wal", "-shm", "-journal")):
+            if sidecar.exists():
+                raise CleanupRefusedError("restore sidecar artifact is unbound")
+        for artifact in data_dir.glob(f".{name}.*"):
+            prefix = f".{name}.restore-"
+            if not artifact.is_file() or not artifact.name.startswith(prefix):
+                raise CleanupRefusedError("restore artifact binding mismatch")
+            attempt = artifact.name.removeprefix(prefix)
+            metadata = metadata_by_attempt.get((attempt, name))
+            if metadata is None or metadata["replacement"] != artifact.name:
+                raise CleanupRefusedError("restore artifact binding mismatch")
 
 
 def _remove_sidecars(destination: Path) -> None:
@@ -939,14 +1139,14 @@ def _remove_sidecars(destination: Path) -> None:
             _fsync_dir(destination.parent)
 
 
-def _restore_file(source: Path, destination: Path, run_dir: Path, receipt: dict[str, Any]) -> None:
-    """새 attempt metadata를 먼저 발행하고 기존 partial artifact는 보존한다."""
-    attempt = uuid.uuid4().hex
+def _restore_file(source: Path, destination: Path, attempt_dir: Path, receipt: dict[str, Any]) -> None:
+    """발행된 successor UUID 아래 metadata를 쓰고 해당 UUID replacement만 복원한다."""
+    attempt = attempt_dir.name
     replacement = destination.with_name(f".{destination.name}.restore-{attempt}")
-    metadata = _attempt_metadata(run_dir, receipt, destination.parent, destination.name, attempt)
-    metadata_path = _attempt_dir(run_dir) / f"{destination.name}.{attempt}.json"
+    metadata = _attempt_metadata(receipt, destination.parent, destination.name, attempt)
+    metadata_path = attempt_dir / f"{destination.name}.json"
     _write_fsync(metadata_path, _canon(metadata), exclusive=True)
-    _fsync_dir(metadata_path.parent)
+    _fsync_dir(attempt_dir)
     with source.open("rb") as reader, replacement.open("xb") as writer:
         shutil.copyfileobj(reader, writer)
         writer.flush()
@@ -962,8 +1162,8 @@ def prepare_rollback(data_dir: Path, run_dir: Path, backup_dir: Path) -> None:
 
     from opencrab.locking import write_lock
 
-    _, manifest = _load_run(run_dir)
-    receipt = _load_receipt(run_dir, backup_dir, manifest, data_dir)
+    candidates, manifest = _load_run(run_dir)
+    receipt = _load_receipt(run_dir, backup_dir, manifest, candidates, data_dir)
     state, _, _ = marker_state(run_dir)
     if state != "absent":
         raise CleanupRefusedError(f"rollback preparation refuses marker state: {state}")
@@ -983,7 +1183,7 @@ def rollback(data_dir: Path, run_dir: Path, backup_dir: Path) -> None:
     from opencrab.locking import write_lock
 
     candidates, manifest = _load_run(run_dir)
-    receipt = _load_receipt(run_dir, backup_dir, manifest, data_dir)
+    receipt = _load_receipt(run_dir, backup_dir, manifest, candidates, data_dir)
     state, tombstone, completion = marker_state(run_dir)
     expected_tombstone = _marker_payload("tombstone", receipt)
     expected_completion = _marker_payload("completion", receipt)
@@ -996,7 +1196,6 @@ def rollback(data_dir: Path, run_dir: Path, backup_dir: Path) -> None:
         state, tombstone, completion = marker_state(run_dir)
         if receipt["data_dir"] != _data_dir_identity(data_dir) or tombstone != expected_tombstone or (completion is not None and completion != expected_completion):
             raise CleanupRefusedError("rollback marker changed before lock")
-        published = _published_attempts(run_dir, receipt)
         _validate_attempts(run_dir, receipt, data_dir)
         if state == "complete tombstone plus completion":
             for name in DB_FILES:
@@ -1006,13 +1205,11 @@ def rollback(data_dir: Path, run_dir: Path, backup_dir: Path) -> None:
                     raise CleanupRefusedError("completed rollback data differs from receipt")
             _fsync_dir(run_dir)
             return
-        if not published:
-            _publish_attempt_successor(run_dir, receipt)
-            published = _published_attempts(run_dir, receipt)
-        if not published:
-            raise CleanupRefusedError("attempt successor was not published")
+        successor = _publish_attempt_successor(run_dir, receipt)
+        attempt_dir = run_dir / "restore-attempts" / successor["directory"]
+        _validate_attempts(run_dir, receipt, data_dir)
         for name in DB_FILES:
-            _restore_file(backup_dir / name, data_dir / name, run_dir, receipt)
+            _restore_file(backup_dir / name, data_dir / name, attempt_dir, receipt)
         for name in DB_FILES:
             verify_sqlite(data_dir / name)
             if _file_sha(data_dir / name) != receipt["files"][name]["sha256"]:
