@@ -154,6 +154,16 @@ def _rw(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True)
 
 
+def _commit(conn: sqlite3.Connection) -> None:
+    """Write transaction의 commit seam이다."""
+    conn.commit()
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    """Write transaction의 rollback seam이다."""
+    conn.rollback()
+
+
 def require_empty_wal(data_dir: Path) -> None:
     for name in DB_FILES:
         wal = data_dir / f"{name}-wal"
@@ -221,6 +231,14 @@ def _row_digest(row: tuple[Any, ...]) -> str:
     return _sha(_canon(list(row)))
 
 
+def _registry_node_record(row: tuple[Any, ...]) -> dict[str, Any]:
+    return {"id": row[0], "space": row[1], "node_type": row[2], "node_id": row[3], "created_at": row[4], "updated_at": row[5]}
+
+
+def _registry_edge_record(row: tuple[Any, ...]) -> dict[str, Any]:
+    return {"id": row[0], "from_space": row[1], "from_id": row[2], "relation": row[3], "to_space": row[4], "to_id": row[5], "created_at": row[6]}
+
+
 def _edge_record(row: tuple[Any, ...]) -> dict[str, Any]:
     frm_type, frm_id, relation, to_type, to_id, props = row
     return {
@@ -235,6 +253,39 @@ def _edge_record(row: tuple[Any, ...]) -> dict[str, Any]:
 
 def _edge_digest(edges: list[dict[str, Any]]) -> str:
     return _sha(_canon(sorted(edges, key=_canon)))
+
+
+def _registry_snapshot(data_dir: Path, node_id: str, *, immutable: bool) -> dict[str, Any]:
+    registry = _ro(data_dir / "opencrab.db", immutable)
+    try:
+        nodes = registry.execute(
+            "SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=? ORDER BY id",
+            (node_id,),
+        ).fetchall()
+        edges = registry.execute(
+            "SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges "
+            "WHERE from_id=? OR to_id=? ORDER BY id",
+            (node_id, node_id),
+        ).fetchall()
+        target_edges = []
+        foreign_edges = []
+        for row in edges:
+            edge = _registry_edge_record(row)
+            endpoints = ((edge["from_space"], edge["from_id"]), (edge["to_space"], edge["to_id"]))
+            same_id_foreign = any(endpoint_id == node_id and endpoint_space != EVIDENCE_SPACE for endpoint_space, endpoint_id in endpoints)
+            if same_id_foreign:
+                raise CleanupRefusedError(f"{node_id}: registry edge foreign tuple")
+            if (EVIDENCE_SPACE, node_id) in endpoints:
+                target_edges.append(edge)
+            else:
+                foreign_edges.append(edge)
+        return {
+            "registry_node": [_registry_node_record(row) for row in nodes],
+            "registry_edges": target_edges,
+            "registry_foreign": foreign_edges,
+        }
+    finally:
+        registry.close()
 
 
 def _candidate_snapshot(data_dir: Path, vector_table: str, node_id: str, *, immutable: bool) -> dict[str, Any]:
@@ -265,6 +316,7 @@ def _candidate_snapshot(data_dir: Path, vector_table: str, node_id: str, *, immu
             "graph": [_row_digest(r) for r in graph_rows],
             "edges": _edge_digest([_edge_record(r) for r in edge_rows]),
             "vector": [_row_digest(r) for r in vector_rows],
+            **_registry_snapshot(data_dir, node_id, immutable=immutable),
         }
     finally:
         doc.close()
@@ -283,6 +335,7 @@ def _select_candidate(data_dir: Path, vector_table: str, source: tuple[Any, ...]
     doc = _ro(data_dir / "doc_store.db", True)
     graph = _ro(data_dir / "graph.db", True)
     vectors = _ro(data_dir / "vectors.db", True)
+    registry = _ro(data_dir / "opencrab.db", True)
     try:
         _load_vec(vectors)
         columns = _ensure_vector_table(vectors, vector_table)
@@ -312,6 +365,15 @@ def _select_candidate(data_dir: Path, vector_table: str, source: tuple[Any, ...]
                 errors.append("vector ownership")
             elif _json_object(row[3], f"vector {node_id}").get("node_id") != node_id:
                 errors.append("vector identity")
+        registry_nodes = registry.execute(
+            "SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=? ORDER BY id",
+            (node_id,),
+        ).fetchall()
+        registry_records = [_registry_node_record(row) for row in registry_nodes]
+        if len(registry_records) != 1:
+            errors.append("registry node multiplicity")
+        elif (registry_records[0]["space"], registry_records[0]["node_type"], registry_records[0]["node_id"]) != (EVIDENCE_SPACE, "Evidence", node_id):
+            errors.append("registry node ownership")
         if errors:
             raise CleanupRefusedError(f"{node_id}: " + ", ".join(errors))
         edges = graph.execute(
@@ -332,6 +394,7 @@ def _select_candidate(data_dir: Path, vector_table: str, source: tuple[Any, ...]
         doc.close()
         graph.close()
         vectors.close()
+        registry.close()
 
 
 def _protected(data_dir: Path, vector_table: str, candidate_ids: set[str]) -> dict[str, Any]:
@@ -339,6 +402,7 @@ def _protected(data_dir: Path, vector_table: str, candidate_ids: set[str]) -> di
     doc = _ro(data_dir / "doc_store.db", True)
     graph = _ro(data_dir / "graph.db", True)
     vectors = _ro(data_dir / "vectors.db", True)
+    registry = _ro(data_dir / "opencrab.db", True)
     try:
         _load_vec(vectors)
         _ensure_vector_table(vectors, vector_table)
@@ -354,31 +418,193 @@ def _protected(data_dir: Path, vector_table: str, candidate_ids: set[str]) -> di
             if node_type == "Evidence" and node_id not in candidate_ids:
                 doc_rows = doc.execute("SELECT space,node_id,node_type,properties FROM doc_nodes WHERE node_id=?", (node_id,)).fetchall()
                 vec_rows = vectors.execute(f"SELECT node_id,pack_id,document,metadata,embedding FROM {vector_table} WHERE node_id=?", (node_id,)).fetchall()
-                noncandidate_evidence.append({"graph": item, "doc": [_row_digest(x) for x in doc_rows], "vector": [_row_digest(x) for x in vec_rows]})
+                source_rows = doc.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (node_id,)).fetchall()
+                registry_rows = registry.execute(
+                    "SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE space=? AND node_id=?",
+                    (EVIDENCE_SPACE, node_id),
+                ).fetchall()
+                noncandidate_evidence.append({
+                    "graph": item,
+                    "graph_raw": _json_value(row),
+                    "doc": [_row_digest(x) for x in doc_rows],
+                    "vector": [_row_digest(x) for x in vec_rows],
+                    "source": [_row_digest(x) for x in source_rows],
+                    "source_raw": [_json_value(x) for x in source_rows],
+                    "registry": [_registry_node_record(x) for x in registry_rows],
+                })
         for row in graph.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges ORDER BY from_id,relation,to_id"):
             edge = _edge_record(row)
             if edge["from_id"] not in candidate_ids and edge["to_id"] not in candidate_ids:
                 protected_edges.append(edge)
-        return {"nodes": protected_nodes, "evidence": noncandidate_evidence, "edges": protected_edges}
+        registry_nodes = []
+        for row in registry.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id"):
+            item = _registry_node_record(row)
+            if (item["space"], item["node_id"]) not in {(EVIDENCE_SPACE, candidate_id) for candidate_id in candidate_ids}:
+                registry_nodes.append(item)
+        registry_edges = []
+        for row in registry.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id"):
+            edge = _registry_edge_record(row)
+            endpoints = {(edge["from_space"], edge["from_id"]), (edge["to_space"], edge["to_id"])}
+            if not endpoints & {(EVIDENCE_SPACE, candidate_id) for candidate_id in candidate_ids}:
+                registry_edges.append(edge)
+        return {"nodes": protected_nodes, "evidence": noncandidate_evidence, "edges": protected_edges, "registry_nodes": registry_nodes, "registry_edges": registry_edges}
     finally:
         doc.close()
         graph.close()
         vectors.close()
+        registry.close()
 
 
-def _claim_guard(data_dir: Path, candidates: list[dict[str, Any]]) -> list[str]:
-    ids = {record["id"] for record in candidates}
+def _valid_claim_source(
+    graph: sqlite3.Connection,
+    registry: sqlite3.Connection,
+    doc: sqlite3.Connection,
+    frozen: dict[str, Any] | None,
+    source_id: str,
+) -> bool:
+    """현재와 frozen 상태가 모두 openclaw Evidence source임을 확인한다."""
+    if frozen is None:
+        return False
+    source = doc.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchall()
+    graph_node = graph.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (source_id,)).fetchone()
+    registry_nodes = registry.execute(
+        "SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE space=? AND node_id=?",
+        (EVIDENCE_SPACE, source_id),
+    ).fetchall()
+    frozen_source = frozen.get("source_raw")
+    frozen_registry = frozen.get("registry")
+    if len(source) != 1 or graph_node is None or len(registry_nodes) != 1 or not isinstance(frozen_source, list) or not isinstance(frozen_registry, list):
+        return False
+    registry_record = _registry_node_record(registry_nodes[0])
+    frozen_graph = frozen.get("graph")
+    return (
+        len(frozen_source) == 1
+        and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == "openclaw"
+        and _strict_pack(source[0][2], f"Claim source {source_id}") == "openclaw"
+        and frozen_graph is not None
+        and isinstance(frozen.get("graph_raw"), list)
+        and _strict_pack(frozen["graph_raw"][3], f"Frozen Claim graph {source_id}") == "openclaw"
+        and graph_node[0] == "Evidence" and graph_node[1] == source_id and graph_node[2] == EVIDENCE_SPACE
+        and _strict_pack(graph_node[3], f"Claim graph {source_id}") == "openclaw"
+        and len(frozen_registry) == 1
+        and frozen_registry[0]["space"] == EVIDENCE_SPACE
+        and frozen_registry[0]["node_type"] == "Evidence"
+        and frozen_registry[0]["node_id"] == source_id
+        and registry_record == frozen_registry[0]
+        and [_json_value(row) for row in source] == frozen_source
+        and _strict_equal({"id": source_id, "type": graph_node[0], "space": graph_node[2], "properties": _props_digest(graph_node[3])}, frozen_graph)
+    )
+
+
+def _claim_failures(
+    graph: sqlite3.Connection,
+    registry: sqlite3.Connection,
+    doc: sqlite3.Connection,
+    candidates: list[dict[str, Any]],
+    manifest: dict[str, Any],
+    *,
+    axis: str,
+    planned_edges: set[str] | None = None,
+    planned_nodes: set[str] | None = None,
+) -> list[str]:
+    """현재 connection projection에서 frozen Claim support를 검사한다."""
+    planned_edges = planned_edges or set()
+    planned_nodes = planned_nodes or set()
+    candidate_ids = {record["id"] for record in candidates}
+    affected = _frozen_claim_supports(candidates, manifest, axis=axis)
+    protected = {item["graph"]["id"]: item for item in manifest["protected"]["evidence"]}
+    bad: list[str] = []
+    for claim_space, claim_id in sorted(affected):
+        if axis == "graph":
+            claim = graph.execute("SELECT node_type,node_id,space_id FROM graph_nodes WHERE node_id=?", (claim_id,)).fetchone()
+            if claim is None or claim != ("Claim", claim_id, claim_space) or claim_id in planned_nodes:
+                bad.append(claim_id)
+                continue
+            rows = graph.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE relation='supports' AND to_id=?", (claim_id,)).fetchall()
+            supports = [_edge_record(row) for row in rows]
+            valid = any(
+                edge["from_type"] == "Evidence" and edge["to_type"] == "Claim"
+                and edge["from_id"] not in candidate_ids
+                and _sha(_canon(edge)) not in planned_edges
+                and _valid_claim_source(graph, registry, doc, protected.get(edge["from_id"]), edge["from_id"])
+                for edge in supports
+            )
+        else:
+            claim = registry.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE space=? AND node_id=?", (claim_space, claim_id)).fetchone()
+            if claim is None or _registry_node_record(claim)["space"] != "claim" or _registry_node_record(claim)["node_type"] != "Claim" or claim_id in planned_nodes:
+                bad.append(claim_id)
+                continue
+            rows = registry.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges WHERE relation='supports' AND to_space=? AND to_id=?", (claim_space, claim_id)).fetchall()
+            supports = [_registry_edge_record(row) for row in rows]
+            valid = any(
+                edge["from_space"] == EVIDENCE_SPACE and edge["from_id"] not in candidate_ids
+                and _sha(_canon(edge)) not in planned_edges
+                and _valid_claim_source(graph, registry, doc, protected.get(edge["from_id"]), edge["from_id"])
+                for edge in supports
+            )
+        if not valid:
+            bad.append(claim_id)
+    return sorted(bad)
+
+
+def _claim_guard(data_dir: Path, candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> list[str]:
     graph = _ro(data_dir / "graph.db", True)
+    registry = _ro(data_dir / "opencrab.db", True)
+    doc = _ro(data_dir / "doc_store.db", True)
     try:
-        claims = {row[0] for row in graph.execute("SELECT node_id FROM graph_nodes WHERE node_type='Claim'")}
-        bad: list[str] = []
-        for claim in claims:
-            supports = {row[0] for row in graph.execute("SELECT from_id FROM graph_edges WHERE relation='supports' AND to_id=?", (claim,))}
-            if supports & ids and supports <= ids:
-                bad.append(claim)
-        return sorted(bad)
+        return _claim_failures(graph, registry, doc, candidates, manifest, axis="graph")
     finally:
         graph.close()
+        registry.close()
+        doc.close()
+
+
+def _registry_claim_guard(data_dir: Path, candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> list[str]:
+    registry = _ro(data_dir / "opencrab.db", True)
+    graph = _ro(data_dir / "graph.db", True)
+    doc = _ro(data_dir / "doc_store.db", True)
+    try:
+        return _claim_failures(graph, registry, doc, candidates, manifest, axis="registry")
+    finally:
+        registry.close()
+        graph.close()
+        doc.close()
+
+
+def _frozen_claim_supports(candidates: list[dict[str, Any]], manifest: dict[str, Any], *, axis: str) -> set[tuple[str, str]]:
+    if axis == "graph":
+        supports = [
+            edge for record in candidates for edge in record["edges"]
+            if edge["relation"] == "supports" and edge["from_type"] == "Evidence"
+        ]
+        claims = {
+            (item["space"], item["id"])
+            for item in manifest["protected"]["nodes"]
+            if item["space"] == "claim" and item["type"] == "Claim"
+        }
+        return {(edge["to_type"].lower(), edge["to_id"]) for edge in supports if (edge["to_type"].lower(), edge["to_id"]) in claims}
+    if axis == "registry":
+        claims = {
+            (node["space"], node["node_id"])
+            for node in manifest["protected"]["registry_nodes"]
+            if node["space"] == "claim" and node["node_type"] == "Claim"
+        }
+        return {
+            (edge["to_space"], edge["to_id"])
+            for record in candidates for edge in record["snapshot"]["registry_edges"]
+            if edge["relation"] == "supports" and (edge["from_space"], edge["from_id"]) == (EVIDENCE_SPACE, record["id"]) and (edge["to_space"], edge["to_id"]) in claims
+        }
+    raise CleanupRefusedError("unknown Claim support axis")
+
+
+def _registry_resume_precheck(data_dir: Path, vector_table: str, candidates: list[dict[str, Any]]) -> None:
+    """Receipt-bound target absence만 허용하고 모든 후보 ownership을 첫 vector write 전에 대조한다."""
+    for record in candidates:
+        current = _candidate_snapshot(data_dir, vector_table, record["id"], immutable=False)
+        done = _done_axes(current)
+        current["edges"] = record["snapshot"]["edges"]
+        if not _allowed(current, record["snapshot"], done):
+            raise CleanupRefusedError(f"{record['id']}: registry resume precheck conflict")
 
 
 def _registry_report(data_dir: Path, candidate_ids: set[str]) -> dict[str, Any]:
@@ -386,13 +612,13 @@ def _registry_report(data_dir: Path, candidate_ids: set[str]) -> dict[str, Any]:
     conn = _ro(data_dir / "opencrab.db", True)
     graph = _ro(data_dir / "graph.db", True)
     try:
-        rows = conn.execute("SELECT space,node_type,node_id FROM ontology_nodes ORDER BY space,node_id").fetchall()
+        rows = [_registry_node_record(row) for row in conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY space,node_id")]
         edges = conn.execute("SELECT from_space,from_id,relation,to_space,to_id FROM ontology_edges ORDER BY id").fetchall()
         graph_ids = {row[0] for row in graph.execute("SELECT node_id FROM graph_nodes")}
         before_orphans = [list(edge) for edge in edges if edge[1] not in graph_ids or edge[4] not in graph_ids]
         expected_ids = graph_ids - candidate_ids
         expected_orphans = [list(edge) for edge in edges if edge[1] not in expected_ids or edge[4] not in expected_ids]
-        selected = [list(row) for row in rows if row[2] in candidate_ids]
+        selected = [[row["space"], row["node_type"], row["node_id"]] for row in rows if row["node_id"] in candidate_ids]
         return {
             "candidate_rows": selected,
             "candidate_edges": [list(edge) for edge in edges if edge[1] in candidate_ids or edge[4] in candidate_ids],
@@ -423,11 +649,15 @@ def select(data_dir: Path, vector_table: str) -> tuple[list[dict[str, Any]], dic
         except CleanupRefusedError as exc:
             errors.append(str(exc))
     candidate_ids = {candidate["id"] for candidate in candidates}
-    last_claims = _claim_guard(data_dir, candidates)
+    protected = _protected(data_dir, vector_table, candidate_ids)
+    provisional_manifest = {"protected": protected}
+    last_claims = _claim_guard(data_dir, candidates, provisional_manifest)
+    registry_claims = _registry_claim_guard(data_dir, candidates, provisional_manifest)
     if last_claims:
         errors.append("candidate set removes final Claim support: " + ", ".join(last_claims))
-    protected = _protected(data_dir, vector_table, candidate_ids)
-    report = {"errors": errors, "registry": _registry_report(data_dir, candidate_ids), "last_support_claims": last_claims}
+    if registry_claims:
+        errors.append("candidate set removes final registry Claim support: " + ", ".join(registry_claims))
+    report = {"errors": errors, "registry": _registry_report(data_dir, candidate_ids), "last_support_claims": last_claims, "last_registry_claims": registry_claims}
     return candidates, {"protected": protected, "report": report}
 
 
@@ -659,11 +889,13 @@ def publish_marker(run_dir: Path, filename: str, payload: dict[str, Any]) -> Non
 
 
 def _allowed(current: dict[str, Any], recorded: dict[str, Any], axes_done: set[str], *, shared_edges_absent: bool = False) -> bool:
-    targets = {"vector": [], "graph": [], "edges": _edge_digest([]), "source": [], "fts": [], "doc": []}
+    targets = {"vector": [], "graph": [], "edges": _edge_digest([]), "source": [], "fts": [], "doc": [], "registry_node": [], "registry_edges": []}
     for key, value in current.items():
         if value == recorded.get(key):
             continue
         if key == "edges" and shared_edges_absent and value == targets[key]:
+            continue
+        if key in {"registry_node", "registry_edges"} and all(item in recorded.get(key, []) for item in value):
             continue
         if key in axes_done and value == targets[key]:
             continue
@@ -754,7 +986,7 @@ def _protected_graph(conn: sqlite3.Connection, candidate_ids: set[str], excluded
     return {"nodes": nodes, "evidence": evidence, "edges": edges}
 
 
-def _validate_projected_protection(conn: sqlite3.Connection, candidates: list[dict[str, Any]], manifest: dict[str, Any], planned_edges: set[str], planned_nodes: set[str]) -> None:
+def _validate_projected_protection(data_dir: Path, conn: sqlite3.Connection, candidates: list[dict[str, Any]], manifest: dict[str, Any], planned_edges: set[str], planned_nodes: set[str]) -> None:
     """Planned graph write 전 protected projection과 affected Claim support를 검사한다."""
     expected = manifest.get("protected")
     if not isinstance(expected, dict):
@@ -768,43 +1000,31 @@ def _validate_projected_protection(conn: sqlite3.Connection, candidates: list[di
     }
     if not _strict_equal(current, expected_graph):
         raise CleanupRefusedError("projected protected graph state changed")
-    claim_rows = {
-        node_id: (space, _props_digest(raw))
-        for node_type, node_id, space, raw in conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_type='Claim'")
-    }
-    frozen_claims = {
-        item["id"]: (item["space"], item["properties"])
-        for item in expected_graph["nodes"]
-        if item["type"] == "Claim"
-    }
-    affected_claims = {
-        edge["to_id"]
-        for record in candidates
-        for edge in record["edges"]
-        if _sha(_canon(edge)) in planned_edges and edge["relation"] == "supports" and edge["to_id"] in claim_rows and claim_rows[edge["to_id"]] == frozen_claims.get(edge["to_id"])
-    }
-    expected_edges = expected_graph["edges"]
-    for claim in affected_claims:
-        expected_supports = {
-            _sha(_canon(edge))
-            for edge in expected_edges
-            if edge["relation"] == "supports" and edge["to_id"] == claim
-        }
-        current_supports = set()
-        projected_supports = set()
-        for row in conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE relation='supports' AND to_id=?", (claim,)):
-            edge = _edge_record(row)
-            key = _sha(_canon(edge))
-            if edge["from_id"] not in candidate_ids:
-                current_supports.add(key)
-                if key not in planned_edges:
-                    projected_supports.add(key)
-        if current_supports != expected_supports or not projected_supports:
+    expected_sources = {item["graph"]["id"]: item.get("source") for item in expected.get("evidence", [])}
+    doc = _ro(data_dir / "doc_store.db", True)
+    try:
+        for evidence_id, source_rows in expected_sources.items():
+            current_source = [_row_digest(row) for row in doc.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (evidence_id,)).fetchall()]
+            if current_source != source_rows:
+                raise CleanupRefusedError("projected protected source state changed")
+    finally:
+        doc.close()
+    registry = _ro(data_dir / "opencrab.db", True)
+    doc = _ro(data_dir / "doc_store.db", True)
+    try:
+        if _claim_failures(conn, registry, doc, candidates, manifest, axis="graph", planned_edges=planned_edges, planned_nodes=planned_nodes):
             raise CleanupRefusedError("planned graph delete removes final Claim support")
+    finally:
+        doc.close()
+        registry.close()
 
 
 def _validate_all_candidate_claims(data_dir: Path, candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> None:
     """모든 candidate graph target의 Claim support 유실을 첫 axis write 전에 막는다."""
+    if _claim_guard(data_dir, candidates, manifest):
+        raise CleanupRefusedError("Claim support changed after frozen manifest")
+    if _registry_claim_guard(data_dir, candidates, manifest):
+        raise CleanupRefusedError("registry Claim support changed after frozen manifest")
     conn = _ro(data_dir / "graph.db", True)
     try:
         planned_edges = {
@@ -813,7 +1033,7 @@ def _validate_all_candidate_claims(data_dir: Path, candidates: list[dict[str, An
             for edge in record["edges"]
         }
         planned_nodes = {record["id"] for record in candidates}
-        _validate_projected_protection(conn, candidates, manifest, planned_edges, planned_nodes)
+        _validate_projected_protection(data_dir, conn, candidates, manifest, planned_edges, planned_nodes)
     finally:
         conn.close()
 
@@ -837,9 +1057,9 @@ def _delete_vector(data_dir: Path, vector_table: str, record: dict[str, Any]) ->
         deleted = conn.execute(f"DELETE FROM {vector_table} WHERE node_id=?", (record["id"],)).rowcount
         if deleted != 1:
             raise CleanupRefusedError(f"{record['id']}: vector delete rowcount")
-        conn.commit()
+        _commit(conn)
     except Exception:
-        conn.rollback()
+        _rollback(conn)
         raise
     finally:
         conn.close()
@@ -879,7 +1099,7 @@ def _delete_graph(data_dir: Path, record: dict[str, Any], candidates: list[dict[
         boundary_projected = boundary_before - deleted_boundary
         if not (component_lower <= component_projected <= component_before) or not (boundary_lower <= boundary_projected <= boundary_before):
             raise CleanupRefusedError(f"{record['id']}: graph planned post-state conflict")
-        _validate_projected_protection(conn, candidates, manifest, deleted_component | deleted_boundary, {record["id"]})
+        _validate_projected_protection(data_dir, conn, candidates, manifest, deleted_component | deleted_boundary, {record["id"]})
         for edge, raw in planned:
             result = conn.execute("DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=? AND from_type=? AND to_type=? AND properties IS ?", (edge["from_id"], edge["relation"], edge["to_id"], edge["from_type"], edge["to_type"], raw)).rowcount
             if result != 1:
@@ -891,11 +1111,11 @@ def _delete_graph(data_dir: Path, record: dict[str, Any], candidates: list[dict[
         boundary_after = {_sha(_canon(edge)) for edge in _validate_boundary_edges(conn, candidates, receipt, manifest)}
         if component_after != component_before - deleted_component or boundary_after != boundary_before - deleted_boundary:
             raise CleanupRefusedError(f"{record['id']}: graph planned post-state conflict")
-        conn.commit()
+        _commit(conn)
         if after_commit is not None:
             after_commit()
     except Exception:
-        conn.rollback()
+        _rollback(conn)
         raise
     finally:
         conn.close()
@@ -906,6 +1126,111 @@ def _edge_raw_for_digest(conn: sqlite3.Connection, edge: dict[str, Any]) -> Any:
     if row is None or _props_digest(row[0]) != edge["properties"]:
         raise CleanupRefusedError("graph edge properties changed")
     return row[0]
+
+
+def _registry_rowcount(cursor: sqlite3.Cursor) -> int:
+    return cursor.rowcount
+
+
+def _registry_delete(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> sqlite3.Cursor:
+    """Registry DELETE의 SQL과 bound parameter를 하나의 관측 seam으로 모은다."""
+    return conn.execute(sql, params)
+
+
+def _registry_targets_match(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], snapshot: dict[str, Any]) -> bool:
+    """Receipt resume에서 승인 target 부재만 허용하는 identity seam이다."""
+    return (
+        all(node in snapshot["registry_node"] for node in nodes)
+        and all(edge in snapshot["registry_edges"] for edge in edges)
+    )
+
+
+def _delete_registry(data_dir: Path, record: dict[str, Any], candidates: list[dict[str, Any]], manifest: dict[str, Any]) -> None:
+    conn = _rw(data_dir / "opencrab.db")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        candidate_targets = {(EVIDENCE_SPACE, candidate["id"]) for candidate in candidates}
+        protected = manifest.get("protected")
+        if not isinstance(protected, dict):
+            raise CleanupRefusedError("manifest has no protected registry state")
+        current_protected_nodes = [
+            _registry_node_record(row)
+            for row in conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id")
+            if (row[1], row[3]) not in candidate_targets
+        ]
+        current_protected_edges = []
+        for row in conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id"):
+            edge = _registry_edge_record(row)
+            endpoints = {(edge["from_space"], edge["from_id"]), (edge["to_space"], edge["to_id"])}
+            if not endpoints & candidate_targets:
+                current_protected_edges.append(edge)
+        if current_protected_nodes != protected.get("registry_nodes") or current_protected_edges != protected.get("registry_edges"):
+            raise CleanupRefusedError("registry protection conflict")
+        graph = _ro(data_dir / "graph.db", True)
+        doc = _ro(data_dir / "doc_store.db", True)
+        try:
+            if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):
+                raise CleanupRefusedError("registry Claim support changed after frozen manifest")
+        finally:
+            doc.close()
+            graph.close()
+        doc = _ro(data_dir / "doc_store.db", True)
+        try:
+            for evidence in protected.get("evidence", []):
+                source = [_row_digest(row) for row in doc.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (evidence["graph"]["id"],)).fetchall()]
+                if source != evidence.get("source"):
+                    raise CleanupRefusedError("registry protection conflict")
+        finally:
+            doc.close()
+        snapshot = record["snapshot"]
+        nodes = conn.execute(
+            "SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=? ORDER BY id",
+            (record["id"],),
+        ).fetchall()
+        all_edges = conn.execute(
+            "SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges "
+            "WHERE from_id=? OR to_id=? ORDER BY id",
+            (record["id"], record["id"]),
+        ).fetchall()
+        edges = []
+        foreign = []
+        for row in all_edges:
+            edge = _registry_edge_record(row)
+            if (EVIDENCE_SPACE, record["id"]) in ((edge["from_space"], edge["from_id"]), (edge["to_space"], edge["to_id"])):
+                edges.append(edge)
+            else:
+                foreign.append(edge)
+        current_nodes = [_registry_node_record(row) for row in nodes]
+        if not _registry_targets_match(current_nodes, edges, snapshot):
+            raise CleanupRefusedError(f"{record['id']}: registry target membership conflict")
+        if foreign:
+            raise CleanupRefusedError(f"{record['id']}: registry edge foreign tuple")
+        if foreign != snapshot["registry_foreign"]:
+            raise CleanupRefusedError(f"{record['id']}: registry edge CAS conflict")
+        for edge in edges:
+            cursor = _registry_delete(
+                conn,
+                "DELETE FROM ontology_edges WHERE id=? AND from_space=? AND from_id=? AND relation=? "
+                "AND to_space=? AND to_id=? AND created_at IS ?",
+                (edge["id"], edge["from_space"], edge["from_id"], edge["relation"], edge["to_space"], edge["to_id"], edge["created_at"]),
+            )
+            if _registry_rowcount(cursor) != 1:
+                raise CleanupRefusedError(f"{record['id']}: registry edge delete rowcount")
+        for node in [_registry_node_record(row) for row in nodes]:
+            cursor = _registry_delete(
+                conn,
+                "DELETE FROM ontology_nodes WHERE id=? AND space=? AND node_type=? AND node_id=? "
+                "AND created_at IS ? AND updated_at IS ?",
+                (node["id"], node["space"], node["node_type"], node["node_id"], node["created_at"], node["updated_at"]),
+            )
+            if _registry_rowcount(cursor) != 1:
+                raise CleanupRefusedError(f"{record['id']}: registry node delete rowcount")
+        _commit(conn)
+    except Exception:
+        _rollback(conn)
+        raise
+    finally:
+        conn.close()
 
 
 def _delete_document(data_dir: Path, record: dict[str, Any]) -> None:
@@ -927,9 +1252,9 @@ def _delete_document(data_dir: Path, record: dict[str, Any]) -> None:
             raise CleanupRefusedError(f"{record['id']}: FTS delete rowcount")
         if doc is not None and conn.execute("DELETE FROM doc_nodes WHERE space=? AND node_id=? AND node_type=? AND properties IS ?", (doc[0], record["id"], doc[2], doc[3])).rowcount != 1:
             raise CleanupRefusedError(f"{record['id']}: doc delete rowcount")
-        conn.commit()
+        _commit(conn)
     except Exception:
-        conn.rollback()
+        _rollback(conn)
         raise
     finally:
         conn.close()
@@ -949,15 +1274,20 @@ def _done_axes(snapshot: dict[str, Any]) -> set[str]:
         done.add("vector")
     if snapshot["graph"] == [] and snapshot["edges"] == _edge_digest([]):
         done |= {"graph", "edges"}
-    for axis in ("source", "fts", "doc"):
+    for axis in ("source", "fts", "doc", "registry_node", "registry_edges"):
         if snapshot[axis] == []:
             done.add(axis)
     return done
 
 
+def _before_axis_allowed(current: dict[str, Any], recorded: dict[str, Any], axes_done: set[str], record: dict[str, Any], axis: str) -> bool:
+    """Axis별 resume precheck seam을 제공한다."""
+    return _allowed(current, recorded, axes_done)
+
+
 def _apply_records(data_dir: Path, run_dir: Path, vector_table: str, candidates: list[dict[str, Any]], protected_digest: str, receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
     for record in candidates:
-        for axis, action in (("vector", _delete_vector), ("graph", _delete_graph), ("document", _delete_document)):
+        for axis, action in (("vector", _delete_vector), ("graph", _delete_graph), ("document", _delete_document), ("registry", _delete_registry)):
             current = _candidate_snapshot(data_dir, vector_table, record["id"], immutable=False)
             done = _done_axes(current)
             graph_conn = _rw(data_dir / "graph.db")
@@ -967,14 +1297,16 @@ def _apply_records(data_dir: Path, run_dir: Path, vector_table: str, candidates:
                 graph_conn.close()
             # The R/D/S helper owns component edges. Generic axis CAS compares every other component.
             current["edges"] = record["snapshot"]["edges"]
-            if not _allowed(current, record["snapshot"], done):
+            if not _before_axis_allowed(current, record["snapshot"], done, record, axis):
                 raise CleanupRefusedError(f"{record['id']}: snapshot conflict before {axis}")
-            target_axes = {"vector"} if axis == "vector" else {"graph", "edges"} if axis == "graph" else {"source", "fts", "doc"}
+            target_axes = {"vector"} if axis == "vector" else {"graph", "edges"} if axis == "graph" else {"source", "fts", "doc"} if axis == "document" else {"registry_node", "registry_edges"}
             if not target_axes <= done:
                 if axis == "vector":
                     action(data_dir, vector_table, record)
                 elif axis == "graph":
                     action(data_dir, record, candidates, receipt, manifest)
+                elif axis == "registry":
+                    action(data_dir, record, candidates, manifest)
                 else:
                     action(data_dir, record)
             after = _candidate_snapshot(data_dir, vector_table, record["id"], immutable=False)
@@ -1019,9 +1351,12 @@ def apply(data_dir: Path, run_dir: Path, vector_table: str, approved_manifest: P
         _load_receipt(run_dir, backup_dir, manifest, candidates, data_dir)
         if _current_protection_digest(data_dir, vector_table, candidates) != protected_digest:
             raise CleanupRefusedError("protected set changed after frozen manifest")
-        if _claim_guard(data_dir, candidates):
+        if _claim_guard(data_dir, candidates, manifest):
             raise CleanupRefusedError("Claim support changed after frozen manifest")
+        if _registry_claim_guard(data_dir, candidates, manifest):
+            raise CleanupRefusedError("registry Claim support changed after frozen manifest")
         receipt = _load_receipt(run_dir, backup_dir, manifest, candidates, data_dir)
+        _registry_resume_precheck(data_dir, vector_table, candidates)
         _validate_all_candidate_claims(data_dir, candidates, manifest)
         _apply_records(data_dir, run_dir, vector_table, candidates, protected_digest, receipt, manifest)
         registry_after = _registry_report(data_dir, {candidate["id"] for candidate in candidates})
