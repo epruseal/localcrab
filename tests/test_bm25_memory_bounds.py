@@ -169,9 +169,11 @@ def test_equal_tokens_across_documents_are_one_object() -> None:
     assert first is second
 
 
-def _reference_scores(nodes: list[dict], query: str) -> dict[str, float]:
+def _reference_scores(
+    nodes: list[dict], query: str, max_text_chars: int | None = None
+) -> dict[str, float]:
     """BM25 from ``tokenize`` and ``_node_text`` only, with no sharing and no index state."""
-    docs = [tokenize(_node_text(n)) for n in nodes]
+    docs = [tokenize(_node_text(n)[:max_text_chars]) for n in nodes]
     n_docs = len(docs)
     avgdl = sum(len(d) for d in docs) / max(n_docs, 1)
     df: Counter[str] = Counter()
@@ -248,24 +250,30 @@ def test_legacy_build_survives_a_datetime_property(monkeypatch) -> None:
         hybrid.shutdown_bm25()
 
 
-def test_trim_drops_oversize_nodes_without_refilling() -> None:
-    window = [_sized("big", 500), _sized("a", 50), _sized("b", 50)]
-    kept = trim_to_budget(window[:2], max_chars=None, max_node_chars=200)
-    assert [n["node_id"] for n in kept] == ["a"]
-
-
-def test_trim_budget_admits_up_to_the_first_node_that_reaches_it() -> None:
+def test_trim_budget_keeps_a_node_while_the_sum_before_it_is_below_the_budget() -> None:
     nodes = [_sized(str(i), 50) for i in range(5)]
     one = node_size(nodes[0])
-    # budget exactly two nodes: the third starts at the budget and is excluded
-    assert len(trim_to_budget(nodes, max_chars=2 * one, max_node_chars=None)) == 2
-    # budget one char over two nodes: the third starts below it and is admitted
-    assert len(trim_to_budget(nodes, max_chars=2 * one + 1, max_node_chars=None)) == 3
+    # the sum before the third node equals the budget: the loop stops before it
+    assert len(trim_to_budget(nodes, max_chars=2 * one)) == 2
+    # the sum before the third node is one below the budget: the loop keeps it
+    assert len(trim_to_budget(nodes, max_chars=2 * one + 1)) == 3
 
 
-def test_trim_limits_disabled_keep_everything() -> None:
+def test_trim_keeps_a_first_node_larger_than_the_budget() -> None:
+    nodes = [_sized("big", 5000), _sized("b", 50)]
+    assert [n["node_id"] for n in trim_to_budget(nodes, max_chars=100)] == ["big"]
+
+
+def test_a_zero_budget_keeps_nothing_in_both_paths(sql_store) -> None:
+    nodes = [_sized("a", 50), _sized("b", 50)]
+    assert trim_to_budget(nodes, max_chars=0) == []
+    _put(sql_store, "a", 50)
+    assert sql_store.list_nodes_within_budget(limit=5, max_chars=0) == []
+
+
+def test_trim_without_a_budget_keeps_everything() -> None:
     nodes = [_sized("a", 5000), _sized("b", 5000)]
-    assert trim_to_budget(nodes, max_chars=None, max_node_chars=None) == nodes
+    assert trim_to_budget(nodes, max_chars=None) == nodes
 
 
 @pytest.fixture()
@@ -280,42 +288,34 @@ def _put(store: LocalSQLDocStore, node_id: str, chars: int) -> None:
     time.sleep(0.002)  # distinct updated_at, so the newest-first order is total
 
 
-def test_sql_window_picks_newest_limit_then_filters_oversize(sql_store) -> None:
+def test_sql_window_keeps_a_large_node_whole(sql_store) -> None:
     _put(sql_store, "b", 50)
-    _put(sql_store, "a", 50)
     _put(sql_store, "big", 800)  # newest
-    got = sql_store.list_nodes_within_budget(limit=2, max_chars=None, max_node_chars=200)
-    assert [n["node_id"] for n in got] == ["a"]
-
-
-def test_node_size_limit_is_inclusive_in_both_paths(sql_store) -> None:
-    _put(sql_store, "edge", 50)
-    stored = sql_store.list_nodes(limit=10)
-    size = node_size(stored[0])
-    for max_node, expected in ((size, ["edge"]), (size - 1, [])):
-        via_sql = sql_store.list_nodes_within_budget(
-            limit=10, max_chars=None, max_node_chars=max_node
-        )
-        via_trim = trim_to_budget(stored, max_chars=None, max_node_chars=max_node)
-        assert [n["node_id"] for n in via_sql] == expected
-        assert [n["node_id"] for n in via_trim] == expected
+    got = sql_store.list_nodes_within_budget(limit=2, max_chars=None)
+    assert [n["node_id"] for n in got] == ["big", "b"]
+    assert len(got[0]["properties"]["text"]) == 800
 
 
 @pytest.mark.parametrize("limit", [1, 3, 5, 100])
-@pytest.mark.parametrize("max_node", [None, 150, 1000])
 @pytest.mark.parametrize("budget", [None, 1, 120, 300, 100000])
-def test_sql_and_fallback_paths_choose_the_same_window(sql_store, limit, max_node, budget) -> None:
+def test_sql_and_fallback_paths_choose_the_same_window(sql_store, limit, budget) -> None:
     for i, chars in enumerate([40, 900, 60, 40, 500, 60, 30]):
         _put(sql_store, f"n{i}", chars)
-    expected = trim_to_budget(
-        sql_store.list_nodes(limit=limit), max_chars=budget, max_node_chars=max_node
-    )
-    got = sql_store.list_nodes_within_budget(
-        limit=limit, max_chars=budget, max_node_chars=max_node
-    )
+    expected = trim_to_budget(sql_store.list_nodes(limit=limit), max_chars=budget)
+    got = sql_store.list_nodes_within_budget(limit=limit, max_chars=budget)
     assert [(n["space"], n["node_id"]) for n in got] == [
         (n["space"], n["node_id"]) for n in expected
     ]
+
+
+def test_sql_budget_boundary_matches_the_loop(sql_store) -> None:
+    for i in range(4):
+        _put(sql_store, f"n{i}", 50)
+    one = node_size(sql_store.list_nodes(limit=1)[0])
+    for budget, kept in ((2 * one, 2), (2 * one + 1, 3), (1, 1)):
+        via_sql = sql_store.list_nodes_within_budget(limit=10, max_chars=budget)
+        via_loop = trim_to_budget(sql_store.list_nodes(limit=10), max_chars=budget)
+        assert len(via_sql) == len(via_loop) == kept
 
 
 def test_worker_falls_back_to_python_cut_when_the_budgeted_query_fails(
@@ -328,7 +328,7 @@ def test_worker_falls_back_to_python_cut_when_the_budgeted_query_fails(
         raise RuntimeError("no such function: SUM OVER")
 
     monkeypatch.setattr(sql_store, "list_nodes_within_budget", broken)
-    monkeypatch.setenv("OPENCRAB_BM25_MAX_NODE_CHARS", "500")
+    monkeypatch.setenv("OPENCRAB_BM25_CHAR_BUDGET", "500")
     hybrid = _hybrid(sql_store)
     try:
         hybrid._bm25.ensure_built(sql_store)
@@ -337,10 +337,10 @@ def test_worker_falls_back_to_python_cut_when_the_budgeted_query_fails(
         hybrid.shutdown_bm25()
 
 
-def test_worker_marks_a_capped_window_as_partial_coverage(sql_store, monkeypatch) -> None:
+def test_worker_marks_a_budget_cut_window_as_partial_coverage(sql_store, monkeypatch) -> None:
     for i, chars in enumerate([40, 4000, 40]):
         _put(sql_store, f"n{i}", chars)
-    monkeypatch.setenv("OPENCRAB_BM25_MAX_NODE_CHARS", "500")
+    monkeypatch.setenv("OPENCRAB_BM25_CHAR_BUDGET", "500")
     hybrid = _hybrid(sql_store)
     try:
         hybrid._bm25.ensure_built(sql_store)
@@ -367,10 +367,10 @@ class _LegacyStore:
 
 def test_legacy_fingerprint_comes_from_the_untrimmed_list(monkeypatch) -> None:
     nodes = [
-        _node("a", updated_at="2026-01-01T00:00:00"),
         {**_sized("big", 5000), "updated_at": "2026-01-02T00:00:00"},
+        _node("a", updated_at="2026-01-01T00:00:00"),
     ]
-    monkeypatch.setenv("OPENCRAB_BM25_MAX_NODE_CHARS", "500")
+    monkeypatch.setenv("OPENCRAB_BM25_CHAR_BUDGET", "500")
     store = _LegacyStore(nodes)
     hybrid = _hybrid(store)
     try:
@@ -378,6 +378,92 @@ def test_legacy_fingerprint_comes_from_the_untrimmed_list(monkeypatch) -> None:
         state = hybrid._bm25.state
         assert state.indexed_rows == 1
         assert state.probe_fingerprint == hybrid._bm25_probe_fingerprint()
+    finally:
+        hybrid.shutdown_bm25()
+
+
+# ---------------------------------------------------------------------------
+# 3b. Head-only tokenising of long node text
+# ---------------------------------------------------------------------------
+
+
+def _long_node(node_id: str = "long", pack_id: str = "A") -> dict:
+    return {
+        "node_id": node_id,
+        "space": "claim",
+        "node_type": "Claim",
+        "properties": {
+            "pack_id": pack_id,
+            "text": "headword " + "filler " * 200 + "tailword",
+        },
+    }
+
+
+def test_only_the_head_of_a_long_text_is_searchable() -> None:
+    nodes = [_long_node()]
+    cut = len(_node_text(nodes[0])) // 2
+    index = BM25Index.build(nodes, max_text_chars=cut)
+    assert [h["node_id"] for h in index.search("headword", pack_ids=["A"])] == ["long"]
+    assert index.search("tailword", pack_ids=["A"]) == []
+
+
+def test_without_a_cut_the_whole_text_is_searchable() -> None:
+    index = BM25Index.build([_long_node()])
+    assert [h["node_id"] for h in index.search("tailword", pack_ids=["A"])] == ["long"]
+
+
+def test_head_only_tokenising_keeps_the_node_objects_and_results() -> None:
+    nodes = [_long_node(), _node("short", text="headword")]
+    original = [dict(n) for n in nodes]
+    cut = len(_node_text(nodes[0])) // 2
+    index = BM25Index.build(nodes, max_text_chars=cut)
+    assert index._docs is nodes
+    assert nodes == original
+    long_hit = next(h for h in index.search("headword", pack_ids=["A"], limit=5) if h["node_id"] == "long")
+    assert long_hit["text"] == _node_text(nodes[0])
+    assert long_hit["properties"] is nodes[0]["properties"]
+    assert index._pack_buckets == {"A": [0, 1]}
+
+
+def test_head_only_scores_match_an_independent_reference() -> None:
+    nodes = [_long_node("a"), _long_node("b"), _node("c", text="headword filler")]
+    cut = len(_node_text(nodes[0])) // 3
+    truncated = [
+        {**n, "properties": {**n["properties"]}} for n in nodes
+    ]
+    index = BM25Index.build(nodes, max_text_chars=cut)
+    got = {h["node_id"]: h["score"] for h in index.search("headword filler", pack_ids=["A"], limit=9)}
+    assert got == _reference_scores(truncated, "headword filler", max_text_chars=cut)
+    assert got
+
+
+def test_the_worker_passes_the_node_text_cut_to_the_index(sql_store, monkeypatch) -> None:
+    sql_store.upsert_node_doc(
+        "claim", "Claim", "long",
+        {"pack_id": "A", "text": "headword " + "filler " * 200 + "tailword"},
+    )
+    monkeypatch.setenv("OPENCRAB_BM25_MAX_NODE_CHARS", "300")
+    hybrid = _hybrid(sql_store)
+    try:
+        hybrid._bm25.ensure_built(sql_store)
+        state = hybrid._bm25.state
+        assert state.indexed_rows == 1 and state.covered_pack_ids == frozenset({"A"})
+        assert [h["node_id"] for h in state.index.search("headword", pack_ids=["A"])] == ["long"]
+        assert state.index.search("tailword", pack_ids=["A"]) == []
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_a_zero_node_text_cut_turns_the_cut_off(sql_store, monkeypatch) -> None:
+    sql_store.upsert_node_doc(
+        "claim", "Claim", "long",
+        {"pack_id": "A", "text": "headword " + "filler " * 200 + "tailword"},
+    )
+    monkeypatch.setenv("OPENCRAB_BM25_MAX_NODE_CHARS", "0")
+    hybrid = _hybrid(sql_store)
+    try:
+        hybrid._bm25.ensure_built(sql_store)
+        assert hybrid._bm25.state.index.search("tailword", pack_ids=["A"])
     finally:
         hybrid.shutdown_bm25()
 

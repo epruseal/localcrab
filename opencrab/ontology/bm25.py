@@ -132,6 +132,8 @@ class BM25Index:
         cls,
         nodes: list[dict[str, Any]],
         fingerprint: tuple[int, str] | None = None,
+        *,
+        max_text_chars: int | None = None,
     ) -> BM25Index:
         """
         Build a BM25 index from a list of node dicts.
@@ -148,6 +150,10 @@ class BM25Index:
         and every query would schedule a rebuild forever. Defaults to
         ``compute_fingerprint(nodes)`` for callers with no store probe (e.g.
         tests, or one-off CLI builds from an already-fetched node list).
+
+        max_text_chars: when set, only the first ``max_text_chars`` characters
+        of each node's ``_node_text`` are tokenised (#506). The index still
+        keeps every node object as given, so results do not change.
         """
         idx = cls()
         idx._docs = nodes
@@ -156,7 +162,10 @@ class BM25Index:
         # lists most of the index's memory. Sharing leaves scores unchanged.
         vocab: dict[str, str] = {}
         idx._tokens = [
-            [vocab.setdefault(tok, tok) for tok in _tokenize(_node_text(n))]
+            [
+                vocab.setdefault(tok, tok)
+                for tok in _tokenize(_node_text(n)[:max_text_chars])
+            ]
             for n in nodes
         ]
         del vocab
@@ -322,30 +331,21 @@ def trim_to_budget(
     nodes: list[dict[str, Any]],
     *,
     max_chars: int | None,
-    max_node_chars: int | None,
 ) -> list[dict[str, Any]]:
-    """Apply the #506 window rules to an already limited, ordered node list.
+    """Return the nodes the #506 budget loop keeps, in the order given.
 
-    1. The function drops a node longer than ``max_node_chars``. It does not
-       refill the gap.
-    2. The function takes the remaining nodes in order while the length of the
-       nodes before them stays below ``max_chars``. A node that starts below
-       the budget is admitted, so the total can exceed the budget by at most
-       one node.
-
-    ``None`` turns a rule off. ``LocalSQLDocStore.list_nodes_within_budget``
-    applies the same rules in SQL, and a test pins that the two agree.
+    The loop keeps a node when the sum of ``node_size`` over the nodes kept
+    before it is below ``max_chars``. ``None`` keeps every node.
+    ``LocalSQLDocStore.list_nodes_within_budget`` runs the same loop in SQL, and
+    a test pins that the two agree.
     """
     kept: list[dict[str, Any]] = []
     total = 0
     for node in nodes:
-        size = node_size(node)
-        if max_node_chars is not None and size > max_node_chars:
-            continue
         if max_chars is not None and total >= max_chars:
             break
         kept.append(node)
-        total += size
+        total += node_size(node)
     return kept
 
 

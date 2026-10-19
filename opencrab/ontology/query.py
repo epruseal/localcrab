@@ -43,12 +43,12 @@ _EDGE_WEIGHTS: dict[str, float] = {
 _DEFAULT_EDGE_SCORE: float = 0.5
 _BM25_NODE_LIMIT = int(os.getenv("OPENCRAB_BM25_NODE_LIMIT", "50000"))
 
-# #506: the BM25 window is bounded by size as well as by row count. Both values
-# count the stored `properties` text (docs/issue-506-bm25-memory.md). A value of
-# 0 or less turns that rule off. They are read per build, so an operator can
-# change them with a restart and a test can set them without a reload.
+# #506: OPENCRAB_BM25_CHAR_BUDGET ends the window once the running stored length
+# of the kept nodes reaches it. OPENCRAB_BM25_MAX_NODE_CHARS cuts the text that
+# is tokenised for each node. A value of 0 or less turns the rule off. Both are
+# read per build (docs/issue-506-bm25-memory.md).
 _BM25_MAX_NODE_CHARS_DEFAULT = 65536
-_BM25_CHAR_BUDGET_DEFAULT = 80_000_000
+_BM25_CHAR_BUDGET_DEFAULT = 200_000_000
 
 # #506: after a build the worker waits this many times the build's duration
 # before the next one, so a write burst cannot keep it rebuilding back to back.
@@ -56,7 +56,7 @@ _BM25_REST_FACTOR = 2.0
 
 
 def _bm25_window_limits() -> tuple[int | None, int | None]:
-    """Return ``(char_budget, max_node_chars)``; ``None`` means the rule is off."""
+    """Return ``(char_budget, max_text_chars)``; ``None`` means the rule is off."""
     budget = int(
         os.getenv("OPENCRAB_BM25_CHAR_BUDGET", str(_BM25_CHAR_BUDGET_DEFAULT))
     )
@@ -203,6 +203,7 @@ class Observation:
     nodes: list[dict[str, Any]]
     covered_pack_ids: frozenset[str]
     indexed_rows: int
+    max_text_chars: int | None = None
 
 
 @dataclass(frozen=True)
@@ -498,7 +499,7 @@ class _Bm25CacheWorker:
         fingerprint is computed from the list before the rules cut it, so it
         stays equal to ``HybridQuery._bm25_probe_fingerprint``.
         """
-        max_chars, max_node_chars = _bm25_window_limits()
+        max_chars, max_text_chars = _bm25_window_limits()
         if probe is None:
             probe = self._native_probe(doc_store)
         if probe is None:
@@ -506,9 +507,9 @@ class _Bm25CacheWorker:
             from opencrab.ontology.bm25 import compute_fingerprint
             marker = compute_fingerprint(listed)
             probe = ProbeResult(marker, None, False)
-            nodes = self._cut_window(listed, max_chars, max_node_chars)
+            nodes = self._cut_window(listed, max_chars)
         else:
-            nodes = self._read_window(doc_store, max_chars, max_node_chars)
+            nodes = self._read_window(doc_store, max_chars)
         return Observation(
             probe=probe,
             nodes=nodes,
@@ -516,40 +517,33 @@ class _Bm25CacheWorker:
                 pack_id for node in nodes if (pack_id := scope_pack_id(node)) is not None
             ),
             indexed_rows=len(nodes),
+            max_text_chars=max_text_chars,
         )
 
     @staticmethod
     def _cut_window(
         nodes: list[dict[str, Any]],
         max_chars: int | None,
-        max_node_chars: int | None,
     ) -> list[dict[str, Any]]:
-        if max_chars is None and max_node_chars is None:
+        if max_chars is None:
             return nodes
         from opencrab.ontology.bm25 import trim_to_budget
 
-        kept = trim_to_budget(
-            nodes, max_chars=max_chars, max_node_chars=max_node_chars
-        )
+        kept = trim_to_budget(nodes, max_chars=max_chars)
         return nodes if len(kept) == len(nodes) else kept
 
     def _read_window(
         self,
         doc_store: Any,
         max_chars: int | None,
-        max_node_chars: int | None,
     ) -> list[dict[str, Any]]:
         """Read the window with the store's own budgeted query when it has one."""
-        if max_chars is None and max_node_chars is None:
+        if max_chars is None:
             return doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
         budgeted = getattr(doc_store, "list_nodes_within_budget", None)
         if budgeted is not None:
             try:
-                nodes = budgeted(
-                    limit=_BM25_NODE_LIMIT,
-                    max_chars=max_chars,
-                    max_node_chars=max_node_chars,
-                )
+                nodes = budgeted(limit=_BM25_NODE_LIMIT, max_chars=max_chars)
             except Exception as exc:  # noqa: BLE001 -- e.g. SQLite older than 3.25
                 logger.warning(
                     "BM25 budgeted window query failed, reading the window and "
@@ -558,13 +552,13 @@ class _Bm25CacheWorker:
             else:
                 if isinstance(nodes, list):
                     return nodes
-        return self._cut_window(
-            doc_store.list_nodes(limit=_BM25_NODE_LIMIT), max_chars, max_node_chars
-        )
+        return self._cut_window(doc_store.list_nodes(limit=_BM25_NODE_LIMIT), max_chars)
 
     def _make_state(self, observation: Observation) -> Bm25CacheState:
         index = _get_bm25().build(
-            observation.nodes, fingerprint=observation.probe.fingerprint
+            observation.nodes,
+            fingerprint=observation.probe.fingerprint,
+            max_text_chars=observation.max_text_chars,
         )
         self._generation += 1
         return Bm25CacheState(

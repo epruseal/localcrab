@@ -75,7 +75,7 @@ class _BuildRecorder:
         self.first_entered = threading.Event()
         self.release_first = threading.Event()
 
-    def build(self, nodes, fingerprint=None):  # noqa: ARG002 - shape match
+    def build(self, nodes, fingerprint=None, **kwargs):  # noqa: ARG002 - shape match
         with self._guard:
             self.calls += 1
             n = self.calls

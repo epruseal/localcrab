@@ -527,22 +527,14 @@ class _SqlDocStoreBase(abc.ABC):
         self,
         limit: int,
         max_chars: int | None = None,
-        max_node_chars: int | None = None,
     ) -> list[dict[str, Any]]:
-        """``list_nodes`` narrowed to the BM25 window rules of issue #506.
+        """``list_nodes`` cut by the issue #506 budget loop.
 
-        The window is the newest ``limit`` rows (the ``list_nodes`` order),
-        minus rows whose stored ``properties`` text is longer than
-        ``max_node_chars`` (the gap is not refilled), cut after the row at
-        which the running length of the kept rows reaches ``max_chars``: a
-        row is kept when the kept rows before it total less than the budget.
-        ``None`` turns a rule off. ``opencrab.ontology.bm25.trim_to_budget``
-        applies the same rules to a plain list, and a test pins that both agree.
-
-        The length is ``LENGTH(CAST(properties AS TEXT))``: the stored text,
-        which for SQLite is the ASCII-escaped JSON (``dump_props``). The query
-        sends only the rows it keeps to Python, so a few huge rows cannot
-        inflate the window's memory.
+        The rows are the ``list_nodes`` rows, in the same order. A row is kept
+        when the sum of ``COALESCE(LENGTH(CAST(properties AS TEXT)), 0)`` over
+        the rows before it is below ``max_chars``. ``None`` keeps all ``limit``
+        rows. ``opencrab.ontology.bm25.trim_to_budget`` runs the same loop on a
+        plain list, and a test pins that both agree.
 
         Window functions need SQLite 3.25 or newer, or PostgreSQL.
         """
@@ -551,10 +543,6 @@ class _SqlDocStoreBase(abc.ABC):
             return []
         table = self._table("doc_nodes")
         params: dict[str, Any] = {"lim": limit}
-        size_filter = ""
-        if max_node_chars is not None:
-            size_filter = "WHERE plen <= :max_node"
-            params["max_node"] = max_node_chars
         budget_filter = ""
         if max_chars is not None:
             budget_filter = "WHERE running - plen < :budget"
@@ -568,7 +556,7 @@ class _SqlDocStoreBase(abc.ABC):
             "   SELECT space, node_id, node_type, properties, updated_at,"
             "    COALESCE(LENGTH(CAST(properties AS TEXT)), 0) AS plen"
             f"   FROM {table} ORDER BY updated_at DESC, space, node_id LIMIT :lim"
-            f"  ) AS win {size_filter}"
+            "  ) AS win"
             f") AS sized {budget_filter}"
             " ORDER BY updated_at DESC, space, node_id"
         )
