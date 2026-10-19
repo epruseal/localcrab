@@ -692,6 +692,7 @@ class _Bm25CacheWorker:
             if ds is None:
                 continue
             built = False
+            failed = False
             started: float | None = None
             try:
                 snapshot = self._await_rest()
@@ -742,6 +743,7 @@ class _Bm25CacheWorker:
                         )
                         self._wake.set()
             except Exception as exc:
+                failed = True
                 logger.warning("BM25 background rebuild failed: %s", exc)
                 if started is not None:
                     # A failed observation or build still counts as work: the
@@ -758,7 +760,8 @@ class _Bm25CacheWorker:
                 snapshot = state = candidate = observation = probe = None
                 if built:
                     _return_freed_memory()
-                    logger.debug("BM25 worker round finished")
+                    if not failed:
+                        logger.debug("BM25 worker round finished")
 
     def join(self, timeout: float | None = None) -> None:
         thread = self.thread

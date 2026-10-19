@@ -152,8 +152,10 @@ class BM25Index:
         tests, or one-off CLI builds from an already-fetched node list).
 
         max_text_chars: when set, only the first ``max_text_chars`` characters
-        of each node's ``_node_text`` are tokenised (#506). The index still
-        keeps every node object as given, so results do not change.
+        of each node's ``_node_text`` are tokenised (#506). The index keeps
+        every node object as given, so a hit returns the full ``text`` and
+        ``properties``. Which nodes match and their scores follow the tokenised
+        part.
         """
         idx = cls()
         idx._docs = nodes

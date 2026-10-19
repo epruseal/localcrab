@@ -8,6 +8,7 @@ during a write burst, and the shared window contract of the two budget paths.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import gc
 import math
@@ -414,10 +415,14 @@ def test_without_a_cut_the_whole_text_is_searchable() -> None:
 
 def test_head_only_tokenising_keeps_the_node_objects_and_results() -> None:
     nodes = [_long_node(), _node("short", text="headword")]
-    original = [dict(n) for n in nodes]
+    original = copy.deepcopy(nodes)
+    objects = list(nodes)
+    properties = [n["properties"] for n in nodes]
     cut = len(_node_text(nodes[0])) // 2
     index = BM25Index.build(nodes, max_text_chars=cut)
     assert index._docs is nodes
+    assert all(a is b for a, b in zip(nodes, objects, strict=True))
+    assert all(n["properties"] is p for n, p in zip(nodes, properties, strict=True))
     assert nodes == original
     long_hit = next(h for h in index.search("headword", pack_ids=["A"], limit=5) if h["node_id"] == "long")
     assert long_hit["text"] == _node_text(nodes[0])
@@ -689,5 +694,26 @@ def test_round_finished_line_follows_the_release_and_the_memory_return(monkeypat
         # the superseded index is already gone when the line appears
         gc.collect()
         assert first() is None
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_a_failed_round_leaves_no_round_finished_line(caplog) -> None:
+    import logging
+
+    store = _TimedStore()
+    hybrid = _hybrid(store)
+    worker = hybrid._bm25
+    store.fail_at = {1}
+    try:
+        worker.ensure_built(store)
+        store.write()
+        with caplog.at_level(logging.DEBUG, logger="opencrab.ontology.query"):
+            hybrid.invalidate_bm25_cache()
+            assert _wait_until(
+                lambda: any("background rebuild failed" in m for m in caplog.messages)
+            )
+            time.sleep(0.3)  # the round ends right after the warning
+        assert not any(m == "BM25 worker round finished" for m in caplog.messages)
     finally:
         hybrid.shutdown_bm25()
