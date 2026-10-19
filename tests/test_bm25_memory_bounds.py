@@ -572,13 +572,22 @@ def test_round_finished_line_follows_the_release_and_the_memory_return(monkeypat
     from opencrab.ontology import query as query_module
 
     log = logging.getLogger("opencrab.ontology.query")
-    monkeypatch.setattr(query_module, "_return_freed_memory", lambda: log.debug("TRIM"))
+    released_when_returned: list[bool] = []
+    holder: list[weakref.ReferenceType] = []
+
+    def returning_memory() -> None:
+        gc.collect()
+        released_when_returned.append(holder[0]() is None)
+        log.debug("TRIM")
+
+    monkeypatch.setattr(query_module, "_return_freed_memory", returning_memory)
     store = _TimedStore()
     hybrid = _hybrid(store)
     worker = hybrid._bm25
     try:
         worker.ensure_built(store)
         first = weakref.ref(worker.state.index)
+        holder.append(first)
         generation = worker.state.generation
         store.write()
         with caplog.at_level(logging.DEBUG, logger="opencrab.ontology.query"):
@@ -589,6 +598,8 @@ def test_round_finished_line_follows_the_release_and_the_memory_return(monkeypat
         assert worker.state.generation > generation
         messages = [m for m in caplog.messages if m in ("TRIM", "BM25 worker round finished")]
         assert messages == ["TRIM", "BM25 worker round finished"]
+        # the memory return runs only after the superseded index is released
+        assert released_when_returned == [True]
         # the superseded index is already gone when the line appears
         gc.collect()
         assert first() is None

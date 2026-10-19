@@ -306,7 +306,7 @@ def node_size(node: dict[str, Any]) -> int:
 
     The SQL doc stores write ``dump_props`` text, which escapes non-ASCII
     characters. This function measures the same text. A value that JSON cannot
-    carry, such as the ``datetime`` that MongoDB returns, is measured as its
+    carry, such as the ``datetime`` that MongoDB returns, counts as its
     ``str``. A size that cannot be measured at all falls back to ``repr``, so
     sizing never fails an index build. PostgreSQL JSONB does not escape
     non-ASCII, so the unit is a per-backend estimate.
