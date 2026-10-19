@@ -11,7 +11,7 @@
 - source, FTS, evidence-space `doc_nodes`, `Evidence` graph node, sqlite-vec row가 각각 정확히 하나다.
 - graph, doc node, vector metadata의 `pack_id`도 문자열 `openclaw`다.
 
-본문 중간에 heartbeat 단어가 있는 일반 대화는 선택하지 않는다. `metadata.source`는 대체 판정에 쓰지 않는다. `Document`, `Claim`, `Community`, foundation node는 삭제하지 않는다. `opencrab.db`의 registry는 후보 node와 edge, pre-existing orphan, expected-after orphan, apply 뒤 actual-after를 읽기 전용 report로 기록한다. 이 도구는 registry를 삭제하거나 수정하지 않는다.
+본문 중간에 heartbeat 단어가 있는 일반 대화는 선택하지 않는다. `metadata.source`는 대체 판정에 쓰지 않는다. `Document`, `Claim`, `Community`, foundation node는 삭제하지 않는다. 도구는 후보 source와 graph metadata의 `pack_id=openclaw`, `evidence|Evidence` registry node, 후보 endpoint의 registry edge를 함께 frozen manifest로 묶는다. apply는 그 정확한 후보 registry node와 named incident edge만 조건 삭제한다. 비후보 registry node와 edge, 후보에 닿지 않는 orphan edge는 삭제하지 않는다. registry report는 pre-existing orphan, expected-after orphan, apply 뒤 actual-after를 계속 기록한다.
 
 ## 사전 중지와 cold 상태
 
@@ -19,9 +19,9 @@
 2. 네 DB의 열린 FD, migration journal, delete journal, rename journal을 확인한다.
 3. `graph.db`, `doc_store.db`, `vectors.db`, `opencrab.db`의 WAL checkpoint를 실행한다.
 4. 네 `-wal` 파일이 비어 있는지 확인한다.
-5. registry가 ontology 검색이나 재적재 흐름의 입력인지 독립적으로 확인한다. 입력이면 apply 전에 중단한다.
+5. registry candidate node와 incident edge가 frozen manifest의 source와 graph ownership, space, type, raw identity와 일치하는지 확인한다. 불일치하면 apply 전에 중단한다.
 
-도구는 non-empty WAL, holder, 스키마 불일치, sqlite-vec 부재를 거부한다. 도구는 store constructor, MCP, 임베딩, source pack, registry 쓰기를 사용하지 않는다.
+도구는 non-empty WAL, holder, 스키마 불일치, sqlite-vec 부재를 거부한다. 도구는 store constructor, MCP, 임베딩, source pack을 사용하지 않는다. registry write는 승인 후보의 조건 삭제만 수행한다.
 
 ## Dry-run과 승인
 
@@ -61,11 +61,11 @@ python scripts/cleanup_openclaw_heartbeat_493.py \
   --backup-dir <new-backup-dir>
 ```
 
-도구는 SQLite backup API로 네 파일 사본을 만들고, mode `0600`, `integrity_check`, SHA-256, receipt directory fsync를 확인한다. receipt는 backup set ID, 네 파일 hash, manifest digest, canonical data directory identity를 묶는다. 첫 apply는 후보와 보호 집합이 frozen full snapshot과 일치할 때만 backup을 만든다. 재개 전에도 도구가 backup hash, integrity, canonical data directory identity를 다시 확인한다.
+도구는 SQLite backup API로 네 파일 사본을 만들고, mode `0600`, `integrity_check`, SHA-256, receipt directory fsync를 확인한다. receipt는 backup set ID, 네 파일 hash, manifest digest, canonical data directory identity를 묶는다. 첫 apply는 후보와 보호 집합이 frozen full snapshot과 일치할 때만 backup을 만든다. 재개 전에도 도구가 backup hash, integrity, canonical data directory identity를 다시 확인한다. 유효한 receipt가 있는 재개는 이미 삭제한 승인 registry node 또는 named incident edge만 target-absent로 허용한다. 변경, 추가, 다른 space tuple, source 또는 graph ownership 불일치는 모든 write 전에 거부한다.
 
-도구는 후보마다 vector, graph와 incident edge, source와 FTS와 evidence doc 순서로 삭제한다. 후보끼리 공유한 graph edge는 component target로 한 번만 삭제한다. 각 축은 `BEGIN IMMEDIATE` 안에서 recorded raw value, owner, node, edge set을 다시 대조한 뒤 조건부 DELETE rowcount를 확인한다. 축 완료 기록은 매 줄 fsync한다. DB target state가 progress journal보다 우선한다.
+도구는 후보마다 vector, graph와 incident edge, source와 FTS와 evidence doc, 승인 후보 registry node와 incident edge 순서로 삭제한다. 후보끼리 공유한 graph edge는 component target로 한 번만 삭제한다. registry incident edge는 frozen `evidence|Evidence` 후보 endpoint에 닿는 named target만 삭제한다. 반대쪽 endpoint가 비후보여도 named target이면 삭제한다. 다른 space의 같은 ID endpoint와 후보에 닿지 않는 orphan registry edge는 삭제하지 않는다. 각 축은 `BEGIN IMMEDIATE` 안에서 recorded raw value, owner, node, edge set을 다시 대조한 뒤 조건부 DELETE rowcount를 확인한다. 축 완료 기록은 매 줄 fsync한다. DB target state가 progress journal보다 우선한다.
 
-`Claim`은 승인 후보 전체를 뺀 뒤에도 `supports`가 남아야 한다. 남는 근거가 없는 Claim이 하나라도 있으면 apply 전체를 거부한다. 비후보 Evidence, Document, Claim과 비후보 edge의 digest가 바뀌면 중단한다.
+`Claim`은 승인 후보 전체를 뺀 뒤에도 graph와 registry 각각에서 실제 비후보 `evidence|Evidence` support가 남아야 한다. 도구는 frozen과 현재 source metadata, graph metadata의 `pack_id=openclaw`을 다시 확인하고, frozen과 현재 registry Evidence raw identity도 대조한다. `claim|Claim` target만 affected Claim이다. 남는 근거가 없는 affected Claim이 하나라도 있으면 apply 전체를 거부한다. 후보와 무관하게 원래 support가 없는 Claim과 다른 space의 `Claim` target은 이 검사를 적용하지 않는다. 비후보 Evidence, Document, Claim과 비후보 edge의 digest가 바뀌면 중단한다.
 
 ## Apply 뒤 대사
 
@@ -92,4 +92,4 @@ rollback은 네 DB를 같은 backup set에서 함께 복원한다. 도구는 먼
 
 ## 금지와 회수
 
-이 절차는 live apply 실행, 서비스 제어, rollback 실행을 자동으로 수행하지 않는다. source pack, MCP, 임베딩, registry row는 수정하지 않는다. tombstone, manifest, approval, receipt, backup set은 보존한다. rollback 뒤 기존 approval은 다시 유효하지 않다.
+이 절차는 live apply 실행, 서비스 제어, rollback 실행을 자동으로 수행하지 않는다. source pack, MCP, 임베딩은 수정하지 않는다. 도구는 승인 후보 registry node와 named incident edge만 조건 삭제한다. 그 밖의 registry row는 수정하지 않는다. tombstone, manifest, approval, receipt, backup set은 보존한다. rollback 뒤 기존 approval은 다시 유효하지 않다.

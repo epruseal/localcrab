@@ -37,8 +37,8 @@ def _schema(root: Path) -> None:
         )
     with _db(root / "opencrab.db") as conn:
         conn.executescript(
-            "CREATE TABLE ontology_nodes (id INTEGER PRIMARY KEY, space TEXT, node_type TEXT, node_id TEXT);"
-            "CREATE TABLE ontology_edges (id INTEGER PRIMARY KEY, from_space TEXT, from_id TEXT, relation TEXT, to_space TEXT, to_id TEXT);"
+            "CREATE TABLE ontology_nodes (id INTEGER PRIMARY KEY AUTOINCREMENT, space TEXT NOT NULL, node_type TEXT NOT NULL, node_id TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')), UNIQUE(space,node_id));"
+            "CREATE TABLE ontology_edges (id INTEGER PRIMARY KEY AUTOINCREMENT, from_space TEXT NOT NULL, from_id TEXT NOT NULL, relation TEXT NOT NULL, to_space TEXT NOT NULL, to_id TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')), UNIQUE(from_space,from_id,relation,to_space,to_id));"
         )
     import sqlite_vec
 
@@ -68,6 +68,8 @@ def _add(root: Path, node_id: str, text: str, pack: object = "openclaw", *, sour
     if graph:
         with _db(root / "graph.db") as conn:
             _put(conn, "INSERT INTO graph_nodes VALUES (?,?,?,?)", (node_type, node_id, space, props))
+        with _db(root / "opencrab.db") as conn:
+            _put(conn, "INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", (space, node_type, node_id))
     if vector:
         import sqlite_vec
 
@@ -85,8 +87,6 @@ def world(tmp_path: Path) -> Path:
     _add(root, "evidence:turn:heartbeat", HEARTBEAT)
     _add(root, "evidence:turn:normal", "discussion includes OpenClaw heartbeat poll later")
     _add(root, "evidence:turn:fallback", HEARTBEAT, pack="other")
-    with _db(root / "opencrab.db") as conn:
-        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("evidence", "Evidence", "evidence:turn:heartbeat"))
     return root
 
 
@@ -108,6 +108,41 @@ _OBSERVER_FORBIDDEN = {
 }
 
 
+_NODE_DELETE_SQL = (
+    "DELETE FROM ontology_nodes WHERE id=? AND space=? AND node_type=? AND node_id=? "
+    "AND created_at IS ? AND updated_at IS ?"
+)
+_EDGE_DELETE_SQL = (
+    "DELETE FROM ontology_edges WHERE id=? AND from_space=? AND from_id=? AND relation=? "
+    "AND to_space=? AND to_id=? AND created_at IS ?"
+)
+
+
+def _frozen_registry_delete_params(candidates: list[dict]) -> dict[str, set[tuple[object, ...]]]:
+    nodes: set[tuple[object, ...]] = set()
+    edges: set[tuple[object, ...]] = set()
+    for candidate in candidates:
+        for node in candidate["snapshot"]["registry_node"]:
+            nodes.add((node["id"], node["space"], node["node_type"], node["node_id"], node["created_at"], node["updated_at"]))
+        for edge in candidate["snapshot"]["registry_edges"]:
+            edges.add((edge["id"], edge["from_space"], edge["from_id"], edge["relation"], edge["to_space"], edge["to_id"], edge["created_at"]))
+    return {"node": nodes, "edge": edges}
+
+
+def _assert_registry_delete_records(records: list[dict], candidates: list[dict]) -> None:
+    allowed = _frozen_registry_delete_params(candidates)
+    for record in records:
+        sql, params = record["sql"], tuple(record["params"])
+        if sql == _NODE_DELETE_SQL:
+            if len(params) != 6 or params not in allowed["node"]:
+                raise AssertionError("registry delete target")
+        elif sql == _EDGE_DELETE_SQL:
+            if len(params) != 7 or params not in allowed["edge"]:
+                raise AssertionError("registry delete target")
+        else:
+            raise AssertionError("registry delete target")
+
+
 def _assert_observer_events(events: list[dict], *, production: bool) -> None:
     if not events:
         raise AssertionError("pragma event missing" if not production else "observer event missing")
@@ -116,6 +151,7 @@ def _assert_observer_events(events: list[dict], *, production: bool) -> None:
     if not all(isinstance(event["source"], str) and isinstance(event["kind"], str) for event in events):
         raise AssertionError("observer event types")
     writes = [event for event in events if event["kind"] == "authorizer" and event["action"] in _OBSERVER_FORBIDDEN]
+    writes = [event for event in writes if event["action"] != sqlite3.SQLITE_DELETE]
     if writes:
         raise AssertionError("forbidden action")
     if production:
@@ -141,6 +177,278 @@ def _assert_observer_events(events: list[dict], *, production: bool) -> None:
             raise AssertionError("pragma name")
 
 
+def _all_registry_raw(path: Path) -> tuple[list[tuple], list[tuple]]:
+    with _db(path) as conn:
+        nodes = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id").fetchall()
+        edges = conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id").fetchall()
+    return nodes, edges
+
+
+def _all_db_bytes(world: Path) -> dict[str, str]:
+    return {name: (world / name).read_bytes().hex() for name in cleanup.DB_FILES}
+
+
+def _all_db_rows(world: Path, registry_conn: sqlite3.Connection | None = None) -> dict[str, list[tuple]]:
+    with _db(world / "doc_store.db") as conn:
+        doc = conn.execute("SELECT source_id,text,metadata FROM doc_sources ORDER BY source_id").fetchall()
+        fts = conn.execute("SELECT source_id,text FROM doc_sources_fts ORDER BY source_id").fetchall()
+        doc_nodes = conn.execute("SELECT space,node_id,node_type,properties FROM doc_nodes ORDER BY space,node_id").fetchall()
+    with _db(world / "vectors.db") as conn:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        vector = conn.execute(f"SELECT * FROM {TABLE} ORDER BY node_id").fetchall()
+    with _db(world / "graph.db") as conn:
+        graph_nodes = conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes ORDER BY node_id").fetchall()
+        graph_edges = conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges ORDER BY from_id,relation,to_id").fetchall()
+    if registry_conn is None:
+        registry_nodes, registry_edges = _all_registry_raw(world / "opencrab.db")
+    else:
+        registry_nodes = registry_conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id").fetchall()
+        registry_edges = registry_conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id").fetchall()
+    return {"source": doc, "fts": fts, "doc": doc_nodes, "vector": vector, "graph": graph_nodes, "graph_edges": graph_edges, "registry": registry_nodes, "registry_edges": registry_edges}
+
+
+def _logical_json_rows(rows_by_table: dict[str, list[tuple]]) -> dict[str, list[object]]:
+    def value(item: object) -> object:
+        if isinstance(item, bytes):
+            return {"bytes": item.hex()}
+        if isinstance(item, tuple):
+            return [value(part) for part in item]
+        return item
+    return {name: [value(row) for row in rows] for name, rows in rows_by_table.items()}
+
+
+def _logical_rows_json(world: Path) -> dict[str, list[object]]:
+    return _logical_json_rows(_all_db_rows(world))
+
+
+def _expected_after_prior_axes(rows: dict[str, list[tuple]], candidate: str) -> dict[str, list[tuple]]:
+    expected = {name: [*values] for name, values in rows.items()}
+    expected["vector"] = [row for row in expected["vector"] if row[0] != candidate]
+    expected["graph"] = [row for row in expected["graph"] if row[1] != candidate]
+    expected["graph_edges"] = [row for row in expected["graph_edges"] if row[1] != candidate and row[4] != candidate]
+    expected["source"] = [row for row in expected["source"] if row[0] != candidate]
+    expected["fts"] = [row for row in expected["fts"] if row[0] != candidate]
+    expected["doc"] = [row for row in expected["doc"] if row[1] != candidate]
+    return expected
+
+
+def _expected_registry_delete(rows: dict[str, list[tuple]], candidate: str) -> dict[str, list[tuple]]:
+    expected = {name: [*values] for name, values in rows.items()}
+    expected["registry"] = [row for row in expected["registry"] if row[3] != candidate]
+    expected["registry_edges"] = [row for row in expected["registry_edges"] if row[2] != candidate and row[5] != candidate]
+    return expected
+
+
+def _logical_rows_setup(snapshot: Path) -> str:
+    return (
+        "import sqlite_vec\n"
+        f"logical_snapshot_path = {str(snapshot)!r}\n"
+        "def logical_value(item):\n"
+        "    if isinstance(item, bytes): return {'bytes': item.hex()}\n"
+        "    if isinstance(item, tuple): return [logical_value(part) for part in item]\n"
+        "    return item\n"
+        "def logical_rows(data, registry_conn=None):\n"
+        "    with sqlite3.connect(data / 'doc_store.db') as conn:\n"
+        "        source = conn.execute('SELECT source_id,text,metadata FROM doc_sources ORDER BY source_id').fetchall(); fts = conn.execute('SELECT source_id,text FROM doc_sources_fts ORDER BY source_id').fetchall(); doc = conn.execute('SELECT space,node_id,node_type,properties FROM doc_nodes ORDER BY space,node_id').fetchall()\n"
+        "    with sqlite3.connect(data / 'vectors.db') as conn:\n"
+        "        conn.enable_load_extension(True); sqlite_vec.load(conn); vector = conn.execute('SELECT * FROM vectors_test ORDER BY node_id').fetchall()\n"
+        "    with sqlite3.connect(data / 'graph.db') as conn:\n"
+        "        graph = conn.execute('SELECT node_type,node_id,space_id,properties FROM graph_nodes ORDER BY node_id').fetchall(); graph_edges = conn.execute('SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges ORDER BY from_id,relation,to_type,to_id').fetchall()\n"
+        "    if registry_conn is None:\n"
+        "        with sqlite3.connect(data / 'opencrab.db') as conn:\n"
+        "            registry = conn.execute('SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id').fetchall(); registry_edges = conn.execute('SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id').fetchall()\n"
+        "    else:\n"
+        "        registry = registry_conn.execute('SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id').fetchall(); registry_edges = registry_conn.execute('SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id').fetchall()\n"
+        "    return {name: [logical_value(row) for row in rows] for name, rows in {'source': source, 'fts': fts, 'doc': doc, 'vector': vector, 'graph': graph, 'graph_edges': graph_edges, 'registry': registry, 'registry_edges': registry_edges}.items()}\n"
+        "def save_logical_rows(data, registry_conn=None):\n"
+        "    open(logical_snapshot_path, 'w', encoding='utf-8').write(json.dumps(logical_rows(data, registry_conn), sort_keys=True))\n"
+    )
+
+
+
+def _catalog_mutation(source: str, old: str, new: str) -> str:
+    assert source.count(old) == 1
+    mutated = source.replace(old, new)
+    assert mutated.count(new) == 1
+    return mutated
+
+
+def _event_action(sql: str) -> str:
+    token = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+    if token not in {"SELECT", "INSERT", "UPDATE", "DELETE", "BEGIN", "COMMIT", "ROLLBACK"}:
+        raise AssertionError("observation error")
+    return token
+
+
+def _assert_event_contract(events: list[dict], *, expect_clean: bool) -> None:
+    application = [event for event in events if event.get("source", "application") == "application"]
+    attempts = {
+        (event.get("connection_id"), event.get("call_id"))
+        for event in application
+        if event.get("phase") == "attempt"
+    }
+    for event in events:
+        source = event.get("source", "application")
+        action = event.get("action")
+        phase = event.get("phase")
+        if source == "sqlite-trace":
+            if phase != "trace":
+                raise AssertionError("observation error")
+            if action in {"INSERT", "UPDATE", "DELETE", "BEGIN", "COMMIT", "ROLLBACK"} and (event.get("connection_id"), event.get("operation_id")) not in attempts:
+                raise AssertionError("coverage error")
+            continue
+        if source != "application" or action not in {"SELECT", "PRAGMA", "INSERT", "UPDATE", "DELETE", "BEGIN", "COMMIT", "ROLLBACK"}:
+            raise AssertionError("observation error")
+        if phase not in {"attempt", "success", "failure", "transaction"}:
+            raise AssertionError("observation error")
+        if phase == "transaction" and action not in {"BEGIN", "COMMIT", "ROLLBACK"}:
+            raise AssertionError("observation error")
+    writes = [event for event in application if event.get("phase") == "attempt" and event.get("action") in {"INSERT", "UPDATE", "DELETE"}]
+    commits = [event for event in application if event.get("phase") == "transaction" and event.get("action") == "COMMIT"]
+    if expect_clean and (writes or commits):
+        raise AssertionError("write event")
+
+
+def _trace_setup(trace: Path, deletes: Path) -> str:
+    return (
+        "import json, sqlite3\n"
+        f"trace = open({str(trace)!r}, 'w', encoding='utf-8')\n"
+        f"deletes = open({str(deletes)!r}, 'w', encoding='utf-8')\n"
+        "call_id = 0\n"
+        "connection_id = 0\n"
+        "def emit(event):\n"
+        "    trace.write(json.dumps(event, sort_keys=True) + '\\n'); trace.flush()\n"
+        "def action_of(sql):\n"
+        "    return sql.lstrip().split(None, 1)[0].upper() if sql and sql.strip() else ''\n"
+        "class TracedConnection(sqlite3.Connection):\n"
+        "    def _event(self, phase, action, sql=None, params=None, operation_id=None, **extra):\n"
+        "        global call_id\n"
+        "        call_id += 1\n"
+        "        emit({'source': 'application', 'phase': phase, 'db': self._trace_db, 'connection_id': self._connection_id, 'action': action, 'sql': sql, 'params': list(params) if params is not None else None, 'call_id': call_id, 'operation_id': operation_id, **extra})\n"
+        "        return call_id\n"
+        "    def execute(self, sql, params=()):\n"
+        "        action = action_of(sql)\n"
+        "        operation_id = self._event('attempt', action, sql, params)\n"
+        "        if action not in {'SELECT', 'PRAGMA', 'INSERT', 'UPDATE', 'DELETE', 'BEGIN', 'COMMIT', 'ROLLBACK'}:\n"
+        "            self._event('failure', action, sql, params, operation_id, error='observation error')\n"
+        "            raise AssertionError('observation error')\n"
+        "        self._operation_id = operation_id\n"
+        "        try:\n"
+        "            cursor = super().execute(sql, params)\n"
+        "        except Exception as exc:\n"
+        "            self._event('failure', action, sql, params, operation_id, error=type(exc).__name__)\n"
+        "            raise\n"
+        "        finally:\n"
+        "            self._operation_id = None\n"
+        "        self._event('success', action, sql, params, operation_id, rowcount=cursor.rowcount)\n"
+        "        return cursor\n"
+        "    def commit(self):\n"
+        "        operation_id = self._event('attempt', 'COMMIT')\n"
+        "        self._operation_id = operation_id\n"
+        "        try:\n"
+        "            result = super().commit()\n"
+        "        except Exception as exc:\n"
+        "            self._event('failure', 'COMMIT', operation_id=operation_id, error=type(exc).__name__)\n"
+        "            raise\n"
+        "        finally:\n"
+        "            self._operation_id = None\n"
+        "        self._event('transaction', 'COMMIT', operation_id=operation_id)\n"
+        "        return result\n"
+        "    def rollback(self):\n"
+        "        operation_id = self._event('attempt', 'ROLLBACK')\n"
+        "        self._operation_id = operation_id\n"
+        "        try:\n"
+        "            result = super().rollback()\n"
+        "        except Exception as exc:\n"
+        "            self._event('failure', 'ROLLBACK', operation_id=operation_id, error=type(exc).__name__)\n"
+        "            raise\n"
+        "        finally:\n"
+        "            self._operation_id = None\n"
+        "        self._event('transaction', 'ROLLBACK', operation_id=operation_id)\n"
+        "        return result\n"
+        "def connect(path, *, read_only, immutable=False):\n"
+        "    global connection_id\n"
+        "    query = 'mode=ro&immutable=1' if read_only and immutable else 'mode=ro' if read_only else 'mode=rw'\n"
+        "    conn = sqlite3.connect(f'{path.resolve().as_uri()}?{query}', uri=True, factory=TracedConnection)\n"
+        "    connection_id += 1\n"
+        "    conn._connection_id = connection_id\n"
+        "    conn._operation_id = None\n"
+        "    conn._trace_db = path.name\n"
+        "    def callback(sql):\n"
+        "        emit({'source': 'sqlite-trace', 'phase': 'trace', 'db': path.name, 'connection_id': conn._connection_id, 'action': action_of(sql), 'sql': sql, 'params': None, 'operation_id': conn._operation_id})\n"
+        "    conn.set_trace_callback(callback)\n"
+        "    return conn\n"
+        "cleanup._rw = lambda path: connect(path, read_only=False)\n"
+        "cleanup._ro = lambda path, immutable: connect(path, read_only=True, immutable=immutable)\n"
+        "original_delete = cleanup._registry_delete\n"
+        "def observe_delete(conn, sql, params):\n"
+        "    action = action_of(sql)\n"
+        "    deletes.write(json.dumps({'source': 'application', 'phase': 'attempt', 'db': 'opencrab.db', 'action': action, 'sql': sql, 'params': list(params)}) + '\\n'); deletes.flush()\n"
+        "    try:\n"
+        "        cursor = original_delete(conn, sql, params)\n"
+        "    except Exception as exc:\n"
+        "        deletes.write(json.dumps({'source': 'application', 'phase': 'failure', 'db': 'opencrab.db', 'action': action, 'error': type(exc).__name__}) + '\\n'); deletes.flush()\n"
+        "        raise\n"
+        "    deletes.write(json.dumps({'source': 'application', 'phase': 'success', 'db': 'opencrab.db', 'action': action, 'rowcount': cursor.rowcount}) + '\\n'); deletes.flush()\n"
+        "    return cursor\n"
+        "cleanup._registry_delete = observe_delete\n"
+    )
+
+
+def _assert_axis_commits(events: list[dict], names: set[str]) -> None:
+    committed = {event.get("db") for event in events if event.get("source") == "application" and event.get("phase") == "transaction" and event.get("action") == "COMMIT"}
+    assert names <= committed
+
+
+def _survivor_raw(world: Path, node_id: str, claim_id: str | None = None) -> dict[str, list[tuple]]:
+    with _db(world / "doc_store.db") as conn:
+        source = conn.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (node_id,)).fetchall()
+        fts = conn.execute("SELECT source_id,text FROM doc_sources_fts WHERE source_id=?", (node_id,)).fetchall()
+        doc = conn.execute("SELECT space,node_id,node_type,properties FROM doc_nodes WHERE node_id=?", (node_id,)).fetchall()
+    with _db(world / "vectors.db") as conn:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        vector = conn.execute(f"SELECT * FROM {TABLE} WHERE node_id=?", (node_id,)).fetchall()
+    with _db(world / "graph.db") as conn:
+        graph = conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (node_id,)).fetchall()
+        graph_support = conn.execute(
+            "SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges "
+            "WHERE (from_type=? AND from_id=? AND to_type=? AND to_id=?) "
+            "OR (from_type=? AND from_id=? AND to_type=? AND to_id=?)",
+            ("Evidence", node_id, "Claim", claim_id, "Claim", claim_id, "Evidence", node_id),
+        ).fetchall() if claim_id else []
+    with _db(world / "opencrab.db") as conn:
+        registry = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (node_id,)).fetchall()
+        registry_support = conn.execute(
+            "SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges "
+            "WHERE (from_space=? AND from_id=? AND to_space=? AND to_id=?) "
+            "OR (from_space=? AND from_id=? AND to_space=? AND to_id=?)",
+            ("evidence", node_id, "claim", claim_id, "claim", claim_id, "evidence", node_id),
+        ).fetchall() if claim_id else []
+    return {"source": source, "fts": fts, "doc": doc, "vector": vector, "graph": graph, "graph_support": graph_support, "registry": registry, "registry_support": registry_support}
+
+
+def _assert_candidate_absent(world: Path, candidate: str) -> None:
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute("SELECT * FROM doc_sources WHERE source_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT * FROM doc_sources_fts WHERE source_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT * FROM doc_nodes WHERE node_id=?", (candidate,)).fetchall() == []
+    with _db(world / "vectors.db") as conn:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        assert conn.execute(f"SELECT * FROM {TABLE} WHERE node_id=?", (candidate,)).fetchall() == []
+    with _db(world / "graph.db") as conn:
+        assert conn.execute("SELECT * FROM graph_nodes WHERE node_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT * FROM graph_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall() == []
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT * FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT * FROM ontology_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall() == []
+
+
 def _cli_main(tmp_path: Path, name: str, args: list[str], setup: str = "") -> subprocess.CompletedProcess[str]:
     script_dir = Path(__file__).parent.parent / "scripts"
     runner = tmp_path / f"{name}.py"
@@ -161,6 +469,33 @@ def _cli_main(tmp_path: Path, name: str, args: list[str], setup: str = "") -> su
         capture_output=True,
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
+
+
+def _run_copy_apply(world: Path, tmp_path: Path, run: Path, backup: Path, approval: Path, source: str, name: str, injection: str = "") -> tuple[subprocess.CompletedProcess[str], list[dict]]:
+    copy = tmp_path / f"{name}.py"
+    trace = tmp_path / f"{name}.jsonl"
+    deletes = tmp_path / f"{name}.deletes.jsonl"
+    copy.write_text(source, encoding="utf-8")
+    runner = tmp_path / f"{name}.runner.py"
+    runner.write_text(
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        f"spec = importlib.util.spec_from_file_location('cleanup_copy', {str(copy)!r})\n"
+        "cleanup = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['cleanup_copy'] = cleanup\n"
+        "spec.loader.exec_module(cleanup)\n"
+        "sys.path.insert(0, " + repr(str(Path(__file__).parent.parent / "scripts")) + ")\n"
+        "import repair_store_mismatch_499 as repair\n"
+        "repair.holders = lambda _: ([], 0)\n"
+        + _trace_setup(trace, deletes)
+        + injection
+        + f"raise SystemExit(cleanup.main({_registry_apply_args(world, run, backup, approval)!r}))\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run([sys.executable, str(runner)], cwd=tmp_path, text=True, capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    delete_events = [json.loads(line) for line in deletes.read_text(encoding="utf-8").splitlines()]
+    return result, [*events, *delete_events]
 
 
 def _cli_rollback_state(world: Path, tmp_path: Path) -> tuple[Path, Path, list[str]]:
@@ -646,8 +981,8 @@ def test_claim_guard_rejects_candidate_only_support(world: Path):
     with _db(world / "graph.db") as conn:
         conn.execute("INSERT INTO graph_nodes VALUES (?,?,?,?)", ("Claim", "claim:only", "claim", "{}"))
         conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", candidate, "supports", "Claim", "claim:only", "{}"))
-    candidates, _ = cleanup.select(world, TABLE)
-    assert cleanup._claim_guard(world, candidates) == ["claim:only"]
+    candidates, detail = cleanup.select(world, TABLE)
+    assert cleanup._claim_guard(world, candidates, {"protected": detail["protected"]}) == ["claim:only"]
 
 
 def test_unrelated_unsupported_claim_does_not_block_candidate_apply(world: Path, tmp_path: Path):
@@ -723,11 +1058,10 @@ def test_cli_document_partial_first_apply_refuses_without_receipt(world: Path, t
     assert not (run / "receipt.json").exists()
 
 
-def test_cli_registry_reports_expected_and_actual_orphans_without_writes(world: Path, tmp_path: Path):
+def test_cli_registry_reports_expected_and_actual_orphans_after_candidate_cleanup(world: Path, tmp_path: Path):
     candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
     registry = world / "opencrab.db"
     with _db(registry) as conn:
-        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("evidence", "Evidence", normal))
         conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", normal, "preexisting", "evidence", "missing"))
         conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "expected", "evidence", normal))
     registry_uri = f"{registry.resolve().as_uri()}?mode=ro"
@@ -780,13 +1114,44 @@ def test_cli_registry_reports_expected_and_actual_orphans_without_writes(world: 
     approval = tmp_path / "approval.json"
     approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
     before_apply = registry.read_bytes()
-    applied = _cli_main(tmp_path, "registry-apply", [*base, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)], setup("apply"))
+    frozen_candidates = cleanup._load_run(run)[0]
+    allowed = _frozen_registry_delete_params(frozen_candidates)
+    with _db(registry) as conn:
+        all_nodes_before = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id").fetchall()
+        all_edges_before = conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id").fetchall()
+        candidate_before = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall()
+    protected_before = [row for row in all_nodes_before if row not in allowed["node"]]
+    protected_edges_before = [row for row in all_edges_before if row not in allowed["edge"]]
+    assert [(row[1], row[2], row[3]) for row in candidate_before] == [("evidence", "Evidence", candidate)]
+    delete_trace = tmp_path / "registry-delete-params.jsonl"
+    apply_setup = setup("apply") + (
+        f"delete_trace = open({str(delete_trace)!r}, 'w', encoding='utf-8')\n"
+        "original_delete = cleanup._registry_delete\n"
+        "def observe_delete(conn, sql, params):\n"
+        "    delete_trace.write(json.dumps({'sql': sql, 'params': list(params)}, sort_keys=True) + '\\n')\n"
+        "    delete_trace.flush()\n"
+        "    return original_delete(conn, sql, params)\n"
+        "cleanup._registry_delete = observe_delete\n"
+    )
+    applied = _cli_main(tmp_path, "registry-apply", [*base, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)], apply_setup)
     assert applied.returncode == 0, applied.stderr
-    assert registry.read_bytes() == before_apply
+    assert registry.read_bytes() != before_apply
+    delete_events = [json.loads(line) for line in delete_trace.read_text(encoding="utf-8").splitlines()]
+    assert delete_events
+    _assert_registry_delete_records(delete_events, frozen_candidates)
+    with _db(registry) as conn:
+        all_nodes_after = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id").fetchall()
+        all_edges_after = conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id").fetchall()
+        assert conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall() == []
+    assert all_nodes_after == protected_before
+    assert all_edges_after == protected_edges_before
     actual_report = _load(run / "registry-after.json")
     with sqlite3.connect(graph_uri, uri=True) as conn:
         actual_ids = {row[0] for row in conn.execute("SELECT node_id FROM graph_nodes")}
-    independently_actual = {edge for edge in edges if edge[1] not in actual_ids or edge[4] not in actual_ids}
+    with sqlite3.connect(registry_uri, uri=True) as conn:
+        conn.execute("PRAGMA query_only=ON")
+        actual_edges = {tuple(row) for row in conn.execute("SELECT from_space,from_id,relation,to_space,to_id FROM ontology_edges")}
+    independently_actual = {edge for edge in actual_edges if edge[1] not in actual_ids or edge[4] not in actual_ids}
     assert {tuple(edge) for edge in actual_report["preexisting_orphans"]} == independently_actual
     events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     _assert_observer_events(events, production=True)
@@ -794,9 +1159,136 @@ def test_cli_registry_reports_expected_and_actual_orphans_without_writes(world: 
     assert any(event["source"] == "apply:_ro" and event["kind"] == "trace" and event["action"] == "SELECT" for event in events)
 
 
-def test_registry_observer_parser_and_virtual_table_controls():
-    def event(*, action: int | str, arg1: str | None = None, arg2: str | None = None, kind: str = "authorizer") -> dict:
-        return {"source": "observer-unit", "kind": kind, "action": action, "arg1": arg1, "arg2": arg2, "raw": None}
+def test_transaction_seams_record_commit_and_rollback(world: Path, tmp_path: Path):
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, manifest = cleanup._load_run(run)
+    cleanup._backup_receipt(world, run, tmp_path / "backup", manifest, candidates)
+    events: list[str] = []
+    original_commit, original_rollback = cleanup._commit, cleanup._rollback
+
+    def commit(conn: sqlite3.Connection) -> None:
+        events.append("commit-attempt")
+        original_commit(conn)
+        events.append("commit-success")
+
+    def rollback(conn: sqlite3.Connection) -> None:
+        events.append("rollback-attempt")
+        original_rollback(conn)
+        events.append("rollback-success")
+
+    cleanup._commit, cleanup._rollback = commit, rollback
+    try:
+        cleanup._delete_vector(world, TABLE, candidates[0])
+        assert events == ["commit-attempt", "commit-success"]
+        events.clear()
+        with pytest.raises(cleanup.CleanupRefusedError):
+            cleanup._delete_vector(world, TABLE, {**candidates[0], "vector": {**candidates[0]["vector"], "digest": "wrong"}})
+        assert events == ["rollback-attempt", "rollback-success"]
+        events.clear()
+        failing_commit = cleanup._commit
+
+        def commit_failure(conn: sqlite3.Connection) -> None:
+            events.append("commit-attempt")
+            raise OSError("commit failure")
+
+        fresh = tmp_path / "fresh"
+        fresh.mkdir()
+        _schema(fresh)
+        _add(fresh, "evidence:turn:heartbeat", HEARTBEAT)
+        fresh_run = tmp_path / "fresh-run"
+        cleanup.dry_run(fresh, fresh_run, TABLE)
+        fresh_candidates, _ = cleanup._load_run(fresh_run)
+        cleanup._commit = commit_failure
+        with pytest.raises(OSError, match="commit failure"):
+            cleanup._delete_vector(fresh, TABLE, fresh_candidates[0])
+        assert events == ["commit-attempt", "rollback-attempt", "rollback-success"]
+        cleanup._commit = failing_commit
+    finally:
+        cleanup._commit, cleanup._rollback = original_commit, original_rollback
+
+
+def _collector_child(tmp_path: Path, name: str, body: str) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
+    trace = tmp_path / f"{name}.jsonl"
+    deletes = tmp_path / f"{name}.deletes.jsonl"
+    runner = tmp_path / f"{name}.runner.py"
+    script_dir = Path(__file__).parent.parent / "scripts"
+    runner.write_text(
+        "from pathlib import Path\n"
+        "import sqlite3, sys\n"
+        f"sys.path.insert(0, {str(script_dir)!r})\n"
+        "import cleanup_openclaw_heartbeat_493 as cleanup\n"
+        "import repair_store_mismatch_499 as repair\n"
+        "repair.holders = lambda _: ([], 0)\n"
+        + _trace_setup(trace, deletes)
+        + body,
+        encoding="utf-8",
+    )
+    result = subprocess.run([sys.executable, str(runner)], cwd=tmp_path, text=True, capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    return result, events
+
+
+def test_event_collector_detects_actual_writes(tmp_path: Path):
+    db = tmp_path / "events.db"
+    bootstrap = (
+        f"with sqlite3.connect({str(db)!r}) as raw:\n"
+        "    raw.execute('CREATE TABLE rows (id INTEGER PRIMARY KEY, value TEXT)')\n"
+        "    raw.execute(\"INSERT INTO rows VALUES (1, 'old')\")\n"
+        "    raw.execute(\"CREATE VIRTUAL TABLE rows_fts USING fts5(value)\")\n"
+        "    raw.execute(\"INSERT INTO rows_fts VALUES ('old')\")\n"
+    )
+    select, select_events = _collector_child(tmp_path, "collector-select", bootstrap + f"conn = cleanup._rw(Path({str(db)!r}))\nconn.execute('SELECT value FROM rows WHERE id=1').fetchone()\nconn.close()\n")
+    assert select.returncode == 0, select.stderr
+    _assert_event_contract(select_events, expect_clean=True)
+
+    delete, delete_events = _collector_child(tmp_path, "collector-delete", f"conn = cleanup._rw(Path({str(db)!r}))\nconn.execute('BEGIN')\nconn.execute('DELETE FROM rows WHERE id=1')\nconn.commit()\nconn.close()\n")
+    assert delete.returncode == 0, delete.stderr
+    with pytest.raises(AssertionError, match="write event"):
+        _assert_event_contract(delete_events, expect_clean=True)
+
+    with sqlite3.connect(db) as raw:
+        raw.execute("INSERT INTO rows VALUES (1, 'old')")
+    update, update_events = _collector_child(tmp_path, "collector-update", f"conn = cleanup._rw(Path({str(db)!r}))\nconn.execute('BEGIN')\nconn.execute(\"UPDATE rows SET value='new' WHERE id=1\")\nconn.rollback()\nconn.close()\n")
+    assert update.returncode == 0, update.stderr
+    with pytest.raises(AssertionError, match="write event"):
+        _assert_event_contract(update_events, expect_clean=True)
+    with sqlite3.connect(db) as raw:
+        assert raw.execute("SELECT value FROM rows WHERE id=1").fetchone() == ("old",)
+
+    fts, fts_events = _collector_child(tmp_path, "collector-fts", f"conn = cleanup._rw(Path({str(db)!r}))\nconn.execute('BEGIN')\nrowcount = conn.execute('DELETE FROM rows_fts WHERE rowid=1').rowcount\nassert rowcount == 1\nconn.commit()\nconn.close()\n")
+    assert fts.returncode == 0, fts.stderr
+    assert any(event.get("source") == "application" and event.get("action") == "DELETE" and event.get("rowcount") == 1 for event in fts_events)
+    assert any(event.get("source") == "application" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in fts_events)
+    delete_attempt = next(event for event in fts_events if event.get("source") == "application" and event.get("phase") == "attempt" and event.get("action") == "DELETE")
+    assert any(
+        event.get("source") == "sqlite-trace"
+        and event.get("connection_id") == delete_attempt["connection_id"]
+        and event.get("operation_id") == delete_attempt["call_id"]
+        and event.get("sql", "").startswith("-- DELETE FROM")
+        and "rows_fts_" in event["sql"]
+        for event in fts_events
+    )
+
+    comment, comment_events = _collector_child(tmp_path, "collector-comment", f"conn = cleanup._rw(Path({str(db)!r}))\nconn.execute(\"-- comment\\\\nDELETE FROM rows WHERE id=1\")\n")
+    assert comment.returncode == 1
+    assert "AssertionError: observation error" in comment.stderr
+    assert any(event.get("source") == "application" and event.get("action") == "--" and event.get("phase") == "failure" for event in comment_events)
+
+    for action in ("DELETE", "BEGIN", "COMMIT"):
+        callback = next(event for event in delete_events if event.get("source") == "sqlite-trace" and event.get("action") == action)
+        with pytest.raises(AssertionError, match="coverage error"):
+            _assert_event_contract([event for event in delete_events if not (event.get("source") == "application" and event.get("phase") == "attempt" and event.get("connection_id") == callback["connection_id"] and event.get("call_id") == callback["operation_id"])], expect_clean=False)
+
+    failure, failure_events = _collector_child(tmp_path, "collector-commit-failure", f"with sqlite3.connect({str(db)!r}) as raw:\n    raw.execute('CREATE TABLE parent (id INTEGER PRIMARY KEY)')\n    raw.execute('CREATE TABLE child (parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)')\nconn = cleanup._rw(Path({str(db)!r}))\nconn.execute('PRAGMA foreign_keys=ON')\nconn.execute('BEGIN')\nconn.execute('INSERT INTO child VALUES (1)')\ntry:\n    conn.commit()\nexcept sqlite3.IntegrityError:\n    conn.rollback()\nfinally:\n    conn.close()\n")
+    assert failure.returncode == 0, failure.stderr
+    assert any(event.get("source") == "application" and event.get("phase") == "failure" and event.get("action") == "COMMIT" and event.get("error") == "IntegrityError" for event in failure_events)
+    assert any(event.get("source") == "application" and event.get("phase") == "transaction" and event.get("action") == "ROLLBACK" for event in failure_events)
+
+
+def test_registry_observer_parser_and_virtual_table_controls(tmp_path: Path):
+    def event(*, action: int | str, arg1: str | None = None, arg2: str | None = None, kind: str = "authorizer", raw: str | None = None) -> dict:
+        return {"source": "observer-unit", "kind": kind, "action": action, "arg1": arg1, "arg2": arg2, "raw": raw}
 
     baseline = [
         event(action=sqlite3.SQLITE_PRAGMA, arg1="query_only"),
@@ -824,6 +1316,1658 @@ def test_registry_observer_parser_and_virtual_table_controls():
             _assert_observer_events(invalid, production=False)
         assert str(excinfo.value) == reason
         _assert_observer_events(baseline, production=False)
+    candidates = [{"snapshot": {
+        "registry_node": [{"id": 1, "space": "evidence", "node_type": "Evidence", "node_id": "evidence:turn:heartbeat", "created_at": "t", "updated_at": "u"}],
+        "registry_edges": [{"id": 2, "from_space": "evidence", "from_id": "evidence:turn:heartbeat", "relation": "supports", "to_space": "claim", "to_id": "claim:keep", "created_at": "t"}],
+    }}]
+    allowed_node = (1, "evidence", "Evidence", "evidence:turn:heartbeat", "t", "u")
+    allowed_edge = (2, "evidence", "evidence:turn:heartbeat", "supports", "claim", "claim:keep", "t")
+    _assert_registry_delete_records([{"sql": _NODE_DELETE_SQL, "params": list(allowed_node)}], candidates)
+    _assert_registry_delete_records([{"sql": _EDGE_DELETE_SQL, "params": list(allowed_edge)}], candidates)
+    invalid_records = [
+        {"sql": "DELETE FROM ontology_nodes WHERE node_id=? AND ? IS NOT NULL AND 0", "params": ["evidence:turn:normal", "evidence:turn:heartbeat"]},
+        {"sql": _NODE_DELETE_SQL, "params": [1, "evidence", "Evidence", "evidence:turn:normal", "t", "u"]},
+        {"sql": _EDGE_DELETE_SQL, "params": [2, "evidence", "evidence:turn:other", "supports", "claim", "claim:keep", "t"]},
+        {"sql": _NODE_DELETE_SQL, "params": [1, "evidence", "Evidence", "evidence:turn:heartbeat", "changed", "u"]},
+        {"sql": _NODE_DELETE_SQL, "params": [1, "Evidence", "evidence", "evidence:turn:heartbeat", "t", "u"]},
+        {"sql": _NODE_DELETE_SQL, "params": [1, "evidence", "Evidence", "evidence:turn:heartbeat", "t"]},
+    ]
+    for record in invalid_records:
+        with pytest.raises(AssertionError, match="registry delete target"):
+            _assert_registry_delete_records([record], candidates)
+    db = tmp_path / "observer.db"
+    with _db(db) as conn:
+        conn.execute("CREATE TABLE ontology_nodes (id INTEGER, space TEXT, node_type TEXT, node_id TEXT, created_at TEXT, updated_at TEXT)")
+        conn.execute("CREATE TABLE ontology_edges (id INTEGER, from_space TEXT, from_id TEXT, relation TEXT, to_space TEXT, to_id TEXT, created_at TEXT)")
+        conn.execute("INSERT INTO ontology_nodes VALUES (?,?,?,?,?,?)", allowed_node)
+        conn.execute("INSERT INTO ontology_nodes VALUES (?,?,?,?,?,?)", (3, "evidence", "Evidence", "evidence:turn:normal", "t", "u"))
+        conn.execute("INSERT INTO ontology_edges VALUES (?,?,?,?,?,?,?)", allowed_edge)
+        before_nodes = conn.execute("SELECT * FROM ontology_nodes ORDER BY id").fetchall()
+        before_edges = conn.execute("SELECT * FROM ontology_edges ORDER BY id").fetchall()
+        conn.commit()
+        captured: list[dict[str, object]] = []
+        original_delete = cleanup._registry_delete
+        def observe(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> sqlite3.Cursor:
+            captured.append({"sql": sql, "params": list(params)})
+            return original_delete(conn, sql, params)
+        cleanup._registry_delete = observe
+        try:
+            conn.execute("BEGIN")
+            cursor = cleanup._registry_delete(conn, "DELETE FROM ontology_nodes WHERE node_id=? AND ? IS NOT NULL AND 0", ("evidence:turn:normal", "evidence:turn:heartbeat"))
+            conn.rollback()
+        finally:
+            cleanup._registry_delete = original_delete
+        assert cursor.rowcount == 0
+        assert conn.execute("SELECT * FROM ontology_nodes ORDER BY id").fetchall() == before_nodes
+        assert conn.execute("SELECT * FROM ontology_edges ORDER BY id").fetchall() == before_edges
+    with pytest.raises(AssertionError, match="registry delete target"):
+        _assert_registry_delete_records(captured, candidates)
+
+
+def test_cli_registry_foreign_space_id_refuses_before_vector_write(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("resource", "Document", candidate))
+    run = tmp_path / "run"
+    base = ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE]
+    result = _cli_main(tmp_path, "foreign-space", base)
+    assert result.returncode == 0, result.stderr
+    assert not (run / "manifest.json").exists()
+    assert "registry node multiplicity" in _load(run / "report.json")["errors"][0]
+
+
+def test_cli_registry_rowcount_failure_rolls_back_registry_transaction(world: Path, tmp_path: Path):
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "opencrab.db") as conn:
+        before_node = conn.execute("SELECT space,node_type,node_id FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall()
+        before_edges = conn.execute("SELECT from_space,from_id,relation,to_space,to_id FROM ontology_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall()
+    args = ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)]
+    result = _cli_main(tmp_path, "registry-rowcount", args, "cleanup._registry_rowcount = lambda cursor: 0\n")
+    assert result.returncode != 0
+    assert "registry node delete rowcount" in result.stderr
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT space,node_type,node_id FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall() == before_node
+        assert conn.execute("SELECT from_space,from_id,relation,to_space,to_id FROM ontology_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall() == before_edges
+
+
+def test_cli_registry_claim_support_refuses_before_every_candidate_write(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("claim", "Claim", "claim:registry-only"))
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "supports", "claim", "claim:registry-only"))
+    before = {path.name: path.read_bytes() for path in world.iterdir()}
+    run = tmp_path / "run"
+    result = cleanup.dry_run(world, run, TABLE)
+    assert result["eligible"] is False
+    assert not (run / "manifest.json").exists()
+    assert any("candidate set removes final registry Claim support" in error for error in _load(run / "report.json")["errors"])
+    assert {path.name: path.read_bytes() for path in world.iterdir()} == before
+
+
+def test_cli_registry_target_resume_completes_missing_edge(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "related", "evidence", normal))
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, manifest = cleanup._load_run(run)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("DELETE FROM ontology_nodes WHERE space=? AND node_id=?", ("evidence", candidate))
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    args = ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)]
+    result = _cli_main(tmp_path, "registry-resume", args)
+    assert result.returncode == 0, result.stderr
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT * FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT * FROM ontology_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall() == []
+
+
+def test_cli_registry_edge_rowcount_failure_rolls_back_atomic_axis(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "related", "evidence", normal))
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    with _db(world / "opencrab.db") as conn:
+        before_nodes = conn.execute("SELECT space,node_type,node_id FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall()
+        before_edges = conn.execute("SELECT from_space,from_id,relation,to_space,to_id FROM ontology_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall()
+    args = ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)]
+    result = _cli_main(tmp_path, "registry-edge-rowcount", args, "cleanup._registry_rowcount = lambda cursor: 0\n")
+    assert result.returncode != 0
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT space,node_type,node_id FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall() == before_nodes
+        assert conn.execute("SELECT from_space,from_id,relation,to_space,to_id FROM ontology_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall() == before_edges
+
+
+def test_cli_registry_claim_guard_mutation_is_red(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("claim", "Claim", "claim:registry-only"))
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "supports", "claim", "claim:registry-only"))
+    run = tmp_path / "run"
+    original = cleanup._registry_claim_guard
+    cleanup._registry_claim_guard = lambda data, candidates, manifest: []
+    try:
+        result = cleanup.dry_run(world, run, TABLE)
+    finally:
+        cleanup._registry_claim_guard = original
+    assert result["eligible"] is True
+    assert (run / "manifest.json").exists()
+
+
+def test_cli_registry_first_partial_refuses_before_backup(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "related", "evidence", normal))
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("DELETE FROM ontology_edges WHERE from_id=? AND relation='related'", (candidate,))
+    args = ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)]
+    result = _cli_main(tmp_path, "registry-first-partial", args)
+    assert result.returncode != 0
+    assert "first apply requires the full frozen snapshot" in result.stderr
+    assert not backup.exists()
+    assert not (run / "receipt.json").exists()
+
+
+def test_cli_registry_target_resume_completes_partial_edge_set(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "related-one", "evidence", normal))
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "related-two", "evidence", normal))
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, manifest = cleanup._load_run(run)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("DELETE FROM ontology_edges WHERE from_id=? AND relation='related-one'", (candidate,))
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    args = ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)]
+    result = _cli_main(tmp_path, "registry-edge-resume", args)
+    assert result.returncode == 0, result.stderr
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT * FROM ontology_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall() == []
+        assert conn.execute("SELECT * FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall() == []
+
+
+def test_cli_registry_foreign_edge_endpoint_refuses_before_vector_write(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "mixed", "resource", candidate))
+    run = tmp_path / "run"
+    result = _cli_main(tmp_path, "foreign-edge", ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE])
+    assert result.returncode == 0, result.stderr
+    report = _load(run / "report.json")
+    assert "registry edge foreign tuple" in report["errors"][0]
+    assert not (run / "manifest.json").exists()
+
+
+def test_cli_registry_protection_prewrite_source_metadata_refuses(world: Path, tmp_path: Path):
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (json.dumps({"pack_id": "other", "node_id": "evidence:turn:normal"}), "evidence:turn:normal"))
+    args = ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)]
+    result = _cli_main(tmp_path, "source-prewrite", args)
+    assert result.returncode != 0
+    assert "first apply requires the full frozen snapshot" in result.stderr
+    assert not backup.exists()
+    assert not (run / "receipt.json").exists()
+
+
+def test_cli_registry_edge_success_node_rowcount_rolls_back(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "related", "evidence", normal))
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    with _db(world / "opencrab.db") as conn:
+        before_nodes = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall()
+        before_edges = conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall()
+    setup = (
+        "original = cleanup._registry_rowcount\n"
+        "calls = 0\n"
+        "def rowcount(cursor):\n"
+        "    global calls\n"
+        "    calls += 1\n"
+        "    return 0 if calls == 2 else original(cursor)\n"
+        "cleanup._registry_rowcount = rowcount\n"
+    )
+    args = ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)]
+    result = _cli_main(tmp_path, "edge-node-rowcount", args, setup)
+    assert result.returncode != 0
+    assert "registry node delete rowcount" in result.stderr
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall() == before_nodes
+        assert conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall() == before_edges
+
+
+def _registry_claim_setup(world: Path, *, include_graph_candidate: bool = True, include_registry_candidate: bool = True) -> tuple[str, str, str]:
+    candidate = "evidence:turn:heartbeat"
+    normal = "evidence:turn:normal"
+    claim = "claim:registry-proof"
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_nodes VALUES (?,?,?,?)", ("Claim", claim, "claim", "{}"))
+        if include_graph_candidate:
+            conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", candidate, "supports", "Claim", claim, "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", normal, "supports", "Claim", claim, "{}"))
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("claim", "Claim", claim))
+        if include_registry_candidate:
+            conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "supports", "claim", claim))
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", normal, "supports", "claim", claim))
+    return candidate, normal, claim
+
+
+def test_cli_registry_claim_production_positive(world: Path, tmp_path: Path):
+    candidate, normal, claim = _registry_claim_setup(world)
+    before_survivor = _survivor_raw(world, normal, claim)
+    assert before_survivor["graph_support"]
+    assert before_survivor["registry_support"]
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    with _db(world / "doc_store.db") as conn:
+        before_source = conn.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (normal,)).fetchall()
+        before_fts = conn.execute("SELECT source_id,text FROM doc_sources_fts WHERE source_id=?", (normal,)).fetchall()
+        before_doc = conn.execute("SELECT space,node_id,node_type,properties FROM doc_nodes WHERE node_id=?", (normal,)).fetchall()
+    with _db(world / "vectors.db") as conn:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        before_vector = conn.execute(f"SELECT node_id,pack_id,document,metadata FROM {TABLE} WHERE node_id=?", (normal,)).fetchall()
+    with _db(world / "graph.db") as conn:
+        before_graph = conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (normal,)).fetchall()
+        before_graph_support = conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id=? AND to_id=?", (normal, claim)).fetchall()
+    with _db(world / "opencrab.db") as conn:
+        before_registry = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (normal,)).fetchall()
+        before_registry_support = conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges WHERE from_id=? AND to_id=?", (normal, claim)).fetchall()
+    trace = tmp_path / "registry-claim-positive.trace"
+    deletes = tmp_path / "registry-claim-positive.deletes.jsonl"
+    result = _cli_main(tmp_path, "registry-claim-positive", ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)], _trace_setup(trace, deletes))
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    delete_events = [json.loads(line) for line in deletes.read_text(encoding="utf-8").splitlines() if json.loads(line).get("phase") == "attempt"]
+    _assert_event_contract(events, expect_clean=False)
+    _assert_registry_delete_records(delete_events, cleanup._load_run(run)[0])
+    edge = next(event for event in delete_events if event["sql"] == _EDGE_DELETE_SQL)
+    _assert_registry_delete_records([edge], cleanup._load_run(run)[0])
+    for params in ([*edge["params"][:2], "evidence:turn:other", *edge["params"][3:]], [edge["params"][0], edge["params"][2], edge["params"][1], *edge["params"][3:]], edge["params"][:-1]):
+        with pytest.raises(AssertionError, match="registry delete target"):
+            _assert_registry_delete_records([{"sql": edge["sql"], "params": params}], cleanup._load_run(run)[0])
+    _assert_axis_commits(events, {"vectors.db", "graph.db", "doc_store.db", "opencrab.db"})
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute("SELECT * FROM doc_sources WHERE source_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT * FROM doc_sources_fts WHERE source_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT * FROM doc_nodes WHERE node_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (normal,)).fetchall() == before_source
+        assert conn.execute("SELECT source_id,text FROM doc_sources_fts WHERE source_id=?", (normal,)).fetchall() == before_fts
+        assert conn.execute("SELECT space,node_id,node_type,properties FROM doc_nodes WHERE node_id=?", (normal,)).fetchall() == before_doc
+    with _db(world / "vectors.db") as conn:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        assert conn.execute(f"SELECT * FROM {TABLE} WHERE node_id=?", (candidate,)).fetchall() == []
+        assert conn.execute(f"SELECT node_id,pack_id,document,metadata FROM {TABLE} WHERE node_id=?", (normal,)).fetchall() == before_vector
+    with _db(world / "graph.db") as conn:
+        assert conn.execute("SELECT * FROM graph_nodes WHERE node_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (normal,)).fetchall() == before_graph
+        assert conn.execute("SELECT * FROM graph_edges WHERE from_id=? AND to_id=?", (candidate, claim)).fetchall() == []
+        assert conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id=? AND to_id=?", (normal, claim)).fetchall() == before_graph_support
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT * FROM ontology_nodes WHERE node_id=?", (candidate,)).fetchall() == []
+        assert conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (normal,)).fetchall() == before_registry
+        assert conn.execute("SELECT * FROM ontology_edges WHERE from_id=? AND to_id=?", (candidate, claim)).fetchall() == []
+        assert conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges WHERE from_id=? AND to_id=?", (normal, claim)).fetchall() == before_registry_support
+    _assert_candidate_absent(world, candidate)
+    assert _survivor_raw(world, normal, claim) == before_survivor
+
+
+@pytest.mark.parametrize("fault", ["missing", "pack"])
+def test_cli_registry_claim_frozen_source_selection_refuses(world: Path, tmp_path: Path, fault: str):
+    _registry_claim_setup(world)
+    normal = "evidence:turn:normal"
+    with _db(world / "doc_store.db") as conn:
+        if fault == "missing":
+            conn.execute("DELETE FROM doc_sources WHERE source_id=?", (normal,))
+        else:
+            conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (json.dumps({"pack_id": "other", "node_id": normal}), normal))
+    before = {path.name: path.read_bytes() for path in world.iterdir()}
+    run = tmp_path / "run"
+    result = _cli_main(tmp_path, f"frozen-source-{fault}", ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE])
+    assert result.returncode == 0, result.stderr
+    assert not (run / "manifest.json").exists()
+    report = _load(run / "report.json")
+    assert report["last_support_claims"] == ["claim:registry-proof"]
+    assert report["last_registry_claims"] == ["claim:registry-proof"]
+    assert {path.name: path.read_bytes() for path in world.iterdir()} == before
+
+
+def test_cli_registry_claim_nonclaim_target_control(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("concept", "Concept", "concept:target"))
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "supports", "concept", "concept:target"))
+        protected_before = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (normal,)).fetchall()
+    before_survivor = _survivor_raw(world, normal)
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    trace = tmp_path / "registry-nonclaim.trace"
+    deletes = tmp_path / "registry-nonclaim.deletes.jsonl"
+    result = _cli_main(tmp_path, "registry-nonclaim", _registry_apply_args(world, run, backup, approval), _trace_setup(trace, deletes))
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    delete_events = [json.loads(line) for line in deletes.read_text(encoding="utf-8").splitlines() if json.loads(line).get("phase") == "attempt"]
+    _assert_event_contract(events, expect_clean=False)
+    _assert_registry_delete_records(delete_events, cleanup._load_run(run)[0])
+    _assert_axis_commits(events, {"vectors.db", "graph.db", "doc_store.db", "opencrab.db"})
+    _assert_candidate_absent(world, candidate)
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (normal,)).fetchall() == protected_before
+    assert _survivor_raw(world, normal) == before_survivor
+
+
+@pytest.mark.parametrize("old,new", [
+    (
+        'all(node in snapshot["registry_node"] for node in nodes)',
+        'all(any({key: value for key, value in node.items() if key != "updated_at"} == {key: value for key, value in expected.items() if key != "updated_at"} for expected in snapshot["registry_node"]) for node in nodes)',
+    ),
+    (
+        'all(edge in snapshot["registry_edges"] for edge in edges)',
+        'all(any({key: value for key, value in edge.items() if key != "created_at"} == {key: value for key, value in expected.items() if key != "created_at"} for expected in snapshot["registry_edges"]) for edge in edges)',
+    ),
+])
+def test_catalog_membership_mutations_compile(tmp_path: Path, old: str, new: str):
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    mutated = _catalog_mutation(source, old, new)
+    copy = tmp_path / "membership_mutation.py"
+    copy.write_text(mutated, encoding="utf-8")
+    compile(mutated, str(copy), "exec")
+
+
+@pytest.mark.parametrize("name,old,new", [
+    (
+        "source-existence",
+        'if len(source) != 1 or graph_node is None or len(registry_nodes) != 1 or not isinstance(frozen_source, list) or not isinstance(frozen_registry, list):\n        return False',
+        'if graph_node is None or len(registry_nodes) != 1 or not isinstance(frozen_source, list) or not isinstance(frozen_registry, list):\n        return False',
+    ),
+    (
+        "frozen-pack",
+        'and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == "openclaw"',
+        'and True',
+    ),
+    (
+        "current-pack",
+        'and _strict_pack(source[0][2], f"Claim source {source_id}") == "openclaw"',
+        'and True',
+    ),
+    (
+        "projected-claim",
+        'if _claim_failures(conn, registry, doc, candidates, manifest, axis="graph", planned_edges=planned_edges, planned_nodes=planned_nodes):\n            raise CleanupRefusedError("planned graph delete removes final Claim support")',
+        'if False:\n            raise CleanupRefusedError("planned graph delete removes final Claim support")',
+    ),
+    (
+        "registry-claim",
+        'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+        'if False:\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+    ),
+    (
+        "doc-raw",
+        'if source != evidence.get("source"):\n                    raise CleanupRefusedError("registry protection conflict")',
+        'if False:\n                    raise CleanupRefusedError("registry protection conflict")',
+    ),
+])
+def test_catalog_branch_mutations_compile(tmp_path: Path, name: str, old: str, new: str):
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    mutated = _catalog_mutation(source, old, new)
+    copy = tmp_path / f"{name}.py"
+    copy.write_text(mutated, encoding="utf-8")
+    compile(mutated, str(copy), "exec")
+
+
+def test_catalog_source_existence_copy_records_empty_source_failure(tmp_path: Path):
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    old = 'if len(source) != 1 or graph_node is None or len(registry_nodes) != 1 or not isinstance(frozen_source, list) or not isinstance(frozen_registry, list):\n        return False'
+    new = 'if graph_node is None or len(registry_nodes) != 1 or not isinstance(frozen_source, list) or not isinstance(frozen_registry, list):\n        return False'
+    assert source.count(old) == 1
+    def setup(root: Path, normal: str, snapshot: Path) -> str:
+        return ("import sqlite3\n"
+            "original_guard = cleanup._claim_guard\n"
+            "def guard(data, candidates, manifest):\n"
+            f"    with sqlite3.connect({str(root / 'doc_store.db')!r}) as conn: conn.execute(\"DELETE FROM doc_sources WHERE source_id=?\", ({normal!r},))\n"
+            "    state = {name: (data / name).read_bytes().hex() for name in cleanup.DB_FILES}\n"
+            f"    open({str(snapshot)!r}, 'w', encoding='utf-8').write(json.dumps(state))\n"
+            "    return original_guard(data, candidates, manifest)\n"
+            "cleanup._claim_guard = guard\n")
+    b_root, b_run, b_backup, b_approval, b_candidates, _b_manifest, b_normal = _fresh_registry_claim_fixture(tmp_path, "source-existence-baseline")
+    m_root, m_run, m_backup, m_approval, m_candidates, _m_manifest, m_normal = _fresh_registry_claim_fixture(tmp_path, "source-existence-mutant")
+    assert [r["snapshot"] for r in b_candidates] == [r["snapshot"] for r in m_candidates]
+    b_snapshot, m_snapshot = tmp_path / "source-baseline.json", tmp_path / "source-mutant.json"
+    baseline, baseline_events = _run_copy_apply(b_root, tmp_path, b_run, b_backup, b_approval, source, "source-existence-baseline-copy", setup(b_root, b_normal, b_snapshot))
+    assert baseline.returncode == 2
+    assert "Claim support changed after frozen manifest" in baseline.stderr
+    _assert_event_contract(baseline_events, expect_clean=True)
+    assert _all_db_bytes(b_root) == _load(b_snapshot)
+    mutant = _catalog_mutation(source, old, new)
+    result, events = _run_copy_apply(m_root, tmp_path, m_run, m_backup, m_approval, mutant, "source-existence-mutant-copy", setup(m_root, m_normal, m_snapshot))
+    assert result.returncode == 1
+    assert "IndexError: list index out of range" in result.stderr
+    _assert_event_contract(events, expect_clean=True)
+    assert _all_db_bytes(m_root) == _load(m_snapshot)
+
+
+@pytest.mark.parametrize("branch,old,new", [
+    ("frozen", 'and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == "openclaw"', 'and True'),
+    ("current", 'and _strict_pack(source[0][2], f"Claim source {source_id}") == "openclaw"', 'and True'),
+])
+def test_catalog_source_pack_copy_reaches_later_guard(tmp_path: Path, branch: str, old: str, new: str):
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    equality = 'and [_json_value(row) for row in source] == frozen_source'
+    assert source.count(old) == source.count(equality) == 1
+    observed = source.replace(old, 'and observe_pack(lambda: ' + old.removeprefix('and ') + ')').replace(equality, 'and observe_equality(lambda: [_json_value(row) for row in source] == frozen_source)')
+    def setup(root: Path, normal: str, marker: Path, snapshot: Path) -> str:
+        if branch == "frozen":
+            change = ("    evidence = next(item for item in manifest['protected']['evidence'] if item['graph']['id'] == " + repr(normal) + ")\n"
+                "    evidence['source_raw'][0][2] = json.dumps({'pack_id': 'other', 'node_id': " + repr(normal) + "})\n")
+        else:
+            change = f"    with sqlite3.connect({str(root / 'doc_store.db')!r}) as conn: conn.execute(\"UPDATE doc_sources SET metadata=? WHERE source_id=?\", (json.dumps({{'pack_id':'other','node_id':{normal!r}}}), {normal!r}))\n"
+        return ("import sqlite3\noriginal_guard = cleanup._claim_guard\n"
+            "def record(kind, value):\n"
+            f"    open({str(marker)!r}, 'a', encoding='utf-8').write(json.dumps({{'kind': kind, 'value': value}}) + '\\n')\n"
+            "def observe_pack(call):\n    value = call(); record('pack', value); return value\n"
+            "def observe_equality(call):\n    value = call(); record('equality', value); return value\n"
+            "def observe_bypass(call):\n    value = call(); record('bypass', value); return value\n"
+            "cleanup.observe_pack = observe_pack\ncleanup.observe_equality = observe_equality\ncleanup.observe_bypass = observe_bypass\n"
+            "def guard(data, candidates, manifest):\n" + change +
+            "    state = {name: (data / name).read_bytes().hex() for name in cleanup.DB_FILES}\n"
+            f"    open({str(snapshot)!r}, 'w', encoding='utf-8').write(json.dumps(state))\n"
+            "    return original_guard(data, candidates, manifest)\ncleanup._claim_guard = guard\n")
+    b_root, b_run, b_backup, b_approval, b_candidates, _b_manifest, b_normal = _fresh_registry_claim_fixture(tmp_path, f"pack-{branch}-baseline")
+    m_root, m_run, m_backup, m_approval, m_candidates, _m_manifest, m_normal = _fresh_registry_claim_fixture(tmp_path, f"pack-{branch}-mutant")
+    assert [r["snapshot"] for r in b_candidates] == [r["snapshot"] for r in m_candidates]
+    b_marker, m_marker = tmp_path / f"pack-{branch}-baseline.marker", tmp_path / f"pack-{branch}-mutant.marker"
+    b_snapshot, m_snapshot = tmp_path / f"pack-{branch}-baseline.raw", tmp_path / f"pack-{branch}-mutant.raw"
+    baseline, baseline_events = _run_copy_apply(b_root, tmp_path, b_run, b_backup, b_approval, observed, f"pack-{branch}-baseline-copy", setup(b_root, b_normal, b_marker, b_snapshot))
+    assert baseline.returncode == 2
+    assert "Claim support changed after frozen manifest" in baseline.stderr
+    assert json.loads(b_marker.read_text().splitlines()[0]) == {"kind": "pack", "value": False}
+    _assert_event_contract(baseline_events, expect_clean=True)
+    assert _all_db_bytes(b_root) == _load(b_snapshot)
+    mutant = _catalog_mutation(observed, 'and observe_pack(lambda: ' + old.removeprefix('and ') + ')', 'and observe_bypass(lambda: True)')
+    result, events = _run_copy_apply(m_root, tmp_path, m_run, m_backup, m_approval, mutant, f"pack-{branch}-mutant-copy", setup(m_root, m_normal, m_marker, m_snapshot))
+    assert result.returncode == 2
+    assert "Claim support changed after frozen manifest" in result.stderr
+    marks = [json.loads(line) for line in m_marker.read_text().splitlines()]
+    assert marks == [{"kind": "bypass", "value": True}, {"kind": "equality", "value": False}]
+    _assert_event_contract(events, expect_clean=True)
+    assert _all_db_bytes(m_root) == _load(m_snapshot)
+
+
+@pytest.mark.parametrize("name,old,new", [
+    (
+        "projected",
+        'if _claim_failures(conn, registry, doc, candidates, manifest, axis="graph", planned_edges=planned_edges, planned_nodes=planned_nodes):\n            raise CleanupRefusedError("planned graph delete removes final Claim support")',
+        'if False:\n            raise CleanupRefusedError("planned graph delete removes final Claim support")',
+    ),
+    (
+        "registry-proof",
+        'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+        'if False:\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+    ),
+    (
+        "doc-raw",
+        'if source != evidence.get("source"):\n                    raise CleanupRefusedError("registry protection conflict")',
+        'if False:\n                    raise CleanupRefusedError("registry protection conflict")',
+    ),
+])
+def test_catalog_proof_copy_runs_fresh_main(world: Path, tmp_path: Path, name: str, old: str, new: str):
+    _candidate, normal, _claim = _registry_claim_setup(world)
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    mutated = _catalog_mutation(source, old, new)
+    result, events = _run_copy_apply(world, tmp_path, run, backup, approval, mutated, f"proof-{name}")
+    assert result.returncode == 0, result.stderr
+    assert events
+    _assert_event_contract(events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in events)
+
+
+@pytest.mark.parametrize("target,old,new", [
+    (
+        "node",
+        'all(node in snapshot["registry_node"] for node in nodes)',
+        'all(any({key: value for key, value in node.items() if key != "updated_at"} == {key: value for key, value in expected.items() if key != "updated_at"} for expected in snapshot["registry_node"]) for node in nodes)',
+    ),
+    (
+        "edge",
+        'all(edge in snapshot["registry_edges"] for edge in edges)',
+        'all(any({key: value for key, value in edge.items() if key != "created_at"} == {key: value for key, value in expected.items() if key != "created_at"} for expected in snapshot["registry_edges"]) for edge in edges)',
+    ),
+])
+def test_catalog_membership_copy_runs_fresh_main(world: Path, tmp_path: Path, target: str, old: str, new: str):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    if target == "edge":
+        with _db(world / "opencrab.db") as conn:
+            conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "recorded", "evidence", normal))
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    if target == "node":
+        with _db(world / "opencrab.db") as conn:
+            conn.execute("UPDATE ontology_nodes SET updated_at='changed' WHERE node_id=?", (candidate,))
+    else:
+        with _db(world / "opencrab.db") as conn:
+            conn.execute("UPDATE ontology_edges SET created_at='changed' WHERE from_id=? AND relation='recorded'", (candidate,))
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    mutated = _catalog_mutation(source, old, new)
+    result, events = _run_copy_apply(world, tmp_path, run, backup, approval, mutated, f"membership-{target}")
+    assert result.returncode != 0
+    assert "registry resume precheck conflict" in result.stderr
+    assert not any(event.get("db") == "opencrab.db" and event.get("sql", "").strip().upper() == "BEGIN IMMEDIATE" for event in events)
+
+
+def test_catalog_frozen_pack_copy_loses_target_guard(world: Path, tmp_path: Path):
+    _candidate, normal, _claim = _registry_claim_setup(world)
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    old = 'and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == "openclaw"'
+    mutated = _catalog_mutation(source, old, "and True")
+    snapshot = tmp_path / "frozen-pack.snapshot.json"
+    injection = (
+        "original_guard = cleanup._claim_guard\n"
+        "def guard(data, candidates, manifest):\n"
+        "    evidence = next(item for item in manifest['protected']['evidence'] if item['graph']['id'] == " + repr(normal) + ")\n"
+        "    evidence['source_raw'][0][2] = json.dumps({'pack_id': 'other', 'node_id': " + repr(normal) + "})\n"
+        "    state = {name: (data / name).read_bytes().hex() for name in cleanup.DB_FILES}\n"
+        "    open(" + repr(str(snapshot)) + ", 'w', encoding='utf-8').write(json.dumps(state))\n"
+        "    return original_guard(data, candidates, manifest)\n"
+        "cleanup._claim_guard = guard\n"
+    )
+    result, events = _run_copy_apply(world, tmp_path, run, backup, approval, mutated, "frozen-pack-copy", injection)
+    assert result.returncode != 0
+    assert "Claim support changed after frozen manifest" in result.stderr
+    assert _all_db_bytes(world) == _load(snapshot)
+    assert not any(event.get("source") == "application" and event.get("phase") == "attempt" and event.get("action") in {"INSERT", "UPDATE", "DELETE"} for event in events)
+
+
+def test_catalog_current_pack_copy_loses_target_guard(world: Path, tmp_path: Path):
+    _candidate, normal, _claim = _registry_claim_setup(world)
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    old = 'and _strict_pack(source[0][2], f"Claim source {source_id}") == "openclaw"'
+    mutated = _catalog_mutation(source, old, "and True")
+    snapshot = tmp_path / "current-pack.snapshot.json"
+    injection = (
+        "import sqlite3\n"
+        "original_guard = cleanup._claim_guard\n"
+        "def guard(data, candidates, manifest):\n"
+        f"    with sqlite3.connect({str(world / 'doc_store.db')!r}) as conn: conn.execute(\"UPDATE doc_sources SET metadata=? WHERE source_id=?\", (json.dumps({{'pack_id':'other','node_id':{normal!r}}}), {normal!r}))\n"
+        "    state = {name: (data / name).read_bytes().hex() for name in cleanup.DB_FILES}\n"
+        f"    open({str(snapshot)!r}, 'w', encoding='utf-8').write(json.dumps(state))\n"
+        "    return original_guard(data, candidates, manifest)\n"
+        "cleanup._claim_guard = guard\n"
+    )
+    result, events = _run_copy_apply(world, tmp_path, run, backup, approval, mutated, "current-pack-copy", injection)
+    assert result.returncode != 0
+    assert "Claim support changed after frozen manifest" in result.stderr
+    assert _all_db_bytes(world) == _load(snapshot)
+    assert not any(event.get("source") == "application" and event.get("phase") == "attempt" and event.get("action") in {"INSERT", "UPDATE", "DELETE"} for event in events)
+
+
+
+def test_catalog_projected_claim_copy_reaches_graph_transaction(world: Path, tmp_path: Path):
+    candidate, normal, _claim = _registry_claim_setup(world)
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    old = 'if _claim_failures(conn, registry, doc, candidates, manifest, axis="graph", planned_edges=planned_edges, planned_nodes=planned_nodes):\n            raise CleanupRefusedError("planned graph delete removes final Claim support")'
+    mutated = _catalog_mutation(source, old, 'if False:\n            raise CleanupRefusedError("planned graph delete removes final Claim support")')
+    snapshot = tmp_path / "projected-copy.snapshot.json"
+    injection = (
+        "import sqlite3\n"
+        "original_projected = cleanup._validate_projected_protection\n"
+        "def projected(data, conn, candidates, manifest, planned_edges, planned_nodes):\n"
+        f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as fault: fault.execute(\"UPDATE ontology_nodes SET node_type='Document' WHERE space='evidence' AND node_id=?\", ({normal!r},))\n"
+        "    state = {name: (data / name).read_bytes().hex() for name in cleanup.DB_FILES}\n"
+        f"    open({str(snapshot)!r}, 'w', encoding='utf-8').write(json.dumps(state))\n"
+        "    return original_projected(data, conn, candidates, manifest, planned_edges, planned_nodes)\n"
+        "cleanup._validate_projected_protection = projected\n"
+    )
+    result, events = _run_copy_apply(world, tmp_path, run, backup, approval, mutated, "projected-copy", injection)
+    assert result.returncode != 0
+    assert "protected set changed" in result.stderr
+    assert not any(event.get("db") == "graph.db" and "BEGIN" in event.get("sql", "").upper() for event in events)
+    assert _all_db_bytes(world) != _load(snapshot)
+
+
+def test_catalog_projected_claim_copy_reaches_graph_transaction_seam(world: Path, tmp_path: Path):
+    candidate, normal, _claim = _registry_claim_setup(world)
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    old = 'if _claim_failures(conn, registry, doc, candidates, manifest, axis="graph", planned_edges=planned_edges, planned_nodes=planned_nodes):\n            raise CleanupRefusedError("planned graph delete removes final Claim support")'
+    mutated = _catalog_mutation(source, old, 'if False:\n            raise CleanupRefusedError("planned graph delete removes final Claim support")')
+    snapshot = tmp_path / "projected-fault-post.rows.json"
+    setup = (
+        "import sqlite3\n"
+        + _logical_rows_setup(snapshot)
+        + "original = cleanup._delete_graph\n"
+        + "def graph_fault(data, record, candidates, receipt, manifest):\n"
+        + f"    with sqlite3.connect(data / 'opencrab.db') as conn: conn.execute(\"UPDATE ontology_nodes SET node_type='Document' WHERE space='evidence' AND node_id=?\", ({normal!r},))\n"
+        + "    save_logical_rows(data)\n"
+        + "    return original(data, record, candidates, receipt, manifest)\n"
+        + "cleanup._delete_graph = graph_fault\n"
+    )
+    baseline, baseline_events = _run_copy_apply(world, tmp_path, run, backup, approval, source, "projected-baseline", setup)
+    assert baseline.returncode == 2
+    assert "planned graph delete removes final Claim support" in baseline.stderr
+    _assert_event_contract(baseline_events, expect_clean=False)
+    assert any(event.get("db") == "graph.db" and event.get("phase") == "transaction" and event.get("action") == "ROLLBACK" for event in baseline_events)
+    assert _logical_rows_json(world) == _load(snapshot)
+
+    fresh = tmp_path / "mutated-data"
+    fresh.mkdir()
+    _schema(fresh)
+    _add(fresh, candidate, HEARTBEAT)
+    _add(fresh, normal, "discussion includes OpenClaw heartbeat poll later")
+    _add(fresh, "evidence:turn:fallback", HEARTBEAT, pack="other")
+    _registry_claim_setup(fresh)
+    _fix_registry_timestamps(fresh)
+    fresh_run, fresh_backup = tmp_path / "mutated-run", tmp_path / "mutated-backup"
+    cleanup.dry_run(fresh, fresh_run, TABLE)
+    fresh_candidates, fresh_manifest = cleanup._load_run(fresh_run)
+    fresh_approval = tmp_path / "mutated-approval.json"
+    fresh_approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(fresh_manifest)), "ordered_ids_sha256": fresh_manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    cleanup._backup_receipt(fresh, fresh_run, fresh_backup, fresh_manifest, fresh_candidates)
+    mutated_result, mutated_events = _run_copy_apply(fresh, tmp_path, fresh_run, fresh_backup, fresh_approval, mutated, "projected-mutated", setup.replace(str(world), str(fresh)))
+    graph_events = [event for event in mutated_events if event.get("db") == "graph.db"]
+    _assert_event_contract(mutated_events, expect_clean=False)
+    assert any(event.get("source") == "application" and event.get("phase") == "attempt" and event.get("action") == "DELETE" for event in graph_events)
+    assert any(event.get("source") == "application" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in graph_events)
+    assert "planned graph delete removes final Claim support" not in mutated_result.stderr
+    assert mutated_result.returncode == 2
+    assert "protected set changed" in mutated_result.stderr
+    fault_rows = _load(snapshot)
+    expected = {name: [row for row in rows if not ((name == "graph" and row[1] == candidate) or (name == "graph_edges" and (row[1] == candidate or row[4] == candidate)))] for name, rows in fault_rows.items()}
+    assert _logical_rows_json(fresh) == expected
+
+
+def test_catalog_registry_claim_copy_reaches_transaction_seam(tmp_path: Path):
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    guard = 'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")'
+    marker = '        graph = _ro(data_dir / "graph.db", True)\n        doc = _ro(data_dir / "doc_store.db", True)\n        try:\n'
+    assert source.count(guard) == source.count(marker) == 1
+    def copied(root: Path, normal: str) -> str:
+        fault = f'            conn.execute("UPDATE ontology_nodes SET node_type=\'Document\' WHERE space=\'evidence\' AND node_id=?", ({normal!r},))\n'
+        result = source.replace(marker, marker + "            _test_capture_registry('pre', conn)\n" + fault + "            _test_capture_registry('post', conn)\n")
+        assert result.count("_test_capture_registry('pre', conn)") == result.count("_test_capture_registry('post', conn)") == 1
+        compile(result, "registry-copy.py", "exec")
+        return result
+    def capture_setup(path: Path) -> str:
+        return (
+            f"registry_capture_path = {str(path)!r}\n"
+            "def capture_registry(name, conn):\n"
+            "    state = json.loads(open(registry_capture_path, 'r', encoding='utf-8').read()) if Path(registry_capture_path).exists() else {}\n"
+            "    state[name] = {'registry': [list(row) for row in conn.execute('SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id').fetchall()], 'registry_edges': [list(row) for row in conn.execute('SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id').fetchall()]}\n"
+            "    open(registry_capture_path, 'w', encoding='utf-8').write(json.dumps(state, sort_keys=True))\n"
+            "cleanup._test_capture_registry = capture_registry\n"
+        )
+    def logical_with_registry(rows: dict[str, list[tuple]], capture: dict) -> dict[str, list[object]]:
+        expected = {name: [*values] for name, values in rows.items()}
+        expected['registry'], expected['registry_edges'] = capture['registry'], capture['registry_edges']
+        return _logical_json_rows(expected)
+    b_root, b_run, b_backup, b_approval, _b_candidates, _b_manifest, b_normal = _fresh_registry_claim_fixture(tmp_path, "registry-proof-baseline", incident_edges=True)
+    m_root, m_run, m_backup, m_approval, m_candidates, _m_manifest, m_normal = _fresh_registry_claim_fixture(tmp_path, "registry-proof-mutant", incident_edges=True)
+    from copy import deepcopy
+    pre_rows = deepcopy(_all_db_rows(b_root))
+    assert pre_rows == _all_db_rows(m_root)
+    prior_axes_rows = _expected_after_prior_axes(deepcopy(pre_rows), "evidence:turn:heartbeat")
+    b_capture, m_capture = tmp_path / "registry-baseline.capture.json", tmp_path / "registry-mutant.capture.json"
+    baseline, baseline_events = _run_copy_apply(b_root, tmp_path, b_run, b_backup, b_approval, copied(b_root, b_normal), "registry-proof-baseline-copy", capture_setup(b_capture))
+    assert baseline.returncode == 2
+    assert "registry Claim support changed after frozen manifest" in baseline.stderr
+    _assert_event_contract(baseline_events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "ROLLBACK" for event in baseline_events)
+    b_states = _load(b_capture)
+    prior_axes_expected = _logical_json_rows(prior_axes_rows)
+    assert logical_with_registry(prior_axes_rows, b_states['pre']) == prior_axes_expected
+    assert _logical_rows_json(b_root) == prior_axes_expected
+    assert b_states['post']['registry'] != b_states['pre']['registry']
+    mutant = _catalog_mutation(copied(m_root, m_normal), guard, 'if False:\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")')
+    result, events = _run_copy_apply(m_root, tmp_path, m_run, m_backup, m_approval, mutant, "registry-proof-mutant-copy", capture_setup(m_capture))
+    assert result.returncode == 2
+    assert "protected set changed" in result.stderr
+    _assert_event_contract(events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in events)
+    records = [{"sql": e["sql"], "params": e["params"]} for e in events if e.get("source") == "application" and e.get("phase") == "attempt" and e.get("action") == "DELETE" and e.get("db") == "opencrab.db"]
+    _assert_registry_delete_records(records, m_candidates)
+    m_states = _load(m_capture)
+    fault_rows = logical_with_registry(prior_axes_rows, m_states['post'])
+    expected_rows = _expected_registry_delete({name: [tuple(row) for row in rows] for name, rows in fault_rows.items()}, "evidence:turn:heartbeat")
+    assert any(row[3] == "unrelated" for row in expected_rows["registry_edges"])
+    assert not any(row[3] in {"incoming", "self"} for row in expected_rows["registry_edges"])
+    expected = _logical_json_rows(expected_rows)
+    assert _logical_rows_json(m_root) == expected
+    before_corruption = _logical_rows_json(m_root)
+    normal = "evidence:turn:normal"
+    with _db(m_root / "vectors.db") as conn:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        replacement = sqlite_vec.serialize_float32([1.0, 0.0])
+        assert conn.execute(f"UPDATE {TABLE} SET embedding=? WHERE node_id=?", (replacement, normal)).rowcount == 1
+        assert conn.execute(f"SELECT embedding FROM {TABLE} WHERE node_id=?", (normal,)).fetchone() == (replacement,)
+    after_corruption = _logical_rows_json(m_root)
+    assert {name: rows for name, rows in after_corruption.items() if name != "vector"} == {name: rows for name, rows in before_corruption.items() if name != "vector"}
+    changed = [(before, after) for before, after in zip(before_corruption["vector"], after_corruption["vector"]) if before != after]
+    assert len(changed) == 1
+    assert changed[0][0][0] == changed[0][1][0] == normal
+    assert changed[0][0][1] == changed[0][1][1]
+    assert changed[0][0][2] != changed[0][1][2]
+    assert changed[0][0][3:] == changed[0][1][3:]
+    with pytest.raises(AssertionError):
+        assert _logical_rows_json(m_root) == expected
+
+
+def test_catalog_doc_raw_copy_reaches_digest_seam(tmp_path: Path):
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    guard = 'if source != evidence.get("source"):\n                    raise CleanupRefusedError("registry protection conflict")'
+    marker = '        doc = _ro(data_dir / "doc_store.db", True)\n        try:\n            for evidence in protected.get("evidence", []):\n'
+    assert source.count(guard) == source.count(marker) == 1
+    def copied(root: Path, normal: str) -> str:
+        fault = f'        with sqlite3.connect({str(root / "doc_store.db")!r}) as fault:\n            fault.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (json.dumps({{"pack_id": "other", "node_id": {normal!r}}}), {normal!r}))\n        _test_capture_logical(data_dir)\n'
+        result = source.replace(marker, fault + marker)
+        assert result.count("_test_capture_logical(data_dir)") == 1
+        compile(result, "docraw-copy.py", "exec")
+        return result
+    def capture_setup(path: Path) -> str:
+        return (
+            "import sqlite_vec\n"
+            f"logical_capture_path = {str(path)!r}\n"
+            "def capture_value(item):\n"
+            "    if isinstance(item, bytes): return {'bytes': item.hex()}\n"
+            "    if isinstance(item, tuple): return [capture_value(part) for part in item]\n"
+            "    return item\n"
+            "def capture_logical(data):\n"
+            "    with sqlite3.connect(data / 'doc_store.db') as conn:\n"
+            "        source_rows = conn.execute('SELECT source_id,text,metadata FROM doc_sources ORDER BY source_id').fetchall(); fts = conn.execute('SELECT source_id,text FROM doc_sources_fts ORDER BY source_id').fetchall(); doc = conn.execute('SELECT space,node_id,node_type,properties FROM doc_nodes ORDER BY space,node_id').fetchall()\n"
+            "    with sqlite3.connect(data / 'vectors.db') as conn:\n"
+            "        conn.enable_load_extension(True); sqlite_vec.load(conn); vector = conn.execute('SELECT * FROM vectors_test ORDER BY node_id').fetchall()\n"
+            "    with sqlite3.connect(data / 'graph.db') as conn:\n"
+            "        graph = conn.execute('SELECT node_type,node_id,space_id,properties FROM graph_nodes ORDER BY node_id').fetchall(); graph_edges = conn.execute('SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges ORDER BY from_id,relation,to_type,to_id').fetchall()\n"
+            "    with sqlite3.connect(data / 'opencrab.db') as conn:\n"
+            "        registry = conn.execute('SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id').fetchall(); registry_edges = conn.execute('SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id').fetchall()\n"
+            "    rows = {'source': source_rows, 'fts': fts, 'doc': doc, 'vector': vector, 'graph': graph, 'graph_edges': graph_edges, 'registry': registry, 'registry_edges': registry_edges}\n"
+            "    open(logical_capture_path, 'w', encoding='utf-8').write(json.dumps({name: [capture_value(row) for row in values] for name, values in rows.items()}, sort_keys=True))\n"
+            "cleanup._test_capture_logical = capture_logical\n"
+        )
+    b_root, b_run, b_backup, b_approval, _b_candidates, _b_manifest, b_normal = _fresh_registry_claim_fixture(tmp_path, "doc-raw-baseline")
+    m_root, m_run, m_backup, m_approval, m_candidates, _m_manifest, m_normal = _fresh_registry_claim_fixture(tmp_path, "doc-raw-mutant")
+    pre_rows = _all_db_rows(b_root)
+    assert pre_rows == _all_db_rows(m_root)
+    b_capture, m_capture = tmp_path / "docraw-baseline-capture.json", tmp_path / "docraw-mutant-capture.json"
+    baseline, baseline_events = _run_copy_apply(b_root, tmp_path, b_run, b_backup, b_approval, copied(b_root, b_normal), "doc-raw-baseline-copy", capture_setup(b_capture))
+    assert baseline.returncode == 2
+    assert "registry protection conflict" in baseline.stderr
+    _assert_event_contract(baseline_events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "ROLLBACK" for event in baseline_events)
+    assert _logical_rows_json(b_root) == _load(b_capture)
+    mutant = _catalog_mutation(copied(m_root, m_normal), guard, 'if False:\n                    raise CleanupRefusedError("registry protection conflict")')
+    result, events = _run_copy_apply(m_root, tmp_path, m_run, m_backup, m_approval, mutant, "doc-raw-mutant-copy", capture_setup(m_capture))
+    assert result.returncode == 2
+    assert "protected set changed" in result.stderr
+    _assert_event_contract(events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in events)
+    records = [{"sql": e["sql"], "params": e["params"]} for e in events if e.get("source") == "application" and e.get("phase") == "attempt" and e.get("action") == "DELETE" and e.get("db") == "opencrab.db"]
+    _assert_registry_delete_records(records, m_candidates)
+    fault_rows = _load(m_capture)
+    expected = _expected_registry_delete(fault_rows, "evidence:turn:heartbeat")
+    assert _logical_rows_json(m_root) == expected
+
+
+@pytest.mark.parametrize("target,old,new", [
+    (
+        "node",
+        'all(node in snapshot["registry_node"] for node in nodes)',
+        'all(any({key: value for key, value in node.items() if key != "updated_at"} == {key: value for key, value in expected.items() if key != "updated_at"} for expected in snapshot["registry_node"]) for node in nodes)',
+    ),
+    (
+        "edge",
+        'all(edge in snapshot["registry_edges"] for edge in edges)',
+        'all(any({key: value for key, value in edge.items() if key != "created_at"} == {key: value for key, value in expected.items() if key != "created_at"} for expected in snapshot["registry_edges"]) for edge in edges)',
+    ),
+])
+def test_catalog_membership_copy_reaches_registry_seam(tmp_path: Path, target: str, old: str, new: str):
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    candidate = "evidence:turn:heartbeat"
+    precheck = "        _registry_resume_precheck(data_dir, vector_table, candidates)"
+    begin = "        conn.execute(\"BEGIN IMMEDIATE\")\n        candidate_targets"
+    assert source.count(precheck) == source.count(begin) == 1
+    fault = (
+        f"conn.execute(\"UPDATE ontology_nodes SET updated_at='changed' WHERE node_id=?\", ({candidate!r},))"
+        if target == "node" else f"conn.execute(\"UPDATE ontology_edges SET created_at='changed' WHERE from_id=? AND relation='recorded'\", ({candidate!r},))"
+    )
+    def injected() -> str:
+        return source.replace(begin, "        conn.execute(\"BEGIN IMMEDIATE\")\n        " + fault + "\n        candidate_targets")
+    b_root, b_run, b_backup, b_approval, _b_candidates, _b_manifest, _b_normal = _fresh_registry_claim_fixture(tmp_path, f"membership-{target}-baseline", registry_edge=target == "edge")
+    m_root, m_run, m_backup, m_approval, m_candidates, _m_manifest, _m_normal = _fresh_registry_claim_fixture(tmp_path, f"membership-{target}-mutant", registry_edge=target == "edge")
+    assert [record["snapshot"] for record in _b_candidates] == [record["snapshot"] for record in m_candidates]
+    assert _all_registry_raw(b_root / "opencrab.db") == _all_registry_raw(m_root / "opencrab.db")
+    baseline_survivor_before = _survivor_raw(b_root, "evidence:turn:normal", "claim:registry-proof")
+    mutant_survivor_before = _survivor_raw(m_root, "evidence:turn:normal", "claim:registry-proof")
+    assert baseline_survivor_before == mutant_survivor_before
+    assert baseline_survivor_before["graph_support"]
+    assert baseline_survivor_before["registry_support"]
+    baseline_source = injected().replace(precheck, "        # membership baseline bypasses receipt precheck")
+    pre_begin = _all_registry_raw(b_root / "opencrab.db")
+    baseline, baseline_events = _run_copy_apply(b_root, tmp_path, b_run, b_backup, b_approval, baseline_source, f"membership-{target}-baseline-copy")
+    assert baseline.returncode == 2
+    assert "registry target membership conflict" in baseline.stderr
+    _assert_event_contract(baseline_events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "ROLLBACK" for event in baseline_events)
+    assert _all_registry_raw(b_root / "opencrab.db") == pre_begin
+    assert _survivor_raw(b_root, "evidence:turn:normal", "claim:registry-proof") == baseline_survivor_before
+    mutant = _catalog_mutation(injected().replace(precheck, "        # membership mutant bypasses receipt precheck"), old, new)
+    result, events = _run_copy_apply(m_root, tmp_path, m_run, m_backup, m_approval, mutant, f"membership-{target}-mutant-copy")
+    assert result.returncode == 0, result.stderr
+    _assert_event_contract(events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in events)
+    records = [{"sql": event["sql"], "params": event["params"]} for event in events if event.get("source") == "application" and event.get("phase") == "attempt" and event.get("action") == "DELETE" and event.get("db") == "opencrab.db"]
+    with pytest.raises(AssertionError, match="registry delete target"):
+        _assert_registry_delete_records(records, m_candidates)
+    _assert_candidate_absent(m_root, candidate)
+    assert _survivor_raw(m_root, "evidence:turn:normal", "claim:registry-proof") == mutant_survivor_before
+
+
+def test_valid_claim_source_empty_source_raises_without_fabrication(world: Path):
+    _candidate, normal, _claim = _registry_claim_setup(world)
+    candidates, detail = cleanup.select(world, TABLE)
+    frozen = next(item for item in detail["protected"]["evidence"] if item["graph"]["id"] == normal)
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("DELETE FROM doc_sources WHERE source_id=?", (normal,))
+    graph = cleanup._ro(world / "graph.db", True)
+    registry = cleanup._ro(world / "opencrab.db", True)
+    doc = cleanup._ro(world / "doc_store.db", True)
+    try:
+        assert cleanup._valid_claim_source(graph, registry, doc, frozen, normal) is False
+    finally:
+        graph.close()
+        registry.close()
+        doc.close()
+
+
+def test_cli_registry_claim_last_support_refuses(world: Path, tmp_path: Path):
+    candidate, normal, claim = _registry_claim_setup(world)
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    setup = (
+        "original = cleanup._claim_guard\n"
+        "def claim_guard(data, candidates, manifest):\n"
+        "    result = original(data, candidates, manifest)\n"
+        "    import sqlite3\n"
+        f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"DELETE FROM ontology_edges WHERE from_id=? AND to_id=?\", ({normal!r}, {claim!r}))\n"
+        "    return result\n"
+        "cleanup._claim_guard = claim_guard\n"
+    )
+    result = _cli_main(tmp_path, "registry-claim-last", ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)], setup)
+    assert result.returncode != 0
+    assert "registry Claim support changed" in result.stderr
+
+
+def _registry_apply_args(world: Path, run: Path, backup: Path, approval: Path) -> list[str]:
+    return ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE, "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)]
+
+
+def _registry_manifest(world: Path, tmp_path: Path) -> tuple[Path, Path, Path, list[dict], dict]:
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, manifest = cleanup._load_run(run)
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    return run, backup, approval, candidates, manifest
+
+
+def _fix_registry_timestamps(root: Path) -> None:
+    with _db(root / "opencrab.db") as conn:
+        conn.execute("UPDATE ontology_nodes SET created_at='fixture-time', updated_at='fixture-time'")
+        conn.execute("UPDATE ontology_edges SET created_at='fixture-time'")
+
+
+def _fresh_registry_claim_fixture(tmp_path: Path, name: str, *, registry_edge: bool = False, incident_edges: bool = False) -> tuple[Path, Path, Path, Path, list[dict], dict, str]:
+    root = tmp_path / name / "data"
+    root.mkdir(parents=True)
+    _schema(root)
+    candidate = "evidence:turn:heartbeat"
+    _add(root, candidate, HEARTBEAT)
+    _add(root, "evidence:turn:normal", "discussion includes OpenClaw heartbeat poll later")
+    _add(root, "evidence:turn:fallback", HEARTBEAT, pack="other")
+    _candidate, normal, _claim = _registry_claim_setup(root)
+    if registry_edge or incident_edges:
+        with _db(root / "opencrab.db") as conn:
+            if registry_edge:
+                conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "recorded", "evidence", normal))
+            if incident_edges:
+                conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", normal, "incoming", "evidence", candidate))
+                conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "self", "evidence", candidate))
+                conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", normal, "unrelated", "evidence", "evidence:turn:fallback"))
+    _fix_registry_timestamps(root)
+    run, backup, approval, candidates, manifest = _registry_manifest(root, tmp_path / name)
+    cleanup._backup_receipt(root, run, backup, manifest, candidates)
+    return root, run, backup, approval, candidates, manifest, normal
+
+
+def test_cli_registry_first_partial_node_refuses_before_backup(world: Path, tmp_path: Path):
+    run, backup, approval, candidates, _ = _registry_manifest(world, tmp_path)
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("DELETE FROM ontology_nodes WHERE space=? AND node_id=?", ("evidence", candidates[0]["id"]))
+    result = _cli_main(tmp_path, "registry-first-node", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "first apply requires the full frozen snapshot" in result.stderr
+    assert not backup.exists() and not (run / "receipt.json").exists()
+
+
+def test_cli_registry_foreign_node_refuses_before_vector_write(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("resource", "Document", candidate))
+    run = tmp_path / "run"
+    result = _cli_main(tmp_path, "registry-foreign-node", ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE])
+    assert result.returncode == 0, result.stderr
+    assert "registry node multiplicity" in _load(run / "report.json")["errors"][0]
+
+
+def test_cli_registry_mixed_tuple_edge_refuses_before_vector_write(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "mixed", "resource", candidate))
+    run = tmp_path / "run"
+    result = _cli_main(tmp_path, "registry-mixed-tuple", ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE])
+    assert result.returncode == 0, result.stderr
+    assert "registry edge foreign tuple" in _load(run / "report.json")["errors"][0]
+
+
+def test_cli_registry_resume_precheck_removal_reaches_allowed_guard(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "approved-partial", "evidence", normal))
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("DELETE FROM ontology_edges WHERE from_id=? AND relation='approved-partial'", (candidate,))
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "late", "evidence", normal))
+    trace = tmp_path / "resume-baseline.trace"
+    deletes = tmp_path / "resume-baseline.deletes.jsonl"
+    before = _all_db_bytes(world)
+    baseline = _cli_main(tmp_path, "resume-precheck-baseline", _registry_apply_args(world, run, backup, approval), _trace_setup(trace, deletes))
+    assert baseline.returncode == 2
+    assert "registry resume precheck conflict" in baseline.stderr
+    baseline_events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    _assert_event_contract(baseline_events, expect_clean=True)
+    assert _all_db_bytes(world) == before
+    assert deletes.read_text(encoding="utf-8") == ""
+    trace = tmp_path / "resume-precheck.trace"
+    deletes = tmp_path / "resume-precheck.deletes.jsonl"
+    setup = _trace_setup(trace, deletes) + "cleanup._registry_resume_precheck = lambda *args: None\n"
+    result = _cli_main(tmp_path, "resume-precheck-loss", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode == 2
+    assert "snapshot conflict before vector" in result.stderr
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    _assert_event_contract(events, expect_clean=True)
+    assert _all_db_bytes(world) == before
+    assert deletes.read_text(encoding="utf-8") == ""
+
+
+def test_catalog_resume_joint_copy_preserves_post_allowed(tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    old = 'if not _before_axis_allowed(current, record["snapshot"], done, record, axis):\n                raise CleanupRefusedError(f"{record[\'id\']}: snapshot conflict before {axis}")'
+    selected = repr(candidate)
+    new = 'if not (record["id"] == ' + selected + ' and axis == "vector") and not _before_axis_allowed(current, record["snapshot"], done, record, axis):\n                raise CleanupRefusedError(f"{record[\'id\']}: snapshot conflict before {axis}")'
+    precheck_old = "        _registry_resume_precheck(data_dir, vector_table, candidates)"
+    assert source.count(precheck_old) == source.count(old) == 1
+    def setup_root(name: str):
+        root = tmp_path / name / "data"
+        root.mkdir(parents=True)
+        _schema(root)
+        _add(root, candidate, HEARTBEAT)
+        _add(root, normal, "discussion includes OpenClaw heartbeat poll later")
+        _add(root, "evidence:turn:fallback", HEARTBEAT, pack="other")
+        with _db(root / "opencrab.db") as conn:
+            conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "approved-partial", "evidence", normal))
+        _fix_registry_timestamps(root)
+        run, backup = tmp_path / name / "run", tmp_path / name / "backup"
+        cleanup.dry_run(root, run, TABLE)
+        candidates, manifest = cleanup._load_run(run)
+        approval = tmp_path / name / "approval.json"
+        approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+        cleanup._backup_receipt(root, run, backup, manifest, candidates)
+        with _db(root / "opencrab.db") as conn:
+            conn.execute("DELETE FROM ontology_edges WHERE from_id=? AND relation='approved-partial'", (candidate,))
+            conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "joint-added", "evidence", normal))
+        return root, run, backup, approval, candidates
+    b_root, b_run, b_backup, b_approval, _b_candidates = setup_root("resume-joint-baseline")
+    m_root, m_run, m_backup, m_approval, _m_candidates = setup_root("resume-joint-mutant")
+    fault_rows_baseline = _all_db_rows(b_root)
+    fault_rows_mutant = _all_db_rows(m_root)
+    assert _b_candidates[0]["id"] == _m_candidates[0]["id"] == candidate
+    assert [row[:4] for row in fault_rows_baseline["registry"]] == [row[:4] for row in fault_rows_mutant["registry"]]
+    assert [row[1:6] for row in fault_rows_baseline["registry_edges"]] == [row[1:6] for row in fault_rows_mutant["registry_edges"]]
+    baseline, baseline_events = _run_copy_apply(b_root, tmp_path, b_run, b_backup, b_approval, source, "resume-joint-baseline-copy")
+    assert baseline.returncode == 2
+    assert "registry resume precheck conflict" in baseline.stderr
+    _assert_event_contract(baseline_events, expect_clean=True)
+    assert _all_db_rows(b_root) == fault_rows_baseline
+    mutated = _catalog_mutation(source.replace(precheck_old, "        # catalog joint probe bypasses precheck"), old, new)
+    result, events = _run_copy_apply(m_root, tmp_path, m_run, m_backup, m_approval, mutated, "resume-joint-mutant-copy")
+    assert result.returncode == 2
+    assert "snapshot conflict after vector" in result.stderr
+    _assert_event_contract(events, expect_clean=False)
+    vector_events = [event for event in events if event.get("db") == "vectors.db"]
+    registry_events = [event for event in events if event.get("db") == "opencrab.db"]
+    assert any(event.get("source") == "application" and event.get("phase") == "attempt" and event.get("action") == "DELETE" for event in vector_events)
+    assert any(event.get("source") == "application" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in vector_events)
+    assert not any(event.get("source") == "application" and event.get("phase") == "attempt" and event.get("action") == "DELETE" for event in registry_events)
+    expected_rows = {name: [row for row in rows if not (name == "vector" and row[0] == candidate)] for name, rows in fault_rows_mutant.items()}
+    assert _all_db_rows(m_root) == expected_rows
+
+
+def test_cli_registry_resume_added_edge_refuses_before_vector(world: Path, tmp_path: Path):
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    candidate, normal = candidates[0]["id"], "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "added", "evidence", normal))
+    result = _cli_main(tmp_path, "registry-resume-added", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "registry resume precheck conflict" in result.stderr
+
+
+def test_cli_registry_resume_changed_edge_refuses_before_vector(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "recorded", "evidence", normal))
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("DELETE FROM ontology_edges WHERE from_id=? AND relation='recorded'", (candidate,))
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "changed", "evidence", normal))
+    result = _cli_main(tmp_path, "registry-resume-changed", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "registry resume precheck conflict" in result.stderr
+
+
+def test_cli_registry_resume_source_owner_refuses_before_vector(world: Path, tmp_path: Path):
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    candidate = candidates[0]["id"]
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (json.dumps({"pack_id": "other", "node_id": candidate}), candidate))
+    result = _cli_main(tmp_path, "registry-resume-source-owner", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "registry resume precheck conflict" in result.stderr
+
+
+def test_cli_registry_resume_graph_owner_refuses_before_vector(world: Path, tmp_path: Path):
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    candidate = candidates[0]["id"]
+    with _db(world / "graph.db") as conn:
+        conn.execute("UPDATE graph_nodes SET properties=? WHERE node_id=?", (json.dumps({"pack_id": "other"}), candidate))
+    result = _cli_main(tmp_path, "registry-resume-graph-owner", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "registry resume precheck conflict" in result.stderr
+
+
+def test_cli_registry_claim_graph_only_control(world: Path, tmp_path: Path):
+    candidate, normal, claim = _registry_claim_setup(world, include_registry_candidate=False)
+    before_survivor = _survivor_raw(world, normal, claim)
+    assert before_survivor["graph_support"]
+    assert before_survivor["registry_support"]
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    trace = tmp_path / "registry-graph-only.trace"
+    deletes = tmp_path / "registry-graph-only.deletes.jsonl"
+    result = _cli_main(tmp_path, "registry-graph-only", _registry_apply_args(world, run, backup, approval), _trace_setup(trace, deletes))
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    _assert_event_contract(events, expect_clean=False)
+    delete_events = [json.loads(line) for line in deletes.read_text(encoding="utf-8").splitlines() if json.loads(line).get("phase") == "attempt"]
+    _assert_registry_delete_records(delete_events, cleanup._load_run(run)[0])
+    _assert_axis_commits(events, {"vectors.db", "graph.db", "doc_store.db", "opencrab.db"})
+    _assert_candidate_absent(world, candidate)
+    assert _survivor_raw(world, normal, claim) == before_survivor
+    with _db(world / "graph.db") as conn:
+        assert conn.execute("SELECT * FROM graph_edges WHERE from_id=? AND to_id=?", (candidate, claim)).fetchall() == []
+        assert conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (normal,)).fetchall() == [("Evidence", normal, "evidence", json.dumps({"pack_id": "openclaw"}))]
+
+
+def test_cli_registry_claim_registry_only_control(world: Path, tmp_path: Path):
+    candidate, normal, claim = _registry_claim_setup(world, include_graph_candidate=False)
+    before_survivor = _survivor_raw(world, normal, claim)
+    assert before_survivor["graph_support"]
+    assert before_survivor["registry_support"]
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    trace = tmp_path / "registry-registry-only.trace"
+    deletes = tmp_path / "registry-registry-only.deletes.jsonl"
+    result = _cli_main(tmp_path, "registry-registry-only", _registry_apply_args(world, run, backup, approval), _trace_setup(trace, deletes))
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    delete_events = [json.loads(line) for line in deletes.read_text(encoding="utf-8").splitlines() if json.loads(line).get("phase") == "attempt"]
+    _assert_event_contract(events, expect_clean=False)
+    _assert_registry_delete_records(delete_events, cleanup._load_run(run)[0])
+    _assert_axis_commits(events, {"vectors.db", "graph.db", "doc_store.db", "opencrab.db"})
+    _assert_candidate_absent(world, candidate)
+    assert _survivor_raw(world, normal, claim) == before_survivor
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT * FROM ontology_edges WHERE from_id=? AND to_id=?", (candidate, claim)).fetchall() == []
+        assert conn.execute("SELECT space,node_type,node_id FROM ontology_nodes WHERE node_id=?", (normal,)).fetchall() == [("evidence", "Evidence", normal)]
+
+
+def _registry_claim_source_fault(world: Path, tmp_path: Path, mutation: str) -> subprocess.CompletedProcess[str]:
+    _candidate, normal, _claim = _registry_claim_setup(world)
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    if mutation == "type":
+        body = f"with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"UPDATE ontology_nodes SET node_type='Document' WHERE space='evidence' AND node_id=?\", ({normal!r},))"
+    elif mutation == "space":
+        body = f"with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"UPDATE ontology_nodes SET space='resource' WHERE node_id=?\", ({normal!r},))"
+    elif mutation == "source-pack":
+        body = f"with sqlite3.connect({str(world / 'doc_store.db')!r}) as conn: conn.execute(\"UPDATE doc_sources SET metadata=? WHERE source_id=?\", (json.dumps({{'pack_id':'other','node_id':{normal!r}}}), {normal!r}))"
+    elif mutation == "graph-pack":
+        body = f"with sqlite3.connect({str(world / 'graph.db')!r}) as conn: conn.execute(\"UPDATE graph_nodes SET properties=? WHERE node_id=?\", (json.dumps({{'pack_id':'other'}}), {normal!r}))"
+    elif mutation == "dangling":
+        body = f"with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"DELETE FROM ontology_nodes WHERE space='evidence' AND node_id=?\", ({normal!r},))"
+    else:
+        raise AssertionError(mutation)
+    trace = tmp_path / f"registry-claim-{mutation}.trace"
+    deletes = tmp_path / f"registry-claim-{mutation}.delete.jsonl"
+    snapshot = tmp_path / f"registry-claim-{mutation}.snapshot.json"
+    setup = (
+        _trace_setup(trace, deletes)
+        + f"snapshot_path = {str(snapshot)!r}\n"
+        + "original = cleanup._claim_guard\n"
+        "def claim_guard(data, candidates, manifest):\n"
+        f"    {body}\n"
+        "    snapshot = {name: (data / name).read_bytes().hex() for name in cleanup.DB_FILES}\n"
+        "    open(snapshot_path, 'w', encoding='utf-8').write(json.dumps(snapshot))\n"
+        "    return original(data, candidates, manifest)\n"
+        "cleanup._claim_guard = claim_guard\n"
+    )
+    before_nodes, before_edges = _all_registry_raw(world / "opencrab.db")
+    result = _cli_main(tmp_path, f"registry-claim-{mutation}", _registry_apply_args(world, run, backup, approval), setup)
+    trace_events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    delete_events = [json.loads(line) for line in deletes.read_text(encoding="utf-8").splitlines()]
+    assert delete_events == []
+    _assert_event_contract(trace_events, expect_clean=True)
+    injection_snapshot = _load(snapshot)
+    assert _all_db_bytes(world) == injection_snapshot
+    result.trace_path = trace  # type: ignore[attr-defined]
+    result.delete_path = deletes  # type: ignore[attr-defined]
+    result.before_registry = (before_nodes, before_edges)  # type: ignore[attr-defined]
+    result.snapshot_path = snapshot  # type: ignore[attr-defined]
+    return result
+
+
+@pytest.mark.parametrize("mutation", ["type", "space", "source-pack", "graph-pack"])
+def test_cli_registry_claim_source_faults_refuse(world: Path, tmp_path: Path, mutation: str):
+    result = _registry_claim_source_fault(world, tmp_path, mutation)
+    assert result.returncode != 0
+    assert "Claim support changed after frozen manifest" in result.stderr
+    delete_events = [json.loads(line) for line in result.delete_path.read_text(encoding="utf-8").splitlines()]  # type: ignore[attr-defined]
+    trace_events = [json.loads(line) for line in result.trace_path.read_text(encoding="utf-8").splitlines()]  # type: ignore[attr-defined]
+    assert delete_events == []
+    _assert_event_contract(trace_events, expect_clean=True)
+    snapshot = _load(result.snapshot_path)  # type: ignore[attr-defined]
+    assert _all_db_bytes(world) == snapshot
+
+
+def test_cli_registry_protection_prewrite_node_refuses(world: Path, tmp_path: Path):
+    run, backup, approval, _candidates, _ = _registry_manifest(world, tmp_path)
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("UPDATE ontology_nodes SET updated_at='changed' WHERE node_id=?", ("evidence:turn:normal",))
+    result = _cli_main(tmp_path, "registry-protect-node", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "first apply requires the full frozen snapshot" in result.stderr
+    assert not backup.exists()
+
+
+def test_cli_registry_protection_prewrite_edge_refuses(world: Path, tmp_path: Path):
+    normal = "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", normal, "noncandidate", "evidence", "missing"))
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("UPDATE ontology_edges SET relation='changed' WHERE from_id=? AND relation='noncandidate'", (normal,))
+    result = _cli_main(tmp_path, "registry-protect-edge", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "first apply requires the full frozen snapshot" in result.stderr
+    assert not backup.exists()
+
+
+def test_cli_registry_node_timestamp_cas_probe(world: Path, tmp_path: Path):
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    candidate = "evidence:turn:heartbeat"
+    setup = (
+        "original = cleanup._delete_registry\n"
+        "def mutate(data, record, candidates, manifest):\n"
+        "    import sqlite3\n"
+        f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"UPDATE ontology_nodes SET updated_at='changed' WHERE node_id=?\", ({candidate!r},))\n"
+        "    return original(data, record, candidates, manifest)\n"
+        "cleanup._delete_registry = mutate\n"
+    )
+    result = _cli_main(tmp_path, "registry-node-cas", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode != 0
+    assert "registry target membership conflict" in result.stderr
+
+
+def test_cli_registry_edge_timestamp_cas_probe(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "recorded", "evidence", normal))
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    setup = (
+        "original = cleanup._delete_registry\n"
+        "def mutate(data, record, candidates, manifest):\n"
+        "    import sqlite3\n"
+        f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"UPDATE ontology_edges SET created_at='changed' WHERE from_id=? AND relation='recorded'\", ({candidate!r},))\n"
+        "    return original(data, record, candidates, manifest)\n"
+        "cleanup._delete_registry = mutate\n"
+    )
+    result = _cli_main(tmp_path, "registry-edge-cas", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode != 0
+    assert "registry target membership conflict" in result.stderr
+
+
+@pytest.mark.parametrize("target", ["node", "edge"])
+def test_timestamp_predicate_copy_reaches_observer_guard(tmp_path: Path, target: str):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    if target == "node":
+        sql = "AND created_at IS ? AND updated_at IS ?"
+        params = '(node["id"], node["space"], node["node_type"], node["node_id"], node["created_at"], node["updated_at"])'
+        mutated_sql = "AND created_at IS ?"
+        mutated_params = '(node["id"], node["space"], node["node_type"], node["node_id"], node["created_at"])'
+    else:
+        sql = "AND to_space=? AND to_id=? AND created_at IS ?"
+        params = '(edge["id"], edge["from_space"], edge["from_id"], edge["relation"], edge["to_space"], edge["to_id"], edge["created_at"])'
+        mutated_sql = "AND to_space=? AND to_id=?"
+        mutated_params = '(edge["id"], edge["from_space"], edge["from_id"], edge["relation"], edge["to_space"], edge["to_id"])'
+    source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
+    assert source.count(sql) == source.count(params) == 1
+    def fresh(name: str):
+        root = tmp_path / name / "data"
+        root.mkdir(parents=True)
+        _schema(root)
+        _add(root, candidate, HEARTBEAT)
+        _add(root, normal, "discussion includes OpenClaw heartbeat poll later")
+        _add(root, "evidence:turn:fallback", HEARTBEAT, pack="other")
+        claim = "claim:predicate-proof"
+        with _db(root / "graph.db") as conn:
+            conn.execute("INSERT INTO graph_nodes VALUES (?,?,?,?)", ("Claim", claim, "claim", "{}"))
+            conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", normal, "supports", "Claim", claim, "{}"))
+            conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Claim", claim, "supports", "Evidence", normal, "{}"))
+        with _db(root / "opencrab.db") as conn:
+            conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("claim", "Claim", claim))
+            conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", normal, "supports", "claim", claim))
+            conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("claim", claim, "supports", "evidence", normal))
+        if target == "edge":
+            with _db(root / "opencrab.db") as conn:
+                conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "recorded", "evidence", normal))
+        _fix_registry_timestamps(root)
+        run, backup = tmp_path / name / "run", tmp_path / name / "backup"
+        cleanup.dry_run(root, run, TABLE)
+        candidates, manifest = cleanup._load_run(run)
+        approval = tmp_path / name / "approval.json"
+        approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+        cleanup._backup_receipt(root, run, backup, manifest, candidates)
+        return root, run, backup, approval, candidates
+    b_root, b_run, b_backup, b_approval, b_candidates = fresh("predicate-baseline")
+    m_root, m_run, m_backup, m_approval, m_candidates = fresh("predicate-mutant")
+    assert [r["id"] for r in b_candidates] == [r["id"] for r in m_candidates] == [candidate]
+    assert [{key: value for key, value in r["snapshot"].items() if key not in {"registry_node", "registry_edges"}} for r in b_candidates] == [{key: value for key, value in r["snapshot"].items() if key not in {"registry_node", "registry_edges"}} for r in m_candidates]
+    baseline_survivor_before = _survivor_raw(b_root, normal, "claim:predicate-proof")
+    mutant_survivor_before = _survivor_raw(m_root, normal, "claim:predicate-proof")
+    assert baseline_survivor_before == mutant_survivor_before
+    assert {row[0:5] for row in baseline_survivor_before["graph_support"]} == {("Evidence", normal, "supports", "Claim", "claim:predicate-proof"), ("Claim", "claim:predicate-proof", "supports", "Evidence", normal)}
+    assert {(row[1], row[2], row[3], row[4], row[5]) for row in baseline_survivor_before["registry_support"]} == {("evidence", normal, "supports", "claim", "claim:predicate-proof"), ("claim", "claim:predicate-proof", "supports", "evidence", normal)}
+    baseline, baseline_events = _run_copy_apply(b_root, tmp_path, b_run, b_backup, b_approval, source, f"predicate-{target}-baseline")
+    assert baseline.returncode == 0, baseline.stderr
+    _assert_event_contract(baseline_events, expect_clean=False)
+    baseline_records = [{"sql": e["sql"], "params": e["params"]} for e in baseline_events if e.get("source") == "application" and e.get("phase") == "attempt" and e.get("action") == "DELETE" and e.get("db") == "opencrab.db"]
+    _assert_registry_delete_records(baseline_records, b_candidates)
+    assert any(e.get("db") == "opencrab.db" and e.get("phase") == "transaction" and e.get("action") == "COMMIT" for e in baseline_events)
+    assert _survivor_raw(b_root, normal, "claim:predicate-proof") == baseline_survivor_before
+    _assert_candidate_absent(b_root, candidate)
+    mutated = source.replace(sql, mutated_sql).replace(params, mutated_params)
+    marker = tmp_path / f"predicate-{target}.marker.jsonl"
+    injection = ("original_match = cleanup._registry_targets_match\n"
+        "def match(nodes, edges, snapshot):\n"
+        "    value = original_match(nodes, edges, snapshot)\n"
+        f"    open({str(marker)!r}, 'a', encoding='utf-8').write(json.dumps({{'membership': value}}) + '\\n')\n"
+        "    return value\ncleanup._registry_targets_match = match\n")
+    result, events = _run_copy_apply(m_root, tmp_path, m_run, m_backup, m_approval, mutated, f"predicate-{target}-mutant", injection)
+    assert result.returncode == 0, result.stderr
+    assert any(event["membership"] is True for event in (json.loads(line) for line in marker.read_text(encoding="utf-8").splitlines()))
+    _assert_event_contract(events, expect_clean=False)
+    records = [{"sql": e["sql"], "params": e["params"]} for e in events if e.get("source") == "application" and e.get("phase") == "attempt" and e.get("action") == "DELETE" and e.get("db") == "opencrab.db"]
+    assert any(record["sql"].endswith(mutated_sql) for record in records)
+    with pytest.raises(AssertionError, match="registry delete target"):
+        _assert_registry_delete_records(records, m_candidates)
+    assert any(e.get("db") == "opencrab.db" and e.get("phase") == "transaction" and e.get("action") == "COMMIT" for e in events)
+    _assert_candidate_absent(m_root, candidate)
+    assert _survivor_raw(m_root, normal, "claim:predicate-proof") == mutant_survivor_before
+
+
+def test_cli_registry_claim_resume_positive(world: Path, tmp_path: Path):
+    candidate, normal, claim = _registry_claim_setup(world)
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    with _db(world / "graph.db") as conn:
+        conn.execute("DELETE FROM graph_edges WHERE from_id=? AND to_id=?", (candidate, claim))
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("DELETE FROM ontology_edges WHERE from_id=? AND to_id=?", (candidate, claim))
+    with _db(world / "doc_store.db") as conn:
+        survivor_source = conn.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (normal,)).fetchall()
+        survivor_fts = conn.execute("SELECT source_id,text FROM doc_sources_fts WHERE source_id=?", (normal,)).fetchall()
+        survivor_doc = conn.execute("SELECT space,node_id,node_type,properties FROM doc_nodes WHERE node_id=?", (normal,)).fetchall()
+    with _db(world / "graph.db") as conn:
+        survivor_graph = conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (normal,)).fetchall()
+        survivor_graph_support = conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id=? AND to_id=?", (normal, claim)).fetchall()
+    with _db(world / "opencrab.db") as conn:
+        survivor_registry = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (normal,)).fetchall()
+        survivor_registry_support = conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges WHERE from_id=? AND to_id=?", (normal, claim)).fetchall()
+    trace = tmp_path / "resume.trace"
+    deletes = tmp_path / "resume-delete.jsonl"
+    absent_edge = next(
+        edge for record in candidates for edge in record["snapshot"]["registry_edges"]
+        if edge["from_id"] == candidate and edge["to_id"] == claim
+    )
+    setup = _trace_setup(trace, deletes)
+    result = _cli_main(tmp_path, "registry-claim-resume-positive", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode == 0, result.stderr
+    delete_events = [json.loads(line) for line in deletes.read_text(encoding="utf-8").splitlines() if json.loads(line).get("phase") == "attempt"]
+    trace_events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    absent_params = (absent_edge["id"], absent_edge["from_space"], absent_edge["from_id"], absent_edge["relation"], absent_edge["to_space"], absent_edge["to_id"], absent_edge["created_at"])
+    assert all(tuple(event["params"]) != absent_params for event in delete_events)
+    _assert_registry_delete_records(delete_events, candidates)
+    canonical = next(event for event in delete_events if event["sql"] == _NODE_DELETE_SQL)
+    _assert_registry_delete_records([canonical], candidates)
+    field_changed = {**canonical, "params": [*canonical["params"]]}
+    field_changed["params"][3] = "evidence:turn:other"
+    ordered = {**canonical, "params": [*canonical["params"]]}
+    ordered["params"][1], ordered["params"][2] = ordered["params"][2], ordered["params"][1]
+    short = {**canonical, "params": canonical["params"][:-1]}
+    for record in (field_changed, ordered, short):
+        with pytest.raises(AssertionError, match="registry delete target"):
+            _assert_registry_delete_records([record], candidates)
+    _assert_event_contract(trace_events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in trace_events)
+    _assert_candidate_absent(world, candidate)
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (normal,)).fetchall() == survivor_source
+        assert conn.execute("SELECT source_id,text FROM doc_sources_fts WHERE source_id=?", (normal,)).fetchall() == survivor_fts
+        assert conn.execute("SELECT space,node_id,node_type,properties FROM doc_nodes WHERE node_id=?", (normal,)).fetchall() == survivor_doc
+    with _db(world / "graph.db") as conn:
+        assert conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (normal,)).fetchall() == survivor_graph
+        assert conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id=? AND to_id=?", (normal, claim)).fetchall() == survivor_graph_support
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT * FROM ontology_edges WHERE from_id=? AND to_id=?", (candidate, claim)).fetchall() == []
+        assert conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes WHERE node_id=?", (normal,)).fetchall() == survivor_registry
+        assert conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges WHERE from_id=? AND to_id=?", (normal, claim)).fetchall() == survivor_registry_support
+
+
+def test_cli_registry_claim_resume_negative(world: Path, tmp_path: Path):
+    candidate, normal, claim = _registry_claim_setup(world)
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    with _db(world / "graph.db") as conn:
+        conn.execute("DELETE FROM graph_edges WHERE from_id=? AND to_id=?", (candidate, claim))
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("DELETE FROM ontology_edges WHERE from_id=? AND to_id=?", (candidate, claim))
+    setup = (
+        "original = cleanup._claim_guard\n"
+        "def claim_guard(data, candidates, manifest):\n"
+        "    result = original(data, candidates, manifest)\n"
+        "    import sqlite3\n"
+        f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"DELETE FROM ontology_edges WHERE from_id=? AND to_id=?\", ({normal!r}, {claim!r}))\n"
+        "    return result\n"
+        "cleanup._claim_guard = claim_guard\n"
+    )
+    result = _cli_main(tmp_path, "registry-claim-resume-negative", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode != 0
+    assert "registry Claim support changed" in result.stderr
+
+
+def test_cli_registry_claim_dangling_source_refuses(world: Path, tmp_path: Path):
+    result = _registry_claim_source_fault(world, tmp_path, "dangling")
+    assert result.returncode != 0
+    assert "Claim support changed after frozen manifest" in result.stderr
+    assert result.delete_path.read_text(encoding="utf-8") == ""  # type: ignore[attr-defined]
+    assert "BEGIN IMMEDIATE" not in result.trace_path.read_text(encoding="utf-8")  # type: ignore[attr-defined]
+    snapshot = _load(result.snapshot_path)  # type: ignore[attr-defined]
+    assert {name: (world / name).read_bytes().hex() for name in cleanup.DB_FILES} == snapshot
+
+
+def test_cli_registry_claim_wrong_type_refuses(world: Path, tmp_path: Path):
+    result = _registry_claim_source_fault(world, tmp_path, "type")
+    assert result.returncode != 0
+    assert "Claim support changed after frozen manifest" in result.stderr
+
+
+def test_cli_registry_claim_wrong_space_refuses(world: Path, tmp_path: Path):
+    result = _registry_claim_source_fault(world, tmp_path, "space")
+    assert result.returncode != 0
+    assert "Claim support changed after frozen manifest" in result.stderr
+
+
+def test_cli_registry_claim_source_pack_refuses(world: Path, tmp_path: Path):
+    result = _registry_claim_source_fault(world, tmp_path, "source-pack")
+    assert result.returncode != 0
+    assert "Claim support changed after frozen manifest" in result.stderr
+
+
+def test_cli_registry_claim_graph_pack_refuses(world: Path, tmp_path: Path):
+    result = _registry_claim_source_fault(world, tmp_path, "graph-pack")
+    assert result.returncode != 0
+    assert "Claim support changed after frozen manifest" in result.stderr
+
+
+def test_cli_registry_first_partial_edge_refuses_before_backup(world: Path, tmp_path: Path):
+    candidate, normal = "evidence:turn:heartbeat", "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "first-partial", "evidence", normal))
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("DELETE FROM ontology_edges WHERE from_id=? AND relation='first-partial'", (candidate,))
+    result = _cli_main(tmp_path, "registry-first-edge", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "first apply requires the full frozen snapshot" in result.stderr
+    assert not backup.exists() and not (run / "receipt.json").exists()
+
+
+def test_cli_registry_resume_foreign_tuple_refuses_before_vector_write(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "resume-mixed", "resource", candidate))
+    result = _cli_main(tmp_path, "registry-resume-foreign", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "registry edge foreign tuple" in result.stderr
+
+
+def test_cli_registry_source_metadata_first_preflight_refuses(world: Path, tmp_path: Path):
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (json.dumps({"pack_id": "other", "node_id": "evidence:turn:normal"}), "evidence:turn:normal"))
+    result = _cli_main(tmp_path, "registry-source-first", _registry_apply_args(world, run, backup, approval))
+    assert result.returncode != 0
+    assert "first apply requires the full frozen snapshot" in result.stderr
+    assert not backup.exists() and not (run / "receipt.json").exists()
+
+
+def test_cli_registry_protection_transaction_node_refuses(world: Path, tmp_path: Path):
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    normal = "evidence:turn:normal"
+    setup = (
+        "original = cleanup._delete_registry\n"
+        "def mutate(data, record, candidates, manifest):\n"
+        "    import sqlite3\n"
+        f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"UPDATE ontology_nodes SET updated_at='changed' WHERE node_id=?\", ({normal!r},))\n"
+        "    return original(data, record, candidates, manifest)\n"
+        "cleanup._delete_registry = mutate\n"
+    )
+    result = _cli_main(tmp_path, "registry-txn-protect-node", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode != 0
+    assert "registry protection conflict" in result.stderr
+
+
+def test_cli_registry_protection_transaction_edge_refuses(world: Path, tmp_path: Path):
+    normal = "evidence:turn:normal"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", normal, "protected-edge", "evidence", "missing"))
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    setup = (
+        "original = cleanup._delete_registry\n"
+        "def mutate(data, record, candidates, manifest):\n"
+        "    import sqlite3\n"
+        f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"UPDATE ontology_edges SET relation='changed' WHERE from_id=? AND relation='protected-edge'\", ({normal!r},))\n"
+        "    return original(data, record, candidates, manifest)\n"
+        "cleanup._delete_registry = mutate\n"
+    )
+    result = _cli_main(tmp_path, "registry-txn-protect-edge", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode != 0
+    assert "registry protection conflict" in result.stderr
+
+
+def test_cli_registry_source_metadata_transaction_refuses(world: Path, tmp_path: Path):
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    normal = "evidence:turn:normal"
+    trace = tmp_path / "registry-source-transaction.trace"
+    deletes = tmp_path / "registry-source-transaction.delete.jsonl"
+    snapshot = tmp_path / "registry-source-transaction.rows.json"
+    setup = (
+        "import sqlite3\n"
+        + _trace_setup(trace, deletes)
+        + _logical_rows_setup(snapshot)
+        + "original = cleanup._delete_registry\n"
+        + "def mutate(data, record, candidates, manifest):\n"
+        + f"    with sqlite3.connect({str(world / 'doc_store.db')!r}) as conn: conn.execute(\"UPDATE doc_sources SET metadata=? WHERE source_id=?\", (json.dumps({{'pack_id':'other','node_id':{normal!r}}}), {normal!r}))\n"
+        + "    save_logical_rows(data)\n"
+        + "    return original(data, record, candidates, manifest)\n"
+        + "cleanup._delete_registry = mutate\n"
+    )
+    with _db(world / "opencrab.db") as conn:
+        before_nodes = conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id").fetchall()
+        before_edges = conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id").fetchall()
+    result = _cli_main(tmp_path, "registry-txn-source", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode == 2
+    assert "registry protection conflict" in result.stderr
+    delete_events = [json.loads(line) for line in deletes.read_text(encoding="utf-8").splitlines()]
+    trace_events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert delete_events == []
+    _assert_event_contract(trace_events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("action") == "BEGIN" for event in trace_events)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "ROLLBACK" for event in trace_events)
+    assert not any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in trace_events)
+    with _db(world / "opencrab.db") as conn:
+        assert conn.execute("SELECT id,space,node_type,node_id,created_at,updated_at FROM ontology_nodes ORDER BY id").fetchall() == before_nodes
+        assert conn.execute("SELECT id,from_space,from_id,relation,to_space,to_id,created_at FROM ontology_edges ORDER BY id").fetchall() == before_edges
+    assert _logical_rows_json(world) == _load(snapshot)
+
+
+def test_cli_registry_resume_added_edge_transaction_refuses(world: Path, tmp_path: Path):
+    run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    candidate, normal = candidates[0]["id"], "evidence:turn:normal"
+    trace = tmp_path / "registry-added-transaction.trace"
+    deletes = tmp_path / "registry-added-transaction.delete.jsonl"
+    snapshot = tmp_path / "registry-added-transaction.rows.json"
+    setup = (
+        "import sqlite3\n"
+        + _trace_setup(trace, deletes)
+        + _logical_rows_setup(snapshot)
+        + "original = cleanup._delete_registry\n"
+        + "def mutate(data, record, candidates, manifest):\n"
+        + f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)\", ('evidence', {candidate!r}, 'late-added', 'evidence', {normal!r}))\n"
+        + "    save_logical_rows(data)\n"
+        + "    return original(data, record, candidates, manifest)\n"
+        + "cleanup._delete_registry = mutate\n"
+    )
+    before_nodes, before_edges = _all_registry_raw(world / "opencrab.db")
+    result = _cli_main(tmp_path, "registry-added-txn", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode != 0
+    assert "registry target membership conflict" in result.stderr
+    delete_events = [json.loads(line) for line in deletes.read_text(encoding="utf-8").splitlines()]
+    trace_events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert delete_events == []
+    _assert_event_contract(trace_events, expect_clean=False)
+    assert any(event.get("db") == "opencrab.db" and event.get("action") == "BEGIN" for event in trace_events)
+    assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "ROLLBACK" for event in trace_events)
+    assert not any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in trace_events)
+    after_nodes, after_edges = _all_registry_raw(world / "opencrab.db")
+    assert after_nodes == before_nodes
+    assert after_edges == _all_registry_raw(world / "opencrab.db")[1]
+    assert _logical_rows_json(world) == _load(snapshot)
+
+
+def test_cli_registry_claim_post_graph_fault_probe(world: Path, tmp_path: Path):
+    candidate, normal, claim = _registry_claim_setup(world)
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    trace = tmp_path / "post-graph.trace"
+    deletes = tmp_path / "post-graph.delete.jsonl"
+    snapshot = tmp_path / "post-graph.snapshot.json"
+    setup = (
+        "import sqlite3\n"
+        + _trace_setup(trace, deletes)
+        + f"snapshot_path = {str(snapshot)!r}\n"
+        + "original = cleanup._claim_guard\n"
+        + "def guard(data, candidates, manifest):\n"
+        + "    result = original(data, candidates, manifest)\n"
+        + f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn:\n"
+        + f"        conn.execute(\"DELETE FROM ontology_nodes WHERE space='evidence' AND node_id=?\", ({normal!r},))\n"
+        + "    snapshot = {name: (data / name).read_bytes().hex() for name in cleanup.DB_FILES}\n"
+        + "    open(snapshot_path, 'w', encoding='utf-8').write(json.dumps(snapshot))\n"
+        + "    return result\n"
+        + "cleanup._claim_guard = guard\n"
+    )
+    result = _cli_main(tmp_path, "registry-post-graph", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode != 0
+    assert "registry Claim support changed" in result.stderr
+    assert deletes.read_text(encoding="utf-8") == ""
+    assert "BEGIN IMMEDIATE" not in trace.read_text(encoding="utf-8")
+    state = _load(snapshot)
+    assert _all_db_bytes(world) == state
 
 
 def test_runbook_states_actual_run_and_successor_contract():
@@ -834,6 +2978,10 @@ def test_runbook_states_actual_run_and_successor_contract():
     assert "하나의 successor UUID directory" in runbook
     assert "data directory fsync" in runbook
     assert "현재 DB file store-set identity를 다시 계산하지 않는다" in runbook
+    assert "승인 후보 registry node와 incident edge" in runbook
+    assert "frozen `evidence|Evidence` 후보 endpoint" in runbook
+    assert "affected Claim" in runbook
+    assert "source와 graph metadata의 `pack_id=openclaw`" in runbook
 
 
 def test_restore_attempt_names_are_unique(tmp_path: Path):
@@ -1436,6 +3584,53 @@ def test_cli_boundary_transaction_rows_reject_before_graph_delete(world: Path, t
     assert "DELETE FROM graph_edges" not in statements
 
 
+def test_cli_projected_claim_proof_refuses_before_graph_delete(world: Path, tmp_path: Path):
+    candidate, normal, _claim = _registry_claim_setup(world)
+    run, backup, approval, _, _ = _registry_manifest(world, tmp_path)
+    with _db(world / "graph.db") as conn:
+        before_candidate = conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (candidate,)).fetchall()
+        before_edges = conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall()
+    trace = tmp_path / "projected-claim.trace"
+    deletes = tmp_path / "projected-claim.delete.jsonl"
+    snapshot = tmp_path / "projected-claim.snapshot.json"
+    setup = (
+        "import sqlite3\n"
+        + _trace_setup(trace, deletes)
+        + f"snapshot_path = {str(snapshot)!r}\n"
+        + "original = cleanup._delete_graph\n"
+        + "def mutate(data, record, candidates, receipt, manifest):\n"
+        + f"    with sqlite3.connect({str(world / 'opencrab.db')!r}) as conn: conn.execute(\"UPDATE ontology_nodes SET node_type='Document' WHERE space='evidence' AND node_id=?\", ({normal!r},))\n"
+        + "    state = {name: (data / name).read_bytes().hex() for name in cleanup.DB_FILES}\n"
+        + "    open(snapshot_path, 'w', encoding='utf-8').write(json.dumps(state))\n"
+        + "    return original(data, record, candidates, receipt, manifest)\n"
+        + "cleanup._delete_graph = mutate\n"
+    )
+    result = _cli_main(tmp_path, "projected-claim", _registry_apply_args(world, run, backup, approval), setup)
+    assert result.returncode != 0
+    assert "planned graph delete removes final Claim support" in result.stderr
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    graph_events = [event for event in events if event.get("db") == "graph.db"]
+    assert not any(event.get("action") == "DELETE" for event in graph_events)
+    assert not any(event.get("phase") == "transaction" and event.get("action") == "COMMIT" for event in graph_events)
+    assert any(event.get("phase") == "transaction" and event.get("action") == "ROLLBACK" for event in graph_events)
+    assert deletes.read_text(encoding="utf-8") == ""
+    assert _all_db_bytes(world) == _load(snapshot)
+    with _db(world / "graph.db") as conn:
+        assert conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (candidate,)).fetchall() == before_candidate
+        assert conn.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE from_id=? OR to_id=?", (candidate, candidate)).fetchall() == before_edges
+
+
+def test_cli_registry_claim_nonclaim_registry_space_control(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("resource", "Claim", "resource:claim"))
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", candidate, "supports", "resource", "resource:claim"))
+    run = tmp_path / "run"
+    result = _cli_main(tmp_path, "resource-claim", ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE])
+    assert result.returncode == 0, result.stderr
+    assert (run / "manifest.json").is_file()
+
+
 def test_cli_claim_preflight_refuses_before_vector_delete(world: Path, tmp_path: Path):
     candidate, other = "evidence:turn:heartbeat", "evidence:turn:normal"
     with _db(world / "graph.db") as conn:
@@ -1478,7 +3673,7 @@ def test_cli_claim_preflight_refuses_before_vector_delete(world: Path, tmp_path:
     )
     result = subprocess.run([sys.executable, str(runner)], cwd=tmp_path, text=True, capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode != 0
-    assert "projected protected graph state changed" in result.stderr
+    assert "Claim support changed after frozen manifest" in result.stderr
     assert "DELETE FROM" not in trace.read_text(encoding="utf-8")
 
 
