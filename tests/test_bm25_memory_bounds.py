@@ -1,0 +1,442 @@
+"""#506: the BM25 cache must keep resident memory bounded under a write stream.
+
+The tests pin the five causes named in ``docs/issue-506-bm25-memory.md``: the
+rebuild worker's references to superseded indexes, per-document token string
+objects, an input window bounded by row count only, back-to-back rebuilds
+during a write burst, and the shared window contract of the two budget paths.
+"""
+
+from __future__ import annotations
+
+import gc
+import threading
+import time
+import weakref
+from unittest.mock import MagicMock
+
+import pytest
+
+from opencrab.ontology.bm25 import BM25Index, node_size, trim_to_budget
+from opencrab.ontology.query import HybridQuery
+from opencrab.stores._json import dump_props
+from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+
+def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def _node(node_id: str, *, pack_id: str | None = "A", text: str = "alpha beta",
+          updated_at: str | None = None) -> dict:
+    props: dict = {"name": text}
+    if pack_id is not None:
+        props["pack_id"] = pack_id
+    doc: dict = {
+        "node_id": node_id,
+        "space": "claim",
+        "node_type": "Claim",
+        "properties": props,
+    }
+    if updated_at:
+        doc["updated_at"] = updated_at
+    return doc
+
+
+def _hybrid(doc_store, debounce: float = 0.0) -> HybridQuery:
+    chroma = MagicMock()
+    chroma.available = False
+    neo4j = MagicMock()
+    neo4j.available = False
+    hybrid = HybridQuery(chroma, neo4j)
+    hybrid._doc_store = doc_store
+    hybrid._bm25_debounce = debounce
+    return hybrid
+
+
+class _TimedStore:
+    """Native-fingerprint doc store whose reads take a controllable time."""
+
+    available = True
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.nodes = [_node("n0", text="alpha base")]
+        self.version = 0
+        self.delay = delay
+        self.builds: list[list[float | None]] = []
+        self.hook = None
+
+    def write(self) -> None:
+        self.version += 1
+        self.nodes.append(_node(f"n{self.version}", text=f"alpha w{self.version}"))
+
+    def bm25_fingerprint(self, limit: int = 0) -> tuple[int, str]:
+        return (len(self.nodes), str(self.version))
+
+    def list_nodes(self, space=None, limit: int = 100) -> list[dict]:
+        idx = len(self.builds)
+        self.builds.append([time.monotonic(), None])
+        snapshot = list(self.nodes)
+        if self.hook is not None:
+            self.hook(idx)
+        time.sleep(self.delay)
+        self.builds[idx][1] = time.monotonic()
+        return snapshot
+
+
+# ---------------------------------------------------------------------------
+# 1. Worker references (cause 1)
+# ---------------------------------------------------------------------------
+
+
+def test_published_rebuild_releases_the_superseded_index() -> None:
+    store = _TimedStore()
+    hybrid = _hybrid(store)
+    worker = hybrid._bm25
+    try:
+        worker.ensure_built(store)
+        first = weakref.ref(worker.state.index)
+        generation = worker.state.generation
+        store.write()
+        hybrid.invalidate_bm25_cache()
+        assert _wait_until(lambda: worker.state.generation > generation)
+        # The rebuild thread is idle once the publish has happened; no other
+        # holder of the first index may remain.
+        assert _wait_until(lambda: (gc.collect(), first() is None)[1]), (
+            "the rebuild worker still references the superseded index"
+        )
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_discarded_candidate_is_released_during_the_rest() -> None:
+    store = _TimedStore(delay=0.1)
+    hybrid = _hybrid(store)
+    worker = hybrid._bm25
+    refs: list[weakref.ReferenceType] = []
+    real_make = worker._make_state
+
+    def recording(observation):
+        state = real_make(observation)
+        refs.append(weakref.ref(state.index))
+        return state
+
+    worker._make_state = recording  # type: ignore[method-assign]
+
+    def write_during_second_build(idx: int) -> None:
+        if idx == 1:  # the first background build: invalidate while it runs
+            store.write()
+            hybrid.invalidate_bm25_cache()
+
+    try:
+        worker.ensure_built(store)  # build 0
+        store.write()
+        store.hook = write_during_second_build
+        hybrid.invalidate_bm25_cache()  # build 1 starts, gets discarded
+        assert _wait_until(lambda: len(refs) >= 2)
+        discarded = refs[1]
+        assert _wait_until(lambda: (gc.collect(), discarded() is None)[1], timeout=0.3), (
+            "a discarded candidate stays referenced while the worker rests"
+        )
+    finally:
+        hybrid.shutdown_bm25()
+
+
+# ---------------------------------------------------------------------------
+# 2. Token string sharing (cause 2)
+# ---------------------------------------------------------------------------
+
+
+def test_equal_tokens_across_documents_are_one_object() -> None:
+    nodes = [
+        _node("a", text="shared unique-a"),
+        _node("b", text="shared unique-b"),
+    ]
+    index = BM25Index.build(nodes)
+    first = next(t for t in index._tokens[0] if t == "shared")
+    second = next(t for t in index._tokens[1] if t == "shared")
+    assert first is second
+
+
+def test_token_sharing_does_not_change_scores() -> None:
+    nodes = [_node(str(i), text=f"common term{i % 3} " + "w" * (i % 4)) for i in range(12)]
+    shared = BM25Index.build(nodes)
+    unshared = BM25Index.build(nodes)
+    unshared._tokens = [["".join(list(t)) for t in toks] for toks in unshared._tokens]
+    assert shared.search("common term1", pack_ids=["A"], limit=12) == unshared.search(
+        "common term1", pack_ids=["A"], limit=12
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. Input window contract (cause 3)
+# ---------------------------------------------------------------------------
+
+
+def _size(text: str) -> int:
+    return len(dump_props({"text": text}))
+
+
+def _sized(node_id: str, chars: int) -> dict:
+    return {
+        "node_id": node_id,
+        "space": "claim",
+        "node_type": "Claim",
+        "properties": {"text": "x" * chars, "pack_id": "A"},
+    }
+
+
+def test_node_size_uses_the_stored_json_length() -> None:
+    node = {"properties": {"text": "한글"}}
+    assert node_size(node) == len(dump_props({"text": "한글"}))
+
+
+def test_trim_drops_oversize_nodes_without_refilling() -> None:
+    window = [_sized("big", 500), _sized("a", 50), _sized("b", 50)]
+    kept = trim_to_budget(window[:2], max_chars=None, max_node_chars=200)
+    assert [n["node_id"] for n in kept] == ["a"]
+
+
+def test_trim_budget_admits_up_to_the_first_node_that_reaches_it() -> None:
+    nodes = [_sized(str(i), 50) for i in range(5)]
+    one = node_size(nodes[0])
+    # budget exactly two nodes: the third starts at the budget and is excluded
+    assert len(trim_to_budget(nodes, max_chars=2 * one, max_node_chars=None)) == 2
+    # budget one char over two nodes: the third starts below it and is admitted
+    assert len(trim_to_budget(nodes, max_chars=2 * one + 1, max_node_chars=None)) == 3
+
+
+def test_trim_limits_disabled_keep_everything() -> None:
+    nodes = [_sized("a", 5000), _sized("b", 5000)]
+    assert trim_to_budget(nodes, max_chars=None, max_node_chars=None) == nodes
+
+
+@pytest.fixture()
+def sql_store(tmp_path):
+    store = LocalSQLDocStore(str(tmp_path / "doc_store.db"))
+    yield store
+    store.close()
+
+
+def _put(store: LocalSQLDocStore, node_id: str, chars: int) -> None:
+    store.upsert_node_doc("claim", "Claim", node_id, {"text": "x" * chars, "pack_id": "A"})
+    time.sleep(0.002)  # distinct updated_at, so the newest-first order is total
+
+
+def test_sql_window_picks_newest_limit_then_filters_oversize(sql_store) -> None:
+    _put(sql_store, "b", 50)
+    _put(sql_store, "a", 50)
+    _put(sql_store, "big", 800)  # newest
+    got = sql_store.list_nodes_within_budget(limit=2, max_chars=None, max_node_chars=200)
+    assert [n["node_id"] for n in got] == ["a"]
+
+
+def test_node_size_limit_is_inclusive_in_both_paths(sql_store) -> None:
+    _put(sql_store, "edge", 50)
+    stored = sql_store.list_nodes(limit=10)
+    size = node_size(stored[0])
+    for max_node, expected in ((size, ["edge"]), (size - 1, [])):
+        via_sql = sql_store.list_nodes_within_budget(
+            limit=10, max_chars=None, max_node_chars=max_node
+        )
+        via_trim = trim_to_budget(stored, max_chars=None, max_node_chars=max_node)
+        assert [n["node_id"] for n in via_sql] == expected
+        assert [n["node_id"] for n in via_trim] == expected
+
+
+@pytest.mark.parametrize("limit", [1, 3, 5, 100])
+@pytest.mark.parametrize("max_node", [None, 150, 1000])
+@pytest.mark.parametrize("budget", [None, 1, 120, 300, 100000])
+def test_sql_and_fallback_paths_choose_the_same_window(sql_store, limit, max_node, budget) -> None:
+    for i, chars in enumerate([40, 900, 60, 40, 500, 60, 30]):
+        _put(sql_store, f"n{i}", chars)
+    expected = trim_to_budget(
+        sql_store.list_nodes(limit=limit), max_chars=budget, max_node_chars=max_node
+    )
+    got = sql_store.list_nodes_within_budget(
+        limit=limit, max_chars=budget, max_node_chars=max_node
+    )
+    assert [(n["space"], n["node_id"]) for n in got] == [
+        (n["space"], n["node_id"]) for n in expected
+    ]
+
+
+def test_worker_falls_back_to_python_cut_when_the_budgeted_query_fails(
+    sql_store, monkeypatch
+) -> None:
+    for i, chars in enumerate([40, 4000, 40]):
+        _put(sql_store, f"n{i}", chars)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("no such function: SUM OVER")
+
+    monkeypatch.setattr(sql_store, "list_nodes_within_budget", broken)
+    monkeypatch.setenv("OPENCRAB_BM25_MAX_NODE_CHARS", "500")
+    hybrid = _hybrid(sql_store)
+    try:
+        hybrid._bm25.ensure_built(sql_store)
+        assert hybrid._bm25.state.indexed_rows == 2
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_worker_marks_a_capped_window_as_partial_coverage(sql_store, monkeypatch) -> None:
+    for i, chars in enumerate([40, 4000, 40]):
+        _put(sql_store, f"n{i}", chars)
+    monkeypatch.setenv("OPENCRAB_BM25_MAX_NODE_CHARS", "500")
+    hybrid = _hybrid(sql_store)
+    try:
+        hybrid._bm25.ensure_built(sql_store)
+        state = hybrid._bm25.state
+        assert state.indexed_rows == 2
+        assert state.total_rows == 3
+        warnings = hybrid._coverage_warnings(state, ["A"])
+        assert any("partial rows" in w for w in warnings)
+    finally:
+        hybrid.shutdown_bm25()
+
+
+class _LegacyStore:
+    """No native fingerprint and no budget method (the MongoStore shape)."""
+
+    available = True
+
+    def __init__(self, nodes: list[dict]) -> None:
+        self._nodes = nodes
+
+    def list_nodes(self, space=None, limit: int = 100) -> list[dict]:
+        return list(self._nodes[:limit])
+
+
+def test_legacy_fingerprint_comes_from_the_untrimmed_list(monkeypatch) -> None:
+    nodes = [
+        _node("a", updated_at="2026-01-01T00:00:00"),
+        {**_sized("big", 5000), "updated_at": "2026-01-02T00:00:00"},
+    ]
+    monkeypatch.setenv("OPENCRAB_BM25_MAX_NODE_CHARS", "500")
+    store = _LegacyStore(nodes)
+    hybrid = _hybrid(store)
+    try:
+        hybrid._bm25.ensure_built(store)
+        state = hybrid._bm25.state
+        assert state.indexed_rows == 1
+        assert state.probe_fingerprint == hybrid._bm25_probe_fingerprint()
+    finally:
+        hybrid.shutdown_bm25()
+
+
+# ---------------------------------------------------------------------------
+# 4. Rebuild rest (cause 4)
+# ---------------------------------------------------------------------------
+
+_DELAY = 0.15
+_REST = 2 * _DELAY
+_TOL = 0.04
+
+
+def _starts_ends(store: _TimedStore) -> tuple[list[float], list[float]]:
+    done = [b for b in store.builds if b[1] is not None]
+    return [b[0] for b in done], [b[1] for b in done]
+
+
+def test_rest_follows_a_first_build_the_worker_runs() -> None:
+    store = _TimedStore(delay=_DELAY)
+    hybrid = _hybrid(store)
+
+    def write_during_first_build(idx: int) -> None:
+        if idx == 0:
+            store.write()
+            hybrid.invalidate_bm25_cache()
+
+    store.hook = write_during_first_build
+    try:
+        hybrid.invalidate_bm25_cache()  # the worker's first wake builds
+        assert _wait_until(lambda: len(_starts_ends(store)[0]) >= 2, timeout=5)
+        starts, ends = _starts_ends(store)
+        assert starts[1] - ends[0] >= _REST - _TOL
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_rest_follows_a_first_build_a_search_thread_finishes() -> None:
+    store = _TimedStore(delay=_DELAY)
+    hybrid = _hybrid(store, debounce=0.3)  # the worker is still debouncing
+
+    def write_during_first_build(idx: int) -> None:
+        if idx == 0:
+            store.write()
+            hybrid.invalidate_bm25_cache()
+
+    store.hook = write_during_first_build
+    try:
+        hybrid.invalidate_bm25_cache()  # wakes the worker; it debounces 0.3 s
+        time.sleep(0.05)
+        hybrid._bm25.ensure_built(store)  # the search thread builds first
+        assert _wait_until(lambda: len(_starts_ends(store)[0]) >= 2, timeout=5)
+        starts, ends = _starts_ends(store)
+        assert starts[1] - ends[0] >= _REST - _TOL
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_rest_follows_a_discarded_build_and_the_last_write_lands() -> None:
+    store = _TimedStore(delay=_DELAY)
+    hybrid = _hybrid(store)
+    worker = hybrid._bm25
+
+    def write_during_build_one(idx: int) -> None:
+        if idx == 1:
+            store.write()
+            hybrid.invalidate_bm25_cache()
+
+    try:
+        worker.ensure_built(store)  # build 0
+        store.write()
+        store.hook = write_during_build_one
+        hybrid.invalidate_bm25_cache()  # build 1 (discarded), then build 2
+        assert _wait_until(lambda: len(_starts_ends(store)[0]) >= 3, timeout=8)
+        starts, ends = _starts_ends(store)
+        assert starts[1] - ends[0] >= _REST - _TOL
+        assert starts[2] - ends[1] >= _REST - _TOL
+        last = f"w{store.version}"
+        assert _wait_until(
+            lambda: any(h["node_id"] == f"n{store.version}"
+                        for h in worker.cache.search(last, pack_ids=["A"], limit=5))
+        )
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_mark_stale_does_not_move_the_rest_deadline() -> None:
+    store = _TimedStore()
+    hybrid = _hybrid(store)
+    worker = hybrid._bm25
+    try:
+        worker.ensure_built(store)
+        deadline = worker._next_build_at
+        assert deadline > 0
+        for _ in range(5):
+            worker.mark_stale()
+        assert worker._next_build_at == deadline
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_shutdown_interrupts_the_rest() -> None:
+    store = _TimedStore(delay=_DELAY)
+    hybrid = _hybrid(store)
+    worker = hybrid._bm25
+    worker.ensure_built(store)
+    store.write()
+    hybrid.invalidate_bm25_cache()
+    time.sleep(0.05)  # the worker is now resting
+    started = time.monotonic()
+    hybrid.shutdown_bm25(timeout=2.0)
+    assert time.monotonic() - started < 1.0
+    thread = worker.thread
+    assert thread is None or not thread.is_alive()
+    assert threading.active_count() >= 1

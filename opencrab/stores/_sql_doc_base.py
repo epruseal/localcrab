@@ -523,6 +523,58 @@ class _SqlDocStoreBase(abc.ABC):
         rows = self._fetch_all(sql, params)
         return [self._row_to_node(r) for r in rows]
 
+    def list_nodes_within_budget(
+        self,
+        limit: int,
+        max_chars: int | None = None,
+        max_node_chars: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """``list_nodes`` narrowed to the BM25 window rules of issue #506.
+
+        The window is the newest ``limit`` rows (the ``list_nodes`` order),
+        minus rows whose stored ``properties`` text is longer than
+        ``max_node_chars`` (the gap is not refilled), cut after the row at
+        which the running length of the kept rows reaches ``max_chars``: a
+        row is kept when the kept rows before it total less than the budget.
+        ``None`` turns a rule off. ``opencrab.ontology.bm25.trim_to_budget``
+        applies the same rules to a plain list, and a test pins that both agree.
+
+        The length is ``LENGTH(CAST(properties AS TEXT))``: the stored text,
+        which for SQLite is the ASCII-escaped JSON (``dump_props``). Rows that
+        are filtered out are never sent to Python, so a few huge rows cannot
+        inflate the window's memory.
+
+        Window functions need SQLite 3.25 or newer, or PostgreSQL.
+        """
+        self._require_available()
+        if limit <= 0:
+            return []
+        table = self._table("doc_nodes")
+        params: dict[str, Any] = {"lim": limit}
+        size_filter = ""
+        if max_node_chars is not None:
+            size_filter = "WHERE plen <= :max_node"
+            params["max_node"] = max_node_chars
+        budget_filter = ""
+        if max_chars is not None:
+            budget_filter = "WHERE running - plen < :budget"
+            params["budget"] = max_chars
+        sql = (
+            "SELECT space, node_id, node_type, properties, updated_at FROM ("
+            " SELECT space, node_id, node_type, properties, updated_at, plen,"
+            "  SUM(plen) OVER (ORDER BY updated_at DESC, space, node_id"
+            "   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running"
+            "  FROM ("
+            "   SELECT space, node_id, node_type, properties, updated_at,"
+            "    COALESCE(LENGTH(CAST(properties AS TEXT)), 0) AS plen"
+            f"   FROM {table} ORDER BY updated_at DESC, space, node_id LIMIT :lim"
+            f"  ) AS win {size_filter}"
+            f") AS sized {budget_filter}"
+            " ORDER BY updated_at DESC, space, node_id"
+        )
+        rows = self._fetch_all(sql, params)
+        return [self._row_to_node(r) for r in rows]
+
     def list_nodes_scoped(
         self, pack_ids: list[str], space: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:

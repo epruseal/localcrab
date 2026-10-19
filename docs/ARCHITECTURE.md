@@ -125,6 +125,11 @@ fingerprint를 확인하던 비용이 쿼리 hot path에 실려 있었다(코퍼
   epoch를 올렸는데, 빌드 주기보다 검색이 빠르게 도착하면 발행 시점 epoch
   비교가 계속 불일치해 유효한 candidate를 무한히 버리는 livelock이 있었다
   (`docs/issue-398-bm25-coverage.md`의 "#422 후속" 절 참고).
+- **재빌드는 쉬어 가며 한다(#506).** 워커는 한 번 관측하고 빌드한 뒤 그 작업에 걸린
+  시간의 두 배가 지날 때까지 다음 빌드를 시작하지 않는다. 쓰기가 계속돼도 워커가
+  쉬지 않고 전체 창을 다시 토큰화하는 일을 막는다. 회차가 끝나면 워커는 지난
+  인덱스와 폐기된 후보에 대한 지역 참조를 비우고 해제된 메모리를 운영체제에
+  돌려준다. 상세: [issue-506-bm25-memory.md](./issue-506-bm25-memory.md).
 - 유일한 동기 빌드는 **콜드 스타트**(캐시 없음)뿐. 이 콜드 빌드는 질의 스레드의
   `_bm25_search()`와 백그라운드 워커의 `_rebuild_loop()` 첫 깨어남이라는 두
   호출부를 갖는데, 둘 다 `_Bm25CacheWorker.ensure_built()`를 거쳐 전용 락으로
@@ -624,6 +629,27 @@ MCP 응답은 기존 `spaces_filter_warnings`에 이 경고를 담는다. BM25 �
 export OPENCRAB_BM25_NODE_LIMIT=100000
 opencrab serve
 ```
+
+### 크기 상한 (#506)
+
+건수 상한만으로는 인덱스 메모리가 묶이지 않는다. 최신순 창에 긴 대화 로그가 들어오면
+건수가 같아도 바이트와 토큰 수가 늘기 때문이다. 창은 세 단계를 거친다.
+
+1. 최신순 상위 `_BM25_NODE_LIMIT`개를 고른다.
+2. 저장된 `properties` 텍스트가 `OPENCRAB_BM25_MAX_NODE_CHARS`(기본 65536)를 넘는
+   노드를 뺀다. 빈자리는 채우지 않는다.
+3. 남은 노드를 최신순으로 누적해 `OPENCRAB_BM25_CHAR_BUDGET`(기본 80_000_000)에 닿는
+   노드의 뒤를 자른다.
+
+두 값이 0 이하이면 해당 규칙을 끈다. 길이는 스토어가 저장한 텍스트의 길이다.
+SQLite 스토어는 한글을 `\uXXXX`로 저장하므로 글자당 6자로 센다. 상한에 걸리면
+`indexed_rows < total_rows`가 되어 `BM25 coverage partial rows` 경고가 나온다. 뺀 노드는
+BM25 결과에서만 빠진다. 벡터 검색 등 다른 경로의 노출은 바꾸지 않는다.
+
+SQL 스토어는 이 규칙을 `list_nodes_within_budget()` 한 질의로 수행한다. 이 질의는
+윈도 함수를 쓰므로 SQLite 3.25 이상이 필요하다. 질의가 실패하거나 스토어가 이
+메서드를 갖지 않으면 워커가 `list_nodes()` 결과를 파이썬(`trim_to_budget`)으로 같은
+규칙에 따라 자른다.
 
 한도를 올리기 전에 인덱스 빌드 시간을 측정해야 한다. `LocalSQLDocStore`로 전환하면
 `list_nodes(limit=N)` 호출 자체의 지연은 N에 무관하게 유지되지만, BM25 인덱스

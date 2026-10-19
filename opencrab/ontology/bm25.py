@@ -18,6 +18,7 @@ from typing import Any
 
 from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.ontology.text_cues import tokenize as _tokenize
+from opencrab.stores._json import dump_props
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,15 @@ class BM25Index:
         """
         idx = cls()
         idx._docs = nodes
-        idx._tokens = [_tokenize(_node_text(n)) for n in nodes]
+        # #506: one str object per distinct token. A per-document tokenize()
+        # result holds a fresh str for every occurrence, which made the token
+        # lists most of the index's memory. Sharing leaves scores unchanged.
+        vocab: dict[str, str] = {}
+        idx._tokens = [
+            [vocab.setdefault(tok, tok) for tok in _tokenize(_node_text(n))]
+            for n in nodes
+        ]
+        del vocab
         for pos, node in enumerate(nodes):
             pid = scope_pack_id(node)
             if pid is not None:
@@ -290,6 +299,46 @@ class BM25Index:
 
     def __len__(self) -> int:
         return len(self._docs)
+
+
+def node_size(node: dict[str, Any]) -> int:
+    """Stored-JSON length of a node's properties (the window size unit, #506).
+
+    ``dump_props`` is what the SQL doc stores write, so this equals the length
+    ``LocalSQLDocStore`` reports for the same row. PostgreSQL JSONB does not
+    escape non-ASCII, so the unit is a per-backend size estimate.
+    """
+    return len(dump_props(node.get("properties") or {}))
+
+
+def trim_to_budget(
+    nodes: list[dict[str, Any]],
+    *,
+    max_chars: int | None,
+    max_node_chars: int | None,
+) -> list[dict[str, Any]]:
+    """Apply the #506 window rules to an already limited, ordered node list.
+
+    1. A node longer than ``max_node_chars`` is dropped. The gap is not refilled.
+    2. The remaining nodes are taken in order while the length of the nodes
+       before them stays below ``max_chars``. The node that reaches the budget
+       is the last one admitted only if it started below the budget, so the
+       total can exceed the budget by at most one node.
+
+    ``None`` disables a rule. ``LocalSQLDocStore.list_nodes_within_budget``
+    implements the same rules in SQL, and a test pins that the two agree.
+    """
+    kept: list[dict[str, Any]] = []
+    total = 0
+    for node in nodes:
+        size = node_size(node)
+        if max_node_chars is not None and size > max_node_chars:
+            continue
+        if max_chars is not None and total >= max_chars:
+            break
+        kept.append(node)
+        total += size
+    return kept
 
 
 def compute_fingerprint(nodes: list[dict[str, Any]]) -> tuple[int, str]:

@@ -93,6 +93,8 @@ ENV_CONTRACT: dict[str, str] = {
     "OPENCRAB_CORS_ORIGINS": "튜너블, serve 비도달",
     "OPENCRAB_BM25_NODE_LIMIT": "튜너블",
     "OPENCRAB_BM25_DEBOUNCE": "튜너블",
+    "OPENCRAB_BM25_MAX_NODE_CHARS": "튜너블",
+    "OPENCRAB_BM25_CHAR_BUDGET": "튜너블",
     "OPENCRAB_AUTO_PACK_MIN_SCORE": "튜너블",
     # opencrab/pack/jsonl_io.py 전용. opencrab/mcp/tools/pack.py 는 이 모듈을
     # 임포트하지 않는다(위 재현 명령으로 확인) -- 팩 CLI 저작 경로에서만 읽힌다.
