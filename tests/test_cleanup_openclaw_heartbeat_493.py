@@ -54,7 +54,7 @@ def _put(conn: sqlite3.Connection, sql: str, values: tuple[object, ...]) -> None
     conn.execute(sql, values)
 
 
-def _add(root: Path, node_id: str, text: str, pack: object = "openclaw", *, source: bool = True, fts: bool = True, doc: bool = True, graph: bool = True, vector: bool = True, node_type: str = "Evidence", space: str = "evidence") -> None:
+def _add(root: Path, node_id: str, text: str, pack: object = "openclaw", *, source: bool = True, fts: bool = True, doc: bool = True, graph: bool = True, vector: bool = True, node_type: str = "Evidence", space: str = "evidence", vector_node_id: bool = True) -> None:
     metadata = json.dumps({"pack_id": pack, "node_id": node_id})
     props = json.dumps({"pack_id": pack})
     if source or fts or doc:
@@ -76,7 +76,7 @@ def _add(root: Path, node_id: str, text: str, pack: object = "openclaw", *, sour
         with _db(root / "vectors.db") as conn:
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
-            _put(conn, f"INSERT INTO {TABLE}(node_id,pack_id,embedding,document,metadata) VALUES (?,?,?,?,?)", (node_id, pack, sqlite_vec.serialize_float32([0.0, 1.0]), text, metadata))
+            _put(conn, f"INSERT INTO {TABLE}(node_id,pack_id,embedding,document,metadata) VALUES (?,?,?,?,?)", (node_id, pack, sqlite_vec.serialize_float32([0.0, 1.0]), text, metadata if vector_node_id else json.dumps({"pack_id": pack})))
 
 
 @pytest.fixture
@@ -266,6 +266,34 @@ def _logical_rows_setup(snapshot: Path) -> str:
         "    open(logical_snapshot_path, 'w', encoding='utf-8').write(json.dumps(logical_rows(data, registry_conn), sort_keys=True))\n"
     )
 
+
+
+def _without_witness_pragmas(trace_text: str) -> str:
+    """apply가 유지하는 쓰기 연결의 `PRAGMA data_version`과 trigger 확인 읽기 줄은 쓰기 추적에서 뺀다."""
+    ignored = {"PRAGMA data_version", "SELECT count(*) FROM sqlite_master WHERE type='trigger'"}
+    return "".join(line for line in trace_text.splitlines(keepends=True) if line.strip() not in ignored)
+
+
+# 가드가 섹션 비교로 옮겨 가면서 parametrize 값(old/new 문자열)이 바뀌었다. 수정 전 test ID를 보존하려고
+# 바뀐 항목의 ID는 수정 전 문자열로 만든다.
+_LEGACY_GUARD_TEXT = {
+    "registry-claim": (
+        'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n' + " " * 16 + 'raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+        "if False:\n" + " " * 16 + 'raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+    ),
+    "registry-proof": (
+        'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n' + " " * 16 + 'raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+        "if False:\n" + " " * 16 + 'raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+    ),
+    "doc-raw": (
+        'if source != evidence.get("source"):\n' + " " * 20 + 'raise CleanupRefusedError("registry protection conflict")',
+        "if False:\n" + " " * 20 + 'raise CleanupRefusedError("registry protection conflict")',
+    ),
+}
+
+
+def _legacy_param_ids(rows: list[tuple[str, str, str]]) -> list[str]:
+    return [f"{name}-{_LEGACY_GUARD_TEXT.get(name, (old, new))[0]}-{_LEGACY_GUARD_TEXT.get(name, (old, new))[1]}" for name, old, new in rows]
 
 
 def _catalog_mutation(source: str, old: str, new: str) -> str:
@@ -1711,7 +1739,7 @@ def test_catalog_membership_mutations_compile(tmp_path: Path, old: str, new: str
     compile(mutated, str(copy), "exec")
 
 
-@pytest.mark.parametrize("name,old,new", [
+_BRANCH_ROWS = [
     (
         "source-existence",
         'if len(source) != 1 or graph_node is None or len(registry_nodes) != 1 or not isinstance(frozen_source, list) or not isinstance(frozen_registry, list):\n        return False',
@@ -1734,15 +1762,18 @@ def test_catalog_membership_mutations_compile(tmp_path: Path, old: str, new: str
     ),
     (
         "registry-claim",
-        'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
-        'if False:\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+        'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n            raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+        'if False:\n            raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
     ),
     (
         "doc-raw",
-        'if source != evidence.get("source"):\n                    raise CleanupRefusedError("registry protection conflict")',
-        'if False:\n                    raise CleanupRefusedError("registry protection conflict")',
+        'if _doc_sections(doc, protected.get("evidence_ids", []), doc_nodes=False)["evidence_source"] != sections.get("evidence_source"):\n            raise CleanupRefusedError("registry protection conflict")',
+        'if False:\n            raise CleanupRefusedError("registry protection conflict")',
     ),
-])
+]
+
+
+@pytest.mark.parametrize("name,old,new", _BRANCH_ROWS, ids=_legacy_param_ids(_BRANCH_ROWS))
 def test_catalog_branch_mutations_compile(tmp_path: Path, name: str, old: str, new: str):
     source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
     mutated = _catalog_mutation(source, old, new)
@@ -1793,8 +1824,10 @@ def test_catalog_source_pack_copy_reaches_later_guard(tmp_path: Path, branch: st
     observed = source.replace(old, 'and observe_pack(lambda: ' + old.removeprefix('and ') + ')').replace(equality, 'and observe_equality(lambda: [_json_value(row) for row in source] == frozen_source)')
     def setup(root: Path, normal: str, marker: Path, snapshot: Path) -> str:
         if branch == "frozen":
-            change = ("    evidence = next(item for item in manifest['protected']['evidence'] if item['graph']['id'] == " + repr(normal) + ")\n"
-                "    evidence['source_raw'][0][2] = json.dumps({'pack_id': 'other', 'node_id': " + repr(normal) + "})\n")
+            change = ("    store = manifest.evidence_store()\n    real_get = store.get\n"
+                "    def mutated_get(key):\n        item = real_get(key)\n"
+                "        if item is not None and key == " + repr(normal) + ": item['source_raw'][0][2] = json.dumps({'pack_id': 'other', 'node_id': " + repr(normal) + "})\n"
+                "        return item\n    store.get = mutated_get\n")
         else:
             change = f"    with sqlite3.connect({str(root / 'doc_store.db')!r}) as conn: conn.execute(\"UPDATE doc_sources SET metadata=? WHERE source_id=?\", (json.dumps({{'pack_id':'other','node_id':{normal!r}}}), {normal!r}))\n"
         return ("import sqlite3\noriginal_guard = cleanup._claim_guard\n"
@@ -1829,7 +1862,7 @@ def test_catalog_source_pack_copy_reaches_later_guard(tmp_path: Path, branch: st
     assert _all_db_bytes(m_root) == _load(m_snapshot)
 
 
-@pytest.mark.parametrize("name,old,new", [
+_PROOF_ROWS = [
     (
         "projected",
         'if _claim_failures(conn, registry, doc, candidates, manifest, axis="graph", planned_edges=planned_edges, planned_nodes=planned_nodes):\n            raise CleanupRefusedError("planned graph delete removes final Claim support")',
@@ -1837,15 +1870,18 @@ def test_catalog_source_pack_copy_reaches_later_guard(tmp_path: Path, branch: st
     ),
     (
         "registry-proof",
-        'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
-        'if False:\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+        'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n            raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
+        'if False:\n            raise CleanupRefusedError("registry Claim support changed after frozen manifest")',
     ),
     (
         "doc-raw",
-        'if source != evidence.get("source"):\n                    raise CleanupRefusedError("registry protection conflict")',
-        'if False:\n                    raise CleanupRefusedError("registry protection conflict")',
+        'if _doc_sections(doc, protected.get("evidence_ids", []), doc_nodes=False)["evidence_source"] != sections.get("evidence_source"):\n            raise CleanupRefusedError("registry protection conflict")',
+        'if False:\n            raise CleanupRefusedError("registry protection conflict")',
     ),
-])
+]
+
+
+@pytest.mark.parametrize("name,old,new", _PROOF_ROWS, ids=_legacy_param_ids(_PROOF_ROWS))
 def test_catalog_proof_copy_runs_fresh_main(world: Path, tmp_path: Path, name: str, old: str, new: str):
     _candidate, normal, _claim = _registry_claim_setup(world)
     run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
@@ -1903,8 +1939,10 @@ def test_catalog_frozen_pack_copy_loses_target_guard(world: Path, tmp_path: Path
     injection = (
         "original_guard = cleanup._claim_guard\n"
         "def guard(data, candidates, manifest):\n"
-        "    evidence = next(item for item in manifest['protected']['evidence'] if item['graph']['id'] == " + repr(normal) + ")\n"
-        "    evidence['source_raw'][0][2] = json.dumps({'pack_id': 'other', 'node_id': " + repr(normal) + "})\n"
+        "    store = manifest.evidence_store()\n    real_get = store.get\n"
+        "    def mutated_get(key):\n        item = real_get(key)\n"
+        "        if item is not None and key == " + repr(normal) + ": item['source_raw'][0][2] = json.dumps({'pack_id': 'other', 'node_id': " + repr(normal) + "})\n"
+        "        return item\n    store.get = mutated_get\n"
         "    state = {name: (data / name).read_bytes().hex() for name in cleanup.DB_FILES}\n"
         "    open(" + repr(str(snapshot)) + ", 'w', encoding='utf-8').write(json.dumps(state))\n"
         "    return original_guard(data, candidates, manifest)\n"
@@ -2022,12 +2060,14 @@ def test_catalog_projected_claim_copy_reaches_graph_transaction_seam(world: Path
 
 def test_catalog_registry_claim_copy_reaches_transaction_seam(tmp_path: Path):
     source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
-    guard = 'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")'
-    marker = '        graph = _ro(data_dir / "graph.db", True)\n        doc = _ro(data_dir / "doc_store.db", True)\n        try:\n'
+    guard = 'if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n            raise CleanupRefusedError("registry Claim support changed after frozen manifest")'
+    head = '    try:\n'
+    tail = '        if _claim_failures(graph, conn, doc, candidates, manifest, axis="registry"):\n'
+    marker = head + tail
     assert source.count(guard) == source.count(marker) == 1
     def copied(root: Path, normal: str) -> str:
-        fault = f'            conn.execute("UPDATE ontology_nodes SET node_type=\'Document\' WHERE space=\'evidence\' AND node_id=?", ({normal!r},))\n'
-        result = source.replace(marker, marker + "            _test_capture_registry('pre', conn)\n" + fault + "            _test_capture_registry('post', conn)\n")
+        fault = f'        conn.execute("UPDATE ontology_nodes SET node_type=\'Document\' WHERE space=\'evidence\' AND node_id=?", ({normal!r},))\n'
+        result = source.replace(marker, head + "        _test_capture_registry('pre', conn)\n" + fault + "        _test_capture_registry('post', conn)\n" + tail)
         assert result.count("_test_capture_registry('pre', conn)") == result.count("_test_capture_registry('post', conn)") == 1
         compile(result, "registry-copy.py", "exec")
         return result
@@ -2061,7 +2101,7 @@ def test_catalog_registry_claim_copy_reaches_transaction_seam(tmp_path: Path):
     assert logical_with_registry(prior_axes_rows, b_states['pre']) == prior_axes_expected
     assert _logical_rows_json(b_root) == prior_axes_expected
     assert b_states['post']['registry'] != b_states['pre']['registry']
-    mutant = _catalog_mutation(copied(m_root, m_normal), guard, 'if False:\n                raise CleanupRefusedError("registry Claim support changed after frozen manifest")')
+    mutant = _catalog_mutation(copied(m_root, m_normal), guard, 'if False:\n            raise CleanupRefusedError("registry Claim support changed after frozen manifest")')
     result, events = _run_copy_apply(m_root, tmp_path, m_run, m_backup, m_approval, mutant, "registry-proof-mutant-copy", capture_setup(m_capture))
     assert result.returncode == 2
     assert "protected set changed" in result.stderr
@@ -2099,11 +2139,11 @@ def test_catalog_registry_claim_copy_reaches_transaction_seam(tmp_path: Path):
 
 def test_catalog_doc_raw_copy_reaches_digest_seam(tmp_path: Path):
     source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
-    guard = 'if source != evidence.get("source"):\n                    raise CleanupRefusedError("registry protection conflict")'
-    marker = '        doc = _ro(data_dir / "doc_store.db", True)\n        try:\n            for evidence in protected.get("evidence", []):\n'
+    guard = 'if _doc_sections(doc, protected.get("evidence_ids", []), doc_nodes=False)["evidence_source"] != sections.get("evidence_source"):\n            raise CleanupRefusedError("registry protection conflict")'
+    marker = '    doc = _ro(data_dir / "doc_store.db", True)\n    try:\n        if _doc_sections(doc, protected.get("evidence_ids", []), doc_nodes=False)["evidence_source"] != sections.get("evidence_source"):\n'
     assert source.count(guard) == source.count(marker) == 1
     def copied(root: Path, normal: str) -> str:
-        fault = f'        with sqlite3.connect({str(root / "doc_store.db")!r}) as fault:\n            fault.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (json.dumps({{"pack_id": "other", "node_id": {normal!r}}}), {normal!r}))\n        _test_capture_logical(data_dir)\n'
+        fault = f'    with sqlite3.connect({str(root / "doc_store.db")!r}) as fault:\n        fault.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (json.dumps({{"pack_id": "other", "node_id": {normal!r}}}), {normal!r}))\n    _test_capture_logical(data_dir)\n'
         result = source.replace(marker, fault + marker)
         assert result.count("_test_capture_logical(data_dir)") == 1
         compile(result, "docraw-copy.py", "exec")
@@ -2140,7 +2180,7 @@ def test_catalog_doc_raw_copy_reaches_digest_seam(tmp_path: Path):
     _assert_event_contract(baseline_events, expect_clean=False)
     assert any(event.get("db") == "opencrab.db" and event.get("phase") == "transaction" and event.get("action") == "ROLLBACK" for event in baseline_events)
     assert _logical_rows_json(b_root) == _load(b_capture)
-    mutant = _catalog_mutation(copied(m_root, m_normal), guard, 'if False:\n                    raise CleanupRefusedError("registry protection conflict")')
+    mutant = _catalog_mutation(copied(m_root, m_normal), guard, 'if False:\n            raise CleanupRefusedError("registry protection conflict")')
     result, events = _run_copy_apply(m_root, tmp_path, m_run, m_backup, m_approval, mutant, "doc-raw-mutant-copy", capture_setup(m_capture))
     assert result.returncode == 2
     assert "protected set changed" in result.stderr
@@ -2169,14 +2209,14 @@ def test_catalog_membership_copy_reaches_registry_seam(tmp_path: Path, target: s
     source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
     candidate = "evidence:turn:heartbeat"
     precheck = "        _registry_resume_precheck(data_dir, vector_table, candidates)"
-    begin = "        conn.execute(\"BEGIN IMMEDIATE\")\n        candidate_targets"
+    begin = "        _begin_write(conn)\n        scope = _scope_for(candidates, manifest)"
     assert source.count(precheck) == source.count(begin) == 1
     fault = (
         f"conn.execute(\"UPDATE ontology_nodes SET updated_at='changed' WHERE node_id=?\", ({candidate!r},))"
         if target == "node" else f"conn.execute(\"UPDATE ontology_edges SET created_at='changed' WHERE from_id=? AND relation='recorded'\", ({candidate!r},))"
     )
     def injected() -> str:
-        return source.replace(begin, "        conn.execute(\"BEGIN IMMEDIATE\")\n        " + fault + "\n        candidate_targets")
+        return source.replace(begin, "        _begin_write(conn)\n        " + fault + "\n        scope = _scope_for(candidates, manifest)")
     b_root, b_run, b_backup, b_approval, _b_candidates, _b_manifest, _b_normal = _fresh_registry_claim_fixture(tmp_path, f"membership-{target}-baseline", registry_edge=target == "edge")
     m_root, m_run, m_backup, m_approval, m_candidates, _m_manifest, _m_normal = _fresh_registry_claim_fixture(tmp_path, f"membership-{target}-mutant", registry_edge=target == "edge")
     assert [record["snapshot"] for record in _b_candidates] == [record["snapshot"] for record in m_candidates]
@@ -3127,7 +3167,7 @@ def test_cli_boundary_validator_rows_use_actual_fa_ra_branches(world: Path, tmp_
         encoding="utf-8",
     )
     result = subprocess.run([sys.executable, str(runner)], cwd=tmp_path, text=True, capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
-    statements = trace.read_text(encoding="utf-8")
+    statements = _without_witness_pragmas(trace.read_text(encoding="utf-8"))
     assert statements.startswith(f"branch={'first' if branch == 'FA' else 'resume'} receipt-before={str(branch == 'RA')}\n")
     if branch == "FA":
         assert "receipt-after=True" in statements
@@ -3492,7 +3532,7 @@ def test_cli_boundary_allowed_transaction_has_no_redelete_or_dangling(world: Pat
     )
     result = subprocess.run([sys.executable, str(runner)], cwd=tmp_path, text=True, capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 0, result.stderr
-    statements = trace.read_text(encoding="utf-8")
+    statements = _without_witness_pragmas(trace.read_text(encoding="utf-8"))
     assert statements.startswith(f"branch={'first' if branch == 'FA' else 'resume'} receipt-before={str(branch == 'RA')}\n")
     if branch == "FA":
         assert "receipt-after=True" in statements
@@ -3576,7 +3616,7 @@ def test_cli_boundary_transaction_rows_reject_before_graph_delete(world: Path, t
     result = subprocess.run([sys.executable, str(runner)], cwd=tmp_path, text=True, capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode != 0, row_id
     assert "boundary edge R/D/S conflict" in result.stderr
-    statements = trace.read_text(encoding="utf-8")
+    statements = _without_witness_pragmas(trace.read_text(encoding="utf-8"))
     assert statements.startswith(f"branch={'first' if branch == 'FA' else 'resume'} receipt-before={str(branch == 'RA')}\n")
     if branch == "FA":
         assert "receipt-after=True" in statements
@@ -3719,7 +3759,7 @@ def test_cli_component_transaction_change_rejects_before_graph_delete(world: Pat
     result = subprocess.run([sys.executable, str(runner)], cwd=tmp_path, text=True, capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode != 0
     assert "component edge R/D/S conflict" in result.stderr
-    statements = trace.read_text(encoding="utf-8")
+    statements = _without_witness_pragmas(trace.read_text(encoding="utf-8"))
     assert "BEGIN IMMEDIATE" in statements
     assert "DELETE FROM graph_edges" not in statements
 
@@ -3888,3 +3928,549 @@ def test_abc_component_resume_b_transaction_uses_rds(world: Path, tmp_path: Path
     cleanup._delete_graph(world, by_id[b], candidates, receipt, manifest)
     with _db(world / "graph.db") as conn:
         assert conn.execute("SELECT node_id FROM graph_nodes WHERE node_id IN (?,?)", (b, c)).fetchall() == [(c,)]
+
+
+# ---- #493 후속: 전체 스캔 제거, 보호 집합 스트리밍, vector 신원 ----
+
+
+def _no_scan(_data: Path) -> tuple[list[int], int]:
+    return [], 0
+
+
+def test_vector_identity_uses_pk_when_metadata_has_no_node_id(tmp_path: Path):
+    """운영 writer는 vector metadata에 node_id를 넣지 않는다. 신원은 vec0 PK 열이다."""
+    root = tmp_path / "data"
+    root.mkdir()
+    _schema(root)
+    _add(root, "evidence:turn:heartbeat", HEARTBEAT, vector_node_id=False)
+    result = cleanup.dry_run(root, tmp_path / "run", TABLE)
+    assert result["eligible"] is True
+    assert result["candidates"] == 1
+
+
+def test_vector_identity_refuses_metadata_node_id_that_differs(tmp_path: Path):
+    root = tmp_path / "data"
+    root.mkdir()
+    _schema(root)
+    _add(root, "evidence:turn:heartbeat", HEARTBEAT, vector_node_id=False)
+    _vector_sql(root, f"UPDATE {TABLE} SET metadata=? WHERE node_id=?", (json.dumps({"pack_id": "openclaw", "node_id": "evidence:turn:other"}), "evidence:turn:heartbeat"))
+    result = cleanup.dry_run(root, tmp_path / "run", TABLE)
+    assert result["eligible"] is False
+    assert any("vector identity" in error for error in result["errors"])
+
+
+def _protection_world(root: Path) -> None:
+    root.mkdir()
+    _schema(root)
+    _add(root, "evidence:turn:heartbeat", HEARTBEAT)
+    _add(root, "evidence:turn:normal", "discussion includes OpenClaw heartbeat poll later")
+    _add(root, "evidence:turn:extra", "extra", source=False, fts=False, vector=False)
+    with _db(root / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_nodes VALUES (?,?,?,?)", ("Document", "doc:keep", "document", "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", "evidence:turn:normal", "cites", "Document", "doc:keep", "{}"))
+    with _db(root / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("document", "Document", "doc:keep"))
+        conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", "evidence:turn:normal", "cites", "document", "doc:keep"))
+    _fix_registry_timestamps(root)
+
+
+def _vector_sql(root: Path, sql: str, params: tuple) -> None:
+    import sqlite_vec
+
+    with _db(root / "vectors.db") as conn:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.execute(sql, params)
+
+
+_NORMAL, _EXTRA = "evidence:turn:normal", "evidence:turn:extra"
+_VECTOR_INSERT = f"INSERT INTO {TABLE}(node_id,pack_id,embedding,document,metadata) VALUES (?,'openclaw',?,'x','{{}}')"
+_PROTECTION_MUTATIONS: dict[tuple[str, str], tuple[str, str, tuple]] = {
+    ("nodes", "update"): ("graph.db", "UPDATE graph_nodes SET properties='{\"a\":1}' WHERE node_id='doc:keep'", ()),
+    ("nodes", "insert"): ("graph.db", "INSERT INTO graph_nodes VALUES ('Document','doc:new','document','{}')", ()),
+    ("nodes", "delete"): ("graph.db", "DELETE FROM graph_nodes WHERE node_id='doc:keep'", ()),
+    ("evidence_graph", "update"): ("graph.db", "UPDATE graph_nodes SET properties='{\"pack_id\":\"openclaw\",\"k\":1}' WHERE node_id=?", (_NORMAL,)),
+    ("evidence_graph", "insert"): ("graph.db", "INSERT INTO graph_nodes VALUES ('Evidence','evidence:turn:new','evidence','{}')", ()),
+    ("evidence_graph", "delete"): ("graph.db", "DELETE FROM graph_nodes WHERE node_id=?", (_NORMAL,)),
+    ("edges", "update"): ("graph.db", "UPDATE graph_edges SET properties='{\"w\":1}' WHERE to_id='doc:keep'", ()),
+    ("edges", "insert"): ("graph.db", "INSERT INTO graph_edges VALUES ('Evidence',?,'other','Document','doc:keep','{}')", (_NORMAL,)),
+    ("edges", "delete"): ("graph.db", "DELETE FROM graph_edges WHERE to_id='doc:keep'", ()),
+    ("evidence_doc", "update"): ("doc_store.db", "UPDATE doc_nodes SET properties='{\"pack_id\":\"openclaw\",\"k\":1}' WHERE node_id=?", (_NORMAL,)),
+    ("evidence_doc", "insert"): ("doc_store.db", "INSERT INTO doc_nodes VALUES ('concept',?,'Concept','{}')", (_EXTRA,)),
+    ("evidence_doc", "delete"): ("doc_store.db", "DELETE FROM doc_nodes WHERE node_id=?", (_NORMAL,)),
+    ("evidence_source", "update"): ("doc_store.db", "UPDATE doc_sources SET text='changed' WHERE source_id=?", (_NORMAL,)),
+    ("evidence_source", "insert"): ("doc_store.db", "INSERT INTO doc_sources VALUES (?,'extra text','{}')", (_EXTRA,)),
+    ("evidence_source", "delete"): ("doc_store.db", "DELETE FROM doc_sources WHERE source_id=?", (_NORMAL,)),
+    ("evidence_vector", "update"): ("vectors.db", f"UPDATE {TABLE} SET document='changed' WHERE node_id=?", (_NORMAL,)),
+    ("evidence_vector", "insert"): ("vectors.db", _VECTOR_INSERT, (_EXTRA, b"")),
+    ("evidence_vector", "delete"): ("vectors.db", f"DELETE FROM {TABLE} WHERE node_id=?", (_NORMAL,)),
+    ("registry_nodes", "update"): ("opencrab.db", "UPDATE ontology_nodes SET updated_at='x' WHERE node_id='doc:keep'", ()),
+    ("registry_nodes", "insert"): ("opencrab.db", "INSERT INTO ontology_nodes(space,node_type,node_id) VALUES ('document','Document','doc:new')", ()),
+    ("registry_nodes", "delete"): ("opencrab.db", "DELETE FROM ontology_nodes WHERE node_id='doc:keep'", ()),
+    ("registry_edges", "update"): ("opencrab.db", "UPDATE ontology_edges SET created_at='x' WHERE to_id='doc:keep'", ()),
+    ("registry_edges", "insert"): ("opencrab.db", "INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES ('evidence',?,'other','document','doc:keep')", (_NORMAL,)),
+    ("registry_edges", "delete"): ("opencrab.db", "DELETE FROM ontology_edges WHERE to_id='doc:keep'", ()),
+}
+
+
+@pytest.mark.parametrize("section,op", sorted(_PROTECTION_MUTATIONS))
+def test_protected_row_change_is_refused_before_any_write(tmp_path: Path, section: str, op: str):
+    """비후보 보호 행 하나가 바뀌거나 추가되거나 사라지면 해당 섹션이 달라지고 apply는 백업 전에 거부한다."""
+    import sqlite_vec
+
+    root = tmp_path / "data"
+    _protection_world(root)
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    assert cleanup.dry_run(root, run, TABLE)["eligible"] is True
+    _candidates, manifest = cleanup._load_run(run)
+    ids = {"evidence:turn:heartbeat"}
+    before, _ = cleanup._protection_sections(root, TABLE, ids)
+    assert cleanup._protection_digest(before) == manifest["protected_sha256"]
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    db, sql, params = _PROTECTION_MUTATIONS[(section, op)]
+    if db == "vectors.db":
+        if op == "insert":
+            params = (params[0], sqlite_vec.serialize_float32([2.0, 3.0]))
+        _vector_sql(root, sql, params)
+    else:
+        with _db(root / db) as conn:
+            conn.execute(sql, params)
+    after, _ = cleanup._protection_sections(root, TABLE, ids)
+    assert section in {name for name in before if before[name] != after[name]}
+    state = _all_db_bytes(root)
+    with pytest.raises(cleanup.CleanupRefusedError):
+        cleanup.apply(root, run, TABLE, approval, backup, scan=_no_scan)
+    assert not backup.exists()
+    assert _all_db_bytes(root) == state
+
+
+def test_protected_graph_raw_properties_text_is_in_the_full_digest_only(tmp_path: Path):
+    """JSON 값이 같고 문자열만 다른 변경은 정규화 섹션을 바꾸지 않고 raw 섹션만 바꾼다."""
+    root = tmp_path / "data"
+    _protection_world(root)
+    ids = {"evidence:turn:heartbeat"}
+    before, _ = cleanup._protection_sections(root, TABLE, ids)
+    with _db(root / "graph.db") as conn:
+        conn.execute("UPDATE graph_nodes SET properties=? WHERE node_id=?", ('{"pack_id":"openclaw"}', _NORMAL))
+    after, _ = cleanup._protection_sections(root, TABLE, ids)
+    assert {name for name in before if before[name] != after[name]} == {"evidence_graph_raw"}
+
+
+def test_witness_ignores_own_commits_and_sees_foreign_commits(world: Path):
+    witness = cleanup._Witness(world)
+    try:
+        conn = witness.writer("graph.db")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO graph_nodes VALUES ('Document','doc:own','document','{}')")
+        conn.commit()
+        assert witness.changed() == []
+        with _db(world / "graph.db") as other:
+            other.execute("INSERT INTO graph_nodes VALUES ('Document','doc:foreign','document','{}')")
+        assert witness.changed() == ["graph.db"]
+    finally:
+        witness.close()
+
+
+def _prepared_apply(world: Path, tmp_path: Path) -> tuple[Path, Path, Path]:
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    assert cleanup.dry_run(world, run, TABLE)["eligible"] is True
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    return run, backup, approval
+
+
+def test_apply_refuses_database_with_trigger_before_any_write(world: Path, tmp_path: Path):
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("CREATE TRIGGER t_493 AFTER DELETE ON doc_nodes BEGIN SELECT 1; END")
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    state = _all_db_bytes(world)
+    with pytest.raises(cleanup.CleanupRefusedError, match="has a trigger") as info:
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+    assert info.value.code == cleanup.EXIT_GUARD
+    assert not backup.exists()
+    assert _all_db_bytes(world) == state
+
+
+def test_foreign_trigger_added_between_axes_stops_the_next_write(world: Path, tmp_path: Path, monkeypatch):
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    original = cleanup._delete_vector
+
+    def vector_then_trigger(data_dir, vector_table, record):
+        original(data_dir, vector_table, record)
+        with _db(world / "doc_store.db") as conn:
+            conn.execute("CREATE TRIGGER t_493 AFTER DELETE ON doc_nodes BEGIN SELECT 1; END")
+
+    monkeypatch.setattr(cleanup, "_delete_vector", vector_then_trigger)
+    with pytest.raises(cleanup.CleanupRefusedError, match="has a trigger"):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+    with _db(world / "graph.db") as conn:
+        assert conn.execute("SELECT node_id FROM graph_nodes WHERE node_id='evidence:turn:heartbeat'").fetchall() == [("evidence:turn:heartbeat",)]
+
+
+def test_foreign_fts_row_added_between_axes_rebuilds_index_and_refuses(world: Path, tmp_path: Path, monkeypatch):
+    """위치 색인은 외부 commit이 보이면 다시 만든다. 새 FTS 행은 기존과 같이 거부된다."""
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    original = cleanup._delete_vector
+
+    def vector_then_fts(data_dir, vector_table, record):
+        original(data_dir, vector_table, record)
+        with _db(world / "doc_store.db") as conn:
+            conn.execute("INSERT INTO doc_sources_fts VALUES (?,?)", (record["id"], "late duplicate"))
+
+    monkeypatch.setattr(cleanup, "_delete_vector", vector_then_fts)
+    with pytest.raises(cleanup.CleanupRefusedError):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute("SELECT source_id FROM doc_sources WHERE source_id='evidence:turn:heartbeat'").fetchall() == [("evidence:turn:heartbeat",)]
+
+
+def test_fts_lookup_by_rowid_matches_direct_query_and_delete_checks_text(world: Path, tmp_path: Path):
+    candidate = "evidence:turn:heartbeat"
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("INSERT INTO doc_sources_fts VALUES (?,?)", (candidate, "duplicate row"))
+        direct = conn.execute("SELECT source_id,text FROM doc_sources_fts WHERE source_id=?", (candidate,)).fetchall()
+    readers = cleanup._Readers(world, TABLE, immutable=True, ids={candidate})
+    try:
+        assert readers.fts_rows(candidate) == direct
+        assert len(direct) == 2
+    finally:
+        readers.close()
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("DELETE FROM doc_sources_fts WHERE text='duplicate row'")
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, _manifest = cleanup._load_run(run)
+    record = candidates[0]
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("UPDATE doc_sources_fts SET text='edited' WHERE source_id=?", (candidate,))
+    with pytest.raises(cleanup.CleanupRefusedError, match="FTS CAS conflict"):
+        cleanup._delete_document(world, record)
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute("SELECT text FROM doc_sources_fts WHERE source_id=?", (candidate,)).fetchall() == [("edited",)]
+
+
+def test_candidate_loop_issues_no_full_scan_statements(world: Path, tmp_path: Path, monkeypatch):
+    statements: list[str] = []
+    original_ro, original_rw = cleanup._ro, cleanup._rw
+
+    def traced_ro(path, immutable):
+        conn = original_ro(path, immutable)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    def traced_rw(path):
+        conn = original_rw(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(cleanup, "_ro", traced_ro)
+    monkeypatch.setattr(cleanup, "_rw", traced_rw)
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+    joined = "\n".join(statements)
+    assert statements
+    for scan in ("FROM doc_sources_fts WHERE source_id", "FROM ontology_nodes WHERE node_id", "FROM ontology_edges WHERE from_id", "FROM ontology_edges WHERE relation='supports' AND to_space"):
+        assert scan not in joined, scan
+
+
+def test_candidate_store_rejects_a_line_changed_after_verification(world: Path, tmp_path: Path):
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, _manifest = cleanup._load_run(run)
+    assert [record["id"] for record in candidates] == ["evidence:turn:heartbeat"]
+    path = run / "candidates.jsonl"
+    data = path.read_bytes()
+    assert data.count(b"heartbeat") >= 1
+    path.write_bytes(data.replace(b"heartbeat", b"heartbeaT", 1))
+    with pytest.raises(cleanup.CleanupRefusedError, match="candidate file does not match manifest"):
+        list(candidates)
+
+
+def test_scoped_edge_validation_union_equals_global(world: Path, tmp_path: Path):
+    a, b, c = "evidence:turn:heartbeat", "evidence:turn:sc-b", "evidence:turn:sc-c"
+    _add(world, b, "Q: Read HEARTBEAT.md if it exists sc b")
+    _add(world, c, "Q: Read HEARTBEAT.md if it exists sc c")
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", a, "ab", "Evidence", b, "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", b, "bc", "Evidence", c, "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", c, "out", "Evidence", "evidence:turn:normal", "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", a, "self", "Evidence", a, "{}"))
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, manifest = cleanup._load_run(run)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    receipt = cleanup._load_receipt(run, backup, manifest, candidates, world)
+    conn = cleanup._ro(world / "graph.db", False)
+    try:
+        for validate in (cleanup._validate_component_edges, cleanup._validate_boundary_edges):
+            global_rows = {cleanup._sha(cleanup._canon(edge)) for edge in validate(conn, candidates, receipt, manifest)}
+            scoped_rows = {
+                cleanup._sha(cleanup._canon(edge))
+                for node_id in (a, b, c)
+                for edge in validate(conn, candidates, receipt, manifest, node_id)
+            }
+            assert global_rows == scoped_rows
+            assert global_rows
+    finally:
+        conn.close()
+
+
+def test_evidence_sidecar_is_bound_to_the_manifest(world: Path, tmp_path: Path):
+    """Claim 판정이 쓰는 Evidence 항목은 sidecar 파일에 있고 manifest의 digest가 그 내용을 묶는다."""
+    _registry_claim_setup(world)
+    run = tmp_path / "run"
+    assert cleanup.dry_run(world, run, TABLE)["eligible"] is True
+    descriptor = _load(run / "manifest.json")["protected"]["evidence"]
+    assert descriptor["file"] == "evidence.jsonl" and descriptor["count"] >= 1
+    candidates, manifest = cleanup._load_run(run)
+    try:
+        assert manifest.evidence_store().get("evidence:turn:normal")["graph"]["id"] == "evidence:turn:normal"
+    finally:
+        candidates.close()
+        manifest.close()
+    path = run / "evidence.jsonl"
+    path.write_bytes(path.read_bytes().replace(b"normal", b"normaL", 1))
+    with pytest.raises(cleanup.CleanupRefusedError, match="evidence file does not match manifest"):
+        cleanup._load_run(run)
+
+
+def test_protection_pass_rejects_invalid_properties_json_on_any_graph_row(world: Path, tmp_path: Path):
+    """기존 _protected와 같이 모든 노드와 edge의 properties JSON을 검증한다(후보에 닿는 edge 포함)."""
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_nodes VALUES ('Concept','concept:bad','concept','not-json')")
+    with pytest.raises(cleanup.CleanupRefusedError, match="properties JSON is invalid"):
+        cleanup.dry_run(world, tmp_path / "node-run", TABLE)
+    with _db(world / "graph.db") as conn:
+        conn.execute("DELETE FROM graph_nodes WHERE node_id='concept:bad'")
+        conn.execute("INSERT INTO graph_edges VALUES ('Evidence','evidence:turn:heartbeat','rel','Evidence','evidence:turn:normal','not-json')")
+    with pytest.raises(cleanup.CleanupRefusedError):
+        cleanup.dry_run(world, tmp_path / "edge-run", TABLE)
+
+
+def _two_candidate_world(world: Path) -> str:
+    second = "evidence:turn:second"
+    _add(world, second, "Q: Read HEARTBEAT.md if it exists second")
+    _fix_registry_timestamps(world)
+    return second
+
+
+def test_change_during_backup_invalidates_the_full_snapshot_mark(world: Path, tmp_path: Path, monkeypatch):
+    """첫 snapshot 검사 뒤 백업 도중의 외부 commit은 사전 검사를 다시 돌려 첫 삭제 전에 거부된다."""
+    second = _two_candidate_world(world)
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    original = cleanup._backup_receipt
+
+    def backup_then_change(*args):
+        receipt = original(*args)
+        with _db(world / "opencrab.db") as conn:
+            conn.execute("UPDATE ontology_nodes SET updated_at='changed' WHERE node_id=?", (second,))
+        return receipt
+
+    monkeypatch.setattr(cleanup, "_backup_receipt", backup_then_change)
+    with pytest.raises(cleanup.CleanupRefusedError, match="resume precheck conflict"):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+    with _db(world / "graph.db") as conn:
+        assert {row[0] for row in conn.execute("SELECT node_id FROM graph_nodes WHERE node_id LIKE 'evidence:turn:%'")} >= {"evidence:turn:heartbeat", second}
+
+
+def test_backup_hash_is_recomputed_even_when_file_metadata_is_unchanged(world: Path, tmp_path: Path, monkeypatch):
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    original = cleanup._backup_receipt
+
+    def backup_then_overwrite(*args):
+        receipt = original(*args)
+        target = backup / "vectors.db"
+        stat = target.stat()
+        with target.open("r+b") as handle:
+            handle.seek(stat.st_size - 1)
+            last = handle.read(1)
+            handle.seek(stat.st_size - 1)
+            handle.write(bytes([last[0] ^ 1]))
+        os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        return receipt
+
+    monkeypatch.setattr(cleanup, "_backup_receipt", backup_then_overwrite)
+    with pytest.raises(cleanup.CleanupRefusedError, match="backup receipt mismatch"):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+
+
+def test_scoped_edge_validation_reads_only_the_candidate_edges(world: Path, tmp_path: Path):
+    """scope_id를 주면 그 후보에 닿는 edge만 조회하고 반환한다. 전체 조회로 되돌리면 이 시험이 실패한다."""
+    a, b, c = "evidence:turn:heartbeat", "evidence:turn:sc-b", "evidence:turn:sc-c"
+    _add(world, b, "Q: Read HEARTBEAT.md if it exists sc b")
+    _add(world, c, "Q: Read HEARTBEAT.md if it exists sc c")
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", a, "ab", "Evidence", b, "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", b, "bc", "Evidence", c, "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("Evidence", c, "out", "Evidence", "evidence:turn:normal", "{}"))
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, manifest = cleanup._load_run(run)
+    cleanup._backup_receipt(world, run, backup, manifest, candidates)
+    receipt = cleanup._load_receipt(run, backup, manifest, candidates, world)
+    conn = cleanup._ro(world / "graph.db", False)
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        global_component = cleanup._validate_component_edges(conn, candidates, receipt, manifest)
+        assert {(edge["from_id"], edge["to_id"]) for edge in global_component} == {(a, b), (b, c)}
+        statements.clear()
+        scoped = cleanup._validate_component_edges(conn, candidates, receipt, manifest, a)
+        assert {(edge["from_id"], edge["to_id"]) for edge in scoped} == {(a, b)}
+        assert statements and all(f"'{a}'" in statement for statement in statements)
+        statements.clear()
+        boundary = cleanup._validate_boundary_edges(conn, candidates, receipt, manifest, c)
+        assert {(edge["from_id"], edge["to_id"]) for edge in boundary} == {(c, "evidence:turn:normal")}
+        assert statements and all(f"'{c}'" in statement for statement in statements)
+    finally:
+        conn.close()
+
+
+def test_verify_protection_does_not_absorb_a_commit_that_lands_during_the_baseline_read(world: Path, tmp_path: Path, monkeypatch):
+    """채택된 기준값과 다른 값이 읽히면 새 기준값으로 흡수하지 않고 거부한다. 읽기 직전에 끼어든 commit을 주입한다."""
+    run = tmp_path / "run"
+    assert cleanup.dry_run(world, run, TABLE)["eligible"] is True
+    candidates, manifest = cleanup._load_run(run)
+    scope = cleanup._RunScope(world, TABLE, candidates, manifest)
+    scope.witness = cleanup._Witness(world)
+    monkeypatch.setattr(cleanup, "_SCOPE", scope)
+    real_snapshot = scope.witness.snapshot
+    injected: list[bool] = []
+
+    def snapshot_after_foreign_commit():
+        if not injected:
+            injected.append(True)
+            with _db(world / "graph.db") as other:
+                other.execute("INSERT INTO graph_nodes VALUES ('Concept','concept:late','concept','{}')")
+        return real_snapshot()
+
+    monkeypatch.setattr(scope.witness, "snapshot", snapshot_after_foreign_commit)
+    try:
+        assert cleanup._verify_protection(world, TABLE, candidates, manifest["protected_sha256"]) is False
+        assert scope.witness.changed() == ["graph.db"]
+    finally:
+        scope.witness.close()
+        candidates.close()
+        manifest.close()
+
+
+def test_trigger_added_before_the_baseline_is_still_refused(world: Path, tmp_path: Path, monkeypatch):
+    """trigger 확인은 기준값을 잡은 뒤 같은 연결로 한다. 기준값 직전에 추가된 trigger도 거부된다."""
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    original_init = cleanup._Witness.__init__
+
+    def init_after_trigger(self, data_dir):
+        with _db(world / "doc_store.db") as conn:
+            conn.execute("CREATE TRIGGER t_493 AFTER DELETE ON doc_nodes BEGIN SELECT 1; END")
+        original_init(self, data_dir)
+
+    monkeypatch.setattr(cleanup._Witness, "__init__", init_after_trigger)
+    with pytest.raises(cleanup.CleanupRefusedError, match="has a trigger"):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+    assert not backup.exists()
+
+
+def test_change_during_the_last_receipt_load_reruns_the_full_precheck_with_a_fresh_index(world: Path, tmp_path: Path, monkeypatch):
+    """마지막 영수증 적재 도중 뒤 후보에 FTS 중복 행이 생기면 위치 색인을 다시 만든 뒤 전량 사전 검사가 첫 삭제 전에 거부한다."""
+    second = _two_candidate_world(world)
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    original = cleanup._load_receipt
+    calls: list[int] = []
+
+    def load_then_change(*args, **kwargs):
+        receipt = original(*args, **kwargs)
+        calls.append(1)
+        if len(calls) == 2:  # 첫 apply에서 사전 검사 바로 앞의 적재
+            with _db(world / "doc_store.db") as conn:
+                conn.execute("INSERT INTO doc_sources_fts VALUES (?,?)", (second, "late duplicate"))
+        return receipt
+
+    monkeypatch.setattr(cleanup, "_load_receipt", load_then_change)
+    with pytest.raises(cleanup.CleanupRefusedError, match="resume precheck conflict"):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+    with _db(world / "doc_store.db") as conn:
+        assert len(conn.execute("SELECT source_id FROM doc_sources WHERE source_id LIKE 'evidence:turn:%'").fetchall()) >= 2
+
+
+def _vector_node_ids(root: Path) -> list[str]:
+    import sqlite_vec
+
+    with _db(root / "vectors.db") as conn:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        return [row[0] for row in conn.execute(f"SELECT node_id FROM {TABLE} ORDER BY node_id")]
+
+
+def test_change_after_the_last_axis_snapshot_is_checked_again(world: Path, tmp_path: Path, monkeypatch):
+    """마지막 축의 snapshot 확인 뒤 축 끝 확인 직전에 끼어든 commit은 같은 축을 다시 검증하게 한다."""
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    original = cleanup._axis_end_check
+    calls: list[int] = []
+
+    def commit_then_end_check(*args):
+        calls.append(1)
+        if len(calls) == 4:  # vector, graph, document, registry 순서의 마지막 축
+            with _db(world / "doc_store.db") as conn:
+                conn.execute("INSERT INTO doc_sources_fts VALUES (?,?)", ("evidence:turn:heartbeat", "late duplicate"))
+        return original(*args)
+
+    monkeypatch.setattr(cleanup, "_axis_end_check", commit_then_end_check)
+    with pytest.raises(cleanup.CleanupRefusedError, match="snapshot conflict"):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+
+
+def test_commit_before_the_axis_snapshot_read_is_seen_by_the_snapshot(world: Path, tmp_path: Path, monkeypatch):
+    """snapshot 읽기 직전의 외부 commit은 색인을 다시 만든 뒤 다시 읽어 첫 삭제 전에 거부된다."""
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    original = cleanup._snapshot_now
+    calls: list[int] = []
+
+    def snapshot_after_commit(*args):
+        calls.append(1)
+        if len(calls) == 2:  # 첫 apply: 전체 snapshot 검사가 1회, 이어서 첫 축의 snapshot
+            with _db(world / "doc_store.db") as conn:
+                conn.execute("INSERT INTO doc_sources_fts VALUES (?,?)", ("evidence:turn:heartbeat", "late duplicate"))
+        return original(*args)
+
+    monkeypatch.setattr(cleanup, "_snapshot_now", snapshot_after_commit)
+    with pytest.raises(cleanup.CleanupRefusedError, match="snapshot conflict before vector"):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+    assert "evidence:turn:heartbeat" in _vector_node_ids(world)
+
+
+def test_commit_right_after_the_precheck_reruns_it_before_the_first_write(world: Path, tmp_path: Path, monkeypatch):
+    second = _two_candidate_world(world)
+    run, backup, approval = _prepared_apply(world, tmp_path)
+    original = cleanup._registry_resume_precheck
+
+    def precheck_then_commit(*args):
+        original(*args)
+        with _db(world / "doc_store.db") as conn:
+            conn.execute("INSERT INTO doc_sources_fts VALUES (?,?)", (second, "late duplicate"))
+
+    monkeypatch.setattr(cleanup, "_registry_resume_precheck", precheck_then_commit)
+    with pytest.raises(cleanup.CleanupRefusedError):
+        cleanup.apply(world, run, TABLE, approval, backup, scan=_no_scan)
+    assert {"evidence:turn:heartbeat", second} <= set(_vector_node_ids(world))
+
+
+def test_scoped_keys_returns_only_the_edges_that_touch_the_candidate():
+    recorded = {
+        "k1": {"from_id": "a", "to_id": "b"},
+        "k2": {"from_id": "b", "to_id": "c"},
+        "k3": {"from_id": "c", "to_id": "c"},
+    }
+    assert cleanup._scoped_keys(recorded, "a") == {"k1"}
+    assert cleanup._scoped_keys(recorded, "b") == {"k1", "k2"}
+    assert cleanup._scoped_keys(recorded, "c") == {"k2", "k3"}
+    assert cleanup._scoped_keys(recorded, "z") == set()
+    scope = cleanup._RunScope(Path("."), TABLE, [], {})
+    previous = cleanup._SCOPE
+    cleanup._SCOPE = scope
+    try:
+        assert cleanup._scoped_keys(recorded, "b") == {"k1", "k2"}
+        assert cleanup._scoped_keys(recorded, "z") == set()
+    finally:
+        cleanup._SCOPE = previous
