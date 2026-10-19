@@ -540,8 +540,8 @@ class _SqlDocStoreBase(abc.ABC):
         applies the same rules to a plain list, and a test pins that both agree.
 
         The length is ``LENGTH(CAST(properties AS TEXT))``: the stored text,
-        which for SQLite is the ASCII-escaped JSON (``dump_props``). Rows that
-        are filtered out are never sent to Python, so a few huge rows cannot
+        which for SQLite is the ASCII-escaped JSON (``dump_props``). The query
+        sends only the rows it keeps to Python, so a few huge rows cannot
         inflate the window's memory.
 
         Window functions need SQLite 3.25 or newer, or PostgreSQL.

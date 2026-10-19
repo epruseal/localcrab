@@ -79,7 +79,10 @@ def _return_freed_memory() -> None:
     global _libc
     try:
         if _libc is None:
-            _libc = ctypes.CDLL("libc.so.6")
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            libc.malloc_trim.restype = ctypes.c_int
+            _libc = libc
         _libc.malloc_trim(0)
     except (OSError, AttributeError):
         pass
@@ -695,6 +698,7 @@ class _Bm25CacheWorker:
             if ds is None:
                 continue
             built = False
+            started: float | None = None
             try:
                 snapshot = self._await_rest()
                 if snapshot is None:
@@ -745,6 +749,13 @@ class _Bm25CacheWorker:
                         self._wake.set()
             except Exception as exc:
                 logger.warning("BM25 background rebuild failed: %s", exc)
+                if started is not None:
+                    # A failed observation or build still counts as work: the
+                    # rest keeps a failing rebuild from repeating during a
+                    # write burst. A first build has no `started` and keeps
+                    # its pre-#506 retry behaviour.
+                    with self._lock:
+                        self._set_rest_locked(started)
             finally:
                 # #506: drop this round's references before the worker sleeps.
                 # The superseded state, a discarded candidate and the node list
@@ -753,6 +764,7 @@ class _Bm25CacheWorker:
                 snapshot = state = candidate = observation = probe = None
                 if built:
                     _return_freed_memory()
+                    logger.debug("BM25 worker round finished")
 
     def join(self, timeout: float | None = None) -> None:
         thread = self.thread

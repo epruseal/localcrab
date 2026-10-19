@@ -11,6 +11,7 @@ BM25 parameters:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections import Counter
@@ -18,7 +19,6 @@ from typing import Any
 
 from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.ontology.text_cues import tokenize as _tokenize
-from opencrab.stores._json import dump_props
 
 logger = logging.getLogger(__name__)
 
@@ -302,13 +302,20 @@ class BM25Index:
 
 
 def node_size(node: dict[str, Any]) -> int:
-    """Stored-JSON length of a node's properties (the window size unit, #506).
+    """Return the stored-JSON length of a node's properties (the #506 window unit).
 
-    ``dump_props`` is what the SQL doc stores write, so this equals the length
-    ``LocalSQLDocStore`` reports for the same row. PostgreSQL JSONB does not
-    escape non-ASCII, so the unit is a per-backend size estimate.
+    The SQL doc stores write ``dump_props`` text, which escapes non-ASCII
+    characters. This function measures the same text. A value that JSON cannot
+    carry, such as the ``datetime`` that MongoDB returns, is measured as its
+    ``str``. A size that cannot be measured at all falls back to ``repr``, so
+    sizing never fails an index build. PostgreSQL JSONB does not escape
+    non-ASCII, so the unit is a per-backend estimate.
     """
-    return len(dump_props(node.get("properties") or {}))
+    props = node.get("properties") or {}
+    try:
+        return len(json.dumps(props, ensure_ascii=True, default=str))
+    except (TypeError, ValueError):
+        return len(repr(props))
 
 
 def trim_to_budget(
@@ -319,14 +326,15 @@ def trim_to_budget(
 ) -> list[dict[str, Any]]:
     """Apply the #506 window rules to an already limited, ordered node list.
 
-    1. A node longer than ``max_node_chars`` is dropped. The gap is not refilled.
-    2. The remaining nodes are taken in order while the length of the nodes
-       before them stays below ``max_chars``. The node that reaches the budget
-       is the last one admitted only if it started below the budget, so the
-       total can exceed the budget by at most one node.
+    1. The function drops a node longer than ``max_node_chars``. It does not
+       refill the gap.
+    2. The function takes the remaining nodes in order while the length of the
+       nodes before them stays below ``max_chars``. A node that starts below
+       the budget is admitted, so the total can exceed the budget by at most
+       one node.
 
-    ``None`` disables a rule. ``LocalSQLDocStore.list_nodes_within_budget``
-    implements the same rules in SQL, and a test pins that the two agree.
+    ``None`` turns a rule off. ``LocalSQLDocStore.list_nodes_within_budget``
+    applies the same rules in SQL, and a test pins that the two agree.
     """
     kept: list[dict[str, Any]] = []
     total = 0

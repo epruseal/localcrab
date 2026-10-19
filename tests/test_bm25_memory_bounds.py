@@ -8,16 +8,20 @@ during a write burst, and the shared window contract of the two budget paths.
 
 from __future__ import annotations
 
+import datetime
 import gc
+import math
 import threading
 import time
 import weakref
+from collections import Counter
 from unittest.mock import MagicMock
 
 import pytest
 
-from opencrab.ontology.bm25 import BM25Index, node_size, trim_to_budget
+from opencrab.ontology.bm25 import _B, _K1, BM25Index, _node_text, node_size, trim_to_budget
 from opencrab.ontology.query import HybridQuery
+from opencrab.ontology.text_cues import tokenize
 from opencrab.stores._json import dump_props
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
@@ -69,6 +73,7 @@ class _TimedStore:
         self.delay = delay
         self.builds: list[list[float | None]] = []
         self.hook = None
+        self.fail_at: set[int] = set()
 
     def write(self) -> None:
         self.version += 1
@@ -85,6 +90,8 @@ class _TimedStore:
             self.hook(idx)
         time.sleep(self.delay)
         self.builds[idx][1] = time.monotonic()
+        if idx in self.fail_at:
+            raise RuntimeError("injected read failure")
         return snapshot
 
 
@@ -162,14 +169,37 @@ def test_equal_tokens_across_documents_are_one_object() -> None:
     assert first is second
 
 
-def test_token_sharing_does_not_change_scores() -> None:
+def _reference_scores(nodes: list[dict], query: str) -> dict[str, float]:
+    """BM25 from ``tokenize`` and ``_node_text`` only, with no sharing and no index state."""
+    docs = [tokenize(_node_text(n)) for n in nodes]
+    n_docs = len(docs)
+    avgdl = sum(len(d) for d in docs) / max(n_docs, 1)
+    df: Counter[str] = Counter()
+    for toks in docs:
+        for term in set(toks):
+            df[term] += 1
+    out: dict[str, float] = {}
+    for node, toks in zip(nodes, docs, strict=True):
+        tf_map = Counter(toks)
+        score = 0.0
+        for term in tokenize(query):
+            if term not in df:
+                continue
+            idf = math.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1)
+            tf = tf_map.get(term, 0)
+            score += idf * (tf * (_K1 + 1)) / (tf + _K1 * (1 - _B + _B * len(toks) / max(avgdl, 1)))
+        if score > 0:
+            out[node["node_id"]] = round(score, 4)
+    return out
+
+
+def test_token_sharing_matches_an_independent_reference() -> None:
     nodes = [_node(str(i), text=f"common term{i % 3} " + "w" * (i % 4)) for i in range(12)]
-    shared = BM25Index.build(nodes)
-    unshared = BM25Index.build(nodes)
-    unshared._tokens = [["".join(list(t)) for t in toks] for toks in unshared._tokens]
-    assert shared.search("common term1", pack_ids=["A"], limit=12) == unshared.search(
-        "common term1", pack_ids=["A"], limit=12
-    )
+    index = BM25Index.build(nodes)
+    hits = index.search("common term1", pack_ids=["A"], limit=12)
+    got = {h["node_id"]: h["score"] for h in hits}
+    assert got == _reference_scores(nodes, "common term1")
+    assert got  # the reference found hits, so the comparison is not vacuous
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +223,29 @@ def _sized(node_id: str, chars: int) -> dict:
 def test_node_size_uses_the_stored_json_length() -> None:
     node = {"properties": {"text": "한글"}}
     assert node_size(node) == len(dump_props({"text": "한글"}))
+
+
+def test_node_size_survives_values_json_cannot_carry() -> None:
+    stamp = datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.UTC)
+    # JSON cannot carry a datetime: the size is that of its str form, not the repr fallback
+    assert node_size({"properties": {"at": stamp}}) == len(dump_props({"at": str(stamp)}))
+    assert node_size({"properties": {"x": float("nan")}}) > 0
+    loop: dict = {}
+    loop["self"] = loop
+    assert node_size({"properties": loop}) > 0
+
+
+def test_legacy_build_survives_a_datetime_property(monkeypatch) -> None:
+    stamp = datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.UTC)
+    node = _node("dt")
+    node["properties"]["created"] = stamp
+    store = _LegacyStore([node])
+    hybrid = _hybrid(store)
+    try:
+        hybrid._bm25.ensure_built(store)
+        assert hybrid._bm25.state.indexed_rows == 1
+    finally:
+        hybrid.shutdown_bm25()
 
 
 def test_trim_drops_oversize_nodes_without_refilling() -> None:
@@ -426,17 +479,118 @@ def test_mark_stale_does_not_move_the_rest_deadline() -> None:
         hybrid.shutdown_bm25()
 
 
-def test_shutdown_interrupts_the_rest() -> None:
+class _RecordingLock:
+    """Wraps a lock and records the thread that tries to take it (see test_bm25_cold_build_race)."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.attempts: list[int] = []
+
+    def acquire(self, *args, **kwargs):
+        self.attempts.append(threading.get_ident())
+        return self._inner.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._inner.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def test_rest_holds_when_the_search_thread_publishes_while_the_worker_waits_on_the_cold_lock() -> None:
+    store = _TimedStore()
+    hybrid = _hybrid(store)
+    worker = hybrid._bm25
+    lock = _RecordingLock(worker._cold_build_lock)
+    worker._cold_build_lock = lock  # type: ignore[assignment]
+    me = threading.get_ident()
+    try:
+        lock.acquire()  # this thread plays the search thread that is building
+        hybrid.invalidate_bm25_cache()  # the worker wakes and blocks in ensure_built
+        assert _wait_until(lambda: any(t != me for t in lock.attempts)), (
+            "the worker never reached the cold-build lock"
+        )
+        observation = worker._observe(store)  # the search thread's build (builds[0])
+        candidate = worker._make_state(observation)
+        store.write()
+        hybrid.invalidate_bm25_cache()  # a write lands during that build
+        deadline = time.monotonic() + 0.4
+        with worker._lock:
+            worker.state = candidate
+            worker.dirty = False
+            worker._next_build_at = deadline
+        lock.release()
+        assert _wait_until(lambda: len(store.builds) >= 2, timeout=5)
+        assert store.builds[1][0] >= deadline - 0.02
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_rest_follows_a_failed_background_rebuild() -> None:
     store = _TimedStore(delay=_DELAY)
     hybrid = _hybrid(store)
     worker = hybrid._bm25
+    store.fail_at = {1}
+    try:
+        worker.ensure_built(store)  # build 0 publishes a state
+        store.write()
+        hybrid.invalidate_bm25_cache()  # build 1 raises after the delay
+        assert _wait_until(lambda: len(store.builds) >= 2 and store.builds[1][1] is not None)
+        failed_at = store.builds[1][1]
+        assert _wait_until(lambda: worker._next_build_at > failed_at)
+        store.write()
+        hybrid.invalidate_bm25_cache()  # a later write wakes the worker again
+        assert _wait_until(lambda: len(store.builds) >= 3, timeout=5)
+        assert store.builds[2][0] - failed_at >= _REST - _TOL
+    finally:
+        hybrid.shutdown_bm25()
+
+
+def test_shutdown_interrupts_a_long_rest() -> None:
+    store = _TimedStore()
+    hybrid = _hybrid(store)
+    worker = hybrid._bm25
     worker.ensure_built(store)
+    with worker._lock:
+        worker._next_build_at = time.monotonic() + 60
     store.write()
     hybrid.invalidate_bm25_cache()
-    time.sleep(0.05)  # the worker is now resting
+    assert _wait_until(lambda: not worker._wake.is_set())  # the worker took the wake and rests
     started = time.monotonic()
-    hybrid.shutdown_bm25(timeout=2.0)
-    assert time.monotonic() - started < 1.0
-    thread = worker.thread
-    assert thread is None or not thread.is_alive()
-    assert threading.active_count() >= 1
+    hybrid.shutdown_bm25(timeout=5.0)
+    assert time.monotonic() - started < 2.0
+    assert worker.thread is None or not worker.thread.is_alive()
+
+
+def test_round_finished_line_follows_the_release_and_the_memory_return(monkeypatch, caplog) -> None:
+    import logging
+
+    from opencrab.ontology import query as query_module
+
+    log = logging.getLogger("opencrab.ontology.query")
+    monkeypatch.setattr(query_module, "_return_freed_memory", lambda: log.debug("TRIM"))
+    store = _TimedStore()
+    hybrid = _hybrid(store)
+    worker = hybrid._bm25
+    try:
+        worker.ensure_built(store)
+        first = weakref.ref(worker.state.index)
+        generation = worker.state.generation
+        store.write()
+        with caplog.at_level(logging.DEBUG, logger="opencrab.ontology.query"):
+            hybrid.invalidate_bm25_cache()
+            assert _wait_until(
+                lambda: any(m == "BM25 worker round finished" for m in caplog.messages)
+            )
+        assert worker.state.generation > generation
+        messages = [m for m in caplog.messages if m in ("TRIM", "BM25 worker round finished")]
+        assert messages == ["TRIM", "BM25 worker round finished"]
+        # the superseded index is already gone when the line appears
+        gc.collect()
+        assert first() is None
+    finally:
+        hybrid.shutdown_bm25()
