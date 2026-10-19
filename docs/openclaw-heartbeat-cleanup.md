@@ -67,6 +67,18 @@ python scripts/cleanup_openclaw_heartbeat_493.py \
 
 `Claim`은 승인 후보 전체를 뺀 뒤에도 graph와 registry 각각에서 실제 비후보 `evidence|Evidence` support가 남아야 한다. 도구는 frozen과 현재 source metadata, graph metadata의 `pack_id=openclaw`을 다시 확인하고, frozen과 현재 registry Evidence raw identity도 대조한다. `claim|Claim` target만 affected Claim이다. 남는 근거가 없는 affected Claim이 하나라도 있으면 apply 전체를 거부한다. 후보와 무관하게 원래 support가 없는 Claim과 다른 space의 `Claim` target은 이 검사를 적용하지 않는다. 비후보 Evidence, Document, Claim과 비후보 edge의 digest가 바뀌면 중단한다.
 
+## 보호 집합 표현과 확인 시점
+
+manifest의 `protected`는 비후보 행 전체가 아니라 섹션별 (행 수, 순서 무관 합 해시)를 담는다. 섹션은 `nodes`(Document, Claim 그래프 노드), `evidence_graph`와 `evidence_graph_raw`(비후보 Evidence 노드의 정규화 항목과 원문 properties), `edges`(후보에 닿지 않는 그래프 edge), `evidence_doc`, `evidence_source`, `evidence_vector`(비후보 Evidence id의 doc_nodes, doc_sources, vector 행), `registry_nodes`, `registry_edges`이다. 비후보 행 하나가 바뀌거나 추가되거나 사라지면 해당 섹션이 달라져 apply가 쓰기 전에 거부한다. 보호 범위는 기존과 같다. 비Evidence 노드 id의 doc_nodes 행과 비후보 FTS 행은 보호 범위 밖이다. 합 해시는 사고와 비적대적 편집을 검출하는 용도이며 적대적 충돌에는 약하다.
+
+`protected`의 `nodes`(Claim 항목), `evidence`(영향 Claim을 지지하는 비후보 Evidence 항목), `registry_nodes`(claim 공간 Claim), `evidence_ids`(동결한 비후보 Evidence id)는 Claim 판정과 인라인 검사의 입력이다. `evidence`는 manifest 본문이 아니라 run directory의 `evidence.jsonl`에 줄 단위로 두고 manifest에는 파일 이름, 항목 수, 전체 sha256만 적는다. apply는 줄마다 길이와 sha256을 고정해 다시 읽을 때 대조한다. 후보 레코드도 `candidates.jsonl`에서 같은 방식으로 읽는다.
+
+apply는 네 DB마다 쓰기 연결을 유지하고 그 연결의 `PRAGMA data_version`으로 이 도구 밖의 commit을 감시한다. 가정: 네 DB에 쓰는 다른 주체는 SQLite 연결이다. 파일을 통째로 교체하면 감시가 보지 못한다. 변화가 없으면 후보 밖 상태가 상수이므로 후보 전체 대상 검사(보호 대조, Claim support, registry 보호 대조)는 첫 후보에서만 실행하고 결과를 재사용한다. 각 쓰기 트랜잭션은 `BEGIN IMMEDIATE` 직후 네 DB의 값을 다시 확인한다. 변화가 보이면 rollback하고, trigger를 다시 확인하고, 후보 전체 R/D/S를 확인하고, 위치 색인(FTS rowid와 registry 행 id)을 다시 만든 뒤 트랜잭션을 다시 시작한다. 전체 보호 digest 대조는 변화가 보인 축의 끝과 모든 후보 처리 뒤에 실행한다. apply는 DB에 trigger가 있으면 쓰기 전에 거부한다.
+
+FTS 조회와 삭제는 `rowid`로 한다. 삭제는 같은 트랜잭션에서 읽은 `source_id`와 `text`를 조건에 다시 넣고 rowcount를 확인한다. vector 신원은 vec0 PK 열 `node_id`이다. metadata에 `node_id` 키가 있으면 후보 id와 같아야 하고 없으면 PK로 대신한다.
+
+재현 명령: 성능과 메모리는 `docs/gate-recipes.md`의 격리 규칙 아래에서 후보 부분집합으로 재고, 보호 집합 경로는 읽기 전용 사본에 `_protection_sections`를 한 번 실행해 최대 RSS를 잰다. 시험은 `tests/test_cleanup_openclaw_heartbeat_493.py`의 `test_protected_row_change_is_refused_before_any_write`, `test_candidate_loop_issues_no_full_scan_statements`가 이 성질을 지킨다.
+
 ## Apply 뒤 대사
 
 서비스를 시작하기 전에 네 primary 축의 후보 ID가 전부 제거됐는지 확인한다. 보호 집합과 정상 대화 보존 집합도 전량 확인한다. registry 잔존은 검색 결과 제거와 재적재 방지의 증거가 아니다. registry가 입력이 아님을 별도로 재확인한다.
