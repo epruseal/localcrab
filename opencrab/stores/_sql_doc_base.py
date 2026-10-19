@@ -523,6 +523,46 @@ class _SqlDocStoreBase(abc.ABC):
         rows = self._fetch_all(sql, params)
         return [self._row_to_node(r) for r in rows]
 
+    def list_nodes_within_budget(
+        self,
+        limit: int,
+        max_chars: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """``list_nodes`` cut by the issue #506 budget loop.
+
+        The rows are the ``list_nodes`` rows, in the same order. A row is kept
+        when the sum of ``COALESCE(LENGTH(CAST(properties AS TEXT)), 0)`` over
+        the rows before it is below ``max_chars``. ``None`` keeps all ``limit``
+        rows. ``opencrab.ontology.bm25.trim_to_budget`` runs the same loop on a
+        plain list, and a test pins that both agree.
+
+        Window functions need SQLite 3.25 or newer, or PostgreSQL.
+        """
+        self._require_available()
+        if limit <= 0:
+            return []
+        table = self._table("doc_nodes")
+        params: dict[str, Any] = {"lim": limit}
+        budget_filter = ""
+        if max_chars is not None:
+            budget_filter = "WHERE running - plen < :budget"
+            params["budget"] = max_chars
+        sql = (
+            "SELECT space, node_id, node_type, properties, updated_at FROM ("
+            " SELECT space, node_id, node_type, properties, updated_at, plen,"
+            "  SUM(plen) OVER (ORDER BY updated_at DESC, space, node_id"
+            "   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running"
+            "  FROM ("
+            "   SELECT space, node_id, node_type, properties, updated_at,"
+            "    COALESCE(LENGTH(CAST(properties AS TEXT)), 0) AS plen"
+            f"   FROM {table} ORDER BY updated_at DESC, space, node_id LIMIT :lim"
+            "  ) AS win"
+            f") AS sized {budget_filter}"
+            " ORDER BY updated_at DESC, space, node_id"
+        )
+        rows = self._fetch_all(sql, params)
+        return [self._row_to_node(r) for r in rows]
+
     def list_nodes_scoped(
         self, pack_ids: list[str], space: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:

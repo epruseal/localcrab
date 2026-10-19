@@ -11,6 +11,7 @@ BM25 parameters:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections import Counter
@@ -131,6 +132,8 @@ class BM25Index:
         cls,
         nodes: list[dict[str, Any]],
         fingerprint: tuple[int, str] | None = None,
+        *,
+        max_text_chars: int | None = None,
     ) -> BM25Index:
         """
         Build a BM25 index from a list of node dicts.
@@ -147,10 +150,27 @@ class BM25Index:
         and every query would schedule a rebuild forever. Defaults to
         ``compute_fingerprint(nodes)`` for callers with no store probe (e.g.
         tests, or one-off CLI builds from an already-fetched node list).
+
+        max_text_chars: when set, only the first ``max_text_chars`` characters
+        of each node's ``_node_text`` are tokenised (#506). The index keeps
+        every node object as given, so a hit returns the full ``text`` and
+        ``properties``. Which nodes match and their scores follow the tokenised
+        part.
         """
         idx = cls()
         idx._docs = nodes
-        idx._tokens = [_tokenize(_node_text(n)) for n in nodes]
+        # #506: one str object per distinct token. A per-document tokenize()
+        # result holds a fresh str for every occurrence, which made the token
+        # lists most of the index's memory. Sharing leaves scores unchanged.
+        vocab: dict[str, str] = {}
+        idx._tokens = [
+            [
+                vocab.setdefault(tok, tok)
+                for tok in _tokenize(_node_text(n)[:max_text_chars])
+            ]
+            for n in nodes
+        ]
+        del vocab
         for pos, node in enumerate(nodes):
             pid = scope_pack_id(node)
             if pid is not None:
@@ -290,6 +310,45 @@ class BM25Index:
 
     def __len__(self) -> int:
         return len(self._docs)
+
+
+def node_size(node: dict[str, Any]) -> int:
+    """Return the stored-JSON length of a node's properties (the #506 window unit).
+
+    The SQL doc stores write ``dump_props`` text, which escapes non-ASCII
+    characters. This function measures the same text. A value that JSON cannot
+    carry, such as the ``datetime`` that MongoDB returns, counts as its
+    ``str``. A size that cannot be measured at all falls back to ``repr``, so
+    sizing never fails an index build. PostgreSQL JSONB does not escape
+    non-ASCII, so the unit is a per-backend estimate.
+    """
+    props = node.get("properties") or {}
+    try:
+        return len(json.dumps(props, ensure_ascii=True, default=str))
+    except (TypeError, ValueError):
+        return len(repr(props))
+
+
+def trim_to_budget(
+    nodes: list[dict[str, Any]],
+    *,
+    max_chars: int | None,
+) -> list[dict[str, Any]]:
+    """Return the nodes the #506 budget loop keeps, in the order given.
+
+    The loop keeps a node when the sum of ``node_size`` over the nodes kept
+    before it is below ``max_chars``. ``None`` keeps every node.
+    ``LocalSQLDocStore.list_nodes_within_budget`` runs the same loop in SQL, and
+    a test pins that the two agree.
+    """
+    kept: list[dict[str, Any]] = []
+    total = 0
+    for node in nodes:
+        if max_chars is not None and total >= max_chars:
+            break
+        kept.append(node)
+        total += node_size(node)
+    return kept
 
 
 def compute_fingerprint(nodes: list[dict[str, Any]]) -> tuple[int, str]:

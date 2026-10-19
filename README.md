@@ -372,6 +372,8 @@ python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --verify
 | `ANTHROPIC_API_KEY` | _(없음)_ | `opencrab extract`의 `--api-key` 미지정 시 폴백(Claude 모델 호출용) |
 | `OPENCRAB_BM25_NODE_LIMIT` | `50000` | BM25 인덱스가 doc 스토어에서 로드하는 노드 상한(인덱스 빌드 시간·메모리 제한). 상세: [ARCHITECTURE.md §6](./docs/ARCHITECTURE.md) |
 | `OPENCRAB_BM25_DEBOUNCE` | `1.5` | BM25 백그라운드 재빌드 디바운스(초) — 연속 ingest를 1회 재빌드로 합침. 상세: [ARCHITECTURE.md](./docs/ARCHITECTURE.md) |
+| `OPENCRAB_BM25_MAX_NODE_CHARS` | `65536` | BM25가 노드마다 토큰화하는 평문(`_node_text`)의 앞 글자 수. 노드는 색인에서 빠지지 않고 뒷부분 단어만 BM25로 찾지 못한다(0 이하이면 자르지 않는다). 상세: [issue-506-bm25-memory.md](./docs/issue-506-bm25-memory.md) |
+| `OPENCRAB_BM25_CHAR_BUDGET` | `200_000_000` | BM25 창을 최신 노드부터 채울 때, 담은 노드의 `properties` 저장 길이 합이 이 값 이상이 되면 멈춘다(0 이하이면 끈다). 상세: [issue-506-bm25-memory.md](./docs/issue-506-bm25-memory.md) |
 | `OPENCRAB_AUTO_PACK_MIN_SCORE` | `10.0` | 자동 팩 선택(키워드 기반 결정적 스코어링)에서 top-1 후보를 채택하는 최소 점수. 미달 시 팩 필터 없이 조회 |
 
 ---

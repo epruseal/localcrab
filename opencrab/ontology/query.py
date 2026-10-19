@@ -14,9 +14,11 @@ Query pipeline:
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,6 +42,50 @@ _EDGE_WEIGHTS: dict[str, float] = {
 }
 _DEFAULT_EDGE_SCORE: float = 0.5
 _BM25_NODE_LIMIT = int(os.getenv("OPENCRAB_BM25_NODE_LIMIT", "50000"))
+
+# #506: OPENCRAB_BM25_CHAR_BUDGET ends the window once the running stored length
+# of the kept nodes reaches it. OPENCRAB_BM25_MAX_NODE_CHARS cuts the text that
+# is tokenised for each node. A value of 0 or less turns the rule off. Both are
+# read per build (docs/issue-506-bm25-memory.md).
+_BM25_MAX_NODE_CHARS_DEFAULT = 65536
+_BM25_CHAR_BUDGET_DEFAULT = 200_000_000
+
+# #506: after a build the worker waits this many times the build's duration
+# before the next one, so a write burst cannot keep it rebuilding back to back.
+_BM25_REST_FACTOR = 2.0
+
+
+def _bm25_window_limits() -> tuple[int | None, int | None]:
+    """Return ``(char_budget, max_text_chars)``; ``None`` means the rule is off."""
+    budget = int(
+        os.getenv("OPENCRAB_BM25_CHAR_BUDGET", str(_BM25_CHAR_BUDGET_DEFAULT))
+    )
+    max_node = int(
+        os.getenv("OPENCRAB_BM25_MAX_NODE_CHARS", str(_BM25_MAX_NODE_CHARS_DEFAULT))
+    )
+    return (budget if budget > 0 else None, max_node if max_node > 0 else None)
+
+
+_libc: Any = None
+
+
+def _return_freed_memory() -> None:
+    """Ask glibc to give freed heap pages back to the OS (#506).
+
+    A rebuild frees the superseded index, but glibc keeps the pages in its
+    arenas and the resident size stays at the rebuild's peak. This call only
+    returns memory that is already free. It is a no-op without ``malloc_trim``.
+    """
+    global _libc
+    try:
+        if _libc is None:
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            libc.malloc_trim.restype = ctypes.c_int
+            _libc = libc
+        _libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 # Lazily imported Phase 4 modules to avoid circular deps at module load
 _BM25Index: Any = None
@@ -157,6 +203,7 @@ class Observation:
     nodes: list[dict[str, Any]]
     covered_pack_ids: frozenset[str]
     indexed_rows: int
+    max_text_chars: int | None = None
 
 
 @dataclass(frozen=True)
@@ -394,6 +441,9 @@ class _Bm25CacheWorker:
         self._generation = 0
         self.thread: threading.Thread | None = None
         self._cold_build_lock = threading.Lock()
+        # #506: monotonic time before which the loop starts no further build.
+        # Written and read under ``_lock`` together with ``state``.
+        self._next_build_at = 0.0
 
     @property
     def cache(self) -> Any:
@@ -443,16 +493,23 @@ class _Bm25CacheWorker:
         doc_store: Any,
         probe: ProbeResult | None = None,
     ) -> Observation:
-        """Read a native probe first, or read legacy nodes exactly once."""
+        """Read a native probe first, or read legacy nodes exactly once.
+
+        The nodes handed to the index follow the #506 window rules. A legacy
+        fingerprint is computed from the list before the rules cut it, so it
+        stays equal to ``HybridQuery._bm25_probe_fingerprint``.
+        """
+        max_chars, max_text_chars = _bm25_window_limits()
         if probe is None:
             probe = self._native_probe(doc_store)
         if probe is None:
-            nodes = doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
+            listed = doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
             from opencrab.ontology.bm25 import compute_fingerprint
-            marker = compute_fingerprint(nodes)
+            marker = compute_fingerprint(listed)
             probe = ProbeResult(marker, None, False)
+            nodes = self._cut_window(listed, max_chars)
         else:
-            nodes = doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
+            nodes = self._read_window(doc_store, max_chars)
         return Observation(
             probe=probe,
             nodes=nodes,
@@ -460,11 +517,48 @@ class _Bm25CacheWorker:
                 pack_id for node in nodes if (pack_id := scope_pack_id(node)) is not None
             ),
             indexed_rows=len(nodes),
+            max_text_chars=max_text_chars,
         )
+
+    @staticmethod
+    def _cut_window(
+        nodes: list[dict[str, Any]],
+        max_chars: int | None,
+    ) -> list[dict[str, Any]]:
+        if max_chars is None:
+            return nodes
+        from opencrab.ontology.bm25 import trim_to_budget
+
+        kept = trim_to_budget(nodes, max_chars=max_chars)
+        return nodes if len(kept) == len(nodes) else kept
+
+    def _read_window(
+        self,
+        doc_store: Any,
+        max_chars: int | None,
+    ) -> list[dict[str, Any]]:
+        """Read the window with the store's own budgeted query when it has one."""
+        if max_chars is None:
+            return doc_store.list_nodes(limit=_BM25_NODE_LIMIT)
+        budgeted = getattr(doc_store, "list_nodes_within_budget", None)
+        if budgeted is not None:
+            try:
+                nodes = budgeted(limit=_BM25_NODE_LIMIT, max_chars=max_chars)
+            except Exception as exc:  # noqa: BLE001 -- e.g. SQLite older than 3.25
+                logger.warning(
+                    "BM25 budgeted window query failed, reading the window and "
+                    "cutting it in Python: %s", exc,
+                )
+            else:
+                if isinstance(nodes, list):
+                    return nodes
+        return self._cut_window(doc_store.list_nodes(limit=_BM25_NODE_LIMIT), max_chars)
 
     def _make_state(self, observation: Observation) -> Bm25CacheState:
         index = _get_bm25().build(
-            observation.nodes, fingerprint=observation.probe.fingerprint
+            observation.nodes,
+            fingerprint=observation.probe.fingerprint,
+            max_text_chars=observation.max_text_chars,
         )
         self._generation += 1
         return Bm25CacheState(
@@ -474,6 +568,18 @@ class _Bm25CacheWorker:
             total_rows=observation.probe.total_rows,
             covered_pack_ids=observation.covered_pack_ids,
             generation=self._generation,
+        )
+
+    def _set_rest_locked(self, started: float) -> None:
+        """Set the next-build deadline from one finished observation or build.
+
+        The caller holds ``_lock`` and calls this in the same critical section
+        that publishes or discards the candidate. The loop reads ``state`` and
+        the deadline together, so a published state never shows an old deadline.
+        """
+        now = time.monotonic()
+        self._next_build_at = max(
+            self._next_build_at, now + _BM25_REST_FACTOR * (now - started)
         )
 
     def ensure_built(self, doc_store: Any) -> Any:
@@ -487,11 +593,13 @@ class _Bm25CacheWorker:
                 return state.index
             with self._lock:
                 build_epoch = self._epoch
+            started = time.monotonic()
             observation = self._observe(doc_store)
             candidate = self._make_state(observation)
             with self._lock:
                 self.state = candidate
                 self.dirty = False
+                self._set_rest_locked(started)
                 changed = self._epoch != build_epoch
                 if changed:
                     self._wake.set()
@@ -551,6 +659,26 @@ class _Bm25CacheWorker:
             self.dirty = True
             self._ensure_worker_awake_locked()
 
+    def _await_rest(self) -> tuple[Bm25CacheState | None, int] | None:
+        """Wait out the rest deadline, then snapshot ``(state, epoch)`` (#506).
+
+        ``state``, the deadline and the epoch are read together under
+        ``_lock`` and the wait happens outside it. A search thread's
+        ``ensure_built`` can publish a state and set a new deadline during the
+        wait, so the snapshot is taken again after every wait. A snapshot with
+        no state returns at once: the first build has no index to protect.
+        Returns ``None`` when the worker is told to stop.
+        """
+        while True:
+            with self._lock:
+                state = self.state
+                epoch = self._epoch
+                remaining = self._next_build_at - time.monotonic()
+            if state is None or remaining <= 0:
+                return state, epoch
+            if self._stop.wait(remaining):
+                return None
+
     def _rebuild_loop(self) -> None:
         while not self._stop.is_set():
             self._wake.wait()
@@ -563,14 +691,21 @@ class _Bm25CacheWorker:
             ds = self._doc_store_getter()
             if ds is None:
                 continue
+            built = False
+            failed = False
+            started: float | None = None
             try:
-                if self.state is None:
-                    self.ensure_built(ds)
-                state = self.state
+                snapshot = self._await_rest()
+                if snapshot is None:
+                    break
+                state, build_epoch = snapshot
                 if state is None:
+                    # First build. This round ends here and the next round
+                    # waits out the rest it set, so the first build cannot
+                    # run straight into a second one.
+                    self.ensure_built(ds)
+                    self._wake.set()
                     continue
-                with self._lock:
-                    build_epoch = self._epoch
                 probe = self._native_probe(ds)
                 if probe is not None and (
                     probe.failed or probe.fingerprint == state.probe_fingerprint
@@ -581,9 +716,12 @@ class _Bm25CacheWorker:
                         else:
                             self._wake.set()
                     continue
+                started = time.monotonic()
+                built = True
                 observation = self._observe(ds, probe)
                 if observation.probe.fingerprint == state.probe_fingerprint:
                     with self._lock:
+                        self._set_rest_locked(started)
                         if self._epoch == build_epoch:
                             self.dirty = False
                         else:
@@ -591,6 +729,7 @@ class _Bm25CacheWorker:
                     continue
                 candidate = self._make_state(observation)
                 with self._lock:
+                    self._set_rest_locked(started)
                     if self._epoch == build_epoch:
                         self.state = candidate
                         self.dirty = False
@@ -599,9 +738,30 @@ class _Bm25CacheWorker:
                             candidate.indexed_rows,
                         )
                     else:
+                        logger.debug(
+                            "BM25 rebuild discarded: a write landed during the build"
+                        )
                         self._wake.set()
             except Exception as exc:
+                failed = True
                 logger.warning("BM25 background rebuild failed: %s", exc)
+                if started is not None:
+                    # A failed observation or build still counts as work: the
+                    # rest keeps a failing rebuild from repeating during a
+                    # write burst. A first build has no `started` and keeps
+                    # its pre-#506 retry behaviour.
+                    with self._lock:
+                        self._set_rest_locked(started)
+            finally:
+                # #506: drop this round's references before the worker sleeps.
+                # The superseded state, a discarded candidate and the node list
+                # would otherwise stay alive until the next round reassigns
+                # these names.
+                snapshot = state = candidate = observation = probe = None
+                if built:
+                    _return_freed_memory()
+                    if not failed:
+                        logger.debug("BM25 worker round finished")
 
     def join(self, timeout: float | None = None) -> None:
         thread = self.thread

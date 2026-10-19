@@ -221,6 +221,19 @@ def test_t8_fingerprint_fetched_before_nodes(tmp_path, monkeypatch) -> None:
 
     ds.list_nodes = racy_list_nodes
 
+    # #506: the worker reads its window through ``list_nodes_within_budget``
+    # when the store has it. The same one-shot write lands there, so the order
+    # (fingerprint first) is pinned for that read too.
+    real_budgeted = ds.list_nodes_within_budget
+
+    def racy_budgeted(*args, **kwargs):
+        if not injected["done"]:
+            injected["done"] = True
+            ds.upsert_node_doc("s1", "T", "race", {"name": "alpha", "pack_id": "p1"})
+        return real_budgeted(*args, **kwargs)
+
+    ds.list_nodes_within_budget = racy_budgeted
+
     hybrid = _hybrid(ds)
     try:
         hybrid._bm25_search("alpha", spaces=None, limit=25, pack_ids=["p1"])  # cold build
