@@ -5,7 +5,7 @@
 MCP 도구 `ontology_query`는 결과 항목의 본문(`text`)과 `metadata`, `graph_context`에 든 문자열을 길이 제한 없이 응답에 싣는다. 노드 하나의 본문이 수십만 자이면 `limit=1` 질의의 응답도 같은 크기가 된다. 이 변경은 두 겹을 둔다.
 
 1. 항목 상한. 결과 항목 안의 저장 데이터 문자열 하나가 `QUERY_FIELD_CHAR_LIMIT`을 넘으면 앞부분만 싣고 잘린 자리와 원래 길이를 `truncation`에 싣는다. 전체 본문은 기존 도구 `ontology_get_node`로 얻는다.
-2. 응답 예산. 항목 상한을 적용한 응답의 전송 길이(아래 "응답 예산의 단위")가 `QUERY_RESPONSE_CHAR_BUDGET`을 넘으면 `results`를 순위 뒤쪽부터 덜어 내어 예산 안에 맞추고, 덜어 낸 사실과 수를 새 필드 `results_truncated`와 `omitted_results`에 싣는다. 예산 안에 드는 가장 앞쪽 결과가 한 건도 없을 때만 고정 내용의 오류 응답을 돌려준다. 이 겹은 항목 상한이 덮지 못하는 자리(식별자, 긴 키, 많은 문자열, 많은 결과)를 한 곳에서 막는다.
+2. 응답 예산. 항목 상한을 적용한 응답의 전송 길이(아래 "응답 예산의 단위")가 `QUERY_RESPONSE_CHAR_BUDGET`을 넘으면 `results`를 순위 뒤쪽부터 덜어 내어 예산 안에 맞추고, 덜어 낸 사실과 수를 새 필드 `results_truncated`와 `omitted_results`에 싣는다. 예산 안에 드는 가장 앞쪽 결과가 한 건도 없을 때만 고정 내용의 오류 응답을 돌려준다. 이 겹은 항목 상한이 덮지 못하는 자리(식별자, 긴 키, 많은 문자열, 많은 결과)를 한 곳에서 다룬다.
 
 `total`의 현재 의미는 반환한 결과 수다(`opencrab/mcp/tools/query.py`가 `len(results)`를 싣는다). 덜어 낸 뒤의 `total`은 싣고 있는 `results`의 길이다. 후보 총수가 아니다.
 
