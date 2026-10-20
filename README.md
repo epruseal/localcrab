@@ -231,7 +231,7 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 
 두 가지 임베딩 백엔드를 지원합니다.
 
-**`openai` (기본)**: OpenAI 호환 임베딩 서버(LM Studio, Ollama 등)를 primary로, 로컬 GGUF를 fallback으로 쓰는 `ResilientEmbeddingFunction` 구조입니다. KURE-v1(한국어 특화, 1024d)이 기본 모델입니다. GGUF 폴백은 KURE-v1-Q8_0(약 635MB, 품질 우선)을 자동 다운로드하며, 외부 서버 없이도 완전 로컬로 동작할 수 있습니다(`pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요). 저사양 환경은 `LOCAL_GGUF_PATH`로 Q4_K_M(438MB) 등 다른 양자화를 지정할 수 있습니다. 폴백이 적재한 모델은 마지막 사용 뒤 일정 시간(생성자 인자 `idle_unload_seconds`, 기본 120초)이 지나면 내려놓고 메모리를 운영체제에 돌려줍니다. 다음 폴백 호출이 모델을 다시 올립니다(설계: `docs/issue-508-gguf-fallback-release.md`).
+**`openai` (기본)**: OpenAI 호환 임베딩 서버(LM Studio, Ollama 등)를 primary로, 로컬 GGUF를 fallback으로 쓰는 `ResilientEmbeddingFunction` 구조입니다. KURE-v1(한국어 특화, 1024d)이 기본 모델입니다. GGUF 폴백은 KURE-v1-Q8_0(약 635MB, 품질 우선)을 자동 다운로드하며, 외부 서버 없이도 완전 로컬로 동작할 수 있습니다(`pip install "opencrab[gguf]"`로 `llama-cpp-python` 설치 필요). 저사양 환경은 `LOCAL_GGUF_PATH`로 Q4_K_M(438MB) 등 다른 양자화를 지정할 수 있습니다. 폴백이 적재한 모델은 마지막 사용 뒤 일정 시간(생성자 인자 `idle_unload_seconds`, 기본 120초)이 지나면 내려놓습니다(`Llama.close()` 뒤에 glibc에서는 `malloc_trim`으로 힙 반환을 시도합니다). 다음 폴백 호출이 모델을 다시 올립니다(설계: `docs/issue-508-gguf-fallback-release.md`).
 
 **`local` (롤백 옵션)**: ChromaDB 기본 EF, all-MiniLM-L6-v2 ONNX, 384d. 설정 없이 바로 동작하지만 한국어 검색 품질이 낮습니다.
 

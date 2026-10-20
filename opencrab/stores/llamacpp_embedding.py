@@ -62,8 +62,8 @@ class LlamaCppEmbeddingFunction:
         최대 컨텍스트 길이. 512 는 localcrab 청크 크기 대비 충분.
         KURE 원본 max 8192 지만 폴백 검색은 짧은 쿼리가 대부분이라 절약.
     idle_unload_seconds : float
-        마지막 사용 뒤 이 시간(초)이 지나면 모델을 내려놓고 메모리를 운영체제에
-        돌려준다(#508). 다음 호출이 모델을 다시 올린다. 0 이하이면 해제하지
+        마지막 사용 뒤 이 시간(초)이 지나면 모델을 내려놓는다(``Llama.close()``
+        뒤 ``malloc_trim`` 으로 힙 반환을 시도한다, #508). 다음 호출이 모델을 다시 올린다. 0 이하이면 해제하지
         않는다(프로세스 수명 동안 상주, 종전 동작). 설계: docs/issue-508-gguf-fallback-release.md
     clock : Callable[[], float]
         유휴 시간 판정에 쓰는 단조 시계. 시험이 대체한다.

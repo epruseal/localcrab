@@ -74,6 +74,10 @@ class _Model:
                 self.world.used_after_close += 1
         if self.world.on_embed is not None:
             self.world.on_embed(text)
+        with self.world.guard:
+            # A close that lands while the call is inside the model also counts.
+            if self.closed:
+                self.world.used_after_close += 1
         return {"data": [{"embedding": [float(len(text)), 1.0, 2.0]}]}
 
     def close(self) -> None:
@@ -363,30 +367,52 @@ def test_concurrent_calls_and_releases_never_overlap(env) -> None:
     clock = _AlwaysDue()
     emb = env.make()
     emb._clock = clock
+    # Yield the interpreter inside every embedding so that releases land both
+    # between calls and while a call holds its lease.
+    env.world.on_embed = lambda text: time.sleep(0)
     stop = threading.Event()
     results: list = []
+    attempts = {"n": 0}
 
     def caller() -> None:
-        for _ in range(150):
+        while not stop.is_set():
             results.append(emb(["xyz"]))
+            time.sleep(0)
 
     def releaser() -> None:
         while not stop.is_set():
             emb.release_if_idle()
+            attempts["n"] += 1
+            time.sleep(0)
 
-    callers = [_start(caller, f"caller-{i}") for i in range(4)]
-    rel = _start(releaser, "releaser")
-    for thread in callers:
-        assert "error" not in _join(thread)
-    stop.set()
-    assert "error" not in _join(rel)
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-5)
+    try:
+        callers = [_start(caller, f"caller-{i}") for i in range(4)]
+        rel = _start(releaser, "releaser")
+        # Termination condition of the harness: enough calls AND enough real
+        # releases happened while the callers were running. The verdict is the
+        # invariants below, not this wait.
+        deadline = time.monotonic() + _WAIT
+        while len(results) < 600 or emb.release_count < 20:
+            assert time.monotonic() < deadline, (
+                f"not enough overlap: calls={len(results)} releases={emb.release_count}"
+            )
+            time.sleep(0.005)
+        stop.set()
+        for thread in callers:
+            assert "error" not in _join(thread)
+        assert "error" not in _join(rel)
+    finally:
+        stop.set()
+        sys.setswitchinterval(old_interval)
 
-    assert len(results) == 600
+    assert attempts["n"] >= emb.release_count >= 20
     assert all(r == results[0] for r in results)
     assert env.world.used_after_close == 0
     assert env.world.max_open == 1
     assert emb._inflight == 0
-    assert emb.load_count >= 1
+    assert emb.load_count == emb.release_count + (1 if emb.loaded else 0)
 
 
 # ---------------------------------------------------------------------------
