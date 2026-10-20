@@ -194,6 +194,15 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 
 [^media]: easyocr/torch는 기본 pip extra에 포함되지 않습니다. 별도 설치 필요: `pip install -r requirements/localcrab-media.txt`.
 
+### 라이브 백업 (서비스를 멈추지 않는 백업)
+
+```bash
+python -m opencrab.stores.backup --to <백업경로>             # 서비스 실행 중에 세트 생성
+python -m opencrab.stores.backup --verify <백업경로>/backup.<세트 식별자>   # 쓰기 없이 검증
+```
+
+서비스 중지와 재기동이 필요 없다. 읽기는 막히지 않고 쓰기는 파일을 고정하는 짧은 구간만 기다린다. 다른 저장소나 다른 장치의 작업이 도는 중에도 같은 명령을 쓴다. 파일 사이 정렬 보장의 범위(`write.lock`을 지키는 쓰기 주체에 한함), 복원 절차(복원은 서비스를 멈추고 한다), 부하 제한 예시는 [docs/live-backup.md](./docs/live-backup.md)에 있다.
+
 ---
 
 ## MCP 툴

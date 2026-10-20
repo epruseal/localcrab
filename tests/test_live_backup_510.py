@@ -277,6 +277,77 @@ class TestPinnedSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# T10: a snapshot copy is flushed in steps, not by one fsync at the end
+# ---------------------------------------------------------------------------
+
+
+class TestPacedFlush:
+    @staticmethod
+    def _count_flushes(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+        """Python-level ``os.fsync`` calls made while a pinned copy runs."""
+        seen = {"during_copy": 0}
+        real_fsync = os.fsync
+        real_copy = bk.backup_sqlite
+        inside = {"on": False}
+
+        def fsync(fd: int) -> None:
+            if inside["on"]:
+                seen["during_copy"] += 1
+            real_fsync(fd)
+
+        def copy(src: Path, dst: Path, **kw: Any) -> None:
+            inside["on"] = kw.get("src_conn") is not None
+            try:
+                real_copy(src, dst, **kw)
+            finally:
+                inside["on"] = False
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(bk, "backup_sqlite", copy)
+        return seen
+
+    def test_a_pinned_copy_is_flushed_every_chunk_and_stays_correct(
+        self, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = self._count_flushes(monkeypatch)
+        monkeypatch.setattr(bk, "_COPY_FLUSH_BYTES", 256 * 1024)
+        bk.backup_data_dir(big_live_dir, settings=_Settings(), lock_timeout=5.0)
+        # graph.db alone is several MB: far more than one chunk.
+        assert seen["during_copy"] >= 10, seen
+        assert _count(_set_dir(big_live_dir) / "graph.db") == _count(big_live_dir / "graph.db")
+        bk.verify_backup_set(_set_dir(big_live_dir))
+
+    def test_control_without_pacing_the_copy_makes_no_flush_calls(
+        self, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = self._count_flushes(monkeypatch)
+        monkeypatch.setattr(bk, "_COPY_FLUSH_BYTES", 0)
+        bk.backup_data_dir(big_live_dir, settings=_Settings(), lock_timeout=5.0)
+        assert seen["during_copy"] == 0, seen
+
+    def test_a_failing_flush_aborts_the_run_and_leaves_no_set(
+        self, tmp_path: Path, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        real_copy = bk.backup_sqlite
+
+        def failing_copy(src: Path, dst: Path, **kw: Any) -> None:
+            if kw.get("src_conn") is not None:
+                monkeypatch.setattr(os, "fsync", _raise_io)
+            real_copy(src, dst, **kw)
+
+        def _raise_io(fd: int) -> None:
+            raise OSError("injected flush failure")
+
+        monkeypatch.setattr(bk, "backup_sqlite", failing_copy)
+        monkeypatch.setattr(bk, "_COPY_FLUSH_BYTES", 256 * 1024)
+        with pytest.raises(bk.BackupError):
+            bk.backup_data_dir(big_live_dir, dest, settings=_Settings(), lock_timeout=5.0)
+        assert list(dest.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
 # T2: the lock really is free while the snapshots are copied
 # ---------------------------------------------------------------------------
 
@@ -385,7 +456,7 @@ class TestManifest:
         text = (s / bk.MANIFEST_NAME).read_text(encoding="utf-8")
         assert json.loads(text) == json.loads(json.dumps(out.manifest))
         assert str(tmp_path) not in text
-        assert "/home/" not in text
+        assert str(Path.home()) not in text
         for rel, meta in out.manifest["files"].items():
             f = s / rel
             assert f.stat().st_size == meta["size"]
@@ -597,7 +668,7 @@ def _checkpoint_busy(path: Path) -> int:
     """Commit a new row, then try a TRUNCATE checkpoint. busy=1 means a reader is still pinned."""
     conn = sqlite3.connect(str(path), isolation_level=None, timeout=1)
     try:
-        conn.execute("INSERT INTO t (id, v) VALUES (abs(random() % 1000000000) + 100000, 'post')")
+        conn.execute("INSERT INTO t (id, v) VALUES (abs(random() / 4), 'post')")
         return int(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0])
     finally:
         conn.close()
@@ -624,6 +695,14 @@ class TestConnectionCleanup:
         bk.backup_data_dir(live_dir, settings=_Settings())
         _assert_all_closed(watched)
         _assert_unpinned(live_dir)
+
+    def test_normal_run_logs_no_rollback_warning(
+        self, live_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A rollback-journal file never began a transaction, so there is nothing to warn about."""
+        with caplog.at_level("WARNING", logger=bk.logger.name):
+            bk.backup_data_dir(live_dir, settings=_Settings())
+        assert [r.getMessage() for r in caplog.records if "rollback" in r.getMessage()] == []
 
     def test_failure_while_still_capturing(self, live_dir: Path, watched: _Watched) -> None:
         # vectors.db is processed after graph.db and doc_store.db are pinned.

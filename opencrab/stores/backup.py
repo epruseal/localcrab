@@ -42,7 +42,9 @@ while the files are CAPTURED, not while they are copied:
 2. The lock is released. Each pinned snapshot is copied with the online backup
    API on the connection that holds the transaction, so the copy is a single
    snapshot that concurrent writers cannot restart. The connection is closed
-   as soon as its copy ends.
+   as soon as its copy ends. The copy is flushed to disk every
+   ``_COPY_FLUSH_BYTES`` while it is written: one fsync of a whole large file
+   at the end would stall the service's own commits on the same volume.
 3. Every SQLite copy is verified with ``integrity_check`` and
    ``MANIFEST.json`` records sizes, sha256, how each file was captured and how
    long the lock was held. ``verify_backup_set()`` re-checks a set later
@@ -154,6 +156,10 @@ _SNAPSHOT_OPEN_TIMEOUT = 5.0
 #: a ceiling for a stalled disk; the deadline is checked between steps and
 #: cannot interrupt a single step.
 _MIN_COPY_BYTES_PER_SECOND = 1 << 20
+
+#: A pinned copy is flushed to disk every this many bytes while it is written,
+#: so the service's own commits never wait behind one fsync of the whole file.
+_COPY_FLUSH_BYTES = 32 << 20
 
 #: Free space that must remain on the destination volume (and on the data
 #: volume, while a snapshot connection lets its WAL grow) after the estimated
@@ -363,6 +369,7 @@ def backup_sqlite(
     deadline: float,
     pages: int = 64,
     src_conn: sqlite3.Connection | None = None,
+    flush_every: int = 0,
     _on_step: Callable[[int, int, int], None] | None = None,
 ) -> None:
     """Copy ``src`` to ``dst`` with SQLite's online backup API.
@@ -425,9 +432,22 @@ def backup_sqlite(
             src_conn = sqlite3.connect(_rw_uri(src), uri=True, timeout=0)
         try:
             dst_conn = sqlite3.connect(str(dst))
+            flush_fd = -1
             try:
+                flush_pages = 0
+                if flush_every > 0:
+                    # Paced flush: SQLite would otherwise fsync the whole copy
+                    # in one commit at the end, and that one fsync of a large
+                    # file stalls every other writer on the volume. The caller
+                    # owns the final fsync of the finished file.
+                    dst_conn.execute("PRAGMA synchronous=OFF")
+                    page_size = int(src_conn.execute("PRAGMA page_size").fetchone()[0])
+                    flush_pages = max(1, flush_every // page_size)
+                    flush_fd = os.open(str(dst), os.O_RDONLY)
+                flushed_at = 0
 
                 def progress(status: int, remaining: int, total: int) -> None:
+                    nonlocal flushed_at
                     remaining_budget = deadline - time.monotonic()
                     if remaining_budget <= 0:
                         raise TimeoutError(
@@ -435,6 +455,9 @@ def backup_sqlite(
                         )
                     if on_step is not None:
                         on_step(status, remaining, total)
+                    if flush_pages and total - remaining - flushed_at >= flush_pages:
+                        flushed_at = total - remaining
+                        os.fsync(flush_fd)
                     if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                         # Compute the remaining budget ONCE and only sleep on
                         # a positive value: recomputing here could go negative
@@ -444,6 +467,8 @@ def backup_sqlite(
 
                 src_conn.backup(dst_conn, pages=pages, progress=progress, sleep=0)
             finally:
+                if flush_fd >= 0:
+                    os.close(flush_fd)
                 dst_conn.close()
         finally:
             if owns_src:
@@ -583,7 +608,10 @@ class _SnapshotPins:
         the owner list only after the close succeeded.
         """
         try:
-            conn.execute("ROLLBACK")
+            # A connection that never began a transaction (a non-WAL source
+            # closed right after its journal-mode probe) has nothing to roll back.
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
         except Exception as exc:  # noqa: BLE001 - the close below ends the transaction anyway
             logger.warning("snapshot rollback failed, closing anyway: %s", exc)
         try:
@@ -1460,6 +1488,7 @@ def _finish_jobs(
             job.destination,
             deadline=time.monotonic() + budget,
             src_conn=snapshot.connection,
+            flush_every=_COPY_FLUSH_BYTES,
         )
         pins.close_checked(snapshot.connection)
     for job in jobs:

@@ -166,7 +166,7 @@ VECTOR_BACKEND 명시됨?
 0. **DB 백업** (작업 전 1회)
    - `$LOCAL_DATA_DIR`(기본 `<LOCAL_DATA_DIR>`, 실행 사용자 HOME 파생)를 `~/opencrab-dump/localcrab-backup/<YYYYMMDD-HHMMSS>/`로 스냅샷.
    - 대상: `graph.db`(+`-wal`/`-shm`), `doc_store.db`, `opencrab.db`(+wal/shm), 그리고 사용 중인 벡터 백엔드에 따라 `chroma/` 디렉터리 또는 `vectors.db`(+wal/shm). `write.lock`/`chroma.lock`은 제외.
-   - WAL 일관성: MCP write 유휴 시점에 복사하거나 sqlite `.backup` 명령으로 일관 스냅샷을 권장.
+   - WAL 일관성: 서비스를 멈추지 않고 `python -m opencrab.stores.backup --to <경로>`로 백업한다(라이브 백업, [docs/live-backup.md](./live-backup.md)). 이 명령이 WAL 파일마다 일관 스냅샷을 만들고 `MANIFEST.json`을 남긴다. 파일을 직접 복사하지 않는다.
 1. **회귀 기준선 테스트** (신규 코드 작성 **전**)
    - 기존 경로의 **정상·실패·엣지** 케이스 characterization 테스트를 작성하고 `make test` 통과로 기준선 확보: `dispatch_tool`(미등록 도구 KeyError 등), `_write_lock` 직렬화, `pack_create`/`pack_ingest`, graph/doc/vec 삭제·upsert 경로. 벡터 백엔드는 로컬 기본값(sqlite-vec)과 chroma 양쪽에서 확인.
    - 기존 관례 재사용: `tests/test_service_paths_characterization.py`의 `local_env`/`local_stores`/`builder` 픽스처, `tmp_path`+`monkeypatch.setenv("LOCAL_DATA_DIR")` 격리, `tests/test_store_concurrency.py` 동시성 패턴.
