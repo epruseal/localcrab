@@ -329,8 +329,8 @@ def _daemon_timer(delay: float, fn: Callable[[], None]) -> threading.Timer:
 def _trim_heap() -> None:
     """glibc 가 free 한 아레나 페이지를 운영체제에 돌려주게 한다(best-effort).
 
-    ``Llama.close()`` 만으로는 익명 메모리 일부가 아레나에 남아 RSS 가
-    내려오지 않는다(#508 측정). glibc 가 아닌 libc 에서는 건너뛴다.
+    ``Llama.close()`` 만으로는 익명 메모리 일부가 아레나에 남아 RSS 가 적재
+    전 수준까지 내려오지 않는다(#508 측정). glibc 가 아닌 libc 에서는 건너뛴다.
     """
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
