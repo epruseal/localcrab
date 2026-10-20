@@ -22,8 +22,15 @@ logger = logging.getLogger(__name__)
             "Hybrid vector + BM25 + graph search with RRF reranking. "
             "A string inside a result's text, metadata or graph_context that is longer "
             "than 4000 characters is cut; the result then carries a `truncation` key "
-            "with the cut paths and original lengths, and the full body is read with "
-            "ontology_get_node(node_id). When the response would pass its size budget, "
+            "with the cut paths and original lengths. Identifier places (a result's "
+            "node_id and canonical, graph_context anchor_id, edge_endpoints and edge, "
+            "selected_packs pack_id) and object keys are not cut. "
+            "ontology_get_node(node_id) returns the full body when it finds the graph "
+            "node in the readable scope and the node's properties hold the body. A "
+            "source without a graph node (found=false), a source whose "
+            "metadata.node_id names another node, a node with property_decode_error, "
+            "and the synthesized text of BM25 and plain node vectors can differ from "
+            "the original. When the response would pass its size budget, "
             "results are dropped from the tail: `total` is the number of results "
             "returned, `results_truncated` is true and `omitted_results` is the number "
             "dropped. If not even the first result fits, the response is "
@@ -127,7 +134,15 @@ def ontology_query(
     Response size (#511): a string inside a result's ``text``, ``metadata`` or
     ``graph_context`` (and inside ``selected_packs``) that is longer than
     ``QUERY_FIELD_CHAR_LIMIT`` is cut, and the item gets a ``truncation`` key.
-    Identifier places are not cut. When the response is over
+    Identifier places (a result's ``node_id`` and ``canonical``, the
+    ``graph_context`` keys ``anchor_id``, ``edge_endpoints`` and ``edge``,
+    ``selected_packs[i].pack_id``) and object keys are not cut. The full body is
+    read with ``ontology_get_node(node_id)`` when that tool finds the graph node
+    in the readable scope and the node's properties hold the body; a source
+    without a graph node, a source whose ``metadata.node_id`` names another
+    node, a node with ``property_decode_error`` and the synthesized text of
+    BM25 and plain node vectors can differ from the original. When the response
+    is over
     ``QUERY_RESPONSE_CHAR_BUDGET``, results are dropped from the tail and the
     response carries ``results_truncated`` and ``omitted_results``; ``total``
     is the number of results returned. Contract: docs/ARCHITECTURE.md, "질의

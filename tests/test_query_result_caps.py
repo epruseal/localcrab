@@ -288,7 +288,9 @@ class TestItemHandling:
 
     def test_nothing_long_in_a_folded_item_is_the_same_object(self):
         item = self._folded("short", "short")
+        before = _json(item)
         assert cap_query_item(item, limit=LIMIT, folded=True) is item
+        assert _json(item) == before
 
     def test_caller_written_folded_duplicates_is_a_plain_value(self):
         item = _item(metadata={"folded_duplicates": {"members": [{"text": "c" * (LIMIT + 1)}]}})
@@ -312,7 +314,9 @@ class TestItemHandling:
 
     def test_selected_pack_short_is_the_same_object(self):
         entry = {"pack_id": "p", "score": 1.0, "matched": ["title"]}
+        before = _json(entry)
         assert cap_selected_pack(entry, limit=LIMIT) is entry
+        assert _json(entry) == before
 
 
 # ---------------------------------------------------------------------------
@@ -344,13 +348,17 @@ class TestResponseBudget:
     def test_row_a_response_at_budget_is_returned_as_is(self):
         response = _response(_results(5, 100))
         length = caps._wire_length(response)
+        before = _json(response)
         assert apply_response_budget(response, budget=length) is response
+        assert _json(response) == before
         out = apply_response_budget(response, budget=length - 1)
         assert out is not response and "results_truncated" in out
 
     def test_row_a_word_for_word_for_default_budget(self):
         response = _response(_results(3, 50))
+        before = _json(response)
         assert apply_response_budget(response) is response
+        assert _json(response) == before
         assert "results_truncated" not in response and "omitted_results" not in response
 
     # -- row B ----------------------------------------------------------------
@@ -389,13 +397,15 @@ class TestResponseBudget:
         assert caps._wire_length(_r(response, out["total"] + 1)) > BUDGET
 
     def test_row_b_drops_a_folded_member_with_its_representative(self):
-        rep = {"node_id": "r", "text": "x" * 500, "metadata": {"folded_duplicates": {"count": 1, "members": [
-            {"node_id": "m", "text": "y" * 500}]}}}
-        tail = {"node_id": "t", "text": "z" * 500}
-        response = _response([rep, tail])
+        head = {"node_id": "head-id-7f3a", "text": "z" * 500}
+        rep = {"node_id": "rep-id-7f3a", "text": "x" * 500, "metadata": {"folded_duplicates": {
+            "count": 1, "members": [{"node_id": "member-id-7f3a", "text": "y" * 500}]}}}
+        response = _response([head, rep])
         out = apply_response_budget(response, budget=caps._wire_length(_r(response, 1)))
-        assert out["results"] == [rep] and out["total"] == 1
+        assert out["results"] == [head] and out["total"] == 1
         assert out["omitted_results"] == 1
+        dumped = _json(out)
+        assert "rep-id-7f3a" not in dumped and "member-id-7f3a" not in dumped
 
     @pytest.mark.parametrize("k", [1, 8, 9, 10, 11, 98, 99, 100, 101, 998, 999])
     def test_row_b_digit_boundaries(self, k):
@@ -538,13 +548,42 @@ def _query(results: list[QueryResult], **kwargs: Any) -> dict[str, Any]:
         return tools.ontology_query(question="q", pack_ids=[PACK], **kwargs)
 
 
+# The response the handler returned before #511 for the fixed input of
+# ``test_short_results_serialize_as_before``. It was produced by running the
+# pre-change handler (the tree before this change) on that input, not by the
+# current code.
+_BASELINE_SHORT_RESPONSE = {
+    "question": "q",
+    "spaces_filter": None,
+    "subject_id": "test-user",
+    "tenant_id": "default",
+    "pipeline": {"bm25": True, "rerank": True, "fts": True},
+    "total": 3,
+    "results": [
+        {
+            "source": "vector",
+            "node_id": f"n{i}",
+            "score": score,
+            "text": f"text {i}",
+            "metadata": {"node_id": f"n{i}", "pack_id": PACK},
+            "graph_context": None,
+            "raw_score": None,
+        }
+        for i, score in enumerate((0.5, 0.4, 0.3))
+    ],
+    "selected_packs": [],
+    "pack_filter": {"pack_ids": [PACK], "auto_pack": False, "include_unpackaged": False},
+}
+
+
 class TestOntologyQueryHandler:
     def test_short_results_serialize_as_before(self):
-        results = [_qr(f"n{i}", f"text {i}") for i in range(3)]
+        results = [
+            _qr(f"n{i}", f"text {i}", score=score) for i, score in enumerate((0.5, 0.4, 0.3))
+        ]
         response = _query(results)
-        assert _json(response["results"]) == _json([r.to_dict() for r in results])
-        assert response["total"] == 3
-        assert "results_truncated" not in response and "omitted_results" not in response
+        assert response == _BASELINE_SHORT_RESPONSE
+        assert _json(response) == _json(_BASELINE_SHORT_RESPONSE)
 
     def test_long_text_and_metadata_are_cut(self):
         big = "한" * 100_000
