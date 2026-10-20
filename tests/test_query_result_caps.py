@@ -407,9 +407,16 @@ class TestResponseBudget:
         dumped = _json(out)
         assert "rep-id-7f3a" not in dumped and "member-id-7f3a" not in dumped
 
-    @pytest.mark.parametrize("k", [1, 8, 9, 10, 11, 98, 99, 100, 101, 998, 999])
-    def test_row_b_digit_boundaries(self, k):
-        n = 1000
+    @pytest.mark.parametrize(
+        ("n", "k"),
+        [
+            (2, 1), (9, 8), (10, 1), (10, 9), (11, 9), (11, 10),
+            (100, 9), (100, 10), (100, 99), (101, 99), (101, 100),
+            (1000, 1), (1000, 8), (1000, 9), (1000, 10), (1000, 11), (1000, 98), (1000, 99),
+            (1000, 100), (1000, 101), (1000, 998), (1000, 999), (1001, 1000),
+        ],
+    )
+    def test_row_b_digit_boundaries(self, n, k):
         # Each result is longer than the two added fields, so R(k) is shorter
         # than the full response for every k < n.
         response = _response([{"node_id": f"n{i}", "text": "t" * 100} for i in range(n)])
@@ -574,6 +581,29 @@ _BASELINE_SHORT_RESPONSE = {
     "selected_packs": [],
     "pack_filter": {"pack_ids": [PACK], "auto_pack": False, "include_unpackaged": False},
 }
+
+
+class TestOntologyQueryDescription:
+    """The tool description is searched by ``tool_search`` and read by clients."""
+
+    def _description(self) -> str:
+        from opencrab.mcp.tools import TOOL_SCHEMAS
+
+        return TOOL_SCHEMAS["ontology_query"]["description"]
+
+    def test_description_does_not_contain_the_substring_pack(self):
+        # ``tool_search`` matches descriptions by a case-insensitive substring.
+        # A "pack" here moves the tool into the description-match group of
+        # the query "pack" (tests/test_tool_catalog_search.py).
+        assert "pack" not in self._description().lower()
+
+    @pytest.mark.parametrize(
+        "token",
+        ["4000", "truncation", "results_truncated", "omitted_results", "response_too_large",
+         "ontology_get_node"],
+    )
+    def test_description_names_the_new_contract(self, token):
+        assert token in self._description()
 
 
 class TestOntologyQueryHandler:

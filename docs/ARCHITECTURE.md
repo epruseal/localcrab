@@ -963,7 +963,9 @@ CLI `query`와 REST `/api/query`는 이 처리를 거치지 않는다.
 - 전체 본문은 `ontology_get_node(node_id)`로 읽는다. 이 도구가 원문을 돌려주지
   못하는 경우가 있다: 노드 id 한도를 넘는 소스 id로 적재해 그래프 노드가 없는
   소스(`found=false`), `metadata.node_id`가 없는 id를 가리키는 소스(`found=false`),
-  `metadata.node_id`가 다른 기존 노드를 가리키는 소스(그 노드를 돌려준다).
+  `metadata.node_id`가 다른 기존 노드를 가리키는 소스(그 노드를 돌려준다),
+  속성 해독 오류(`property_decode_error`)가 있는 노드(`found=true`이지만 속성이
+  원문을 담지 않는다).
   BM25 leg와 일반 노드 벡터의 `text`는 합성 문자열이므로 원래 값은 노드의
   `properties`에서 읽는다.
 

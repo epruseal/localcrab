@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
             "A string inside a result's text, metadata or graph_context that is longer "
             "than 4000 characters is cut; the result then carries a `truncation` key "
             "with the cut paths and original lengths. Identifier places (a result's "
-            "node_id and canonical, graph_context anchor_id, edge_endpoints and edge, "
-            "selected_packs pack_id) and object keys are not cut. "
+            "node_id and canonical, graph_context anchor_id, edge_endpoints and edge) "
+            "and object keys are not cut. "
             "ontology_get_node(node_id) returns the full body when it finds the graph "
             "node in the readable scope and the node's properties hold the body. A "
             "source without a graph node (found=false), a source whose "
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
             "the original. When the response would pass its size budget, "
             "results are dropped from the tail: `total` is the number of results "
             "returned, `results_truncated` is true and `omitted_results` is the number "
-            "dropped. If not even the first result fits, the response is "
+            "dropped. If no result can be returned within the budget, the response is "
             "{\"error\": \"response_too_large\", \"message\": ...}. (#511)"
         ),
         "inputSchema": {
