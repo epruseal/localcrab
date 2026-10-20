@@ -23,10 +23,34 @@ WHAT THIS DOES NOT GUARANTEE
 ----------------------------
 Per-file transactional consistency only. ``.backup()`` says nothing about two
 different files agreeing on a point in time. The cross-process ``write.lock``
-held around the whole run narrows that window for every writer that honours
-it, but not every writer does -- ``billing.db`` is deliberately written
-outside it (#105), and the ownership map has known holes (#141). Say exactly
-this and no more, in the output and in the docs.
+held while the files are captured narrows that window for every writer that
+honours it, but not every writer does -- ``billing.db`` is deliberately
+written outside it (#105), and the ownership map has known holes (#141). Say
+exactly this and no more, in the output and in the docs.
+
+LIVE BACKUP (#510)
+------------------
+The service keeps running during a backup, so ``write.lock`` is held only
+while the files are CAPTURED, not while they are copied:
+
+1. With ``write.lock`` held, every WAL-mode SQLite source gets a read
+   transaction (``BEGIN`` plus one read) that stays open. A WAL reader sees one
+   fixed snapshot for as long as the transaction lives, and writers keep
+   committing beside it. Files that are not in WAL mode (a rollback journal
+   would let a held read transaction block that file's writers) and the
+   directory and opaque targets are copied inside this window.
+2. The lock is released. Each pinned snapshot is copied with the online backup
+   API on the connection that holds the transaction, so the copy is a single
+   snapshot that concurrent writers cannot restart. The connection is closed
+   as soon as its copy ends.
+3. Every SQLite copy is verified with ``integrity_check`` and
+   ``MANIFEST.json`` records sizes, sha256, how each file was captured and how
+   long the lock was held. ``verify_backup_set()`` re-checks a set later
+   without writing to it.
+
+While a snapshot connection is open the WAL file of that database grows,
+because a checkpoint cannot pass the snapshot; it is checkpointed again after
+the close. The disk check in ``backup_data_dir`` keeps room for that.
 
 TARGET LIST (#123)
 ------------------
@@ -71,6 +95,9 @@ SQLite copy are readable by the owner only.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import logging
 import math
 import os
 import secrets
@@ -79,12 +106,13 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 __all__ = [
+    "MANIFEST_NAME",
     "BackupDurabilityError",
     "BackupEntry",
     "BackupError",
@@ -93,8 +121,11 @@ __all__ = [
     "backup_data_dir",
     "backup_sqlite",
     "local_data_dir_inventory",
+    "verify_backup_set",
     "verify_sqlite",
 ]
+
+logger = logging.getLogger(__name__)
 
 Kind = Literal["sqlite", "directory", "opaque", "excluded"]
 Status = Literal["verified", "unverified", "skipped", "excluded"]
@@ -108,6 +139,28 @@ _TIMEOUT_ENV = "OPENCRAB_BACKUP_LOCK_TIMEOUT"
 _SET_PREFIX = "backup."
 _STAGING_PREFIX = ".backup-staging."
 _EXTERNAL_DIR = "external-vector"
+
+#: The set's own description: file sizes, sha256, how each SQLite file was
+#: captured, and how long write.lock was held (#510).
+MANIFEST_NAME = "MANIFEST.json"
+_MANIFEST_FORMAT = 1
+
+#: Busy wait, in seconds, when opening a source for a snapshot. Spent while
+#: write.lock is held, so it is short on purpose.
+_SNAPSHOT_OPEN_TIMEOUT = 5.0
+
+#: The copy of a pinned snapshot gets ``max(lock_timeout, bytes / this)``
+#: seconds. A pinned copy never waits on SQLITE_BUSY, so the budget is only
+#: a ceiling for a stalled disk; the deadline is checked between steps and
+#: cannot interrupt a single step.
+_MIN_COPY_BYTES_PER_SECOND = 1 << 20
+
+#: Free space that must remain on the destination volume (and on the data
+#: volume, while a snapshot connection lets its WAL grow) after the estimated
+#: copy. A backup must not fill the disk under a running service.
+_FREE_SPACE_RESERVE = 1 << 30
+
+_UNLOCKED_WRITER_LABELS = frozenset({"billing.db"})
 
 
 class BackupError(RuntimeError):
@@ -176,6 +229,9 @@ class BackupEntry:
     source: Path | None = None
     destination: Path | None = None
     note: str = ""
+    #: ``wal_snapshot`` | ``copied_under_lock`` for SQLite entries, else "".
+    capture: str = ""
+    journal_mode: str = ""
 
 
 @dataclass
@@ -183,6 +239,8 @@ class BackupOutcome:
     set_dir: Path
     entries: list[BackupEntry] = field(default_factory=list)
     leftover_stagings: list[Path] = field(default_factory=list)
+    #: The content of ``MANIFEST.json`` as written into the set (#510).
+    manifest: dict[str, Any] = field(default_factory=dict)
 
     @property
     def copied(self) -> dict[str, str]:
@@ -304,9 +362,16 @@ def backup_sqlite(
     *,
     deadline: float,
     pages: int = 64,
+    src_conn: sqlite3.Connection | None = None,
     _on_step: Callable[[int, int, int], None] | None = None,
 ) -> None:
     """Copy ``src`` to ``dst`` with SQLite's online backup API.
+
+    ``src_conn`` (#510) is an already-open source connection that the CALLER
+    owns and keeps open. It is used as is and never closed here. When it holds
+    an open read transaction on a WAL database, the copy reads that one fixed
+    snapshot from the first page to the last, so writers that keep committing
+    cannot restart it. ``src`` is then used for messages only.
 
     ``deadline`` is an absolute ``time.monotonic()`` value. It is enforced
     from the progress callback, which is the only place it CAN be enforced:
@@ -355,7 +420,9 @@ def backup_sqlite(
         # deadline measured 5.06s. With timeout=0 the same case measures
         # 0.20s. The waiting is done by the callback below, which is
         # deadline-aware.
-        src_conn = sqlite3.connect(_rw_uri(src), uri=True, timeout=0)
+        owns_src = src_conn is None
+        if src_conn is None:
+            src_conn = sqlite3.connect(_rw_uri(src), uri=True, timeout=0)
         try:
             dst_conn = sqlite3.connect(str(dst))
             try:
@@ -379,7 +446,8 @@ def backup_sqlite(
             finally:
                 dst_conn.close()
         finally:
-            src_conn.close()
+            if owns_src:
+                src_conn.close()
         # Same access as the source, no wider and no narrower: an operator
         # whose backups are read by another account configured that on the
         # source.
@@ -428,6 +496,347 @@ def verify_sqlite(path: Path) -> None:
         raise BackupError(f"backup {path} does not open as a SQLite database: {exc}") from exc
     if not result or result[0] != "ok":
         raise BackupError(f"backup {path} failed integrity_check: {result}")
+
+
+# ---------------------------------------------------------------------------
+# Snapshot pins (#510)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Snapshot:
+    """A source connection holding an open read transaction on a WAL database."""
+
+    connection: sqlite3.Connection
+    journal_mode: str
+    copy_bytes: int
+
+
+@dataclass
+class _Job:
+    """One SQLite target whose copy and verification run after write.lock is released."""
+
+    entry: BackupEntry
+    source: Path
+    destination: Path
+    snapshot: _Snapshot | None  # None: already copied under the lock, only verification is left
+
+
+class _SnapshotPins:
+    """Owner of every snapshot connection this run opened.
+
+    A connection joins the list the moment it exists, before any statement
+    runs on it, and leaves it only after ``close()`` succeeded. A connection
+    whose close failed therefore stays owned and is tried again by
+    ``close_all``. A held read transaction keeps a WAL database from being
+    checkpointed past the snapshot, so an unclosed connection is a real cost
+    to the running service, not a cosmetic leak.
+    """
+
+    def __init__(self) -> None:
+        self._open: list[sqlite3.Connection] = []
+
+    def open_snapshot(self, source: Path) -> tuple[str, _Snapshot | None]:
+        """Open ``source``; pin a read snapshot when it is a WAL database.
+
+        Returns ``(journal_mode, snapshot)``. ``snapshot`` is None when the
+        database is not in WAL mode: a held read transaction on a rollback
+        journal database would block its writers after write.lock is gone, so
+        such a file must be copied while the lock is still held.
+        """
+        try:
+            conn = sqlite3.connect(
+                _rw_uri(source),
+                uri=True,
+                timeout=_SNAPSHOT_OPEN_TIMEOUT,
+                isolation_level=None,
+            )
+        except (sqlite3.Error, OSError) as exc:
+            raise self._unusable(source, exc) from exc
+        self._open.append(conn)
+        try:
+            mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            if mode != "wal":
+                self.close_checked(conn)
+                return mode, None
+            conn.execute("BEGIN")
+            # Any read statement starts the read transaction; BEGIN alone is lazy.
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchall()
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        except (sqlite3.Error, OSError) as exc:
+            raise self._unusable(source, exc) from exc
+        return mode, _Snapshot(conn, mode, page_count * page_size)
+
+    @staticmethod
+    def _unusable(source: Path, exc: BaseException) -> BackupError:
+        # Same wording contract as backup_sqlite: no raw-copy fallback.
+        return BackupError(
+            f"{source} could not be opened for a snapshot ({exc}). "
+            "It is not a usable SQLite database; refusing to report a raw copy as a backup."
+        )
+
+    def release(self, conn: sqlite3.Connection) -> bool:
+        """End the transaction and close ``conn``. True when the close succeeded.
+
+        A failing rollback does not skip the close, and the connection leaves
+        the owner list only after the close succeeded.
+        """
+        try:
+            conn.execute("ROLLBACK")
+        except Exception as exc:  # noqa: BLE001 - the close below ends the transaction anyway
+            logger.warning("snapshot rollback failed, closing anyway: %s", exc)
+        try:
+            conn.close()
+        except Exception as exc:  # noqa: BLE001 - reported through the return value
+            logger.warning("snapshot connection close failed: %s", exc)
+            return False
+        if conn in self._open:
+            self._open.remove(conn)
+        return True
+
+    def close_checked(self, conn: sqlite3.Connection) -> None:
+        """``release`` with one retry; a connection that stays open aborts the run."""
+        if self.release(conn) or self.release(conn):
+            return
+        raise BackupError(
+            "a snapshot connection could not be closed; refusing to publish a backup "
+            "while it still holds a read transaction on the live database"
+        )
+
+    def close_all(self) -> int:
+        """Try once more to close everything still owned. Never raises.
+
+        Returns the number of connections that are still open. The caller is
+        already handling an exception and this must not replace it.
+        """
+        for conn in list(self._open):
+            self.release(conn)
+        if self._open:
+            logger.error("%d snapshot connection(s) could not be closed", len(self._open))
+        return len(self._open)
+
+
+def _tree_bytes(path: Path) -> int:
+    """Sum of regular file sizes under ``path``; links are not followed."""
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        for name in filenames:
+            f = Path(dirpath) / name
+            if not f.is_symlink():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    continue
+    return total
+
+
+def _estimate_bytes(targets: Iterable[BackupTarget], data_dir: Path) -> int:
+    """Rough bytes the set will take: main file plus ``-wal`` for SQLite, tree size otherwise.
+
+    An estimate only. The copy budget of a pinned snapshot uses the page
+    count of the snapshot itself.
+    """
+    total = 0
+    for target in targets:
+        if target.kind == "excluded":
+            continue
+        source = _source_for(target, data_dir)
+        if not source.exists():
+            continue
+        if target.kind == "sqlite":
+            total += source.resolve().stat().st_size
+            wal = Path(str(source) + "-wal")
+            if wal.is_file():
+                total += wal.stat().st_size
+        else:
+            total += _tree_bytes(source)
+    return total
+
+
+def _require_free_space(dest: Path, data_dir: Path, needed: int) -> None:
+    """Refuse before writing anything when the volumes cannot take the copy."""
+    reserve = _FREE_SPACE_RESERVE
+    dest_free = shutil.disk_usage(dest).free
+    if dest_free < needed + reserve:
+        raise BackupError(
+            f"not enough free space on the destination volume: the backup needs about "
+            f"{needed} bytes plus a {reserve} byte reserve, {dest_free} bytes are free"
+        )
+    if os.stat(dest).st_dev != os.stat(data_dir).st_dev:
+        # While a snapshot connection is open the WAL files grow on the data volume.
+        data_free = shutil.disk_usage(data_dir).free
+        if data_free < reserve:
+            raise BackupError(
+                f"not enough free space on the data volume: {data_free} bytes are free, "
+                f"{reserve} bytes are kept in reserve for WAL growth during the backup"
+            )
+
+
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _manifest_files(root: Path) -> dict[str, dict[str, Any]]:
+    """Every file under ``root`` except the manifest. Links are recorded, not followed."""
+    files: dict[str, dict[str, Any]] = {}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        for d in list(dirnames):
+            if (here / d).is_symlink():
+                files[(here / d).relative_to(root).as_posix()] = {"symlink": True}
+                dirnames.remove(d)
+        for name in filenames:
+            f = here / name
+            rel = f.relative_to(root).as_posix()
+            if rel == MANIFEST_NAME:
+                continue
+            if f.is_symlink():
+                files[rel] = {"symlink": True}
+            else:
+                files[rel] = {"size": f.stat().st_size, "sha256": _hash_file(f)}
+    return dict(sorted(files.items()))
+
+
+def _manifest_label(label: str) -> str:
+    """A label safe to publish: an absolute VECTOR_DB_FILE shrinks to its file name."""
+    return Path(label).name if os.path.isabs(label) else label
+
+
+def _write_manifest(
+    staging: Path,
+    outcome: BackupOutcome,
+    *,
+    set_id: str,
+    lock_info: dict[str, Any],
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for e in outcome.entries:
+        item: dict[str, Any] = {"label": _manifest_label(e.label), "status": e.status}
+        if e.destination is not None:
+            item["path"] = e.destination.relative_to(staging).as_posix()
+        if e.capture:
+            item["capture"] = e.capture
+            item["journal_mode"] = e.journal_mode
+            item["mcp_write_tools_hold_write_lock"] = e.label not in _UNLOCKED_WRITER_LABELS
+        entries.append(item)
+    manifest: dict[str, Any] = {
+        "format": _MANIFEST_FORMAT,
+        "set_id": set_id,
+        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "lock": lock_info,
+        "entries": entries,
+        "files": _manifest_files(staging),
+    }
+    fd = os.open(str(staging / MANIFEST_NAME), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=False)
+        fh.write("\n")
+    return manifest
+
+
+def _readonly_integrity(path: Path) -> None:
+    """``integrity_check`` through an immutable read-only open: the file is not touched."""
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+        try:
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        raise BackupError(f"{path.name} does not open as a SQLite database: {exc}") from exc
+    if not result or result[0] != "ok":
+        raise BackupError(f"{path.name} failed integrity_check: {result}")
+
+
+def verify_backup_set(set_dir: str | Path) -> dict[str, Any]:
+    """Check a published set against its ``MANIFEST.json``. Writes nothing.
+
+    Checks that every listed file exists, that links are still links, that
+    sizes and sha256 match, and that every SQLite file passes
+    ``integrity_check`` (opened immutable and read-only). A file that is in the
+    set but not in the manifest is reported as ``unlisted`` and is not a
+    failure: other tools add their own state beside a set. Raises
+    ``BackupError`` naming every mismatch.
+    """
+    root = Path(set_dir)
+    if root.is_symlink() or not root.is_dir():
+        raise BackupError(f"backup set directory does not exist: {root}")
+    manifest_path = root / MANIFEST_NAME
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise BackupError(f"{MANIFEST_NAME} is missing from {root.name}") from exc
+    except (OSError, ValueError) as exc:
+        raise BackupError(f"{MANIFEST_NAME} in {root.name} cannot be read: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("format") != _MANIFEST_FORMAT:
+        raise BackupError(
+            f"{MANIFEST_NAME} in {root.name} has an unsupported format: "
+            f"{manifest.get('format') if isinstance(manifest, dict) else type(manifest).__name__}"
+        )
+    files = manifest.get("files")
+    entries = manifest.get("entries")
+    if not isinstance(files, dict) or not isinstance(entries, list):
+        raise BackupError(f"{MANIFEST_NAME} in {root.name} is malformed")
+
+    problems: list[str] = []
+    intact: set[str] = set()
+    for rel, meta in files.items():
+        parts = Path(rel).parts
+        if os.path.isabs(rel) or ".." in parts or not isinstance(meta, dict):
+            problems.append(f"{rel}: unsafe or malformed manifest entry")
+            continue
+        path = root / rel
+        if meta.get("symlink"):
+            if not path.is_symlink():
+                problems.append(f"{rel}: expected a symbolic link")
+            continue
+        if path.is_symlink() or not path.is_file():
+            problems.append(f"{rel}: missing or not a regular file")
+            continue
+        if path.stat().st_size != meta.get("size"):
+            problems.append(f"{rel}: size differs from the manifest")
+            continue
+        if _hash_file(path) != meta.get("sha256"):
+            problems.append(f"{rel}: sha256 differs from the manifest")
+            continue
+        intact.add(rel)
+
+    checked: list[str] = []
+    for e in entries:
+        if not isinstance(e, dict) or "capture" not in e or "path" not in e:
+            continue
+        rel = e["path"]
+        if rel not in intact:
+            continue  # already reported above
+        try:
+            _readonly_integrity(root / rel)
+        except BackupError as exc:
+            problems.append(str(exc))
+        else:
+            checked.append(rel)
+
+    unlisted = sorted(
+        p.relative_to(root).as_posix()
+        for p in root.rglob("*")
+        if not p.is_dir()
+        and p.relative_to(root).as_posix() not in files
+        and p.name != MANIFEST_NAME
+    )
+    if problems:
+        raise BackupError(f"backup set {root.name} failed verification: " + "; ".join(problems))
+    return {
+        "set": root.name,
+        "files_verified": len(intact),
+        "sqlite_integrity_checked": checked,
+        "unlisted": unlisted,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +1058,7 @@ def backup_data_dir(
     settings: Any | None = None,
     lock_timeout: float | None = None,
     on_event: Callable[[str], None] | None = None,
+    exclude: Iterable[str] = (),
 ) -> BackupOutcome:
     """Back up every present store artifact under ``data_dir`` as one set.
 
@@ -656,8 +1066,19 @@ def backup_data_dir(
     point -- the migration script, the CLI, a direct caller -- can bypass it.
     The lock is re-entrant within a thread, so an outer holder is fine.
 
-    Guarantee: per-file transactional consistency for every SQLite target.
-    NOT a cross-file point-in-time snapshot; see the module docstring.
+    Two phases (#510). While ``write.lock`` is held the function captures:
+    directory and opaque targets and SQLite files that are not in WAL mode are
+    copied, and every WAL SQLite file gets a pinned read snapshot. The lock is
+    then released and the pinned snapshots are copied, verified and described
+    in ``MANIFEST.json``. The writers that honour ``write.lock`` are blocked
+    only for the first phase.
+
+    ``exclude`` lists inventory labels to skip (recorded as ``excluded``). An
+    unknown label is refused before anything is written.
+
+    Per-file transactional consistency holds for every SQLite target. Alignment
+    across files depends on every writer honouring ``write.lock``; see the
+    module docstring.
 
     Trust boundary: ``dest_dir`` is the location the CALLER chose and is not
     containment-checked (a symlinked ancestor is a normal backup-volume
@@ -698,6 +1119,19 @@ def backup_data_dir(
             raise BackupError(f"data directory does not exist: {data_dir}")
 
         targets = local_data_dir_inventory(settings)
+        wanted = set(exclude)
+        unknown = wanted - {t.label for t in targets}
+        if unknown:
+            raise BackupError(
+                f"unknown --exclude label(s) {sorted(unknown)}; "
+                f"valid labels: {sorted(t.label for t in targets)}"
+            )
+        targets = [
+            replace(t, kind="excluded", reason="excluded by the operator (--exclude)")
+            if t.label in wanted
+            else t
+            for t in targets
+        ]
 
         # A destination inside a directory-kind source would put staging in a tree
         # this run is about to copy, and copytree would recurse into its own output.
@@ -732,6 +1166,8 @@ def backup_data_dir(
                 "module cannot stand behind."
             )
 
+        _require_free_space(dest, data_dir, _estimate_bytes(targets, data_dir))
+
         leftovers = _leftover_stagings(dest)
         for p in leftovers:
             # Another run's interrupted staging. Reported, never deleted: it is
@@ -746,23 +1182,51 @@ def backup_data_dir(
         if final.exists() or final.is_symlink():
             raise BackupError(f"backup set already exists, refusing to overwrite: {final}")
 
-        with write_lock(str(data_dir), timeout=timeout):
-            # Exclusive create. Not makedirs(exist_ok=True): a pre-planted
-            # directory or symlink here would be written through, and every
-            # temporary artifact below relies on this directory being ours.
-            # Owner-only while the set is being written; it takes the data
-            # directory's own mode right before publication, so the set is
-            # exactly as reachable as the data it snapshots.
-            os.mkdir(staging, 0o700)
-            try:
-                outcome = _run_targets(targets, data_dir, staging, final, say, timeout)
-                shutil.copymode(data_dir, staging)
-                _fsync_tree(staging)
-            except BaseException:
+        pins = _SnapshotPins()
+        jobs: list[_Job] = []
+        staging_owned = False
+        wait_started = time.monotonic()
+        try:
+            with write_lock(str(data_dir), timeout=timeout):
+                acquired = time.monotonic()
+                acquired_at = datetime.now(UTC)
+                # Exclusive create. Not makedirs(exist_ok=True): a pre-planted
+                # directory or symlink here would be written through, and every
+                # temporary artifact below relies on this directory being ours.
+                # Owner-only while the set is being written; it takes the data
+                # directory's own mode right before publication, so the set is
+                # exactly as reachable as the data it snapshots.
+                os.mkdir(staging, 0o700)
+                staging_owned = True
+                outcome = _run_targets(
+                    targets, data_dir, staging, final, say, timeout, pins=pins, jobs=jobs
+                )
+            released = time.monotonic()
+            released_at = datetime.now(UTC)
+            lock_info = {
+                "wait_seconds": round(acquired - wait_started, 3),
+                "held_seconds": round(released - acquired, 3),
+                "acquired_at": acquired_at.isoformat(timespec="milliseconds"),
+                "released_at": released_at.isoformat(timespec="milliseconds"),
+            }
+            _finish_jobs(jobs, pins, staging, say, timeout)
+            outcome.manifest = _write_manifest(
+                staging, outcome, set_id=set_id, lock_info=lock_info
+            )
+            shutil.copymode(data_dir, staging)
+            _fsync_tree(staging)
+        except BaseException:
+            # One cleanup scope for the lock block AND the unlocked phase, so a
+            # failure anywhere -- including the lock release itself -- closes
+            # every snapshot connection and removes only a staging directory
+            # this run created. _publish below stays outside it: a failed
+            # rename keeps the intact staging for diagnosis.
+            pins.close_all()
+            if staging_owned:
                 shutil.rmtree(staging, ignore_errors=True)
-                raise
+            raise
 
-            _publish(staging, final)
+        _publish(staging, final)
         published = final
 
         # Rewrite the recorded destinations from staging to the published set.
@@ -791,9 +1255,10 @@ def backup_data_dir(
             + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
         )
         say(
-            "guarantee: per-file transactional consistency for SQLite targets. "
-            "Files are NOT aligned to one point in time -- write.lock narrows that window "
-            "only for writers that honour it (see issue #141)."
+            f"write.lock: waited {lock_info['wait_seconds']}s, held {lock_info['held_seconds']}s. "
+            "SQLite targets were captured inside that window; each file is transactionally "
+            "consistent. Alignment across files covers only writers that honour write.lock "
+            "(billing.db and some scripts do not, see issue #141)."
         )
     except _CallbackError as cf:
         raise cf.exc
@@ -858,7 +1323,17 @@ def _run_targets(
     final: Path,
     say: Callable[[str], None],
     timeout: float,
+    *,
+    pins: _SnapshotPins,
+    jobs: list[_Job],
 ) -> BackupOutcome:
+    """Capture every target while write.lock is held (#510).
+
+    Directory and opaque targets, and SQLite files that are not in WAL mode,
+    are copied here. A WAL SQLite file is only pinned (a read snapshot is
+    opened) and queued in ``jobs``; its bytes are copied after the lock is
+    released. Every SQLite copy is verified later, from ``jobs``.
+    """
     outcome = BackupOutcome(set_dir=final)
     # Keyed on (resolved source, destination), NOT the source alone. Deduping
     # by source discarded an aliased target's own slot: with
@@ -916,12 +1391,30 @@ def _run_targets(
             )
 
         if target.kind == "sqlite":
-            deadline = time.monotonic() + timeout
-            backup_sqlite(source, destination, deadline=deadline)
-            verify_sqlite(destination)
-            status: Status = "verified"
-            note = "online .backup() + integrity_check"
-        elif target.kind == "directory":
+            journal_mode, snapshot = pins.open_snapshot(source)
+            if snapshot is None:
+                backup_sqlite(source, destination, deadline=time.monotonic() + timeout)
+                capture = "copied_under_lock"
+                note = "online .backup() under write.lock + integrity_check"
+            else:
+                capture = "wal_snapshot"
+                note = "online .backup() from a pinned WAL snapshot + integrity_check"
+            entry = BackupEntry(
+                target.label,
+                "verified",
+                source=source,
+                destination=destination,
+                note=note,
+                capture=capture,
+                journal_mode=journal_mode,
+            )
+            jobs.append(_Job(entry, source, destination, snapshot))
+            seen_sources[(resolved, destination)] = destination
+            outcome.entries.append(entry)
+            continue
+
+        status: Status
+        if target.kind == "directory":
             _copy_directory(source, destination)
             status = "unverified"
             note = _directory_note(target, destination, source)
@@ -942,6 +1435,39 @@ def _run_targets(
         say(f"  {status:10} {target.label} -> {destination.relative_to(staging)}  ({note})")
 
     return outcome
+
+
+def _finish_jobs(
+    jobs: list[_Job],
+    pins: _SnapshotPins,
+    staging: Path,
+    say: Callable[[str], None],
+    timeout: float,
+) -> None:
+    """Copy the pinned snapshots, then verify every SQLite copy. Runs without write.lock.
+
+    Each snapshot connection is closed as soon as its copy ends, so the WAL of
+    that database can be checkpointed again while the others are still being
+    copied.
+    """
+    for job in jobs:
+        snapshot = job.snapshot
+        if snapshot is None:
+            continue
+        budget = max(timeout, snapshot.copy_bytes / _MIN_COPY_BYTES_PER_SECOND)
+        backup_sqlite(
+            job.source,
+            job.destination,
+            deadline=time.monotonic() + budget,
+            src_conn=snapshot.connection,
+        )
+        pins.close_checked(snapshot.connection)
+    for job in jobs:
+        verify_sqlite(job.destination)
+        say(
+            f"  {job.entry.status:10} {job.entry.label} -> "
+            f"{job.destination.relative_to(staging)}  ({job.entry.note})"
+        )
 
 
 def _copy_directory(source: Path, destination: Path) -> None:
@@ -1026,9 +1552,10 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m opencrab.stores.backup",
         description=(
-            "Back up the local store directory as one consistent set. SQLite files are "
-            "copied with the online backup API and verified; see the module docstring "
-            "for exactly what is and is not guaranteed."
+            "Back up the local store directory as one set while the services keep running. "
+            "SQLite files are copied with the online backup API and verified; see the "
+            "module docstring and docs/live-backup.md for exactly what is and is not "
+            "guaranteed."
         ),
     )
     parser.add_argument(
@@ -1050,9 +1577,63 @@ def _main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the canonical target inventory and exit without writing anything",
     )
+    parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "how long to wait for write.lock before giving up "
+            f"(default: ${_TIMEOUT_ENV} or {DEFAULT_LOCK_TIMEOUT:g})"
+        ),
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="LABEL",
+        help=(
+            "skip one inventory target by its label (see --list); repeatable. The set "
+            "records it as excluded, and a restore of that set will not contain it."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "print one JSON object (the set's manifest plus set_dir) on stdout; "
+            "progress messages go to stderr"
+        ),
+    )
+    parser.add_argument(
+        "--verify",
+        default=None,
+        metavar="SET_DIR",
+        help=(
+            "check a published backup set against its MANIFEST.json instead of making "
+            "one: sizes, sha256 and integrity_check. Writes nothing."
+        ),
+    )
     args = parser.parse_args(argv)
 
     settings = None
+
+    if args.verify is not None:
+        try:
+            report = verify_backup_set(args.verify)
+        except BackupError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(report))
+        else:
+            print(
+                f"OK {report['set']}: {report['files_verified']} file(s) match the manifest, "
+                f"{len(report['sqlite_integrity_checked'])} SQLite file(s) pass integrity_check"
+            )
+            for rel in report["unlisted"]:
+                print(f"  unlisted (not in the manifest, not checked): {rel}")
+        return 0
 
     if args.list:
         # Handled BEFORE resolving the data directory: listing the targets
@@ -1084,12 +1665,22 @@ def _main(argv: list[str] | None = None) -> int:
             return 1
         data_dir = settings.local_data_dir
 
+    # With --json, stdout carries only the final object; progress goes to stderr.
+    progress_stream = sys.stderr if args.json else None
+
     try:
         # flush=True so a closed stdout fails HERE, inside the callback, not
         # silently at interpreter exit with a bare exit code.
-        backup_data_dir(
-            data_dir, args.to, settings=settings, on_event=lambda m: print(m, flush=True)
+        outcome = backup_data_dir(
+            data_dir,
+            args.to,
+            settings=settings,
+            lock_timeout=args.lock_timeout,
+            exclude=args.exclude,
+            on_event=lambda m: print(m, file=progress_stream, flush=True),
         )
+        if args.json:
+            print(json.dumps({"set_dir": str(outcome.set_dir), **outcome.manifest}), flush=True)
     except BackupDurabilityError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

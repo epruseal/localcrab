@@ -1544,9 +1544,9 @@ class TestModePreservation:
         seen: list[int] = []
         real = bk._run_targets
 
-        def spy(targets, data_dir, staging, final, say, timeout):  # type: ignore[no-untyped-def]
+        def spy(targets, data_dir, staging, final, say, timeout, **kw):  # type: ignore[no-untyped-def]
             seen.append(_mode(staging))
-            return real(targets, data_dir, staging, final, say, timeout)
+            return real(targets, data_dir, staging, final, say, timeout, **kw)
 
         monkeypatch.setattr(bk, "_run_targets", spy)
         bk.backup_data_dir(populated_dir, settings=_Settings())
