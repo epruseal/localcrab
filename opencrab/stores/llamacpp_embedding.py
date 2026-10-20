@@ -21,10 +21,18 @@
 
 롤백:
   - EMBEDDING_BACKEND=local 으로 기존 minilm 컬렉션 즉시 복귀.
+
+상주 메모리(#508):
+  - 적재한 모델은 마지막 사용 뒤 idle_unload_seconds 가 지나면 내려놓는다
+    (Llama.close() 다음 malloc_trim). 다음 호출이 모델을 다시 올린다.
+    알고리즘과 상태 전이: docs/issue-508-gguf-fallback-release.md
 """
 
+import ctypes
 import logging
 import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +61,12 @@ class LlamaCppEmbeddingFunction:
     n_ctx : int
         최대 컨텍스트 길이. 512 는 localcrab 청크 크기 대비 충분.
         KURE 원본 max 8192 지만 폴백 검색은 짧은 쿼리가 대부분이라 절약.
+    idle_unload_seconds : float
+        마지막 사용 뒤 이 시간(초)이 지나면 모델을 내려놓는다(``Llama.close()``
+        뒤 ``malloc_trim`` 으로 힙 반환을 시도한다, #508). 다음 호출이 모델을 다시 올린다. 0 이하이면 해제하지
+        않는다(프로세스 수명 동안 상주, 종전 동작). 설계: docs/issue-508-gguf-fallback-release.md
+    clock : Callable[[], float]
+        유휴 시간 판정에 쓰는 단조 시계. 시험이 대체한다.
     """
 
     def __init__(
@@ -61,6 +75,8 @@ class LlamaCppEmbeddingFunction:
         dim: int = 1024,
         n_threads: int = 4,
         n_ctx: int = 512,
+        idle_unload_seconds: float = 120.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._gguf_path = gguf_path
         self._dim = dim
@@ -75,7 +91,23 @@ class LlamaCppEmbeddingFunction:
         # 있어서다. 같은 스레드의 재진입은 plain Lock 이면 영구 데드락이
         # 되므로 이 마커로 즉시 RuntimeError 를 낸다.
         self._llm_lock = threading.Lock()
+        # 적재 중이거나 해제 중인(= _llm_lock 을 쥔) 스레드. 같은 스레드의 재진입
+        # 검사에 쓴다.
         self._llm_init_owner: threading.Thread | None = None
+
+        # #508: 유휴 해제 상태. _state_lock 은 아래 필드를 읽고 쓰는 짧은 임계
+        # 구역의 잠금이며, 이 잠금을 쥔 채 적재/해제/임베딩을 하지 않는다.
+        self._idle_unload_seconds = idle_unload_seconds
+        self._clock = clock
+        self._state_lock = threading.Lock()
+        self._inflight = 0
+        self._last_used = 0.0
+        self._timer: Any = None
+        self._timer_gen = 0
+        self._timer_factory: Callable[[float, Callable[[], None]], Any] = _daemon_timer
+        self.load_count = 0
+        self.release_count = 0
+        self.release_error_count = 0
 
     # ------------------------------------------------------------------
     # ChromaDB EmbeddingFunction 프로토콜
@@ -85,15 +117,23 @@ class LlamaCppEmbeddingFunction:
         """텍스트 리스트 → L2 정규화된 임베딩 리스트."""
         if not input:
             return []
-        llm = self._get_llm()
-        result = []
-        for text in input:
-            # create_embedding 은 단건씩 호출 (llama-cpp 내부 배치 없음).
-            # KURE 는 쿼리/패시지 프리픽스 불필요 (bge-m3 계열, 대칭 임베딩).
-            resp = llm.create_embedding(text)
-            vec = resp["data"][0]["embedding"]
-            result.append(l2_normalize(vec))
-        return result
+        llm = self._acquire(True)
+        try:
+            result = []
+            for text in input:
+                # create_embedding 은 단건씩 호출 (llama-cpp 내부 배치 없음).
+                # KURE 는 쿼리/패시지 프리픽스 불필요 (bge-m3 계열, 대칭 임베딩).
+                resp = llm.create_embedding(text)
+                vec = resp["data"][0]["embedding"]
+                result.append(l2_normalize(vec))
+            return result
+        finally:
+            self._return_lease()
+
+    @property
+    def loaded(self) -> bool:
+        """모델이 지금 적재돼 있으면 True."""
+        return self._llm is not None
 
     def name(self) -> str:
         """OpenAIEmbeddingFunction 과 동일한 고정 이름 반환."""
@@ -109,17 +149,26 @@ class LlamaCppEmbeddingFunction:
     # ------------------------------------------------------------------
 
     def _get_llm(self) -> Any:
-        """최초 폴백 호출 시 모델 로드(lazy). 이후 캐시.
+        """모델을 돌려준다(없으면 적재). 임대(lease)는 잡지 않는다.
+
+        ``__call__`` 은 ``_acquire(True)`` 로 임대를 잡는다. 이 메서드는 임대 없이
+        같은 적재 경로를 쓰는 형태이며 시험이 직접 부른다.
+        """
+        return self._acquire(False)
+
+    def _acquire(self, lease: bool) -> Any:
+        """최초 폴백 호출 시 모델 로드(lazy). 이후 캐시. ``lease`` 가 참이면 모델을
+        돌려주는 모든 분기가 ``_inflight`` 를 올린다(#508, 반납은 ``_return_lease``).
 
         직렬화(#302): REST API 앱의 요청 핸들러는 스레드풀로 디스패치되므로
         (FastAPI 의 plain ``def`` 라우트, ``run_in_threadpool``), 공유
         임베딩 함수 인스턴스 하나에 여러 요청 스레드가 동시에 첫 호출을
         할 수 있다. 락 없이는 둘 다 ``if self._llm is None`` 을 통과해
         모델을 두 번 로드한다(GGUF 로드는 초 단위로 느려 창이 넓다).
-        아래 빠른 읽기는 락 없이 수행한다 — CPython 에서 전역 필드 읽기와
-        마지막의 단일 대입은 각각 GIL 아래 원자적이고, 완성된 객체를
-        한 번에 배정하므로(부분 완성 상태를 락 없는 읽기에 노출하지
-        않는다) 안전하다.
+        ``lease=False`` 의 빠른 읽기는 락 없이 수행한다 — CPython 에서 필드
+        읽기와 단일 대입은 GIL 아래 원자적이고, 완성된 객체를 한 번에
+        배정하므로 안전하다. ``lease=True`` 는 모델 참조 취득과 ``_inflight``
+        증가를 ``_state_lock`` 한 구역에서 처리한다(해제 판정과 같은 잠금).
 
         재진입 가드: 같은 스레드가 로드 도중 자기 자신을 통해
         ``_get_llm()`` 을 다시 부르면(오늘 그런 호출자는 없다) plain
@@ -132,7 +181,13 @@ class LlamaCppEmbeddingFunction:
         GGUF 파일이 없으면 huggingface_hub 로 자동 다운로드를 시도한다.
         다운로드 실패 시 안내 메시지와 함께 RuntimeError 를 발생시킨다.
         """
-        if self._llm is not None:
+        if lease:
+            with self._state_lock:
+                if self._llm is not None:
+                    self._inflight += 1
+                    self._last_used = self._clock()
+                    return self._llm
+        elif self._llm is not None:
             return self._llm
 
         if self._llm_init_owner is threading.current_thread():
@@ -143,35 +198,144 @@ class LlamaCppEmbeddingFunction:
             )
 
         with self._llm_lock:
-            if self._llm is not None:
-                return self._llm
             try:
                 self._llm_init_owner = threading.current_thread()
-                import os
-                # ── GGUF 파일 존재 확인 / 자동 다운로드 ──────────────────
-                if not self._gguf_path or not os.path.exists(self._gguf_path):
-                    self._gguf_path = _ensure_local_gguf(self._gguf_path)
-
-                try:
-                    from llama_cpp import Llama  # type: ignore[import]
-                except ImportError as exc:
-                    raise RuntimeError(
-                        "llama-cpp-python 이 설치되지 않았습니다. "
-                        "pip install llama-cpp-python 으로 설치하세요."
-                    ) from exc
-                logger.info("로컬 GGUF 로드 중: %s", self._gguf_path)
-                llm = Llama(
-                    model_path=self._gguf_path,
-                    embedding=True,
-                    n_ctx=self._n_ctx,
-                    n_threads=self._n_threads,
-                    verbose=False,
-                )
-                logger.info("로컬 GGUF 로드 완료 (dim=%d)", self._dim)
-                self._llm = llm
+                with self._state_lock:
+                    if self._llm is not None:
+                        # 다른 스레드가 먼저 적재했다. 이 분기도 임대를 잡는다.
+                        if lease:
+                            self._inflight += 1
+                            self._last_used = self._clock()
+                        return self._llm
+                llm = self._load_model()
+                with self._state_lock:
+                    self._llm = llm
+                    self.load_count += 1
+                    if lease:
+                        self._inflight += 1
+                        self._last_used = self._clock()
+                return llm
             finally:
                 self._llm_init_owner = None
-        return self._llm
+
+    def _load_model(self) -> Any:
+        """GGUF 를 읽어 ``Llama`` 객체를 만든다(``_llm_lock`` 아래에서만 부른다)."""
+        import os
+        # ── GGUF 파일 존재 확인 / 자동 다운로드 ──────────────────
+        if not self._gguf_path or not os.path.exists(self._gguf_path):
+            self._gguf_path = _ensure_local_gguf(self._gguf_path)
+
+        try:
+            from llama_cpp import Llama  # type: ignore[import]
+        except ImportError as exc:
+            raise RuntimeError(
+                "llama-cpp-python 이 설치되지 않았습니다. "
+                "pip install llama-cpp-python 으로 설치하세요."
+            ) from exc
+        logger.info("로컬 GGUF 로드 중: %s", self._gguf_path)
+        llm = Llama(
+            model_path=self._gguf_path,
+            embedding=True,
+            n_ctx=self._n_ctx,
+            n_threads=self._n_threads,
+            verbose=False,
+        )
+        logger.info("로컬 GGUF 로드 완료 (dim=%d)", self._dim)
+        return llm
+
+    # ------------------------------------------------------------------
+    # 유휴 해제 (#508)
+    # ------------------------------------------------------------------
+
+    def _return_lease(self) -> None:
+        """임대를 반납한다. 해제 타이머가 없으면 하나 만든다."""
+        with self._state_lock:
+            self._inflight -= 1
+            self._last_used = self._clock()
+            self._arm_timer_locked(self._idle_unload_seconds)
+
+    def _arm_timer_locked(self, delay: float) -> None:
+        """``_state_lock`` 을 쥔 채 부른다. 타이머는 ``_timer`` 가 비었을 때만 만든다."""
+        if self._idle_unload_seconds <= 0 or self._timer is not None:
+            return
+        self._timer_gen += 1
+        gen = self._timer_gen
+        timer = self._timer_factory(max(delay, 0.0), lambda: self._on_timer(gen))
+        self._timer = timer
+        timer.start()
+
+    def _on_timer(self, gen: int) -> None:
+        try:
+            self.release_if_idle(from_timer=True)
+        except Exception:
+            logger.warning("로컬 GGUF 유휴 해제 타이머 실패", exc_info=True)
+        finally:
+            with self._state_lock:
+                if self._timer_gen == gen:
+                    self._timer = None
+
+    def release_if_idle(self, from_timer: bool = False) -> bool:
+        """유휴 시간이 지났고 사용 중인 호출이 없으면 모델을 내려놓고 True.
+
+        타이머가 부르는 경로 말고 시험이 직접 부르는 경로도 같은 판정을 쓴다.
+        """
+        if self._idle_unload_seconds <= 0:
+            return False
+        me = threading.current_thread()
+        if self._llm_init_owner is me:
+            return False  # 적재나 해제 중인 스레드가 되돌아온 호출
+        with self._llm_lock:
+            try:
+                self._llm_init_owner = me
+                with self._state_lock:
+                    if from_timer:
+                        self._timer = None
+                    llm = self._llm
+                    if llm is None:
+                        return False
+                    if self._inflight > 0:
+                        self._arm_timer_locked(self._idle_unload_seconds)
+                        return False
+                    remaining = self._idle_unload_seconds - (self._clock() - self._last_used)
+                    if remaining > 0:
+                        self._arm_timer_locked(remaining)
+                        return False
+                    self._llm = None
+                try:
+                    close = getattr(llm, "close", None)
+                    if close is not None:
+                        close()
+                except Exception:
+                    self.release_error_count += 1
+                    logger.warning("로컬 GGUF 해제 중 close() 실패", exc_info=True)
+                    llm = None
+                    _trim_heap()
+                    return True
+                llm = None
+                _trim_heap()
+                self.release_count += 1
+                logger.info("로컬 GGUF 해제 (유휴 %.0fs)", self._idle_unload_seconds)
+                return True
+            finally:
+                self._llm_init_owner = None
+
+
+def _daemon_timer(delay: float, fn: Callable[[], None]) -> threading.Timer:
+    timer = threading.Timer(delay, fn)
+    timer.daemon = True
+    return timer
+
+
+def _trim_heap() -> None:
+    """glibc 가 free 한 아레나 페이지를 운영체제에 돌려주게 한다(best-effort).
+
+    ``Llama.close()`` 만으로는 익명 메모리 일부가 아레나에 남아 RSS 가 적재
+    전 수준까지 내려오지 않는다(#508 측정). glibc 가 아닌 libc 에서는 건너뛴다.
+    """
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 # ---------------------------------------------------------------------------
