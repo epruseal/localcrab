@@ -19,7 +19,15 @@ logger = logging.getLogger(__name__)
     "ontology_query",
     {
         "description": (
-            "Hybrid vector + BM25 + graph search with RRF reranking."
+            "Hybrid vector + BM25 + graph search with RRF reranking. "
+            "A string inside a result's text, metadata or graph_context that is longer "
+            "than 4000 characters is cut; the result then carries a `truncation` key "
+            "with the cut paths and original lengths, and the full body is read with "
+            "ontology_get_node(node_id). When the response would pass its size budget, "
+            "results are dropped from the tail: `total` is the number of results "
+            "returned, `results_truncated` is true and `omitted_results` is the number "
+            "dropped. If not even the first result fits, the response is "
+            "{\"error\": \"response_too_large\", \"message\": ...}. (#511)"
         ),
         "inputSchema": {
             "type": "object",
@@ -116,6 +124,15 @@ def ontology_query(
     therefore never forwarded to ``hybrid.query`` here, client-supplied or
     not -- #145 removed it as a tool argument entirely.
 
+    Response size (#511): a string inside a result's ``text``, ``metadata`` or
+    ``graph_context`` (and inside ``selected_packs``) that is longer than
+    ``QUERY_FIELD_CHAR_LIMIT`` is cut, and the item gets a ``truncation`` key.
+    Identifier places are not cut. When the response is over
+    ``QUERY_RESPONSE_CHAR_BUDGET``, results are dropped from the tail and the
+    response carries ``results_truncated`` and ``omitted_results``; ``total``
+    is the number of results returned. Contract: docs/ARCHITECTURE.md, "질의
+    응답 크기 처리 (#511)".
+
     Parameters
     ----------
     question:
@@ -152,6 +169,7 @@ def ontology_query(
     from opencrab.auth import current_principal
     from opencrab.config import get_settings
     from opencrab.mcp.tools import _current_read_scope, _get_context
+    from opencrab.services import result_caps
     from opencrab.services.canonical_ids import enrich as enrich_canonical
     from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 
@@ -235,6 +253,16 @@ def ontology_query(
             enrich_canonical(
                 ctx.get("neo4j"), result_dicts + members, pack_ids=sorted(scope)
             )
+        # #511: cut long strings after the enrichment, so a folded member
+        # keeps its canonical block and identifier places stay whole.
+        result_dicts = [
+            result_caps.cap_query_item(
+                result_dict,
+                limit=result_caps.QUERY_FIELD_CHAR_LIMIT,
+                folded=bool(result.folded_count),
+            )
+            for result, result_dict in zip(results, result_dicts)
+        ]
         response: dict[str, Any] = {
             "question": question,
             "spaces_filter": spaces,
@@ -251,7 +279,12 @@ def ontology_query(
         if outcome.warnings:
             response["spaces_filter_warnings"] = list(outcome.warnings)
         if include_pack_provenance:
-            response["selected_packs"] = selected_packs
+            response["selected_packs"] = [
+                result_caps.cap_selected_pack(
+                    pack, limit=result_caps.QUERY_FIELD_CHAR_LIMIT
+                )
+                for pack in selected_packs
+            ]
             response["pack_filter"] = {
                 "pack_ids": effective_pack_ids,
                 "auto_pack": bool(auto_pack),
@@ -259,7 +292,10 @@ def ontology_query(
             }
             if pack_filter_warnings:
                 response["pack_filter"]["warnings"] = pack_filter_warnings
-        return response
+        # #511: drop results from the tail when the response is over budget.
+        return result_caps.apply_response_budget(
+            response, budget=result_caps.QUERY_RESPONSE_CHAR_BUDGET
+        )
     except Exception as exc:
         logger.error("ontology_query failed: %s", exc)
         return {"error": safe_tool_error("ontology_query", exc)}
