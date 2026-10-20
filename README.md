@@ -203,7 +203,7 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | **문법·노드** | `ontology_manifest` | MetaOntology OS 전체 문법 반환 |
 | | `ontology_add_node` | 문법 검증 후 노드 추가/업데이트 |
 | | `ontology_add_edge` | 문법 검증 후 방향 엣지 추가 |
-| **조회** | `ontology_query` | 벡터+BM25+그래프 하이브리드 검색 (RRF 재랭킹, pack 필터, ReBAC 필터) |
+| **조회** | `ontology_query` | 벡터+BM25+그래프 하이브리드 검색 (RRF 재랭킹, pack 필터, ReBAC 필터). 결과 문자열 길이 상한과 응답 예산은 [ARCHITECTURE.md 11절](docs/ARCHITECTURE.md#11-질의-응답-크기-처리-511) |
 | | `ontology_get_node` | node_id로 단일 노드 조회 |
 | | `ontology_list_nodes` | 노드 목록 (space·pack_id 필터) |
 | | `ontology_list_edges` | 엣지 목록 (pack_id 필터) |

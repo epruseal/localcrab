@@ -12,6 +12,7 @@
 8. [임베딩 백엔드 (EMBEDDING_BACKEND)](#8-임베딩-백엔드-embedding_backend)
 9. [그래프/문서 노드 키 집합 정합성 (#317)](#9-그래프문서-노드-키-집합-정합성-317)
 10. [질의 결과의 동일 본문 접기 (#482)](#10-질의-결과의-동일-본문-접기-482)
+11. [질의 응답 크기 처리 (#511)](#11-질의-응답-크기-처리-511)
 
 ---
 
@@ -934,4 +935,66 @@ docstring은 이 절을 가리킨다.
 
 ```bash
 .venv/bin/pytest tests/test_query_duplicate_fold.py -q
+```
+
+## 11. 질의 응답 크기 처리 (#511)
+
+이 절은 MCP `ontology_query` 응답의 크기 처리 계약의 정본이다. 설계와 결정표는
+`docs/issue-511-query-text-cap.md`에 있고 코드는 `opencrab/services/result_caps.py`다.
+CLI `query`와 REST `/api/query`는 이 처리를 거치지 않는다.
+
+### 항목 상한
+
+결과 항목의 `text`, `metadata`, `graph_context`에 든 문자열이
+`QUERY_FIELD_CHAR_LIMIT`(글자 수)을 넘으면 앞부분만 싣는다. 접힌 결과의
+`metadata.folded_duplicates.members`는 각각 결과 항목으로 처리한다.
+`selected_packs[i]`의 문자열도 같은 상한을 받는다. 상한을 넘은 항목에는 새 키
+`truncation`이 붙는다.
+
+```json
+{"limit_chars": 4000,
+ "fields": [{"path": ["text"], "original_chars": 380000}],
+ "full_text_tool": "ontology_get_node"}
+```
+
+- 잘린 문자열이 없는 항목에는 `truncation`이 없고 변경 전 응답과 같은 값을 싣는다.
+- 식별자 자리(`node_id`, `canonical`, `graph_context`의 `anchor_id`와
+  `edge_endpoints`와 `edge`, `selected_packs[i].pack_id`)와 객체 키는 자르지 않는다.
+- 전체 본문은 `ontology_get_node(node_id)`로 읽는다. 이 도구가 원문을 돌려주지
+  못하는 경우가 있다: 노드 id 한도를 넘는 소스 id로 적재해 그래프 노드가 없는
+  소스(`found=false`), `metadata.node_id`가 없는 id를 가리키는 소스(`found=false`),
+  `metadata.node_id`가 다른 기존 노드를 가리키는 소스(그 노드를 돌려준다),
+  속성 해독 오류(`property_decode_error`)가 있는 노드(`found=true`이지만 속성이
+  원문을 담지 않는다).
+  BM25 leg와 일반 노드 벡터의 `text`는 합성 문자열이므로 원래 값은 노드의
+  `properties`에서 읽는다.
+
+### 응답 예산
+
+응답 길이가 `QUERY_RESPONSE_CHAR_BUDGET`을 넘으면 `results`의 뒤쪽 결과를 덜어 낸다.
+길이의 단위는 서버가 도구 결과를 문자열로 만들고(`ensure_ascii=True`) 전송 봉투가
+그 문자열을 다시 직렬화한 길이다(`result_caps._wire_length`). 한글 한 글자는 이
+단위에서 7글자다.
+
+| 조건 | 응답 |
+| --- | --- |
+| 길이가 예산 이하 | 변경 없음. 새 필드 없음 |
+| 예산 초과, 결과를 하나 이상 담을 수 있음 | 앞쪽 결과를 가장 많이 담은 응답. `total`은 담은 결과 수, `results_truncated`는 `true`, `omitted_results`는 덜어 낸 결과 수 |
+| 예산 초과, 결과 한 건도 담을 수 없음(결과 0건이거나 `results` 밖 필드만으로 초과하는 경우 포함) | `{"error": "response_too_large", "message": ...}` (고정 문구) |
+
+`total`의 의미는 반환한 결과 수로 유지한다. 덜어 낸 결과는 응답에 싣지 않는다.
+접힌 구성원은 대표 결과와 함께 덜어 낸다.
+
+### 알려진 한계
+
+- 두 상수는 모듈 상수이고 설정으로 열지 않는다. 대상 클라이언트의 수용 한도는
+  측정하지 못했다.
+- 서버는 `ensure_ascii=True`로 직렬화하므로 한글 한 글자가 안쪽 문자열에서 6글자,
+  전송 봉투에서 7글자다. 이 설정은 이 변경의 범위 밖이다.
+- 덜어 낸 결과를 이어서 받는 방법(페이지 넘기기)은 없다.
+
+### 재현 명령
+
+```bash
+.venv/bin/pytest tests/test_query_result_caps.py -q
 ```
