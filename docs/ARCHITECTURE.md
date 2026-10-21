@@ -522,7 +522,9 @@ python -m opencrab.stores.backup --verify /backup/path/backup.<세트 식별자>
 ```
 
 백업은 서비스를 멈추지 않고 돈다(issue #510). `write.lock`은 파일을 고정하는
-짧은 구간에만 잡고, 그 뒤 복사는 잠금 없이 진행한다. 다른 저장소가 쓸 수
+구간에만 잡고, WAL 모드 SQLite 파일의 복사는 잠금을 푼 뒤 진행한다. WAL이
+아닌 SQLite 파일과 디렉터리형 대상은 잠금 안에서 복사하므로 그 구간이 크기에
+비례해 늘어난다. 다른 저장소가 쓸 수
 있게 쓰는 법, 보장 범위, 복원 절차, 문제 해결을 [docs/live-backup.md](./live-backup.md)에
 모았다. 이 절은 그 요약이다.
 

@@ -30,8 +30,10 @@ exactly this and no more, in the output and in the docs.
 
 LIVE BACKUP (#510)
 ------------------
-The service keeps running during a backup, so ``write.lock`` is held only
-while the files are CAPTURED, not while they are copied:
+The service keeps running during a backup. ``write.lock`` is held while the
+files are CAPTURED. For WAL-mode SQLite files that is only the time to pin a
+snapshot, not the time to copy. Files that cannot be pinned are copied inside
+the window, so for them the hold time grows with their size (see below):
 
 1. With ``write.lock`` held, every WAL-mode SQLite source gets a read
    transaction (``BEGIN`` plus one read) that stays open. A WAL reader sees one
@@ -43,12 +45,16 @@ while the files are CAPTURED, not while they are copied:
    API on the connection that holds the transaction, so the copy is a single
    snapshot that concurrent writers cannot restart. The connection is closed
    as soon as its copy ends. The copy is flushed to disk every
-   ``_COPY_FLUSH_BYTES`` while it is written: one fsync of a whole large file
-   at the end would stall the service's own commits on the same volume.
-3. Every SQLite copy is verified with ``integrity_check`` and
-   ``MANIFEST.json`` records sizes, sha256, how each file was captured and how
-   long the lock was held. ``verify_backup_set()`` re-checks a set later
-   without writing to it.
+   ``_COPY_FLUSH_BYTES`` while it is written. In a measurement with a store of
+   about a gigabyte, flushing once at the end of each file made the service's
+   reads and writes pause together for about a second; flushing in steps
+   removed the pause. The cause is probably the single large fsync; that was
+   not confirmed directly.
+3. Every SQLite copy made by this run is verified with ``integrity_check``
+   (directory targets are not, except a copied chroma catalog), and
+   ``MANIFEST.json`` records sizes, sha256, how each SQLite file was captured
+   and how long the lock was held. ``verify_backup_set()`` re-checks a set
+   later without writing to it. Its checks are limited: see its docstring.
 
 While a snapshot connection is open the WAL file of that database grows,
 because a checkpoint cannot pass the snapshot; it is checkpointed again after
@@ -157,8 +163,9 @@ _SNAPSHOT_OPEN_TIMEOUT = 5.0
 #: cannot interrupt a single step.
 _MIN_COPY_BYTES_PER_SECOND = 1 << 20
 
-#: A pinned copy is flushed to disk every this many bytes while it is written,
-#: so the service's own commits never wait behind one fsync of the whole file.
+#: A pinned copy is flushed to disk every this many bytes while it is written.
+#: Measured: one fsync of a whole large copy at the end paused the service's
+#: reads and writes for about a second; stepwise flushing removed the pause.
 _COPY_FLUSH_BYTES = 32 << 20
 
 #: Free space that must remain on the destination volume (and on the data
@@ -436,10 +443,11 @@ def backup_sqlite(
             try:
                 flush_pages = 0
                 if flush_every > 0:
-                    # Paced flush: SQLite would otherwise fsync the whole copy
-                    # in one commit at the end, and that one fsync of a large
-                    # file stalls every other writer on the volume. The caller
-                    # owns the final fsync of the finished file.
+                    # Paced flush: SQLite would otherwise fsync the whole copy in
+                    # one commit at the end. Measured on a large copy, that
+                    # paused the service's own commits for about a second (the
+                    # single fsync is the likely cause). The caller owns the
+                    # final fsync of the finished file.
                     dst_conn.execute("PRAGMA synchronous=OFF")
                     page_size = int(src_conn.execute("PRAGMA page_size").fetchone()[0])
                     flush_pages = max(1, flush_every // page_size)
@@ -787,11 +795,19 @@ def verify_backup_set(set_dir: str | Path) -> dict[str, Any]:
     """Check a published set against its ``MANIFEST.json``. Writes nothing.
 
     Checks that every listed file exists, that links are still links, that
-    sizes and sha256 match, and that every SQLite file passes
-    ``integrity_check`` (opened immutable and read-only). A file that is in the
-    set but not in the manifest is reported as ``unlisted`` and is not a
-    failure: other tools add their own state beside a set. Raises
+    sizes and sha256 match, and that every SQLite entry that declares a
+    ``capture`` passes ``integrity_check`` (opened immutable and read-only). A
+    file that is in the set but not in the manifest is reported as ``unlisted``
+    and is not a failure: other tools add their own state beside a set. Raises
     ``BackupError`` naming every mismatch.
+
+    Limits (the stronger structural checks are tracked in issue #522): the
+    manifest is trusted for its own structure. An entry whose ``capture`` is
+    missing is not integrity-checked, an entry's ``path`` is not required to
+    appear in ``files``, a set directory replaced by a link is not detected,
+    and a file removed from both the set and ``files`` goes unnoticed. The
+    check finds damage and loss of the files the manifest lists; it is not
+    meant to resist someone who edits the manifest.
     """
     root = Path(set_dir)
     if root.is_symlink() or not root.is_dir():

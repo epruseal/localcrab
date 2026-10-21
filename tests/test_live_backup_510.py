@@ -151,16 +151,34 @@ def _ids(path: Path) -> set[int]:
 # ---------------------------------------------------------------------------
 
 
+def _rows(path_or_conn: Any) -> set[tuple[int, str]]:
+    """Every ``(id, v)`` row of table ``t`` in a database file or on a given connection."""
+    if isinstance(path_or_conn, sqlite3.Connection):
+        return {(int(i), str(v)) for i, v in path_or_conn.execute("SELECT id, v FROM t")}
+    conn = sqlite3.connect(str(path_or_conn))
+    try:
+        return {(int(i), str(v)) for i, v in conn.execute("SELECT id, v FROM t")}
+    finally:
+        conn.close()
+
+
+def _assert_copy_equals_pin(expected: set[tuple[int, str]], copy: Path) -> None:
+    assert _rows(copy) == expected, "the copy differs from the rows visible at the pin"
+
+
 class TestPinnedSnapshot:
     def test_copy_completes_and_matches_the_pin_while_a_writer_keeps_committing(
         self, tmp_path: Path, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         live_dir = big_live_dir
         marks: dict[str, int] = {}
+        pinned: dict[str, set[tuple[int, str]]] = {}
         real = bk.backup_sqlite
 
         def spy(src: Path, dst: Path, **kw: Any) -> None:
             if kw.get("src_conn") is not None and src.name == "graph.db":
+                # Read on the pinned connection itself: this is the pin-time row set.
+                pinned["rows"] = _rows(kw["src_conn"])
                 marks["before"] = _count(src, "t")
                 kw["_on_step"] = lambda *_a: time.sleep(0.004)
                 real(src, dst, **kw)
@@ -173,12 +191,35 @@ class TestPinnedSnapshot:
             bk.backup_data_dir(live_dir, settings=_Settings(), lock_timeout=5.0)
         copy = _set_dir(live_dir) / "graph.db"
         assert marks["after"] > marks["before"], "the writer did not run during the copy"
-        assert _count(copy) <= marks["before"], "the copy contains rows committed after the pin"
+        _assert_copy_equals_pin(pinned["rows"], copy)
+        # A set made while the service was writing passes the existing verifier.
+        assert "graph.db" in bk.verify_backup_set(_set_dir(live_dir))["sqlite_integrity_checked"]
         conn = sqlite3.connect(str(copy))
         try:
             assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         finally:
             conn.close()
+
+    @pytest.mark.parametrize("damage", ["drop_row", "change_value"])
+    def test_control_the_row_comparison_detects_a_damaged_copy(
+        self, tmp_path: Path, big_live_dir: Path, damage: str
+    ) -> None:
+        """The comparison must fail for a missing row and for a changed value."""
+        bk.backup_data_dir(big_live_dir, settings=_Settings(), lock_timeout=5.0)
+        copy = _set_dir(big_live_dir) / "graph.db"
+        expected = _rows(copy)
+        _assert_copy_equals_pin(expected, copy)  # undamaged copy passes
+        conn = sqlite3.connect(str(copy))
+        try:
+            if damage == "drop_row":
+                conn.execute("DELETE FROM t WHERE id = (SELECT min(id) FROM t)")
+            else:
+                conn.execute("UPDATE t SET v = 'changed' WHERE id = (SELECT min(id) FROM t)")
+            conn.commit()
+        finally:
+            conn.close()
+        with pytest.raises(AssertionError):
+            _assert_copy_equals_pin(expected, copy)
 
     def test_control_without_the_pin_the_same_copy_cannot_finish(
         self, tmp_path: Path, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -496,8 +537,11 @@ class TestVerify:
         raw = bytearray(f.read_bytes())
         raw[-1] ^= 0xFF
         f.write_bytes(bytes(raw))
-        with pytest.raises(bk.BackupError, match=r"graph\.db: sha256 differs"):
+        with pytest.raises(bk.BackupError, match=r"graph\.db: sha256 differs") as excinfo:
             bk.verify_backup_set(made)
+        # Only the damaged file is named: files that were not touched stay out of the message.
+        for untouched in ("doc_store.db", "vectors.db", "opencrab.db", "billing.db"):
+            assert untouched not in str(excinfo.value)
 
     def test_a_deleted_file_is_named(self, made: Path) -> None:
         (made / "vectors.db").unlink()
@@ -633,12 +677,25 @@ class _Proxy:
 
 class _Watched(list):  # type: ignore[type-arg]
     plan: dict[str, int]
+    #: Every connection opened through a ``mode=rw`` URI, recorded the moment
+    #: ``sqlite3.connect`` returns it, before any statement runs on it.
+    created: list[sqlite3.Connection]
 
 
 @pytest.fixture
 def watched(monkeypatch: pytest.MonkeyPatch) -> _Watched:
     """Every snapshot connection the run opens, optionally wrapped by ``watched.plan``."""
     conns = _Watched()
+    conns.created = []
+    real_connect = sqlite3.connect
+
+    def recording_connect(database: Any, *a: Any, **k: Any) -> sqlite3.Connection:
+        conn = real_connect(database, *a, **k)
+        if isinstance(database, str) and database.startswith("file:") and "mode=rw" in database:
+            conns.created.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", recording_connect)
     real_open = bk._SnapshotPins.open_snapshot
     plan: dict[str, int] = {"fail_close": 0, "fail_rollback": 0, "only": 0}
 
@@ -685,6 +742,24 @@ def _assert_all_closed(conns: list[Any]) -> None:
         raise AssertionError("a snapshot connection is still open")
 
 
+def _assert_created_closed(watched: _Watched, expect_open: tuple[Any, ...] = ()) -> None:
+    """Every connection the run created is closed, except those a test names as left open.
+
+    ``watched.created`` is filled where ``sqlite3.connect`` returns, so a
+    connection whose owner registration came late (or never) is still seen.
+    """
+    assert watched.created, "no source connection was created"
+    for c in watched.created:
+        if any(c is e or c is getattr(e, "_real", None) for e in expect_open):
+            c.execute("SELECT 1")  # the one connection the test expects to be open
+            continue
+        try:
+            c.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            continue
+        raise AssertionError("a connection created by the run is still open")
+
+
 def _assert_unpinned(live_dir: Path) -> None:
     for name in ("graph.db", "doc_store.db", "vectors.db"):
         assert _checkpoint_busy(live_dir / name) == 0, f"{name} is still pinned"
@@ -694,6 +769,7 @@ class TestConnectionCleanup:
     def test_normal_run_closes_every_connection(self, live_dir: Path, watched: _Watched) -> None:
         bk.backup_data_dir(live_dir, settings=_Settings())
         _assert_all_closed(watched)
+        _assert_created_closed(watched)
         _assert_unpinned(live_dir)
 
     def test_normal_run_logs_no_rollback_warning(
@@ -710,10 +786,36 @@ class TestConnectionCleanup:
         with pytest.raises(bk.BackupError):
             bk.backup_data_dir(live_dir, settings=_Settings())
         _assert_all_closed(watched)
-        assert len(watched) == 2
+        # The unusable vectors.db was opened too: it is in ``created`` but never
+        # returned from open_snapshot, so only the creation-time record sees it.
+        assert len(watched) == 2 and len(watched.created) > len(watched)
+        _assert_created_closed(watched)
         assert _stagings(live_dir) == []
         for name in ("graph.db", "doc_store.db"):
             assert _checkpoint_busy(live_dir / name) == 0
+
+    def test_control_a_late_registered_connection_is_caught_by_the_creation_record(
+        self, live_dir: Path, watched: _Watched, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Register the connection only after its first statement: the leak must be visible."""
+
+        def late_open(self: Any, source: Path) -> Any:
+            conn = sqlite3.connect(bk._rw_uri(source), uri=True, timeout=5, isolation_level=None)
+            conn.execute("PRAGMA journal_mode")  # raises on the corrupt file
+            self._open.append(conn)  # too late
+            return "wal", None
+
+        monkeypatch.setattr(bk._SnapshotPins, "open_snapshot", late_open)
+        (live_dir / "graph.db").write_bytes(b"not a database at all")
+        with pytest.raises(bk.BackupError):
+            bk.backup_data_dir(live_dir, settings=_Settings())
+        try:
+            with pytest.raises(AssertionError):
+                _assert_created_closed(watched)
+        finally:
+            for c in watched.created:
+                with contextlib.suppress(sqlite3.Error):
+                    c.close()
 
     @pytest.mark.parametrize("which", [1, 2])
     def test_failure_while_copying_a_snapshot(
@@ -733,6 +835,7 @@ class TestConnectionCleanup:
         with pytest.raises(bk.BackupError):
             bk.backup_data_dir(live_dir, settings=_Settings())
         _assert_all_closed(watched)
+        _assert_created_closed(watched)
         _assert_unpinned(live_dir)
         assert _stagings(live_dir) == []
 
@@ -746,6 +849,7 @@ class TestConnectionCleanup:
         with pytest.raises(bk.BackupError):
             bk.backup_data_dir(live_dir, settings=_Settings())
         _assert_all_closed(watched)
+        _assert_created_closed(watched)
         _assert_unpinned(live_dir)
         assert _stagings(live_dir) == []
 
@@ -766,6 +870,7 @@ class TestConnectionCleanup:
         with pytest.raises(bk.BackupError):
             bk.backup_data_dir(live_dir, settings=_Settings())
         _assert_all_closed(watched)
+        _assert_created_closed(watched)
         _assert_unpinned(live_dir)
         assert _stagings(live_dir) == []
 
@@ -828,6 +933,7 @@ class TestConnectionCleanup:
         proxies = [c for c in watched if isinstance(c, _Proxy)]
         assert len(proxies) == 1 and proxies[0].close_calls == 2
         _assert_all_closed(watched)
+        _assert_created_closed(watched)
         _assert_unpinned(live_dir)
         assert _set_dir(live_dir)
 
@@ -839,6 +945,7 @@ class TestConnectionCleanup:
         watched.plan["only"] = 1
         bk.backup_data_dir(live_dir, settings=_Settings())
         _assert_all_closed(watched)
+        _assert_created_closed(watched)
         _assert_unpinned(live_dir)
 
     def test_a_close_that_never_succeeds_aborts_the_run_and_closes_the_others(
@@ -852,6 +959,8 @@ class TestConnectionCleanup:
         assert len(stuck) == 1 and stuck[0].close_calls >= 3  # two in close_checked, one more in close_all
         others = [c for c in watched if not isinstance(c, _Proxy)]
         _assert_all_closed(others)
+        # Every created connection but the one this test deliberately keeps open.
+        _assert_created_closed(watched, expect_open=tuple(stuck))
         assert _stagings(live_dir) == []
         assert not [p for p in live_dir.iterdir() if p.name.startswith("backup.")]
         stuck[0].fail_close = 0
@@ -870,6 +979,7 @@ class TestPublishRenameFailureKeepsStaging:
             bk.backup_data_dir(live_dir, settings=_Settings())
         assert len(_stagings(live_dir)) == 1
         _assert_all_closed(watched)  # connections close before the rename, not after
+        _assert_created_closed(watched)
         _assert_unpinned(live_dir)
 
 

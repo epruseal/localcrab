@@ -201,7 +201,7 @@ python -m opencrab.stores.backup --to <백업경로>             # 서비스 실
 python -m opencrab.stores.backup --verify <백업경로>/backup.<세트 식별자>   # 쓰기 없이 검증
 ```
 
-서비스 중지와 재기동이 필요 없다. 읽기는 막히지 않고 쓰기는 파일을 고정하는 짧은 구간만 기다린다. 다른 저장소나 다른 장치의 작업이 도는 중에도 같은 명령을 쓴다. 파일 사이 정렬 보장의 범위(`write.lock`을 지키는 쓰기 주체에 한함), 복원 절차(복원은 서비스를 멈추고 한다), 부하 제한 예시는 [docs/live-backup.md](./docs/live-backup.md)에 있다.
+서비스 중지와 재기동이 필요 없다. 읽기는 `write.lock`에 막히지 않는다. 쓰기는 백업이 `write.lock`을 쥔 구간만 기다린다. WAL 모드 파일은 그 구간에 고정만 하므로 짧고, WAL이 아닌 SQLite 파일과 디렉터리형 대상은 잠금 안에서 복사하므로 크기에 비례해 늘어난다. 다른 저장소나 다른 장치의 작업이 도는 중에도 같은 명령을 쓴다. 파일 사이 정렬 보장의 범위(`write.lock`을 지키는 쓰기 주체에 한함), `--verify`의 한계, 복원 절차(복원은 서비스를 멈추고 한다), 부하 제한 예시는 [docs/live-backup.md](./docs/live-backup.md)에 있다.
 
 ---
 
