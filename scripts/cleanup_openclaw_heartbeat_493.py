@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""OpenClaw heartbeat 레코드를 네 SQLite 저장소에서 정리한다.
+"""승인된 후보 레코드를 네 SQLite 저장소에서 정리한다.
 
 기본 동작은 읽기 전용 dry-run이다. 이 도구는 라이브 서비스 제어를 하지 않는다.
+후보는 두 방식 중 하나로 고른다. 기본 방식은 #493 폴링 레코드 접두 규칙이다.
+`--approved-ids <파일>`을 주면 승인된 ID 집합만 후보로 삼는다(#513, #520).
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
+import dataclasses
 import errno
 import hashlib
 import json
@@ -21,6 +25,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+from opencrab.grammar.manifest import SPACES
 from opencrab.stores.backup import backup_sqlite, verify_sqlite
 
 EXIT_OK = 0
@@ -94,6 +99,126 @@ def _strict_pack(raw: Any, label: str) -> str:
 
 def _props_digest(raw: Any) -> str:
     return _sha(_canon(_json_object(raw, "properties")))
+
+
+@dataclasses.dataclass(frozen=True)
+class _Selection:
+    """후보를 어떻게 고르고 어떤 노드를 후보로 보는지 정한다.
+
+    pack_id와 node_type은 후보 검증, 보호 집합, Claim 근거 판정, CAS 삭제가 함께 쓴다.
+    ids가 None이면 #493 접두 규칙이고 집합이면 승인된 ID 집합이다.
+    """
+
+    pack_id: str
+    node_type: str
+    ids: frozenset[str] | None
+    support_types: frozenset[str] | None = None
+
+
+_PREFIX_SELECTION = _Selection("openclaw", "Evidence", None)
+_SELECTION: _Selection = _PREFIX_SELECTION
+# 보호 섹션 분기가 이미 다루는 타입은 후보 타입이 될 수 없다.
+_RESERVED_NODE_TYPES = frozenset({"Document", "Claim"})
+_IDS_FILE_KEYS = {"pack_id", "node_type", "ids"}
+
+
+@contextlib.contextmanager
+def _selection_scope(selection: _Selection) -> Iterator[None]:
+    """선택을 설정하고 나올 때 이전 값을 복원한다. 모듈 전역 _SCOPE와 같은 방식의 전역 상태이다."""
+    global _SELECTION
+    previous = _SELECTION
+    _SELECTION = selection
+    try:
+        yield
+    finally:
+        _SELECTION = previous
+
+
+def _claim_source_types() -> set[str]:
+    """승인 run에 동결한 생존 근거 타입을 쓴다. 구 ID run은 Evidence와 선택 타입을 유지한다."""
+    return set(_SELECTION.support_types) if _SELECTION.support_types is not None else {"Evidence", _SELECTION.node_type}
+
+
+def _ids_digest(ids: Any) -> str:
+    return _sha(_canon(sorted(ids)))
+
+
+def _check_selection_fields(pack_id: Any, node_type: Any) -> None:
+    if not isinstance(pack_id, str) or not pack_id:
+        raise CleanupRefusedError("selection pack_id must be a non-empty string")
+    if not isinstance(node_type, str) or not node_type or node_type in _RESERVED_NODE_TYPES:
+        raise CleanupRefusedError("selection node_type must be a non-empty string other than Document and Claim")
+
+
+def _load_approved_ids(path: Path | None) -> _Selection:
+    """승인 ID 파일을 읽어 _parse_approved_ids로 검증한다."""
+    if path is None or not path.is_file():
+        raise CleanupRefusedError("--approved-ids file is missing")
+    return _parse_approved_ids(_json_object(path.read_text(encoding="utf-8"), "approved ids"))
+
+
+def _parse_approved_ids(data: dict[str, Any]) -> _Selection:
+    """승인 ID 본문을 검증한다. 키는 pack_id, node_type, ids뿐이고 ids는 비어 있지 않은 중복 없는 문자열 목록이다.
+
+    선택 스크립트도 파일을 쓰기 전에 이 함수로 본문을 검증한다. 입력 계약의 정본은 이 함수이다.
+    """
+    if not isinstance(data, dict) or set(data) != _IDS_FILE_KEYS:
+        raise CleanupRefusedError("approved ids file has unexpected or missing fields")
+    _check_selection_fields(data["pack_id"], data["node_type"])
+    ids = data["ids"]
+    if not isinstance(ids, list) or not ids or any(not isinstance(item, str) or not item for item in ids):
+        raise CleanupRefusedError("approved ids must be a non-empty list of non-empty strings")
+    if len(set(ids)) != len(ids):
+        raise CleanupRefusedError("approved ids contain duplicates")
+    return _Selection(data["pack_id"], data["node_type"], frozenset(ids), frozenset(SPACES[EVIDENCE_SPACE]["node_types"]) | {data["node_type"]})
+
+
+def _selection_record(selection: _Selection) -> dict[str, Any]:
+    """manifest에 동결할 선택 기록이다. 승인 파일이 manifest sha256에 묶이므로 선택도 승인에 묶인다."""
+    if selection.ids is None:
+        return {"mode": "prefix"}
+    return {
+        "mode": "id-set",
+        "pack_id": selection.pack_id,
+        "node_type": selection.node_type,
+        "approved_count": len(selection.ids),
+        "approved_ids_sha256": _ids_digest(selection.ids),
+        "support_types": sorted(selection.support_types or {"Evidence", selection.node_type}),
+    }
+
+
+def _selection_from_manifest(manifest: dict[str, Any], candidate_ids: list[str]) -> _Selection:
+    """manifest의 선택 기록과 검증된 후보 파일의 ID로 선택을 복원한다.
+
+    선택 기록이 없는 manifest는 접두 규칙이다. id-set이면 후보 ID의 개수와 sha256이 기록과 같아야 한다.
+    """
+    record = manifest.get("selection")
+    if record is None:
+        return _PREFIX_SELECTION
+    if not isinstance(record, dict):
+        raise CleanupRefusedError("manifest selection is invalid")
+    if record.get("mode") == "prefix":
+        if set(record) != {"mode"}:
+            raise CleanupRefusedError("manifest selection is invalid")
+        return _PREFIX_SELECTION
+    keys = {"mode", "pack_id", "node_type", "approved_count", "approved_ids_sha256"}
+    if record.get("mode") != "id-set" or set(record) not in (keys, keys | {"support_types"}):
+        raise CleanupRefusedError("manifest selection is invalid")
+    _check_selection_fields(record["pack_id"], record["node_type"])
+    if record["approved_count"] != len(candidate_ids) or record["approved_ids_sha256"] != _ids_digest(candidate_ids):
+        raise CleanupRefusedError("manifest selection does not match the candidate file")
+    support_types = record.get("support_types")
+    if "support_types" in record:
+        if (
+            not isinstance(support_types, list) or not support_types
+            or any(not isinstance(item, str) or not item for item in support_types)
+            or len(set(support_types)) != len(support_types)
+            or not {"Evidence", record["node_type"]}.issubset(support_types)
+            or _RESERVED_NODE_TYPES.intersection(support_types)
+        ):
+            raise CleanupRefusedError("manifest selection support_types is invalid")
+    # 구 ID manifest는 당시 보호 범위를 유지한다.
+    return _Selection(record["pack_id"], record["node_type"], frozenset(candidate_ids), frozenset(support_types) if support_types is not None else None)
 
 
 def _file_sha(path: Path) -> str:
@@ -618,6 +743,7 @@ class _Manifest(dict):
     """manifest 사전에 run 위치를 붙인다. 직렬화에는 영향이 없다. evidence 항목은 sidecar 파일에서 읽는다."""
 
     run_dir: Path | None = None
+    selection: _Selection = _PREFIX_SELECTION
     _evidence: _EvidenceStore | None = None
 
     def evidence_store(self) -> _EvidenceStore:
@@ -721,11 +847,14 @@ def _candidate_snapshot(data_dir: Path, vector_table: str, node_id: str, *, immu
 
 def _select_candidate(data_dir: Path, vector_table: str, source: tuple[Any, ...], readers: _Readers | None = None) -> dict[str, Any]:
     node_id, text, metadata = source
-    if not isinstance(node_id, str) or not node_id.startswith("evidence:turn:"):
-        raise CleanupRefusedError("internal selection received an invalid source id")
-    if not isinstance(text, str) or not text.startswith(PREFIXES):
-        raise CleanupRefusedError("internal selection received a non-heartbeat source")
-    if _strict_pack(metadata, f"source {node_id}") != "openclaw":
+    if _SELECTION.ids is None:
+        if not isinstance(node_id, str) or not node_id.startswith("evidence:turn:"):
+            raise CleanupRefusedError("internal selection received an invalid source id")
+        if not isinstance(text, str) or not text.startswith(PREFIXES):
+            raise CleanupRefusedError("internal selection received a non-heartbeat source")
+    elif not isinstance(node_id, str) or node_id not in _SELECTION.ids:
+        raise CleanupRefusedError("internal selection received an unapproved source id")
+    if _strict_pack(metadata, f"source {node_id}") != _SELECTION.pack_id:
         raise CleanupRefusedError("internal selection received another pack")
     own = readers is None
     if own:
@@ -744,17 +873,17 @@ def _select_candidate(data_dir: Path, vector_table: str, source: tuple[Any, ...]
             errors.append("source FTS identity")
         if len(docs) != 1:
             errors.append("evidence doc multiplicity")
-        elif docs[0][0] != EVIDENCE_SPACE or docs[0][2] != "Evidence" or _strict_pack(docs[0][3], f"doc {node_id}") != "openclaw":
+        elif docs[0][0] != EVIDENCE_SPACE or docs[0][2] != _SELECTION.node_type or _strict_pack(docs[0][3], f"doc {node_id}") != _SELECTION.pack_id:
             errors.append("evidence doc ownership")
         if len(nodes) != 1:
             errors.append("Evidence graph multiplicity")
-        elif nodes[0][0] != "Evidence" or nodes[0][2] != EVIDENCE_SPACE or _strict_pack(nodes[0][3], f"graph {node_id}") != "openclaw":
+        elif nodes[0][0] != _SELECTION.node_type or nodes[0][2] != EVIDENCE_SPACE or _strict_pack(nodes[0][3], f"graph {node_id}") != _SELECTION.pack_id:
             errors.append("Evidence graph ownership")
         if len(vectors_rows) != 1:
             errors.append("vector multiplicity")
         else:
             row = vectors_rows[0]
-            if row[1] != "openclaw" or _strict_pack(row[3], f"vector {node_id}") != "openclaw":
+            if row[1] != _SELECTION.pack_id or _strict_pack(row[3], f"vector {node_id}") != _SELECTION.pack_id:
                 errors.append("vector ownership")
             elif "node_id" in _json_object(row[3], f"vector {node_id}") and _json_object(row[3], f"vector {node_id}")["node_id"] != node_id:
                 # 신원은 vec0 PK 열 node_id이다. 운영 writer는 metadata에 node_id를 넣지 않으므로 키가 있을 때만 대조한다.
@@ -763,7 +892,7 @@ def _select_candidate(data_dir: Path, vector_table: str, source: tuple[Any, ...]
         registry_records = [_registry_node_record(row) for row in registry_nodes]
         if len(registry_records) != 1:
             errors.append("registry node multiplicity")
-        elif (registry_records[0]["space"], registry_records[0]["node_type"], registry_records[0]["node_id"]) != (EVIDENCE_SPACE, "Evidence", node_id):
+        elif (registry_records[0]["space"], registry_records[0]["node_type"], registry_records[0]["node_id"]) != (EVIDENCE_SPACE, _SELECTION.node_type, node_id):
             errors.append("registry node ownership")
         if errors:
             raise CleanupRefusedError(f"{node_id}: " + ", ".join(errors))
@@ -794,6 +923,7 @@ def _graph_sections(conn: sqlite3.Connection, candidate_ids: set[str], *, raw: b
     """
     excluded_nodes = excluded_nodes or set()
     nodes, evidence, evidence_raw, edges = _SectionHash(), _SectionHash(), _SectionHash(), _SectionHash()
+    protected_types = _claim_source_types()  # 후보와 같은 타입의 비후보도 보호한다
     evidence_ids: list[str] = []
     claims: list[dict[str, Any]] = []
     for row in conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes"):
@@ -806,7 +936,7 @@ def _graph_sections(conn: sqlite3.Connection, candidate_ids: set[str], *, raw: b
             nodes.add(item)
             if node_type == "Claim":
                 claims.append(item)
-        elif node_type == "Evidence" and node_id not in candidate_ids:
+        elif node_type in protected_types and node_id not in candidate_ids:
             evidence.add({"id": node_id, "type": node_type, "space": space, "properties": properties})
             if raw:
                 evidence_raw.add({"id": node_id, "row": _json_value(row)})
@@ -892,9 +1022,9 @@ def _protection_digest(sections: dict[str, Any]) -> str:
 
 
 def _evidence_item(doc: sqlite3.Connection, graph: sqlite3.Connection, vectors: sqlite3.Connection, registry: sqlite3.Connection, vector_table: str, node_id: str, candidate_ids: set[str]) -> dict[str, Any] | None:
-    """Claim support 판정이 쓰는 비후보 Evidence 항목이다. Evidence 비후보 노드가 아니면 None이다."""
+    """Claim 근거 판정에 쓸 비후보 항목을 동결한다. 허용 근거 타입이 아니거나 후보이면 None이다."""
     row = graph.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (node_id,)).fetchone()
-    if row is None or row[0] != "Evidence" or node_id in candidate_ids:
+    if row is None or row[0] not in _claim_source_types() or node_id in candidate_ids:
         return None
     source_rows = doc.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (node_id,)).fetchall()
     registry_rows = registry.execute(
@@ -958,7 +1088,7 @@ def _valid_claim_source(
     frozen: dict[str, Any] | None,
     source_id: str,
 ) -> bool:
-    """현재와 frozen 상태가 모두 openclaw Evidence source임을 확인한다."""
+    """현재와 동결 상태의 근거 타입, 팩, 공간과 행이 같은지 확인한다."""
     if frozen is None:
         return False
     source = doc.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchall()
@@ -973,18 +1103,20 @@ def _valid_claim_source(
         return False
     registry_record = _registry_node_record(registry_nodes[0])
     frozen_graph = frozen.get("graph")
+    source_type = frozen_graph.get("type") if isinstance(frozen_graph, dict) else None
     return (
         len(frozen_source) == 1
-        and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == "openclaw"
-        and _strict_pack(source[0][2], f"Claim source {source_id}") == "openclaw"
+        and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == _SELECTION.pack_id
+        and _strict_pack(source[0][2], f"Claim source {source_id}") == _SELECTION.pack_id
         and frozen_graph is not None
         and isinstance(frozen.get("graph_raw"), list)
-        and _strict_pack(frozen["graph_raw"][3], f"Frozen Claim graph {source_id}") == "openclaw"
-        and graph_node[0] == "Evidence" and graph_node[1] == source_id and graph_node[2] == EVIDENCE_SPACE
-        and _strict_pack(graph_node[3], f"Claim graph {source_id}") == "openclaw"
+        and _strict_pack(frozen["graph_raw"][3], f"Frozen Claim graph {source_id}") == _SELECTION.pack_id
+        and source_type in _claim_source_types()
+        and graph_node[0] == source_type and graph_node[1] == source_id and graph_node[2] == EVIDENCE_SPACE
+        and _strict_pack(graph_node[3], f"Claim graph {source_id}") == _SELECTION.pack_id
         and len(frozen_registry) == 1
         and frozen_registry[0]["space"] == EVIDENCE_SPACE
-        and frozen_registry[0]["node_type"] == "Evidence"
+        and frozen_registry[0]["node_type"] == source_type
         and frozen_registry[0]["node_id"] == source_id
         and registry_record == frozen_registry[0]
         and [_json_value(row) for row in source] == frozen_source
@@ -1024,7 +1156,8 @@ def _claim_failures(
             rows = graph.execute("SELECT from_type,from_id,relation,to_type,to_id,properties FROM graph_edges WHERE relation='supports' AND to_id=?", (claim_id,)).fetchall()
             supports = [_edge_record(row) for row in rows]
             valid = any(
-                edge["from_type"] == "Evidence" and edge["to_type"] == "Claim"
+                edge["from_type"] in _claim_source_types() and edge["to_type"] == "Claim"
+                and edge["from_type"] == ((protected.get(edge["from_id"]) or {}).get("graph") or {}).get("type")
                 and edge["from_id"] not in candidate_ids
                 and _sha(_canon(edge)) not in planned_edges
                 and _valid_claim_source(graph, registry, doc, protected.get(edge["from_id"]), edge["from_id"])
@@ -1075,7 +1208,7 @@ def _frozen_claim_supports(candidates: list[dict[str, Any]], manifest: dict[str,
     if axis == "graph":
         supports = [
             edge for record in candidates for edge in record["edges"]
-            if edge["relation"] == "supports" and edge["from_type"] == "Evidence"
+            if edge["relation"] == "supports" and edge["from_type"] == _SELECTION.node_type
         ]
         claims = {
             (item["space"], item["id"])
@@ -1233,15 +1366,30 @@ def select(data_dir: Path, vector_table: str, store: _CandidateStore | None = No
     errors: list[str] = []
     doc = _ro(data_dir / "doc_store.db", True)
     try:
-        ids = {row[0] for row in doc.execute("SELECT source_id FROM doc_sources WHERE source_id LIKE 'evidence:turn:%'")}
+        approved = _SELECTION.ids
+        if approved is None:
+            ids = {row[0] for row in doc.execute("SELECT source_id FROM doc_sources WHERE source_id LIKE 'evidence:turn:%'")}
+        else:
+            ids = set(approved)
         readers = _Readers(data_dir, vector_table, immutable=True, ids=ids)
         try:
-            for row in doc.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id LIKE 'evidence:turn:%' ORDER BY source_id"):
-                try:
-                    if _strict_pack(row[2], f"source {row[0]}") == "openclaw" and isinstance(row[1], str) and row[1].startswith(PREFIXES):
+            if approved is None:
+                for row in doc.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id LIKE 'evidence:turn:%' ORDER BY source_id"):
+                    try:
+                        if _strict_pack(row[2], f"source {row[0]}") == _SELECTION.pack_id and isinstance(row[1], str) and row[1].startswith(PREFIXES):
+                            candidates.append(_select_candidate(data_dir, vector_table, row, readers))
+                    except CleanupRefusedError as exc:
+                        errors.append(str(exc))
+            else:
+                # 승인된 ID는 모두 후보가 되거나 오류가 된다. 조용히 빠지는 ID는 없다.
+                for node_id in sorted(approved):
+                    row = doc.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (node_id,)).fetchone()
+                    try:
+                        if row is None:
+                            raise CleanupRefusedError(f"{node_id}: approved id has no source row")
                         candidates.append(_select_candidate(data_dir, vector_table, row, readers))
-                except CleanupRefusedError as exc:
-                    errors.append(str(exc))
+                    except CleanupRefusedError as exc:
+                        errors.append(str(exc))
         finally:
             readers.close()
     finally:
@@ -1266,8 +1414,18 @@ def _ordered_digest(candidates: Any) -> str:
     return _sha(_canon(ids))
 
 
-def dry_run(data_dir: Path, run_dir: Path, vector_table: str) -> dict[str, Any]:
-    """후보와 보호 집합을 기록한다. 오류가 있으면 manifest를 만들지 않는다."""
+def dry_run(data_dir: Path, run_dir: Path, vector_table: str, approved_ids: Path | None = None) -> dict[str, Any]:
+    """후보와 보호 집합을 기록한다. 오류가 있으면 manifest를 만들지 않는다.
+
+    approved_ids가 없으면 #493 접두 규칙으로 고른다. 있으면 그 파일의 ID 집합만 후보로 삼는다.
+    승인 파일은 run directory를 만들기 전에 검사한다.
+    """
+    selection = _PREFIX_SELECTION if approved_ids is None else _load_approved_ids(approved_ids)
+    with _selection_scope(selection):
+        return _dry_run(data_dir, run_dir, vector_table)
+
+
+def _dry_run(data_dir: Path, run_dir: Path, vector_table: str) -> dict[str, Any]:
     if any((run_dir / name).exists() for name in ("candidates.jsonl", "manifest.json", "receipt.json")):
         raise CleanupRefusedError("run directory already has published data")
     run_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -1284,6 +1442,7 @@ def dry_run(data_dir: Path, run_dir: Path, vector_table: str) -> dict[str, Any]:
             "snapshot_sha256": _store_set_digest(data_dir),
             "store_set_sha256": _store_set_digest(data_dir),
             "vector_table": vector_table,
+            "selection": _selection_record(_SELECTION),
             "protected": frozen,
             "protected_sha256": protected_digest,
         }
@@ -1307,12 +1466,13 @@ def _load_run(run_dir: Path) -> tuple[_CandidateStore, dict[str, Any]]:
     if manifest.get("candidate_sha256") != candidates.sha256 or manifest.get("ordered_ids_sha256") != _ordered_digest(candidates):
         candidates.close()
         raise CleanupRefusedError("candidate file does not match manifest")
-    if isinstance((manifest.get("protected") or {}).get("evidence"), dict):
-        try:
+    try:
+        manifest.selection = _selection_from_manifest(manifest, candidates.ids)
+        if isinstance((manifest.get("protected") or {}).get("evidence"), dict):
             manifest.evidence_store()
-        except CleanupRefusedError:
-            candidates.close()
-            raise
+    except CleanupRefusedError:
+        candidates.close()
+        raise
     return candidates, manifest
 
 
@@ -1786,7 +1946,7 @@ def _delete_graph(data_dir: Path, record: dict[str, Any], candidates: list[dict[
     try:
         _begin_write(conn)
         node = conn.execute("SELECT node_type,node_id,space_id,properties FROM graph_nodes WHERE node_id=?", (record["id"],)).fetchone()
-        if node is None or node[0] != "Evidence" or node[2] != EVIDENCE_SPACE or _props_digest(node[3]) != record["graph"]["properties"]:
+        if node is None or node[0] != _SELECTION.node_type or node[2] != EVIDENCE_SPACE or _props_digest(node[3]) != record["graph"]["properties"]:
             raise CleanupRefusedError(f"{record['id']}: graph CAS conflict")
         component_before = {_sha(_canon(edge)) for edge in _validate_component_edges(conn, candidates, receipt, manifest, record["id"])}
         boundary_before = {_sha(_canon(edge)) for edge in _validate_boundary_edges(conn, candidates, receipt, manifest, record["id"])}
@@ -1820,7 +1980,7 @@ def _delete_graph(data_dir: Path, record: dict[str, Any], candidates: list[dict[
             result = conn.execute("DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=? AND from_type=? AND to_type=? AND properties IS ?", (edge["from_id"], edge["relation"], edge["to_id"], edge["from_type"], edge["to_type"], raw)).rowcount
             if result != 1:
                 raise CleanupRefusedError(f"{record['id']}: graph edge delete rowcount")
-        deleted = conn.execute("DELETE FROM graph_nodes WHERE node_id=? AND node_type='Evidence' AND space_id=? AND properties IS ?", (record["id"], EVIDENCE_SPACE, node[3])).rowcount
+        deleted = conn.execute("DELETE FROM graph_nodes WHERE node_id=? AND node_type=? AND space_id=? AND properties IS ?", (record["id"], _SELECTION.node_type, EVIDENCE_SPACE, node[3])).rowcount
         if deleted != 1:
             raise CleanupRefusedError(f"{record['id']}: graph delete rowcount")
         component_after = {_sha(_canon(edge)) for edge in _validate_component_edges(conn, candidates, receipt, manifest, record["id"])}
@@ -1989,7 +2149,7 @@ def _delete_document(data_dir: Path, record: dict[str, Any]) -> None:
             raise CleanupRefusedError(f"{record['id']}: source CAS conflict")
         if fts and (len(fts) != 1 or _row_digest(fts[0][1]) != record["snapshot"]["fts"][0]):
             raise CleanupRefusedError(f"{record['id']}: FTS CAS conflict")
-        if doc is not None and (doc[0] != EVIDENCE_SPACE or doc[2] != "Evidence" or _props_digest(doc[3]) != record["doc"]["properties"]):
+        if doc is not None and (doc[0] != EVIDENCE_SPACE or doc[2] != _SELECTION.node_type or _props_digest(doc[3]) != record["doc"]["properties"]):
             raise CleanupRefusedError(f"{record['id']}: doc CAS conflict")
         if source is not None and conn.execute("DELETE FROM doc_sources WHERE source_id=?", (record["id"],)).rowcount != 1:
             raise CleanupRefusedError(f"{record['id']}: source delete rowcount")
@@ -2098,7 +2258,8 @@ def apply(data_dir: Path, run_dir: Path, vector_table: str, approved_manifest: P
     scope = _RunScope(data_dir, vector_table, candidates, manifest)
     _SCOPE = scope
     try:
-        _apply_run(data_dir, run_dir, vector_table, approved_manifest, backup_dir, scan, candidates, manifest, scope)
+        with _selection_scope(manifest.selection):
+            _apply_run(data_dir, run_dir, vector_table, approved_manifest, backup_dir, scan, candidates, manifest, scope)
     finally:
         _SCOPE = None
         if scope.readers is not None:
@@ -2371,6 +2532,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--rollback", action="store_true")
     parser.add_argument("--prepare-rollback", action="store_true")
     parser.add_argument("--approved-manifest")
+    parser.add_argument("--approved-ids", help="dry-run에서만 쓴다. 이 파일의 ID 집합만 후보로 삼는다.")
     parser.add_argument("--backup-dir")
     return parser.parse_args(argv)
 
@@ -2381,6 +2543,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if sum((args.apply, args.rollback, args.prepare_rollback)) > 1:
             raise CleanupRefusedError("choose only one of --apply, --rollback, --prepare-rollback")
+        if args.approved_ids and (args.apply or args.rollback or args.prepare_rollback):
+            raise CleanupRefusedError("--approved-ids is only for dry-run; apply and rollback read the selection from the manifest")
         if args.apply:
             if not args.backup_dir:
                 raise CleanupRefusedError("--backup-dir is required for apply")
@@ -2397,7 +2561,7 @@ def main(argv: list[str] | None = None) -> int:
             rollback(data_dir, run_dir, Path(args.backup_dir).resolve())
             print("rollback complete")
         else:
-            result = dry_run(data_dir, run_dir, args.vector_table)
+            result = dry_run(data_dir, run_dir, args.vector_table, Path(args.approved_ids) if args.approved_ids else None)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return EXIT_OK
     except CleanupRefusedError as exc:

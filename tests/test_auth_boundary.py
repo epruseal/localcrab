@@ -255,19 +255,19 @@ class TestServeFlagScope:
 
 
 class TestCliWriteActor:
-    def test_ingest_without_local_user_fails_before_writing(self, env, tmp_path):
-        (tmp_path / "a.txt").write_text("hello")
-        result = CliRunner().invoke(main, ["ingest", str(tmp_path / "a.txt")])
+    def test_ingest_without_local_user_fails_before_writing(self, env, src_dir):
+        (src_dir / "a.txt").write_text("hello")
+        result = CliRunner().invoke(main, ["ingest", str(src_dir / "a.txt")])
         assert result.exit_code != 0
         assert "opencrab init" in result.output
         assert "Traceback" not in result.output
 
-    def test_extract_dry_run_needs_no_local_user(self, env, tmp_path):
+    def test_extract_dry_run_needs_no_local_user(self, env, src_dir):
         """--dry-run writes nothing; requiring a principal there would break a
         command that works today."""
-        (tmp_path / "a.md").write_text("x")
+        (src_dir / "a.md").write_text("x")
         result = CliRunner().invoke(
-            main, ["extract", str(tmp_path / "a.md"), "--dry-run", "--api-key", "sk-test"]
+            main, ["extract", str(src_dir / "a.md"), "--dry-run", "--api-key", "sk-test"]
         )
         assert "opencrab init" not in result.output
 
@@ -278,12 +278,12 @@ class TestCliWriteActor:
         assert r.exit_code == 0
         assert "user_id" in json.loads(r.output)
 
-    def test_ingest_records_principal_as_source_actor(self, env, tmp_path):
+    def test_ingest_records_principal_as_source_actor(self, env, src_dir):
         from opencrab.config import get_settings
         from opencrab.stores.factory import make_doc_store
 
         user_id, _ = _bootstrap()
-        src = tmp_path / "note.txt"
+        src = src_dir / "note.txt"
         src.write_text("body text")
         result = CliRunner().invoke(main, ["ingest", str(src)])
         assert result.exit_code == 0
