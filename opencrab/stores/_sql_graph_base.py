@@ -2704,6 +2704,8 @@ class _SqlGraphStoreBase(abc.ABC):
         properties: dict[str, Any] | None = None, *, expected_current_digest: str, owner_pack_id: str,
         return_receipt: bool = False,
     ) -> bool | EdgeWriteReceipt:
+        """Replace one edge by CAS. This layer does not check the principal or the pack registry.
+        See ``GraphStore.update_edge`` for the contract."""
         self._require_write_available()
         validate_digest(expected_current_digest, edge=True)
         if not isinstance(owner_pack_id, str) or not owner_pack_id:
@@ -4428,6 +4430,8 @@ class _SqlGraphStoreBase(abc.ABC):
         return self._run_mutation_tx(body)
 
     def update_edges_batch(self, edges: list[dict[str, Any]], *, return_receipt: bool = False) -> Any:
+        """Replace many edges by CAS. This layer does not check the principal or the pack registry.
+        See ``GraphStoreExtended.update_edges_batch`` for the contract."""
         self._require_write_available()
         if not edges:
             return () if return_receipt else 0
