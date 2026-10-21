@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import struct
 import threading
@@ -1082,6 +1083,32 @@ class SqliteVecStore(_SqliteConnMixin):
                 )
         self._ann_cache = None  # in-process write -> invalidate ANN cache
         return [record["id"] for record in clean]
+
+    def verify_recovery_row(self, node_id: str) -> bool:
+        """Validate the current physical vector representation for one row."""
+        self._require_available()
+        try:
+            row = self._conn.execute(
+                f"SELECT vec_to_json(embedding) FROM {self._table} WHERE node_id=?",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            values = json.loads(row[0])
+            if (not isinstance(values, list) or len(values) != self._dim
+                    or any(not isinstance(value, (int, float)) or not math.isfinite(value)
+                           for value in values)):
+                return False
+            if self._has_bit_column:
+                bit_ok = self._conn.execute(
+                    f"SELECT vec_to_json(embedding_bit) = vec_to_json(vec_quantize_binary(embedding))"
+                    f" FROM {self._table} WHERE node_id=?",
+                    (node_id,),
+                ).fetchone()
+                return bool(bit_ok and bit_ok[0])
+            return True
+        except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+            return False
 
     def get_by_id(self, doc_id: str) -> dict[str, Any] | None:
         self._require_available()

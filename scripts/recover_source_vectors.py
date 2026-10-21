@@ -49,11 +49,14 @@ class SourceReader:
 
     def get_source(self, source_id: str) -> SourceRow | None:
         uri = f"file:{self._path}?mode=ro"
-        with sqlite3.connect(uri, uri=True) as conn:
+        conn = sqlite3.connect(uri, uri=True)
+        try:
             row = conn.execute(
                 "SELECT source_id, text, metadata FROM doc_sources WHERE source_id=?",
                 (source_id,),
             ).fetchone()
+        finally:
+            conn.close()
         if row is None:
             return None
         metadata, corrupted = decode_properties(row[2])
@@ -93,7 +96,7 @@ def read_approved(path: Path) -> tuple[list[str], str, str]:
         if not isinstance(value, dict) or set(value) != {"id"}:
             raise RecoveryError(f"approved file has invalid record at line {lineno}")
         ident = value["id"]
-        if not isinstance(ident, str) or not ident:
+        if not isinstance(ident, str) or not ident or not ident.strip():
             raise RecoveryError(f"approved file has invalid id at line {lineno}")
         ids.append(ident)
     if not ids or len(ids) != len(set(ids)):
@@ -105,7 +108,8 @@ def checked_source(reader: SourceReader, ident: str) -> tuple[SourceRow, str, st
     source = reader.get_source(ident)
     if source is None:
         raise RecoveryError("approved source is absent")
-    if source.property_decode_error or not isinstance(source.metadata, dict):
+    if (not isinstance(source.text, str) or source.property_decode_error
+            or not isinstance(source.metadata, dict)):
         raise RecoveryError("approved source metadata is malformed")
     pack_id = source.metadata.get("pack_id")
     if not isinstance(pack_id, str) or not pack_id:
@@ -146,6 +150,29 @@ def load_manifest(path: Path) -> dict[str, Any]:
     return value
 
 
+def vector_identity(vector: Any) -> dict[str, Any]:
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+    if not isinstance(vector, SqliteVecStore):
+        raise RecoveryError("recovery requires sqlite-vec")
+    db_path = Path(vector._db_path)
+    if not db_path.is_absolute():
+        local_conn = getattr(vector, "_conn", None)
+        db_path = Path(local_conn.execute("PRAGMA database_list").fetchone()[2]) if local_conn is not None else db_path
+    resolved = db_path.resolve(strict=False)
+    return {
+        "class": f"{type(vector).__module__}.{type(vector).__name__}",
+        "table": vector._table,
+        "dimension": vector._dim,
+        "has_bit": vector._has_bit_column,
+        "path_digest": hashlib.sha256(str(resolved).encode()).hexdigest(),
+    }
+
+
+def _event(callback: Callable[[str], None], name: str) -> None:
+    callback(name)
+
+
 def plan(
     approved: Path,
     run_dir: Path,
@@ -153,6 +180,7 @@ def plan(
     vector: Any,
     sql: Any,
     principal: Principal,
+    event: Callable[[str], None] = lambda _name: None,
 ) -> dict[str, Any]:
     if run_dir.exists():
         raise RecoveryError("run directory already exists")
@@ -160,8 +188,11 @@ def plan(
     targets = []
     with principal_scope(principal):
         for ident in ids:
+            _event(event, "source_read")
             source, pack_id, source_digest = checked_source(reader, ident)
+            _event(event, "authorized")
             authorize(sql, principal, pack_id)
+            _event(event, "vector_read")
             _row, vector_digest = checked_vector(vector, ident, pack_id)
             targets.append({
                 "id": ident,
@@ -175,6 +206,9 @@ def plan(
         "version": MANIFEST_VERSION,
         "approved_raw_digest": raw_digest,
         "approved_semantic_digest": semantic_digest,
+        "approved_ids": ids,
+        "principal_digest": _digest({"user_id": principal.user_id, "is_local": principal.is_local}),
+        "vector_identity": vector_identity(vector),
         "targets": targets,
         "backup": None,
     }
@@ -188,7 +222,9 @@ def verify_current_target(vector: Any, ident: str, source: SourceRow, pack_id: s
     if row.get("document") != source.text or _sanitize_metadata(row["metadata"]) != metadata:
         raise RecoveryError("vector readback does not match source target")
     verifier = getattr(vector, "verify_recovery_row", None)
-    if callable(verifier) and not verifier(ident):
+    if not callable(verifier):
+        raise RecoveryError("vector embedding verifier is unavailable")
+    if not verifier(ident):
         raise RecoveryError("vector embedding representation is invalid")
     return row
 
@@ -203,22 +239,40 @@ def apply(
     backup_to: Path,
     backup_runner: Callable[[Path], dict[str, Any]],
     lock_factory: Callable[[], contextlib.AbstractContextManager[Any]],
+    event: Callable[[str], None] = lambda _name: None,
 ) -> dict[str, Any]:
     manifest_path = run_dir / "manifest.json"
     manifest = load_manifest(manifest_path)
-    _ids, raw_digest, semantic_digest = read_approved(approved)
+    ids, raw_digest, semantic_digest = read_approved(approved)
+    target_ids = [target.get("id") for target in manifest.get("targets", []) if isinstance(target, dict)]
     if (raw_digest != manifest.get("approved_raw_digest")
-            or semantic_digest != manifest.get("approved_semantic_digest")):
+            or semantic_digest != manifest.get("approved_semantic_digest")
+            or ids != manifest.get("approved_ids")
+            or target_ids != ids
+            or not ids):
         raise RecoveryError("approved file does not match dry-run manifest")
+    if manifest.get("principal_digest") != _digest({"user_id": principal.user_id, "is_local": principal.is_local}):
+        raise RecoveryError("principal does not match dry-run manifest")
+    if manifest.get("vector_identity") != vector_identity(vector):
+        raise RecoveryError("vector store does not match dry-run manifest")
     backup = backup_runner(backup_to)
     if not isinstance(backup, dict) or not backup.get("verified"):
         raise RecoveryError("backup did not verify")
     manifest["backup"] = backup
     write_manifest(manifest_path, manifest)
+    _event(event, "backup_verified")
     with principal_scope(principal), lock_factory():
+        _event(event, "lock_entered")
+        if manifest.get("principal_digest") != _digest({"user_id": principal.user_id, "is_local": principal.is_local}):
+            raise RecoveryError("principal changed before apply lock")
+        if manifest.get("vector_identity") != vector_identity(vector):
+            raise RecoveryError("vector store changed before apply lock")
         for target in manifest["targets"]:
+            _event(event, "source_read")
             source, pack_id, source_digest = checked_source(reader, target["id"])
+            _event(event, "authorized")
             authorize(sql, principal, pack_id)
+            _event(event, "vector_read")
             _before, vector_digest = checked_vector(vector, target["id"], pack_id)
             if target["state"] == "verified":
                 if source_digest != target["source_digest"]:
@@ -230,6 +284,7 @@ def apply(
             target["state"] = "written"
             write_manifest(manifest_path, manifest)
             metadata = _sanitize_metadata(source.metadata)
+            _event(event, "upsert")
             vector.upsert_texts(texts=[source.text], ids=[target["id"]], metadatas=[metadata])
             verify_current_target(vector, target["id"], source, pack_id)
             target["state"] = "verified"
