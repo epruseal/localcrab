@@ -57,6 +57,7 @@ from opencrab.auth import (
     refuse_stale_shared_secret_env,
     verify_token,
 )
+from opencrab.common.json_transport import serialize_jsonrpc_response
 from opencrab.mcp import protocol
 from opencrab.mcp.server import MCPServer
 
@@ -154,6 +155,16 @@ def install_access_log_redaction() -> None:
 # responses are just as cacheable by an intermediary, and their URLs carry the
 # same secret.
 _NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _jsonrpc_response(content: Any, **kwargs: Any) -> Response:
+    """Return a JSON-RPC response with valid UTF-8 JSON bytes."""
+    return Response(
+        content=serialize_jsonrpc_response(content, allow_nan=False),
+        media_type="application/json",
+        **kwargs,
+    )
+
 
 # #136: HTTP status for JSON-RPC error codes on MODERN single requests
 # (legacy responses keep the pre-#136 blanket 200). #250: when the legacy era
@@ -372,7 +383,7 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
             try:
                 body = await request.json()
             except Exception:
-                return JSONResponse(
+                return _jsonrpc_response(
                     {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
                     status_code=400,
                     headers=_NO_STORE,
@@ -389,7 +400,7 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
             # (#250).
             if isinstance(body, list):
                 if not legacy_enabled or _batch_is_modern(request, body):
-                    return JSONResponse(
+                    return _jsonrpc_response(
                         {
                             "jsonrpc": "2.0",
                             "id": None,
@@ -407,7 +418,7 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                 out = [r for r in (server.handle_request(item) for item in body) if r is not None]
                 if not out:
                     return Response(status_code=202, headers=_NO_STORE)
-                return JSONResponse(out, headers=_NO_STORE)
+                return _jsonrpc_response(out, headers=_NO_STORE)
 
             # #250: a body that is neither an object nor an array is Invalid
             # Request on a modern-only server (400 + -32600), rejected before
@@ -415,7 +426,7 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
             # enabled configurations keep their historical handling of this
             # shape untouched.
             if not legacy_enabled and not isinstance(body, dict):
-                return JSONResponse(
+                return _jsonrpc_response(
                     {
                         "jsonrpc": "2.0",
                         "id": None,
@@ -447,7 +458,7 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                         # omitting it keeps this layer consistent with
                         # handle_request, which never answers a notification.
                         return Response(status_code=400, headers=_NO_STORE)
-                    return JSONResponse(
+                    return _jsonrpc_response(
                         {
                             "jsonrpc": "2.0",
                             "id": body.get("id"),
@@ -505,8 +516,8 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
             # changes.
             if (modern_http or not legacy_enabled) and "error" in resp:
                 status = _MODERN_ERROR_STATUS.get(resp["error"]["code"], 200)
-                return JSONResponse(resp, status_code=status, headers=_NO_STORE)
-            return JSONResponse(resp, headers=_NO_STORE)
+                return _jsonrpc_response(resp, status_code=status, headers=_NO_STORE)
+            return _jsonrpc_response(resp, headers=_NO_STORE)
 
     @router.get("/mcp")
     @router.get("/mcp/", include_in_schema=False)
