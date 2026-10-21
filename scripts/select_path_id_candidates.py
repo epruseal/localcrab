@@ -16,6 +16,15 @@ import sqlite3
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# 승인 ID 파일 계약의 정본은 정리 도구이다. 같은 검증을 써서 정리 도구가 거부할 파일을 만들지 않는다.
+from cleanup_openclaw_heartbeat_493 import (  # noqa: E402
+    CleanupRefusedError,
+    _check_selection_fields,
+    _parse_approved_ids,
+)
+
 EXIT_OK = 0
 EXIT_NO_MATCH = 1
 EXIT_REFUSED = 2
@@ -97,12 +106,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if output.exists():
             raise SelectionRefusedError("output file already exists")
+        _check_selection_fields(args.pack_id, args.node_type)
         ids = select_ids(data_dir, args.pack_id, args.node_type, set(args.basename), args.path_prefix)
         if not ids:
             print("no node matched", file=sys.stderr)
             return EXIT_NO_MATCH
+        _parse_approved_ids({"pack_id": args.pack_id, "node_type": args.node_type, "ids": ids})
         digest = write_approved_ids(output, args.pack_id, args.node_type, ids)
-    except (SelectionRefusedError, sqlite3.Error) as exc:
+    except (SelectionRefusedError, CleanupRefusedError, sqlite3.Error) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     per_name: dict[str, int] = {}

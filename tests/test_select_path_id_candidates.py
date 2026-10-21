@@ -39,6 +39,8 @@ def data_dir(tmp_path: Path) -> Path:
         ("TextUnit", stage + "broken.md", "not json"),  # 읽을 수 없는 properties
         ("TextUnit", "/elsewhere/records.jsonl", {"pack_id": "pack-a"}),  # 데이터 디렉터리 밖
         ("TextUnit", "chunk:abc", {"pack_id": "pack-a"}),
+        ("Document", stage + "records.jsonl.doc", {"pack_id": "pack-a"}),
+        ("Claim", stage + "claim.md", {"pack_id": ""}),
     ])
     return root
 
@@ -103,6 +105,23 @@ def test_missing_graph_db_is_refused_without_creating_it(tmp_path: Path):
     empty.mkdir()
     assert _main(empty, tmp_path / "ids.json", "records.jsonl") == selector.EXIT_REFUSED
     assert not (empty / "graph.db").exists()
+
+
+@pytest.mark.parametrize("pack,node_type,name", [
+    ("pack-a", "Document", "records.jsonl.doc"),
+    ("", "Claim", "claim.md"),
+    ("pack-a", "Claim", "claim.md"),
+    ("", "TextUnit", "records.jsonl"),
+    ("pack-a", "", "records.jsonl"),
+])
+def test_selection_fields_the_cleanup_tool_refuses_are_refused_before_writing(data_dir: Path, tmp_path: Path, pack: str, node_type: str, name: str):
+    """정리 도구가 거부할 pack_id와 node_type이면 일치 행이 있어도 파일을 쓰지 않는다."""
+    before = (data_dir / "graph.db").read_bytes()
+    output = tmp_path / "ids.json"
+    args = ["--local-data-dir", str(data_dir), "--pack-id", pack, "--node-type", node_type, "--basename", name, "--output", str(output)]
+    assert selector.main(args) == selector.EXIT_REFUSED
+    assert not output.exists()
+    assert (data_dir / "graph.db").read_bytes() == before
 
 
 def test_prefix_bounds_cover_exactly_the_prefix():

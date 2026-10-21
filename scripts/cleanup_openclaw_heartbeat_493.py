@@ -144,11 +144,18 @@ def _check_selection_fields(pack_id: Any, node_type: Any) -> None:
 
 
 def _load_approved_ids(path: Path | None) -> _Selection:
-    """승인 ID 파일을 읽는다. 키는 pack_id, node_type, ids뿐이고 ids는 비어 있지 않은 중복 없는 문자열 목록이다."""
+    """승인 ID 파일을 읽어 _parse_approved_ids로 검증한다."""
     if path is None or not path.is_file():
         raise CleanupRefusedError("--approved-ids file is missing")
-    data = _json_object(path.read_text(encoding="utf-8"), "approved ids")
-    if set(data) != _IDS_FILE_KEYS:
+    return _parse_approved_ids(_json_object(path.read_text(encoding="utf-8"), "approved ids"))
+
+
+def _parse_approved_ids(data: dict[str, Any]) -> _Selection:
+    """승인 ID 본문을 검증한다. 키는 pack_id, node_type, ids뿐이고 ids는 비어 있지 않은 중복 없는 문자열 목록이다.
+
+    선택 스크립트도 파일을 쓰기 전에 이 함수로 본문을 검증한다. 입력 계약의 정본은 이 함수이다.
+    """
+    if not isinstance(data, dict) or set(data) != _IDS_FILE_KEYS:
         raise CleanupRefusedError("approved ids file has unexpected or missing fields")
     _check_selection_fields(data["pack_id"], data["node_type"])
     ids = data["ids"]

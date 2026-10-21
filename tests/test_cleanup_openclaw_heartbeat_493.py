@@ -4533,11 +4533,44 @@ def test_approved_ids_dry_run_selects_exactly_the_approved_set_without_writes(id
     assert [json.loads(line)["id"] for line in (prefix_run / "candidates.jsonl").read_text(encoding="utf-8").splitlines()] == ["evidence:turn:heartbeat"]
 
 
-@pytest.mark.parametrize("fault", ["no-source-row", "other-pack", "other-type", "missing-fts", "wrong-space"])
+_ONE_AXIS_PACK_ERRORS = {
+    "source-pack-only": "another pack",
+    "doc-pack-only": "evidence doc ownership",
+    "graph-pack-only": "Evidence graph ownership",
+    "vector-pack-only": "vector ownership",
+}
+
+
+def _set_one_axis_pack(world: Path, node_id: str, axis: str, pack: str) -> None:
+    """한 축의 pack_id만 바꾼다. 나머지 축은 그대로 둔다."""
+    if axis == "source-pack-only":
+        with _db(world / "doc_store.db") as conn:
+            conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (json.dumps({"pack_id": pack, "node_id": node_id}), node_id))
+    elif axis == "doc-pack-only":
+        with _db(world / "doc_store.db") as conn:
+            conn.execute("UPDATE doc_nodes SET properties=? WHERE node_id=?", (json.dumps({"pack_id": pack}), node_id))
+    elif axis == "graph-pack-only":
+        with _db(world / "graph.db") as conn:
+            conn.execute("UPDATE graph_nodes SET properties=? WHERE node_id=?", (json.dumps({"pack_id": pack}), node_id))
+    else:
+        import sqlite_vec
+
+        with _db(world / "vectors.db") as conn:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            row = conn.execute(f"SELECT node_id,embedding,document FROM {TABLE} WHERE node_id=?", (node_id,)).fetchone()
+            conn.execute(f"DELETE FROM {TABLE} WHERE node_id=?", (node_id,))
+            conn.execute(f"INSERT INTO {TABLE}(node_id,pack_id,embedding,document,metadata) VALUES (?,?,?,?,?)", (row[0], pack, row[1], row[2], json.dumps({"pack_id": pack, "node_id": node_id})))
+
+
+@pytest.mark.parametrize("fault", ["no-source-row", "other-pack", "other-type", "missing-fts", "wrong-space", *_ONE_AXIS_PACK_ERRORS])
 def test_approved_ids_dry_run_refuses_any_unmatched_id(id_world: Path, tmp_path: Path, fault: str):
     ids = [_ART_A]
     node_type = "TextUnit"
-    if fault == "no-source-row":
+    if fault in _ONE_AXIS_PACK_ERRORS:
+        # ID 경로는 소스 팩 사전 필터 없이 후보 검증을 부른다. 축 하나의 팩만 달라도 거부해야 한다.
+        _set_one_axis_pack(id_world, _ART_A, fault, "pack-b")
+    elif fault == "no-source-row":
         ids.append(_STAGE + "absent.md")
     elif fault == "other-pack":
         ids.append(_OTHER_PACK)
@@ -4554,6 +4587,8 @@ def test_approved_ids_dry_run_refuses_any_unmatched_id(id_world: Path, tmp_path:
     assert result["eligible"] is False
     assert result["errors"]
     assert not (run / "manifest.json").exists()
+    if fault in _ONE_AXIS_PACK_ERRORS:
+        assert _ONE_AXIS_PACK_ERRORS[fault] in " ".join(result["errors"])
 
 
 @pytest.mark.parametrize("fault", ["extra-key", "missing-key", "duplicate", "empty", "empty-string", "claim-type", "document-type", "not-object", "missing-file"])
@@ -4626,27 +4661,39 @@ def test_approved_ids_last_claim_support_blocks_manifest_and_other_support_allow
     assert allowed["eligible"] is True, allowed
 
 
-def _id_interrupted_apply(id_world: Path, tmp_path: Path, run: Path, approval: Path, backup: Path) -> None:
-    """첫 프로세스가 첫 graph commit 직후 죽는다."""
+def _id_interrupted_apply(id_world: Path, tmp_path: Path, run: Path, approval: Path, backup: Path, at: str = "after-graph-commit") -> None:
+    """첫 프로세스가 죽는다. before-graph는 첫 후보의 vector 축 뒤 graph 축 전이고 after-graph-commit은 첫 graph commit 직후이다."""
+    if at == "before-graph":
+        body = "    raise SystemExit(77)\n"
+    else:
+        body = "    original(data, record, candidates, receipt, manifest, after_commit=lambda: (_ for _ in ()).throw(SystemExit(77)))\n"
     setup = (
         "original = cleanup._delete_graph\n"
         "def stop(data, record, candidates, receipt, manifest):\n"
-        "    original(data, record, candidates, receipt, manifest, after_commit=lambda: (_ for _ in ()).throw(SystemExit(77)))\n"
-        "cleanup._delete_graph = stop\n"
+        + body
+        + "cleanup._delete_graph = stop\n"
     )
     result = _cli_main(tmp_path, "id-interrupted", [*_id_base(id_world, run), "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)], setup)
     assert result.returncode == 77, result.stderr
 
 
-def test_cli_approved_ids_resume_in_new_process_completes(id_world: Path, tmp_path: Path):
+@pytest.mark.parametrize("at", ["before-graph", "after-graph-commit"])
+def test_cli_approved_ids_resume_in_new_process_completes(id_world: Path, tmp_path: Path, at: str):
     run, backup = tmp_path / "run", tmp_path / "backup"
     cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_A, _ART_B]))
     approval = _id_approval(tmp_path, run)
     survivors = {node_id: _survivor_raw(id_world, node_id) for node_id in (_KEEP, _OTHER_PACK, "evidence:turn:heartbeat")}
-    _id_interrupted_apply(id_world, tmp_path, run, approval, backup)
-    with _db(id_world / "graph.db") as conn:
-        remaining = {row[0] for row in conn.execute("SELECT node_id FROM graph_nodes WHERE node_type='TextUnit'")}
-    assert len({_ART_A, _ART_B} & remaining) == 1  # 첫 프로세스는 후보 하나의 graph 축만 끝냈다
+    _id_interrupted_apply(id_world, tmp_path, run, approval, backup, at)
+    first = min(_ART_A, _ART_B)  # 후보는 id 순서로 처리한다
+    raw = _survivor_raw(id_world, first)
+    if at == "before-graph":
+        # 첫 후보의 vector 행만 지워졌고 graph, document, registry 축은 남았다.
+        assert raw["vector"] == []
+        assert raw["graph"] and raw["source"] and raw["fts"] and raw["doc"] and raw["registry"]
+    else:
+        assert raw["vector"] == [] and raw["graph"] == []
+        assert raw["source"] and raw["registry"]
+    assert _survivor_raw(id_world, max(_ART_A, _ART_B))["vector"]  # 둘째 후보는 시작 전이다
     resumed = _cli_main(tmp_path, "id-resume", [*_id_base(id_world, run), "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)])
     assert resumed.returncode == 0, resumed.stderr
     for candidate in (_ART_A, _ART_B):

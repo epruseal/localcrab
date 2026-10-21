@@ -100,10 +100,10 @@ def _pg_test_db_tripwire():
 def src_dir(tmp_path):
     """Source files for ``ingest``/``extract`` live outside the data directory.
 
-    The CLI refuses files under ``LOCAL_DATA_DIR`` (#520). Tests that set
-    ``LOCAL_DATA_DIR`` to ``tmp_path`` put their input here instead: a sibling
-    of ``tmp_path``, so it is outside the data directory and pytest still
-    removes it with the rest of the temp tree.
+    The CLI refuses files under ``LOCAL_DATA_DIR`` (#520). Some tests set
+    ``LOCAL_DATA_DIR`` to ``tmp_path``. Those tests put their input here.
+    This directory is a sibling of ``tmp_path`` and is outside the data
+    directory. Pytest removes it with the rest of the temp tree.
     """
     path = tmp_path.parent / f"{tmp_path.name}-src"
     path.mkdir()

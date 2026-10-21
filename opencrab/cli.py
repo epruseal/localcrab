@@ -65,12 +65,12 @@ def _discover_source_files(
 ) -> tuple[list[Path], list[Path]]:
     """Collect the files `ingest`/`extract` read, split by data-directory scope.
 
-    Returns ``(allowed, refused)``. A file whose resolved path lies under the
-    configured data directory is refused (#520): that tree holds the stores
-    and the pipeline staging output, and `ingest` uses the absolute path as
-    the document id, so ingesting it turns pipeline output into document
-    nodes. The check uses ``resolve()`` on both sides, so a symlink that
-    points into the data directory is refused too.
+    Returns ``(allowed, refused)``. The function refuses a file when its
+    resolved path is under the configured data directory (#520). That tree
+    holds the stores and the pipeline staging output. `ingest` uses the
+    absolute path as the document id. Thus an ingest of that tree turns
+    pipeline output into document nodes. The check resolves both paths, so
+    it also refuses a symlink that points into the data directory.
     """
     extensions = [e.strip() for e in extension.split(",")]
     root = Path(path)
