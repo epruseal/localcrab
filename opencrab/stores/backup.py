@@ -33,7 +33,13 @@ LIVE BACKUP (#510)
 The service keeps running during a backup. ``write.lock`` is held while the
 files are CAPTURED. For WAL-mode SQLite files that is only the time to pin a
 snapshot, not the time to copy. Files that cannot be pinned are copied inside
-the window, so for them the hold time grows with their size (see below):
+the window, so for them the hold time grows with their size (see below).
+"The lock block" below means the ``with write_lock(...)`` block of
+``backup_data_dir``; ``lock.held_seconds`` in the manifest is the length of that
+block. If the caller already holds ``write.lock`` in the same thread (a
+re-entrant call, as ``scripts/backfill_space.py`` makes), the OS lock stays held
+until that caller releases it, which can be after this function returns, so
+``held_seconds`` is then shorter than the real hold time.
 
 1. With ``write.lock`` held, every WAL-mode SQLite source gets a read
    transaction (``BEGIN`` plus one read) that stays open. A WAL reader sees one
@@ -41,7 +47,7 @@ the window, so for them the hold time grows with their size (see below):
    committing beside it. Files that are not in WAL mode (a rollback journal
    would let a held read transaction block that file's writers) and the
    directory and opaque targets are copied inside this window.
-2. The lock is released. Each pinned snapshot is copied with the online backup
+2. The lock block ends. Each pinned snapshot is copied with the online backup
    API on the connection that holds the transaction, so the copy is a single
    snapshot that concurrent writers cannot restart. The connection is closed
    as soon as its copy ends. The copy is flushed to disk every
@@ -53,7 +59,7 @@ the window, so for them the hold time grows with their size (see below):
 3. Every SQLite copy made by this run is verified with ``integrity_check``
    (directory targets are not, except a copied chroma catalog), and
    ``MANIFEST.json`` records sizes, sha256, how each SQLite file was captured
-   and how long the lock was held. ``verify_backup_set()`` re-checks a set
+   and how long the lock block lasted. ``verify_backup_set()`` re-checks a set
    later without writing to it. Its checks are limited: see its docstring.
 
 While a snapshot connection is open the WAL file of that database grows,
@@ -149,7 +155,7 @@ _STAGING_PREFIX = ".backup-staging."
 _EXTERNAL_DIR = "external-vector"
 
 #: The set's own description: file sizes, sha256, how each SQLite file was
-#: captured, and how long write.lock was held (#510).
+#: captured, and how long this function's write.lock block lasted (#510).
 MANIFEST_NAME = "MANIFEST.json"
 _MANIFEST_FORMAT = 1
 
@@ -158,9 +164,10 @@ _MANIFEST_FORMAT = 1
 _SNAPSHOT_OPEN_TIMEOUT = 5.0
 
 #: The copy of a pinned snapshot gets ``max(lock_timeout, bytes / this)``
-#: seconds. A pinned copy never waits on SQLITE_BUSY, so the budget is only
-#: a ceiling for a stalled disk; the deadline is checked between steps and
-#: cannot interrupt a single step.
+#: seconds. A pinned copy never waits on SQLITE_BUSY. The budget grows with
+#: the snapshot size and bounds a copy that stops making progress; it does not
+#: promise that a slow copy that keeps progressing finishes in time. The
+#: deadline is checked between steps and cannot interrupt a single step.
 _MIN_COPY_BYTES_PER_SECOND = 1 << 20
 
 #: A pinned copy is flushed to disk every this many bytes while it is written.
@@ -385,7 +392,9 @@ def backup_sqlite(
     owns and keeps open. It is used as is and never closed here. When it holds
     an open read transaction on a WAL database, the copy reads that one fixed
     snapshot from the first page to the last, so writers that keep committing
-    cannot restart it. ``src`` is then used for messages only.
+    cannot restart it. ``src`` must still be the path of the database ``src_conn``
+    is open on. It names the source in messages, and its access mode is copied to
+    the destination.
 
     ``deadline`` is an absolute ``time.monotonic()`` value. It is enforced
     from the progress callback, which is the only place it CAN be enforced:
@@ -547,7 +556,8 @@ class _Snapshot:
 
 @dataclass
 class _Job:
-    """One SQLite target whose copy and verification run after write.lock is released."""
+    """One SQLite target whose verification, and for a pinned WAL file its copy, runs after
+    this function's lock block ends."""
 
     entry: BackupEntry
     source: Path
@@ -804,7 +814,8 @@ def verify_backup_set(set_dir: str | Path) -> dict[str, Any]:
     Limits (the stronger structural checks are tracked in issue #522): the
     manifest is trusted for its own structure. An entry whose ``capture`` is
     missing is not integrity-checked, an entry's ``path`` is not required to
-    appear in ``files``, a set directory replaced by a link is not detected,
+    appear in ``files``, a directory inside the set replaced by a link is not detected (a set root
+    that is a link is refused),
     and a file removed from both the set and ``files`` goes unnoticed. The
     check finds damage and loss of the files the manifest lists; it is not
     meant to resist someone who edits the manifest.
@@ -998,7 +1009,7 @@ def _require_contained(path: Path, root: Path) -> None:
 
 
 def _resolve_timeout(explicit: float | None) -> float:
-    """The lock and per-file budget in seconds: finite and not negative.
+    """The lock wait and the copy budget of non-WAL SQLite files, in seconds: finite and not negative.
 
     Checked here, at the input boundary, because nothing downstream can
     cope with anything else: a NaN deadline makes ``remaining_budget <= 0``
@@ -1008,10 +1019,13 @@ def _resolve_timeout(explicit: float | None) -> float:
     default: silently running with a budget the operator did not set is
     the same class of failure as silently dropping a configured target.
 
-    The same number is also the per-file copy budget in ``_run_targets``,
-    so ``0`` is accepted ("do not wait for the lock") and then every copy
-    expires before its first page with ``TimeoutError``. That is the
-    documented deadline behaviour, not a boundary rejection.
+    The same number is also the copy budget of a non-WAL SQLite file that
+    ``_run_targets`` copies inside the lock block, so ``0`` is accepted
+    ("do not wait for the lock") and then such a copy reports ``TimeoutError``
+    from its first progress callback, after the first backup step has run. That
+    is the documented deadline behaviour, not a boundary rejection. A pinned WAL
+    file gets ``max(timeout, snapshot_bytes / 1 MiB/s)`` and a directory copy
+    has no budget.
     """
     if explicit is not None:
         origin, candidate = "lock_timeout", explicit
@@ -1112,13 +1126,21 @@ def backup_data_dir(
 
     Two phases (#510). While ``write.lock`` is held the function captures:
     directory and opaque targets and SQLite files that are not in WAL mode are
-    copied, and every WAL SQLite file gets a pinned read snapshot. The lock is
-    then released and the pinned snapshots are copied, verified and described
-    in ``MANIFEST.json``. The writers that honour ``write.lock`` are blocked
-    only for the first phase.
+    copied, and every WAL SQLite file gets a pinned read snapshot. The lock
+    block then ends and the pinned snapshots are copied, verified and described
+    in ``MANIFEST.json``. The writers that honour ``write.lock`` wait only for
+    the first phase. This holds unless the caller already holds ``write.lock`` in
+    the same thread (a re-entrant call, as ``scripts/backfill_space.py`` makes):
+    then the OS lock stays held until that caller releases it, which can be after
+    this function returns, and ``lock.held_seconds`` is only the length of this
+    function's own block.
 
-    ``exclude`` lists inventory labels to skip (recorded as ``excluded``). An
-    unknown label is refused before anything is written.
+    ``exclude`` lists inventory labels to skip. A target that exists is
+    recorded as ``excluded``; a target that is absent anyway is recorded as
+    ``skipped``. Excluding a label skips that inventory target only: content
+    that another target's copy contains stays (a ``VECTOR_DB_FILE`` inside
+    ``chroma/`` is copied with ``chroma/``). An unknown label is refused before
+    anything is written.
 
     Per-file transactional consistency holds for every SQLite target. Alignment
     across files depends on every writer honouring ``write.lock``; see the
@@ -1260,7 +1282,7 @@ def backup_data_dir(
             shutil.copymode(data_dir, staging)
             _fsync_tree(staging)
         except BaseException:
-            # One cleanup scope for the lock block AND the unlocked phase, so a
+            # One cleanup scope for the lock block AND the phase after it, so a
             # failure anywhere -- including the lock release itself -- closes
             # every snapshot connection and removes only a staging directory
             # this run created. _publish below stays outside it: a failed
@@ -1299,7 +1321,8 @@ def backup_data_dir(
             + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
         )
         say(
-            f"write.lock: waited {lock_info['wait_seconds']}s, held {lock_info['held_seconds']}s. "
+            f"write.lock block: waited {lock_info['wait_seconds']}s, held {lock_info['held_seconds']}s "
+            "(a caller that already holds write.lock keeps it past this block). "
             "SQLite targets were captured inside that window; each file is transactionally "
             "consistent. Alignment across files covers only writers that honour write.lock "
             "(billing.db and some scripts do not, see issue #141)."
@@ -1375,8 +1398,8 @@ def _run_targets(
 
     Directory and opaque targets, and SQLite files that are not in WAL mode,
     are copied here. A WAL SQLite file is only pinned (a read snapshot is
-    opened) and queued in ``jobs``; its bytes are copied after the lock is
-    released. Every SQLite copy is verified later, from ``jobs``.
+    opened) and queued in ``jobs``; its bytes are copied after this function's
+    lock block ends. Every SQLite copy is verified later, from ``jobs``.
     """
     outcome = BackupOutcome(set_dir=final)
     # Keyed on (resolved source, destination), NOT the source alone. Deduping
@@ -1488,7 +1511,8 @@ def _finish_jobs(
     say: Callable[[str], None],
     timeout: float,
 ) -> None:
-    """Copy the pinned snapshots, then verify every SQLite copy. Runs without write.lock.
+    """Copy the pinned snapshots, then verify every SQLite copy. Runs after this function's lock block
+    has ended; a lock the caller holds itself stays held.
 
     Each snapshot connection is closed as soon as its copy ends, so the WAL of
     that database can be checkpointed again while the others are still being
@@ -1639,7 +1663,8 @@ def _main(argv: list[str] | None = None) -> int:
         metavar="LABEL",
         help=(
             "skip one inventory target by its label (see --list); repeatable. The set "
-            "records it as excluded, and a restore of that set will not contain it."
+            "records an existing target as excluded and an absent one as skipped. The set "
+            "holds no separate copy of it; content inside another target's copy stays."
         ),
     )
     parser.add_argument(

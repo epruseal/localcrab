@@ -601,6 +601,13 @@ class TestExcludeAndSpace:
         assert by["chroma"]["status"] == "excluded"
         assert (s / "graph.db").is_file()
 
+    def test_excluding_a_target_that_is_absent_records_skipped(self, live_dir: Path) -> None:
+        assert not (live_dir / "chroma").exists()
+        out = bk.backup_data_dir(live_dir, settings=_Settings(), exclude=["chroma"])
+        by = {e["label"]: e for e in out.manifest["entries"]}
+        assert by["chroma"]["status"] == "skipped"
+        assert "path" not in by["chroma"]
+
     def test_unknown_label_is_refused_before_anything_is_written(self, live_dir: Path) -> None:
         with pytest.raises(bk.BackupError, match="unknown --exclude label"):
             bk.backup_data_dir(live_dir, settings=_Settings(), exclude=["nope.db"])

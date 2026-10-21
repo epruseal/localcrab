@@ -521,8 +521,10 @@ python -m opencrab.stores.backup --to /backup/path          # 백업 세트 생�
 python -m opencrab.stores.backup --verify /backup/path/backup.<세트 식별자>  # 세트 검증 (쓰기 없음)
 ```
 
-백업은 서비스를 멈추지 않고 돈다(issue #510). `write.lock`은 파일을 고정하는
-구간에만 잡고, WAL 모드 SQLite 파일의 복사는 잠금을 푼 뒤 진행한다. WAL이
+백업은 서비스를 멈추지 않고 돈다(issue #510). 이 도구의 `write.lock` 블록은 파일을
+고정하는 구간에만 걸리고, WAL 모드 SQLite 파일의 복사는 그 블록이 끝난 뒤
+진행한다. 호출자가 이미 쥔 잠금(`scripts/backfill_space.py`)은 블록이 끝나도
+풀리지 않는다. WAL이
 아닌 SQLite 파일과 디렉터리형 대상은 잠금 안에서 복사하므로 그 구간이 크기에
 비례해 늘어난다. 다른 저장소가 쓸 수
 있게 쓰는 법, 보장 범위, 복원 절차, 문제 해결을 [docs/live-backup.md](./live-backup.md)에
@@ -535,11 +537,11 @@ python -m opencrab.stores.backup --verify /backup/path/backup.<세트 식별자>
 rename으로 끝나므로 세트는 완전히 있거나 아예 없는 두 상태만 가능하다.
 
 SQLite 대상은 `sqlite3.Connection.backup()` 온라인 백업 API로 복사된다.
-WAL 모드 파일은 `write.lock`을 쥔 채 읽기 트랜잭션으로 고정하고, 잠금을
-푼 뒤 그 고정된 연결에서 복사한다. WAL이 아닌 파일과 디렉터리 대상은
+WAL 모드 파일은 `write.lock`을 쥔 채 읽기 트랜잭션으로 고정하고, 이 도구의
+잠금 블록이 끝난 뒤 그 고정된 연결에서 복사한다. WAL이 아닌 파일과 디렉터리 대상은
 잠금 안에서 복사한다. 복사본을 다시 열어 `PRAGMA integrity_check`를
-통과해야 성공으로 보고되고, 세트에는 크기와 sha256과 잠금 보유 시간을 적은
-`MANIFEST.json`이 들어간다. 이 보장은 **파일 하나 단위의 트랜잭션
+통과해야 성공으로 보고되고, 세트에는 크기와 sha256과 이 도구의 잠금 블록 길이를
+적은 `MANIFEST.json`이 들어간다. 이 보장은 **파일 하나 단위의 트랜잭션
 일관성**이며 여러 파일이 같은 시점을 함께 가리킨다는 뜻은 아니다. 고정
 구간의 `write.lock`이 그 어긋남의 폭을 줄여 주지만 이 락을 지키는 writer에
 한해서다. `billing.db`는 issue #105에 따라 애초에 이 락 밖에서 쓰인다.
