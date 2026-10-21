@@ -272,3 +272,17 @@ def test_foreign_source_does_not_suppress_node_vector(live, tmp_path, pack_sql):
     res = _increment_nodes(builder, graph, docs, vec, changed, pack_sql)
     assert res[:5] == (0, 1, 0, 0, 0)
     assert vec.rows["node-only"] != before
+
+
+def test_decode_error_source_stops_before_node_write(live, tmp_path, pack_sql, monkeypatch):
+    builder, graph, docs, vec, nodes, chunks, before = _seed(live, tmp_path, pack_sql)
+    changed = _write_jsonl(tmp_path / "nodes-changed.jsonl", [_node(id="shared-id", properties={"degree": 2})])
+    calls = []
+    monkeypatch.setattr(builder, "add_node", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(
+        docs, "get_source", lambda _id: {"metadata": {}, "property_decode_error": True})
+    import pytest
+    with pytest.raises(RuntimeError, match="doc source is malformed"):
+        _increment_nodes(builder, graph, docs, vec, changed, pack_sql)
+    assert calls == []
+    assert vec.rows["shared-id"] == before
