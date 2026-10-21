@@ -80,7 +80,12 @@ def stack(tmp_path):
     try:
         yield st
     finally:
+        worker = hybrid._bm25_worker
         hybrid.shutdown_bm25()
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)
+            if worker.is_alive():
+                pytest.fail("BM25 worker did not stop before store close")
         vector.close()
         graph.close()
         docs.close()

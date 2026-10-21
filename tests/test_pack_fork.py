@@ -125,7 +125,12 @@ def stack(tmp_path):
     try:
         yield stack
     finally:
+        worker = hybrid._bm25_worker
         hybrid.shutdown_bm25()
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)
+            if worker.is_alive():
+                pytest.fail("BM25 worker did not stop before store close")
         # Each test owns four native/database handles.  Chroma keeps file
         # descriptors open beyond the last collection call, so returning the
         # dictionary without closing the stores exhausts the process limit
