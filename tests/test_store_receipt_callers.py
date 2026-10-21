@@ -126,10 +126,10 @@ def _make_extraction_result_1n1e(source_id: str):
     )
 
 
-def _invoke_extract(cli_env, runner, *, add_node, add_edge):
+def _invoke_extract(src_dir, runner, *, add_node, add_edge):
     """``add_node``/``add_edge``: a receipt dict to return, or an Exception
     instance to raise (for the #1b exception-path tests)."""
-    (cli_env / "doc.md").write_text("Alex owns the demo project.")
+    (src_dir / "doc.md").write_text("Alex owns the demo project.")
 
     fake_extractor = MagicMock()
     fake_extractor.extract_from_file.side_effect = (
@@ -152,7 +152,7 @@ def _invoke_extract(cli_env, runner, *, add_node, add_edge):
         "opencrab.ontology.builder.OntologyBuilder", return_value=fake_builder
     ):
         result = runner.invoke(
-            main, ["extract", str(cli_env), "--api-key", "test-key"]
+            main, ["extract", str(src_dir), "--api-key", "test-key"]
         )
     return result
 
@@ -163,38 +163,38 @@ def _invoke_extract(cli_env, runner, *, add_node, add_edge):
 
 
 class TestCliExtractReceiptPath:
-    def test_both_kinds_fail_reports_both_precisely(self, bootstrapped, cli_env, runner):
+    def test_both_kinds_fail_reports_both_precisely(self, bootstrapped, cli_env, src_dir, runner):
         """#1 — node/edge 둘 다 실패 영수증. 양쪽 문구를 정확히 단언한다(부분
         문자열 "1 not stored" 하나만으로는 반대쪽 배선 누락을 못 잡기 때문)."""
-        result = _invoke_extract(cli_env, runner, add_node=FAIL_RECEIPT, add_edge=FAIL_RECEIPT)
+        result = _invoke_extract(src_dir, runner, add_node=FAIL_RECEIPT, add_edge=FAIL_RECEIPT)
         # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
         assert result.exit_code == 3, result.output
         assert "Done with store failures" in result.output
         assert "nodes=1 attempted (1 not stored)" in result.output
         assert "edges=1 attempted (1 not stored)" in result.output
 
-    def test_node_only_failure_reports_asymmetric_counts(self, bootstrapped, cli_env, runner):
+    def test_node_only_failure_reports_asymmetric_counts(self, bootstrapped, cli_env, src_dir, runner):
         """#1-node"""
-        result = _invoke_extract(cli_env, runner, add_node=FAIL_RECEIPT, add_edge=OK_RECEIPT)
+        result = _invoke_extract(src_dir, runner, add_node=FAIL_RECEIPT, add_edge=OK_RECEIPT)
         # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
         assert result.exit_code == 3, result.output
         assert "nodes=1 attempted (1 not stored)" in result.output
         assert "edges=1 attempted (0 not stored)" in result.output
 
-    def test_edge_only_failure_reports_asymmetric_counts(self, bootstrapped, cli_env, runner):
+    def test_edge_only_failure_reports_asymmetric_counts(self, bootstrapped, cli_env, src_dir, runner):
         """#1-edge — "unavailable" 변형 fixture 사용."""
         result = _invoke_extract(
-            cli_env, runner, add_node=OK_RECEIPT, add_edge=FAIL_RECEIPT_UNAVAILABLE
+            src_dir, runner, add_node=OK_RECEIPT, add_edge=FAIL_RECEIPT_UNAVAILABLE
         )
         # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
         assert result.exit_code == 3, result.output
         assert "nodes=1 attempted (0 not stored)" in result.output
         assert "edges=1 attempted (1 not stored)" in result.output
 
-    def test_malformed_stores_counted_as_failure_not_success(self, bootstrapped, cli_env, runner):
+    def test_malformed_stores_counted_as_failure_not_success(self, bootstrapped, cli_env, src_dir, runner):
         """#6b (cli 슬라이스) — stores 가 truthy non-dict("oops")여도 예외 없이
         실패로 계상되어야 한다."""
-        result = _invoke_extract(cli_env, runner, add_node=MALFORMED_RECEIPT, add_edge=OK_RECEIPT)
+        result = _invoke_extract(src_dir, runner, add_node=MALFORMED_RECEIPT, add_edge=OK_RECEIPT)
         # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
         assert result.exit_code == 3, result.output
         assert "nodes=1 attempted (1 not stored)" in result.output
@@ -213,21 +213,21 @@ class TestCliExtractReceiptPath:
 
 
 class TestCliExtractExceptionPath:
-    def test_add_node_exception_counted_as_node_failure_only(self, bootstrapped, cli_env, runner):
+    def test_add_node_exception_counted_as_node_failure_only(self, bootstrapped, cli_env, src_dir, runner):
         """#1b-node — add_node 만 예외를 던진다. add_edge 는 별개의 except 블록이므로
         edge 쪽 실패 카운터가 (오배선으로) 같이 증가하면 안 된다."""
         result = _invoke_extract(
-            cli_env, runner, add_node=RuntimeError("node boom"), add_edge=OK_RECEIPT
+            src_dir, runner, add_node=RuntimeError("node boom"), add_edge=OK_RECEIPT
         )
         # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
         assert result.exit_code == 3, result.output
         assert "nodes=1 attempted (1 not stored)" in result.output
         assert "edges=1 attempted (0 not stored)" in result.output
 
-    def test_add_edge_exception_counted_as_edge_failure_only(self, bootstrapped, cli_env, runner):
+    def test_add_edge_exception_counted_as_edge_failure_only(self, bootstrapped, cli_env, src_dir, runner):
         """#1b-edge — 정반대 배선."""
         result = _invoke_extract(
-            cli_env, runner, add_node=OK_RECEIPT, add_edge=RuntimeError("edge boom")
+            src_dir, runner, add_node=OK_RECEIPT, add_edge=RuntimeError("edge boom")
         )
         # #189: 저장소 쓰기 실패는 부분 실패이므로 exit code 3 이어야 한다.
         assert result.exit_code == 3, result.output
@@ -240,9 +240,9 @@ class TestCliExtractExceptionPath:
 # ---------------------------------------------------------------------------
 
 
-def test_extract_all_succeed_summary_line_unchanged(bootstrapped, cli_env, runner):
+def test_extract_all_succeed_summary_line_unchanged(bootstrapped, cli_env, src_dir, runner):
     """#2"""
-    result = _invoke_extract(cli_env, runner, add_node=OK_RECEIPT, add_edge=OK_RECEIPT)
+    result = _invoke_extract(src_dir, runner, add_node=OK_RECEIPT, add_edge=OK_RECEIPT)
     assert result.exit_code == 0, result.output
     assert "nodes=1 edges=1 errors=0" in result.output
     assert "not stored" not in result.output

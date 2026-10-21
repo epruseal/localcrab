@@ -97,6 +97,20 @@ def _pg_test_db_tripwire():
 
 
 @pytest.fixture
+def src_dir(tmp_path):
+    """Source files for ``ingest``/``extract`` live outside the data directory.
+
+    The CLI refuses files under ``LOCAL_DATA_DIR`` (#520). Tests that set
+    ``LOCAL_DATA_DIR`` to ``tmp_path`` put their input here instead: a sibling
+    of ``tmp_path``, so it is outside the data directory and pytest still
+    removes it with the rest of the temp tree.
+    """
+    path = tmp_path.parent / f"{tmp_path.name}-src"
+    path.mkdir()
+    return path
+
+
+@pytest.fixture
 def fast_mongo_timeout(monkeypatch):
     """``pymongo.MongoClient``를 패치해 도달 불가능한 호스트에 대한
     서버 선택 타임아웃을 짧게(100ms) 강제한다.

@@ -1747,12 +1747,12 @@ _BRANCH_ROWS = [
     ),
     (
         "frozen-pack",
-        'and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == "openclaw"',
+        'and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == _SELECTION.pack_id',
         'and True',
     ),
     (
         "current-pack",
-        'and _strict_pack(source[0][2], f"Claim source {source_id}") == "openclaw"',
+        'and _strict_pack(source[0][2], f"Claim source {source_id}") == _SELECTION.pack_id',
         'and True',
     ),
     (
@@ -1814,8 +1814,8 @@ def test_catalog_source_existence_copy_records_empty_source_failure(tmp_path: Pa
 
 
 @pytest.mark.parametrize("branch,old,new", [
-    ("frozen", 'and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == "openclaw"', 'and True'),
-    ("current", 'and _strict_pack(source[0][2], f"Claim source {source_id}") == "openclaw"', 'and True'),
+    ("frozen", 'and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == _SELECTION.pack_id', 'and True'),
+    ("current", 'and _strict_pack(source[0][2], f"Claim source {source_id}") == _SELECTION.pack_id', 'and True'),
 ])
 def test_catalog_source_pack_copy_reaches_later_guard(tmp_path: Path, branch: str, old: str, new: str):
     source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
@@ -1933,7 +1933,7 @@ def test_catalog_frozen_pack_copy_loses_target_guard(world: Path, tmp_path: Path
     run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
     cleanup._backup_receipt(world, run, backup, manifest, candidates)
     source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
-    old = 'and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == "openclaw"'
+    old = 'and _strict_pack(frozen_source[0][2], f"Frozen Claim source {source_id}") == _SELECTION.pack_id'
     mutated = _catalog_mutation(source, old, "and True")
     snapshot = tmp_path / "frozen-pack.snapshot.json"
     injection = (
@@ -1960,7 +1960,7 @@ def test_catalog_current_pack_copy_loses_target_guard(world: Path, tmp_path: Pat
     run, backup, approval, candidates, manifest = _registry_manifest(world, tmp_path)
     cleanup._backup_receipt(world, run, backup, manifest, candidates)
     source = (Path(__file__).parent.parent / "scripts" / "cleanup_openclaw_heartbeat_493.py").read_text(encoding="utf-8")
-    old = 'and _strict_pack(source[0][2], f"Claim source {source_id}") == "openclaw"'
+    old = 'and _strict_pack(source[0][2], f"Claim source {source_id}") == _SELECTION.pack_id'
     mutated = _catalog_mutation(source, old, "and True")
     snapshot = tmp_path / "current-pack.snapshot.json"
     injection = (
@@ -4474,3 +4474,229 @@ def test_scoped_keys_returns_only_the_edges_that_touch_the_candidate():
         assert cleanup._scoped_keys(recorded, "z") == set()
     finally:
         cleanup._SCOPE = previous
+
+
+# --- 승인된 ID 집합 선택 (#513, #520) ---
+
+_STAGE = "/data-root/staging/run-1/"
+_ART_A = _STAGE + "records.jsonl"
+_ART_B = _STAGE + "report.md"
+_KEEP = _STAGE + "keep.md"
+_OTHER_PACK = _STAGE + "other-pack.md"
+
+
+@pytest.fixture
+def id_world(tmp_path: Path) -> Path:
+    """파일 경로를 id로 쓰는 TextUnit 노드와 그 주변 대조군이다."""
+    root = tmp_path / "id-data"
+    root.mkdir()
+    _schema(root)
+    _add(root, _ART_A, "artifact one", pack="pack-a", node_type="TextUnit")
+    _add(root, _ART_B, "artifact two", pack="pack-a", node_type="TextUnit")
+    _add(root, _KEEP, "kept text unit", pack="pack-a", node_type="TextUnit")
+    _add(root, _OTHER_PACK, "other pack text unit", pack="pack-b", node_type="TextUnit")
+    _add(root, "evidence:turn:heartbeat", HEARTBEAT)
+    return root
+
+
+def _ids_file(tmp_path: Path, ids: list[str], *, pack: str = "pack-a", node_type: str = "TextUnit", name: str = "ids.json", extra: dict | None = None) -> Path:
+    path = tmp_path / name
+    path.write_text(json.dumps({"pack_id": pack, "node_type": node_type, "ids": ids, **(extra or {})}), encoding="utf-8")
+    return path
+
+
+def _id_base(world: Path, run: Path) -> list[str]:
+    return ["--local-data-dir", str(world), "--run-dir", str(run), "--vector-table", TABLE]
+
+
+def _id_approval(tmp_path: Path, run: Path) -> Path:
+    manifest = _load(run / "manifest.json")
+    approval = tmp_path / "id-approval.json"
+    approval.write_text(json.dumps({"manifest_sha256": cleanup._sha(cleanup._canon(manifest)), "ordered_ids_sha256": manifest["ordered_ids_sha256"]}), encoding="utf-8")
+    return approval
+
+
+def test_approved_ids_dry_run_selects_exactly_the_approved_set_without_writes(id_world: Path, tmp_path: Path):
+    before = _all_db_bytes(id_world)
+    run = tmp_path / "run"
+    result = cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_B, _ART_A]))
+    assert result["eligible"] is True, result
+    lines = (run / "candidates.jsonl").read_text(encoding="utf-8").splitlines()
+    assert sorted(json.loads(line)["id"] for line in lines) == sorted([_ART_A, _ART_B])
+    selection = _load(run / "manifest.json")["selection"]
+    assert selection == {"mode": "id-set", "pack_id": "pack-a", "node_type": "TextUnit", "approved_count": 2, "approved_ids_sha256": cleanup._ids_digest([_ART_A, _ART_B])}
+    assert _all_db_bytes(id_world) == before
+    # 기본 선택은 종전 그대로이며 선택 기록은 prefix다.
+    prefix_run = tmp_path / "prefix-run"
+    cleanup.dry_run(id_world, prefix_run, TABLE)
+    assert _load(prefix_run / "manifest.json")["selection"] == {"mode": "prefix"}
+    assert [json.loads(line)["id"] for line in (prefix_run / "candidates.jsonl").read_text(encoding="utf-8").splitlines()] == ["evidence:turn:heartbeat"]
+
+
+@pytest.mark.parametrize("fault", ["no-source-row", "other-pack", "other-type", "missing-fts", "wrong-space"])
+def test_approved_ids_dry_run_refuses_any_unmatched_id(id_world: Path, tmp_path: Path, fault: str):
+    ids = [_ART_A]
+    node_type = "TextUnit"
+    if fault == "no-source-row":
+        ids.append(_STAGE + "absent.md")
+    elif fault == "other-pack":
+        ids.append(_OTHER_PACK)
+    elif fault == "other-type":
+        ids.append("evidence:turn:heartbeat")
+    elif fault == "missing-fts":
+        with _db(id_world / "doc_store.db") as conn:
+            conn.execute("DELETE FROM doc_sources_fts WHERE source_id=?", (_ART_A,))
+    else:
+        with _db(id_world / "graph.db") as conn:
+            conn.execute("UPDATE graph_nodes SET space_id='concept' WHERE node_id=?", (_ART_A,))
+    run = tmp_path / fault
+    result = cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, ids, node_type=node_type))
+    assert result["eligible"] is False
+    assert result["errors"]
+    assert not (run / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("fault", ["extra-key", "missing-key", "duplicate", "empty", "empty-string", "claim-type", "document-type", "not-object", "missing-file"])
+def test_approved_ids_file_format_is_strict(id_world: Path, tmp_path: Path, fault: str):
+    path = tmp_path / "ids.json"
+    if fault == "extra-key":
+        _ids_file(tmp_path, [_ART_A], extra={"note": "x"})
+    elif fault == "missing-key":
+        path.write_text(json.dumps({"pack_id": "pack-a", "ids": [_ART_A]}), encoding="utf-8")
+    elif fault == "duplicate":
+        _ids_file(tmp_path, [_ART_A, _ART_A])
+    elif fault == "empty":
+        _ids_file(tmp_path, [])
+    elif fault == "empty-string":
+        _ids_file(tmp_path, [_ART_A, ""])
+    elif fault == "claim-type":
+        _ids_file(tmp_path, [_ART_A], node_type="Claim")
+    elif fault == "document-type":
+        _ids_file(tmp_path, [_ART_A], node_type="Document")
+    elif fault == "not-object":
+        path.write_text(json.dumps([_ART_A]), encoding="utf-8")
+    run = tmp_path / "run"
+    with pytest.raises(cleanup.CleanupRefusedError):
+        cleanup.dry_run(id_world, run, TABLE, path)
+    assert not run.exists()
+
+
+def test_cli_approved_ids_is_dry_run_only(id_world: Path, tmp_path: Path):
+    ids = _ids_file(tmp_path, [_ART_A])
+    run = tmp_path / "run"
+    for flag in (["--apply", "--backup-dir", str(tmp_path / "b")], ["--rollback", "--backup-dir", str(tmp_path / "b")], ["--prepare-rollback", "--backup-dir", str(tmp_path / "b")]):
+        result = _cli_main(tmp_path, "ids-only-dry", [*_id_base(id_world, run), "--approved-ids", str(ids), *flag])
+        assert result.returncode == 2, result.stderr
+        assert "only for dry-run" in result.stderr
+    assert not run.exists()
+
+
+def test_cli_approved_ids_apply_and_rollback_in_separate_processes(id_world: Path, tmp_path: Path):
+    """dry-run, apply, prepare-rollback, rollback을 각각 새 프로세스로 돌린다. apply는 manifest에서 선택을 복원한다."""
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    base = _id_base(id_world, run)
+    dry = _cli_main(tmp_path, "id-dry", [*base, "--approved-ids", str(_ids_file(tmp_path, [_ART_A, _ART_B]))])
+    assert dry.returncode == 0, dry.stderr
+    before_rows = _all_db_rows(id_world)
+    survivors = {node_id: _survivor_raw(id_world, node_id) for node_id in (_KEEP, _OTHER_PACK, "evidence:turn:heartbeat")}
+    applied = _cli_main(tmp_path, "id-apply", [*base, "--apply", "--approved-manifest", str(_id_approval(tmp_path, run)), "--backup-dir", str(backup)])
+    assert applied.returncode == 0, applied.stderr
+    for candidate in (_ART_A, _ART_B):
+        _assert_candidate_absent(id_world, candidate)
+    for node_id, raw in survivors.items():
+        assert _survivor_raw(id_world, node_id) == raw
+    prepared = _cli_main(tmp_path, "id-prepare", [*base, "--prepare-rollback", "--backup-dir", str(backup)])
+    assert prepared.returncode == 0, prepared.stderr
+    rolled = _cli_main(tmp_path, "id-rollback", [*base, "--rollback", "--backup-dir", str(backup)])
+    assert rolled.returncode == 0, rolled.stderr
+    assert _all_db_rows(id_world) == before_rows
+
+
+def test_approved_ids_last_claim_support_blocks_manifest_and_other_support_allows(id_world: Path, tmp_path: Path):
+    with _db(id_world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_nodes VALUES (?,?,?,?)", ("Claim", "claim:one", "claim", "{}"))
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("TextUnit", _ART_A, "supports", "Claim", "claim:one", "{}"))
+    blocked = cleanup.dry_run(id_world, tmp_path / "blocked", TABLE, _ids_file(tmp_path, [_ART_A]))
+    assert blocked["eligible"] is False
+    assert "final Claim support" in blocked["errors"][0]
+    # 같은 타입의 비후보가 같은 Claim을 지지하면 후보를 지워도 지지가 남는다.
+    with _db(id_world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", ("TextUnit", _KEEP, "supports", "Claim", "claim:one", "{}"))
+    allowed = cleanup.dry_run(id_world, tmp_path / "allowed", TABLE, _ids_file(tmp_path, [_ART_A], name="ids2.json"))
+    assert allowed["eligible"] is True, allowed
+
+
+def _id_interrupted_apply(id_world: Path, tmp_path: Path, run: Path, approval: Path, backup: Path) -> None:
+    """첫 프로세스가 첫 graph commit 직후 죽는다."""
+    setup = (
+        "original = cleanup._delete_graph\n"
+        "def stop(data, record, candidates, receipt, manifest):\n"
+        "    original(data, record, candidates, receipt, manifest, after_commit=lambda: (_ for _ in ()).throw(SystemExit(77)))\n"
+        "cleanup._delete_graph = stop\n"
+    )
+    result = _cli_main(tmp_path, "id-interrupted", [*_id_base(id_world, run), "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)], setup)
+    assert result.returncode == 77, result.stderr
+
+
+def test_cli_approved_ids_resume_in_new_process_completes(id_world: Path, tmp_path: Path):
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_A, _ART_B]))
+    approval = _id_approval(tmp_path, run)
+    survivors = {node_id: _survivor_raw(id_world, node_id) for node_id in (_KEEP, _OTHER_PACK, "evidence:turn:heartbeat")}
+    _id_interrupted_apply(id_world, tmp_path, run, approval, backup)
+    with _db(id_world / "graph.db") as conn:
+        remaining = {row[0] for row in conn.execute("SELECT node_id FROM graph_nodes WHERE node_type='TextUnit'")}
+    assert len({_ART_A, _ART_B} & remaining) == 1  # 첫 프로세스는 후보 하나의 graph 축만 끝냈다
+    resumed = _cli_main(tmp_path, "id-resume", [*_id_base(id_world, run), "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)])
+    assert resumed.returncode == 0, resumed.stderr
+    for candidate in (_ART_A, _ART_B):
+        _assert_candidate_absent(id_world, candidate)
+    for node_id, raw in survivors.items():
+        assert _survivor_raw(id_world, node_id) == raw
+
+
+def test_cli_approved_ids_resume_protects_same_type_non_candidate(id_world: Path, tmp_path: Path):
+    """후보와 같은 타입의 비후보는 보호 집합에 든다. 중단 뒤 그 행이 바뀌면 재개가 거부한다."""
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_A, _ART_B]))
+    approval = _id_approval(tmp_path, run)
+    _id_interrupted_apply(id_world, tmp_path, run, approval, backup)
+    with _db(id_world / "doc_store.db") as conn:
+        conn.execute("UPDATE doc_sources SET text='changed after interruption' WHERE source_id=?", (_KEEP,))
+    resumed = _cli_main(tmp_path, "id-resume-protected", [*_id_base(id_world, run), "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)])
+    assert resumed.returncode == 2
+    assert "protected set changed" in resumed.stderr
+
+
+@pytest.mark.parametrize("tamper", ["digest", "count", "mode", "extra-key", "reserved-type"])
+def test_load_run_refuses_tampered_selection_record(id_world: Path, tmp_path: Path, tamper: str):
+    run = tmp_path / "run"
+    cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_A, _ART_B]))
+    manifest = _load(run / "manifest.json")
+    record = manifest["selection"]
+    if tamper == "digest":
+        record["approved_ids_sha256"] = cleanup._ids_digest([_ART_A])
+    elif tamper == "count":
+        record["approved_count"] = 1
+    elif tamper == "mode":
+        record["mode"] = "everything"
+    elif tamper == "extra-key":
+        record["ids"] = [_ART_A]
+    else:
+        record["node_type"] = "Claim"
+    (run / "manifest.json").write_bytes(cleanup._canon(manifest))
+    with pytest.raises(cleanup.CleanupRefusedError, match="selection"):
+        cleanup._load_run(run)
+
+
+def test_load_run_reads_legacy_manifest_without_selection_as_prefix(world: Path, tmp_path: Path):
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    manifest = _load(run / "manifest.json")
+    del manifest["selection"]
+    (run / "manifest.json").write_bytes(cleanup._canon(manifest))
+    candidates, loaded = cleanup._load_run(run)
+    try:
+        assert loaded.selection == cleanup._PREFIX_SELECTION
+    finally:
+        candidates.close()

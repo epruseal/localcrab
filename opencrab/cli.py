@@ -60,6 +60,43 @@ def _exit_if_partial_failure(has_failures: bool) -> None:
         raise SystemExit(EXIT_PARTIAL_FAILURE)
 
 
+def _discover_source_files(
+    path: str, recursive: bool, extension: str, data_dir: str
+) -> tuple[list[Path], list[Path]]:
+    """Collect the files `ingest`/`extract` read, split by data-directory scope.
+
+    Returns ``(allowed, refused)``. A file whose resolved path lies under the
+    configured data directory is refused (#520): that tree holds the stores
+    and the pipeline staging output, and `ingest` uses the absolute path as
+    the document id, so ingesting it turns pipeline output into document
+    nodes. The check uses ``resolve()`` on both sides, so a symlink that
+    points into the data directory is refused too.
+    """
+    extensions = [e.strip() for e in extension.split(",")]
+    root = Path(path)
+    if root.is_dir():
+        found = list(root.rglob("*")) if recursive else list(root.iterdir())
+    else:
+        found = [root]
+    found = [f for f in found if f.is_file() and f.suffix in extensions]
+    base = Path(data_dir).resolve()
+    allowed: list[Path] = []
+    refused: list[Path] = []
+    for file in found:
+        (refused if file.resolve().is_relative_to(base) else allowed).append(file)
+    return allowed, refused
+
+
+def _report_refused_sources(refused: list[Path], data_dir: str) -> None:
+    """Print one line for the files `_discover_source_files` refused."""
+    if refused:
+        console.print(
+            f"[yellow]Skipped {len(refused)} file(s) under the data directory "
+            f"{data_dir}: files there are store or pipeline output and are not "
+            "ingested as documents (#520).[/yellow]"
+        )
+
+
 def _make_stores(
     cfg: Settings,
     *,
@@ -536,15 +573,12 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
     hybrid = HybridQuery(chroma, neo4j)
 
     extensions = [e.strip() for e in extension.split(",")]
-    root = Path(path)
-    if root.is_dir():
-        files = list(root.rglob("*")) if recursive else list(root.iterdir())
-    else:
-        files = [root]
-    files = [f for f in files if f.is_file() and f.suffix in extensions]
+    files, refused = _discover_source_files(path, recursive, extension, cfg.local_data_dir)
+    _report_refused_sources(refused, cfg.local_data_dir)
 
     if not files:
-        console.print(f"[yellow]No files with extensions {extensions} found in {path}[/yellow]")
+        if not refused:
+            console.print(f"[yellow]No files with extensions {extensions} found in {path}[/yellow]")
         return
 
     console.print(f"[cyan]Ingesting {len(files)} file(s)...[/cyan]")
@@ -716,15 +750,12 @@ def extract(
     target_pack_id = resolve_write_pack(sql, principal, pack_id) if principal else None
 
     extensions = [e.strip() for e in extension.split(",")]
-    root = Path(path)
-    if root.is_dir():
-        files = list(root.rglob("*")) if recursive else list(root.iterdir())
-    else:
-        files = [root]
-    files = [f for f in files if f.is_file() and f.suffix in extensions]
+    files, refused = _discover_source_files(path, recursive, extension, cfg.local_data_dir)
+    _report_refused_sources(refused, cfg.local_data_dir)
 
     if not files:
-        console.print(f"[yellow]No files with extensions {extensions} found.[/yellow]")
+        if not refused:
+            console.print(f"[yellow]No files with extensions {extensions} found.[/yellow]")
         return
 
     console.print(f"[cyan]Extracting ontology from {len(files)} file(s)...[/cyan]")

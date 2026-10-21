@@ -1267,12 +1267,12 @@ def test_rest_ingest_materialises_graph_node_and_all_store_rows(
     assert any(n["node_id"] == "src-rest-1" for n in listing["nodes"]), listing
 
 
-def test_cli_ingest_materialises_graph_node_and_all_store_rows(cli74_bootstrapped, tmp_path):
+def test_cli_ingest_materialises_graph_node_and_all_store_rows(cli74_bootstrapped, src_dir):
     """CLI `ingest` 가 write_source 를 우회하는 변이라면 이 이슈의 결함이
 
     CLI 경로에서만 되살아난다.
     """
-    src = tmp_path / "doc.txt"
+    src = src_dir / "doc.txt"
     src.write_text("CLI 본문", encoding="utf-8")
 
     result = CliRunner().invoke(_cli_main, ["ingest", str(src)])
@@ -1390,7 +1390,7 @@ def test_rest_ingest_reports_failure_receipt_when_graph_write_is_rejected(
 
 
 def test_cli_ingest_reports_fail_and_zero_successes_when_graph_write_is_rejected(
-    cli74_bootstrapped, tmp_path, monkeypatch,
+    cli74_bootstrapped, src_dir, monkeypatch,
 ):
     """CLI 는 doc_status 가 `"skipped (graph write failed)"` 라 doc_ok=False 가
 
@@ -1402,7 +1402,7 @@ def test_cli_ingest_reports_fail_and_zero_successes_when_graph_write_is_rejected
     double = _GraphThatRejectsTheWrite(GraphWriteUnavailable("down for maintenance"))
     monkeypatch.setattr(_factory, "make_graph_store", lambda cfg: double)  # noqa: ARG005
 
-    src = tmp_path / "doc.txt"
+    src = src_dir / "doc.txt"
     src.write_text("CLI 본문", encoding="utf-8")
 
     result = CliRunner().invoke(_cli_main, ["ingest", str(src)])

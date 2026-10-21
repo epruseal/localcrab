@@ -429,13 +429,13 @@ class TestStatus:
 class TestIngest:
     # --- Normal ---
     def test_ingest_directory_writes_vector_and_reports_count(
-        self, bootstrapped, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, src_dir, runner, mock_vector_store
     ):
-        (cli_env / "a.txt").write_text("hello world")
-        (cli_env / "b.md").write_text("second doc")
-        (cli_env / "skip.bin").write_text("ignored extension")
+        (src_dir / "a.txt").write_text("hello world")
+        (src_dir / "b.md").write_text("second doc")
+        (src_dir / "skip.bin").write_text("ignored extension")
 
-        result = runner.invoke(main, ["ingest", str(cli_env), "-e", ".txt,.md"])
+        result = runner.invoke(main, ["ingest", str(src_dir), "-e", ".txt,.md"])
 
         assert result.exit_code == 0
         assert "Ingested 2/2 files." in result.output
@@ -444,21 +444,21 @@ class TestIngest:
         assert mock_vector_store.count() == 3
 
     # --- Error ---
-    def test_ingest_missing_path_exits_nonzero_no_traceback(self, cli_env, runner):
-        result = runner.invoke(main, ["ingest", str(cli_env / "does-not-exist")])
+    def test_ingest_missing_path_exits_nonzero_no_traceback(self, cli_env, src_dir, runner):
+        result = runner.invoke(main, ["ingest", str(src_dir / "does-not-exist")])
         assert result.exit_code != 0
         assert result.exception is None or isinstance(result.exception, SystemExit)
         assert "Traceback" not in result.output
 
     # --- Edge ---
     def test_ingest_single_file_path_is_accepted(
-        self, bootstrapped, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, src_dir, runner, mock_vector_store
     ):
         """A single file (not a directory) is a plausible PATH argument
         (click.Path(exists=True) allows file_okay+dir_okay by default) and
         must be ingested directly rather than crash trying to iterdir() a
         file — reproduced as NotADirectoryError before the fix."""
-        f = cli_env / "solo.txt"
+        f = src_dir / "solo.txt"
         f.write_text("single file content")
 
         result = runner.invoke(main, ["ingest", str(f)])
@@ -470,7 +470,7 @@ class TestIngest:
         assert mock_vector_store.count() == 2
 
     def test_ingest_pack_id_inferred_from_path(
-        self, bootstrapped, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, src_dir, runner, mock_vector_store
     ):
         from opencrab.config import get_settings
         from opencrab.pack.ownership import create_pack
@@ -478,7 +478,7 @@ class TestIngest:
 
         create_pack(make_sql_store(get_settings()), bootstrapped, "demo-pack")
 
-        pack_dir = cli_env / "packs" / "demo-pack" / "stage"
+        pack_dir = src_dir / "packs" / "demo-pack" / "stage"
         pack_dir.mkdir(parents=True)
         (pack_dir / "doc.txt").write_text("packed content")
 
@@ -489,15 +489,15 @@ class TestIngest:
 
     # --- Error (#189) ---
     def test_ingest_partial_failure_exits_nonzero_and_keeps_successful_file(
-        self, bootstrapped, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, src_dir, runner, mock_vector_store
     ):
         """#189: one file failing to read must not leave the process exit
         code at 0 -- a caller checking only the exit code has no way to see
         that "Ingested 1/2 files." meant a real failure. The file that DID
         succeed must still land (a partial failure must not be treated as
         a reason to also discard what already worked)."""
-        (cli_env / "ok.txt").write_text("good content")
-        (cli_env / "bad.txt").write_text("unreadable content")
+        (src_dir / "ok.txt").write_text("good content")
+        (src_dir / "bad.txt").write_text("unreadable content")
 
         real_read_text = Path.read_text
 
@@ -507,7 +507,7 @@ class TestIngest:
             return real_read_text(self, *args, **kwargs)
 
         with patch.object(Path, "read_text", flaky_read_text):
-            result = runner.invoke(main, ["ingest", str(cli_env), "-e", ".txt"])
+            result = runner.invoke(main, ["ingest", str(src_dir), "-e", ".txt"])
 
         assert result.exit_code != 0
         assert "Ingested 1/2 files." in result.output
@@ -516,37 +516,91 @@ class TestIngest:
         assert mock_vector_store.count() == 2
 
     def test_ingest_write_source_failure_exits_nonzero(
-        self, bootstrapped, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, src_dir, runner, mock_vector_store
     ):
         """#189 sibling path: write_source reporting a failed receipt (#158
         contract -- failures are reported, not raised) must also surface as
         a non-zero exit, the same as an exception raised directly in the
         loop."""
-        (cli_env / "doc.txt").write_text("content")
+        (src_dir / "doc.txt").write_text("content")
 
         with patch(
             "opencrab.pack.source_writer.write_source",
             return_value={"stores": {"documents": "error: simulated", "chromadb": "ok"}},
         ):
-            result = runner.invoke(main, ["ingest", str(cli_env), "-e", ".txt"])
+            result = runner.invoke(main, ["ingest", str(src_dir), "-e", ".txt"])
 
         assert result.exit_code != 0
         assert "Ingested 0/1 files." in result.output
 
     # --- Edge (#189) ---
     def test_ingest_empty_files_only_still_exits_zero(
-        self, bootstrapped, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, src_dir, runner, mock_vector_store
     ):
         """Regression guard: an empty file is silently skipped (not a
         failure) since before #189 -- the exit-code fix must not reclassify
         that skip as a failure. Only the `except` branch may raise the
         process's exit code."""
-        (cli_env / "empty.txt").write_text("")
+        (src_dir / "empty.txt").write_text("")
 
-        result = runner.invoke(main, ["ingest", str(cli_env), "-e", ".txt"])
+        result = runner.invoke(main, ["ingest", str(src_dir), "-e", ".txt"])
 
         assert result.exit_code == 0
         assert "Ingested 0/1 files." in result.output
+
+    # --- Data directory guard (#520) ---
+    def test_ingest_skips_files_under_data_dir(
+        self, bootstrapped, cli_env, runner, mock_vector_store
+    ):
+        """#520: a pipeline stages its output under the data directory and
+        calls `ingest -r` on the staging tree. The absolute path becomes the
+        document id, so every output file turned into a document node. Files
+        under the data directory are refused. The exit code stays 0 so a
+        caller that checks it keeps running."""
+        stage = cli_env / "pack-x" / "stage" / "run-1"
+        stage.mkdir(parents=True)
+        (stage / "records.jsonl").write_text('{"id": 1}')
+        (stage / "README.md").write_text("pipeline output")
+
+        result = runner.invoke(main, ["ingest", str(stage), "-r", "-e", ".md,.jsonl"])
+
+        assert result.exit_code == 0
+        assert "Skipped 2 file(s) under the data directory" in result.output
+        assert "Ingested" not in result.output
+        assert mock_vector_store.count() == 0
+        from opencrab.config import get_settings
+        from opencrab.stores.factory import make_doc_store
+
+        assert make_doc_store(get_settings()).list_sources(limit=10) == []
+
+    def test_ingest_data_dir_guard_keeps_outside_files(
+        self, bootstrapped, cli_env, src_dir, runner, mock_vector_store
+    ):
+        """The refusal is per file: a file outside the data directory in the
+        same walk is still ingested. A symlink that points into the data
+        directory is judged by its resolved path."""
+        (src_dir / "ok.txt").write_text("outside content")
+        inside = cli_env / "inside.txt"
+        inside.write_text("store-side content")
+        (src_dir / "link.txt").symlink_to(inside)
+
+        result = runner.invoke(main, ["ingest", str(src_dir), "-e", ".txt"])
+
+        assert result.exit_code == 0
+        assert "Skipped 1 file(s) under the data directory" in result.output
+        assert "Ingested 1/1 files." in result.output
+
+    def test_ingest_single_file_under_data_dir_is_skipped(
+        self, bootstrapped, cli_env, runner, mock_vector_store
+    ):
+        f = cli_env / "solo.txt"
+        f.write_text("single file content")
+
+        result = runner.invoke(main, ["ingest", str(f)])
+
+        assert result.exit_code == 0
+        assert "Skipped 1 file(s) under the data directory" in result.output
+        assert mock_vector_store.count() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +618,7 @@ class TestQuery:
         assert "No results found." in result.output
 
     def test_human_output_finds_ingested_result(
-        self, bootstrapped, cli_env, runner, mock_vector_store
+        self, bootstrapped, cli_env, src_dir, runner, mock_vector_store
     ):
         # #147: reads are scoped to packs the caller owns/may read (DESIGN.md
         # §3.2/§3.10, invariant 5) -- a pack-less ingest ("effective_pack"
@@ -579,9 +633,9 @@ class TestQuery:
         from opencrab.stores.factory import make_sql_store
 
         create_pack(make_sql_store(get_settings()), bootstrapped, "pack-a", title="Pack A")
-        (cli_env / "doc.txt").write_text("the quick brown fox jumps")
+        (src_dir / "doc.txt").write_text("the quick brown fox jumps")
         assert runner.invoke(
-            main, ["ingest", str(cli_env / "doc.txt"), "--pack-id", "pack-a"]
+            main, ["ingest", str(src_dir / "doc.txt"), "--pack-id", "pack-a"]
         ).exit_code == 0
 
         result = runner.invoke(main, ["query", "the quick brown fox jumps"])
@@ -943,9 +997,9 @@ def _make_extraction_result(source_id: str):
 class TestExtract:
     # --- Normal ---
     def test_extract_writes_nodes_and_edges_and_reports_summary(
-        self, bootstrapped, cli_env, runner
+        self, bootstrapped, cli_env, src_dir, runner
     ):
-        (cli_env / "doc.md").write_text("Alex owns the demo project.")
+        (src_dir / "doc.md").write_text("Alex owns the demo project.")
 
         fake_extractor = MagicMock()
         fake_extractor.extract_from_file.side_effect = (
@@ -955,7 +1009,7 @@ class TestExtract:
             "opencrab.ontology.extractor.LLMExtractor", return_value=fake_extractor
         ):
             result = runner.invoke(
-                main, ["extract", str(cli_env), "--api-key", "test-key"]
+                main, ["extract", str(src_dir), "--api-key", "test-key"]
             )
 
         assert result.exit_code == 0
@@ -970,8 +1024,8 @@ class TestExtract:
         assert graph.get_node("Agent", "alex_agent") is not None
         graph.close()
 
-    def test_extract_dry_run_does_not_write(self, cli_env, runner):
-        (cli_env / "doc.md").write_text("Alex owns the demo project.")
+    def test_extract_dry_run_does_not_write(self, cli_env, src_dir, runner):
+        (src_dir / "doc.md").write_text("Alex owns the demo project.")
 
         fake_extractor = MagicMock()
         fake_extractor.extract_from_file.side_effect = (
@@ -982,7 +1036,7 @@ class TestExtract:
         ):
             result = runner.invoke(
                 main,
-                ["extract", str(cli_env), "--api-key", "test-key", "--dry-run"],
+                ["extract", str(src_dir), "--api-key", "test-key", "--dry-run"],
             )
 
         assert result.exit_code == 0
@@ -996,12 +1050,12 @@ class TestExtract:
 
     # --- Error ---
     def test_extract_no_api_key_clear_error_no_traceback(
-        self, cli_env, runner, monkeypatch
+        self, cli_env, src_dir, runner, monkeypatch
     ):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        (cli_env / "doc.md").write_text("content")
+        (src_dir / "doc.md").write_text("content")
 
-        result = runner.invoke(main, ["extract", str(cli_env)])
+        result = runner.invoke(main, ["extract", str(src_dir)])
 
         assert result.exit_code != 0
         assert result.exception is None or isinstance(result.exception, SystemExit)
@@ -1009,13 +1063,13 @@ class TestExtract:
         assert "ANTHROPIC_API_KEY" in result.output
 
     def test_extract_per_file_exception_exits_nonzero_and_keeps_other_file(
-        self, bootstrapped, cli_env, runner
+        self, bootstrapped, cli_env, src_dir, runner
     ):
         """#189: extract_from_file raising for one file must not leave the
         process exit code at 0. The other file's extraction must still be
         written (a partial failure keeps the partial success)."""
-        (cli_env / "ok.md").write_text("Alex owns the demo project.")
-        (cli_env / "bad.md").write_text("unparseable content")
+        (src_dir / "ok.md").write_text("Alex owns the demo project.")
+        (src_dir / "bad.md").write_text("unparseable content")
 
         fake_extractor = MagicMock()
 
@@ -1029,7 +1083,7 @@ class TestExtract:
             "opencrab.ontology.extractor.LLMExtractor", return_value=fake_extractor
         ):
             result = runner.invoke(
-                main, ["extract", str(cli_env), "--api-key", "test-key"]
+                main, ["extract", str(src_dir), "--api-key", "test-key"]
             )
 
         assert result.exit_code != 0
@@ -1042,12 +1096,12 @@ class TestExtract:
         graph.close()
 
     def test_extract_result_errors_field_exits_nonzero_without_exception(
-        self, bootstrapped, cli_env, runner
+        self, bootstrapped, cli_env, src_dir, runner
     ):
         """#189: a result carrying ``errors`` (no exception raised -- the
         extractor's own partial-failure signal, distinct from the
         exception path above) must also flip the exit code."""
-        (cli_env / "doc.md").write_text("content")
+        (src_dir / "doc.md").write_text("content")
 
         fake_extractor = MagicMock()
 
@@ -1061,7 +1115,7 @@ class TestExtract:
             "opencrab.ontology.extractor.LLMExtractor", return_value=fake_extractor
         ):
             result = runner.invoke(
-                main, ["extract", str(cli_env), "--api-key", "test-key"]
+                main, ["extract", str(src_dir), "--api-key", "test-key"]
             )
 
         assert result.exit_code != 0
@@ -1069,11 +1123,11 @@ class TestExtract:
         assert "warn=1" in result.output
 
     def test_extract_dry_run_extraction_failure_exits_nonzero(
-        self, cli_env, runner
+        self, cli_env, src_dir, runner
     ):
         """--dry-run writes nothing, so store-write failure counters stay at
         0, but an extraction failure alone must still flip the exit code."""
-        (cli_env / "bad.md").write_text("unparseable content")
+        (src_dir / "bad.md").write_text("unparseable content")
 
         fake_extractor = MagicMock()
         fake_extractor.extract_from_file.side_effect = RuntimeError("simulated")
@@ -1082,15 +1136,15 @@ class TestExtract:
         ):
             result = runner.invoke(
                 main,
-                ["extract", str(cli_env), "--api-key", "test-key", "--dry-run"],
+                ["extract", str(src_dir), "--api-key", "test-key", "--dry-run"],
             )
 
         assert result.exit_code != 0
         assert "(dry-run)" in result.output
 
     # --- Edge ---
-    def test_extract_single_file_path_is_accepted(self, bootstrapped, cli_env, runner):
-        f = cli_env / "solo.md"
+    def test_extract_single_file_path_is_accepted(self, bootstrapped, cli_env, src_dir, runner):
+        f = src_dir / "solo.md"
         f.write_text("Alex owns the demo project.")
 
         fake_extractor = MagicMock()
@@ -1106,13 +1160,32 @@ class TestExtract:
         assert result.exception is None
         assert "nodes=2 edges=1" in result.output
 
+    def test_extract_skips_files_under_data_dir(self, bootstrapped, cli_env, runner):
+        """#520: `extract` shares the file discovery of `ingest`, so it must
+        refuse the same files and never hand them to the extractor."""
+        stage = cli_env / "pack-x" / "stage"
+        stage.mkdir(parents=True)
+        (stage / "records.md").write_text("pipeline output")
+
+        fake_extractor = MagicMock()
+        with patch(
+            "opencrab.ontology.extractor.LLMExtractor", return_value=fake_extractor
+        ):
+            result = runner.invoke(
+                main, ["extract", str(stage), "-r", "--api-key", "k", "--dry-run"]
+            )
+
+        assert result.exit_code == 0
+        assert "Skipped 1 file(s) under the data directory" in result.output
+        fake_extractor.extract_from_file.assert_not_called()
+
     def test_extract_node_write_failure_exits_nonzero(
-        self, bootstrapped, cli_env, runner
+        self, bootstrapped, cli_env, src_dir, runner
     ):
         """#189 sibling-path guard: a node write failure (exception raised
         by `builder.add_node`, distinct from an edge write failure below)
         must flip the exit code on its own."""
-        (cli_env / "doc.md").write_text("Alex owns the demo project.")
+        (src_dir / "doc.md").write_text("Alex owns the demo project.")
 
         fake_extractor = MagicMock()
         fake_extractor.extract_from_file.side_effect = (
@@ -1125,20 +1198,20 @@ class TestExtract:
             side_effect=RuntimeError("simulated node write failure"),
         ):
             result = runner.invoke(
-                main, ["extract", str(cli_env), "--api-key", "test-key"]
+                main, ["extract", str(src_dir), "--api-key", "test-key"]
             )
 
         assert result.exit_code != 0
         assert "not stored" in result.output or "simulated node write failure" in result.output
 
     def test_extract_edge_write_failure_exits_nonzero(
-        self, bootstrapped, cli_env, runner
+        self, bootstrapped, cli_env, src_dir, runner
     ):
         """#189 sibling-path guard: an edge write failure alone (nodes land
         fine) must also flip the exit code -- a mutation that wires only
         `total_node_write_failures` into the exit check would pass the node
         test above but miss this one."""
-        (cli_env / "doc.md").write_text("Alex owns the demo project.")
+        (src_dir / "doc.md").write_text("Alex owns the demo project.")
 
         fake_extractor = MagicMock()
         fake_extractor.extract_from_file.side_effect = (
@@ -1151,7 +1224,7 @@ class TestExtract:
             side_effect=RuntimeError("simulated edge write failure"),
         ):
             result = runner.invoke(
-                main, ["extract", str(cli_env), "--api-key", "test-key"]
+                main, ["extract", str(src_dir), "--api-key", "test-key"]
             )
 
         assert result.exit_code != 0
