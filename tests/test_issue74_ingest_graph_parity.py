@@ -80,6 +80,7 @@ def stack(tmp_path):
     try:
         yield st
     finally:
+        hybrid.shutdown_bm25()
         vector.close()
         graph.close()
         docs.close()

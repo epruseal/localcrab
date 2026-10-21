@@ -125,6 +125,7 @@ def stack(tmp_path):
     try:
         yield stack
     finally:
+        hybrid.shutdown_bm25()
         # Each test owns four native/database handles.  Chroma keeps file
         # descriptors open beyond the last collection call, so returning the
         # dictionary without closing the stores exhausts the process limit
