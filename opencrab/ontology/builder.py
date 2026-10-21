@@ -602,12 +602,13 @@ class OntologyBuilder:
             reads the stored digest and writes the new properties through
             the graph's ``update_edge`` CAS. ``update_edge`` re-checks, inside
             its transaction, the endpoint types, that the stored edge belongs
-            to ``pack_id``, and that the digest still matches. An edge of
-            another pack, an edge without ``pack_id``, and a digest that
-            changed since the read all stay ``EdgeIdentityConflict``. The
-            replacement overwrites all properties of the stored edge. The
-            result then carries ``"replaced": True``. This is the only
-            in-package route to ``update_edge``, and ``authorize`` has
+            to ``pack_id``, and that the digest still matches. The slot
+            check refuses an edge of another pack with ``ValueError`` before
+            any write. An edge without ``pack_id`` and a digest that changed
+            since the read stay ``EdgeIdentityConflict``. The replacement
+            overwrites all properties of the stored edge. The result then
+            carries ``"replaced": True``. A pack write reaches
+            ``update_edge`` only through this branch, and ``authorize`` has
             already run when it is reached.
 
         Returns

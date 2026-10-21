@@ -341,10 +341,11 @@ class GraphStore(Protocol):
         Authorization contract: this layer checks the CAS digest, the endpoint
         types and that the stored and new ``pack_id`` equal ``owner_pack_id``.
         It does not read a principal and does not consult the pack registry,
-        like ``upsert_edge`` and ``delete_edge``. The in-package gate is
-        ``OntologyBuilder.add_edge(replace_own=True)``, which runs
-        ``write_gate.authorize`` before it reaches this method. Any other
-        caller must call ``write_gate.authorize`` for ``owner_pack_id`` first.
+        like ``upsert_edge`` and ``delete_edge``. A pack write reaches this
+        method only through ``OntologyBuilder.add_edge(replace_own=True)``,
+        which runs ``write_gate.authorize`` first. The Neo4j batch method also
+        calls it inside the store layer. Any other caller must call
+        ``write_gate.authorize`` for ``owner_pack_id`` first.
         ``tests/test_edge_update_gate_guard.py`` fails when production code
         outside the listed places references this method.
         """
@@ -836,13 +837,11 @@ class GraphStoreExtended(Protocol):
         """Batch form of ``update_edge``; each item carries its own
         ``expected_current_digest`` and ``owner_pack_id``.
 
-        Authorization contract: this layer checks the CAS digest, the endpoint
-        types and that the stored and new ``pack_id`` equal ``owner_pack_id``.
-        It does not read a principal and does not consult the pack registry,
-        like ``upsert_edge`` and ``delete_edge``. The in-package gate is
-        ``OntologyBuilder.add_edge(replace_own=True)``, which runs
-        ``write_gate.authorize`` before it reaches this method. Any other
-        caller must call ``write_gate.authorize`` for ``owner_pack_id`` first.
+        Authorization contract: this layer checks the digest, the endpoint
+        types and the pack ids of each item. It does not read a principal and
+        does not consult the pack registry. No in-package pack write calls
+        this method. A caller must call ``write_gate.authorize`` for every
+        ``owner_pack_id`` in the batch first.
         ``tests/test_edge_update_gate_guard.py`` fails when production code
         outside the listed places references this method.
         """

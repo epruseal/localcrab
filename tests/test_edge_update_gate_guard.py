@@ -1,8 +1,8 @@
 """엣지 갱신 메서드의 인가 계약과 `load_edges` 반환 형태를 정적으로 고정한다.
 
 `update_edge` / `update_edges_batch` 는 저장소 계층에 principal 이나 등록부 소유권
-검사가 없다. 패키지 안의 인가 지점은 `OntologyBuilder.add_edge(replace_own=True)` 한
-곳이다. 이 파일의 첫 검사는 그 두 이름을 가리키는 프로덕션 참조가 표에 적힌
+검사가 없다. 팩 쓰기가 단건 `update_edge` 에 닿는 길은
+`OntologyBuilder.add_edge(replace_own=True)` 하나다. 이 파일의 첫 검사는 그 두 이름을 가리키는 프로덕션 참조가 표에 적힌
 자리 밖에 없고, 빌더 안의 참조가 최상위 `authorize` 문장 뒤에 있음을 확인한다.
 
 한계: 실행 중에 조립한 이름(`"update_" + "edge"` 등)은 정적 검사로 볼 수 없다.

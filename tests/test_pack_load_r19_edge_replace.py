@@ -114,6 +114,36 @@ class TestReplaceChangedEdge:
         assert stored[_KEY]["pack_id"] == "pack-a"
         assert applied == {_KEY}
 
+    def test_replacement_overwrites_all_properties(self, live, tmp_path):
+        builder, graph, docs, id_map = _setup(live, tmp_path)
+        f1 = _edges_file(tmp_path, "e1.jsonl", [_edge(note="a", extra="x")])
+        _load("pack-a", f1, builder, id_map, replace_changed=True)
+        assert _stored_edges(tmp_path)[_KEY]["extra"] == "x", "전제 위반"
+
+        f2 = _edges_file(tmp_path, "e2.jsonl", [_edge(note="b")])
+        assert _load("pack-a", f2, builder, id_map, replace_changed=True) == (1, 0, 0)
+
+        stored = _stored_edges(tmp_path)[_KEY]
+        assert stored["note"] == "b"
+        assert "extra" not in stored, "교체가 병합으로 바뀌어 파일에 없는 속성이 남았다"
+
+    def test_counters_accumulate_over_several_replaced_edges(self, live, tmp_path):
+        builder, graph, docs, id_map = _setup(live, tmp_path, node_ids=("n1", "n2", "n3"))
+        f1 = _edges_file(tmp_path, "e1.jsonl",
+                         [_edge(note="a"), _edge(tgt="n3", note="a")])
+        assert _load("pack-a", f1, builder, id_map, replace_changed=True) == (2, 0, 0)
+
+        f2 = _edges_file(tmp_path, "e2.jsonl",
+                         [_edge(note="b"), _edge(tgt="n3", note="b")])
+        counters: Counter = Counter({"replaced": 2})
+        res = _load("pack-a", f2, builder, id_map, replace_changed=True, counters=counters)
+        assert res == (2, 0, 0)
+        assert counters["replaced"] == 4, "호출 안 교체 건수가 기존 카운터에 더해지지 않았다"
+
+        res = _load("pack-a", f2, builder, id_map, replace_changed=True, counters=counters)
+        assert res == (2, 0, 0)
+        assert counters["replaced"] == 4, "변경 없는 재실행이 카운터를 바꿨다"
+
     def test_replacement_with_a_failed_leg_counts_as_error_not_replaced(
             self, live, tmp_path, monkeypatch):
         builder, graph, docs, id_map = _setup(live, tmp_path)
@@ -161,6 +191,11 @@ class TestReplaceChangedEdge:
         with pytest.raises(EdgeIdentityConflict):
             builder.add_edge("resource", "n1", "cites", "resource", "n2",
                              properties={"note": "c"}, pack_id="pack-a", origin="server")
+        # 기본 origin 은 client 다. 클라이언트 경로는 교체 없이 충돌을 그대로 낸다.
+        with pytest.raises(EdgeIdentityConflict):
+            builder.add_edge("resource", "n1", "cites", "resource", "n2",
+                             properties={"note": "c"}, pack_id="pack-a")
+        assert _stored_edges(tmp_path)[_KEY]["note"] == "a"
 
     def test_replace_own_is_refused_for_client_origin_and_fork_copy(
             self, live, tmp_path, monkeypatch):
@@ -335,8 +370,14 @@ class TestOneCycleWithNodeChange:
                 "pack-a", nf2, builder, {}, state["nodes"], graph, docs,
                 state["doc_node_spaces"], sql=pack_sql)
             counters: Counter = Counter()
-            edge_res = _load("pack-a", f2, builder, id_map, replace_changed=True,
-                             counters=counters)
+            applied: set = set()
+            edge_res = _load("pack-a", f2, builder, id_map, applied=applied,
+                             replace_changed=True, counters=counters)
+            fin = pack_load.incremental_finalize(
+                "pack-a", graph, docs, _NoVec(), state, node_res[5], set(), applied,
+                False, nodes_total=2, chunks_total=0, sql=pack_sql)
+            assert fin["edge_del"] == 0, "finalize 가 교체한 엣지를 지웠다"
+            assert _KEY in _stored_edges(tmp_path)
             return node_res, edge_res, counters
 
         node_res, edge_res, counters = run_cycle()

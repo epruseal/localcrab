@@ -341,10 +341,11 @@ SELECT COUNT(*) FROM graph_nodes
 - **Neo4j**: 이 경로의 Cypher 는 시험에서 실행하지 않았다. `update_edge` 가 저장된
   `edge_digest` 속성을 요구하므로 그 속성이 없는 옛 엣지는 교체되지 않고 err 로 남는다.
 - **#524, 갱신 메서드의 인가 계약**: `update_edge` 와 `update_edges_batch` 는 저장소 계층이라
-  principal 이나 등록부를 읽지 않는다(`upsert_edge`, `delete_edge`, `update_node` 와 같다). 패키지
-  안의 인가 지점은 `OntologyBuilder.add_edge(replace_own=True)` 한 곳이며, 호출 앞에 최상위
-  `authorize` 문장이 있다. 다른 호출자는 `owner_pack_id` 에 대해 `write_gate.authorize` 를 먼저
-  불러야 한다. `tests/test_edge_update_gate_guard.py` 는 두 이름을 가리키는 프로덕션 참조가
+  principal 이나 등록부를 읽지 않는다(`upsert_edge`, `delete_edge`, `update_node` 와 같다). 팩 쓰기가
+  단건 `update_edge` 에 닿는 길은 `OntologyBuilder.add_edge(replace_own=True)` 하나이며, 호출 앞에
+  최상위 `authorize` 문장이 있다(Neo4j 의 `update_edges_batch` 가 저장소 계층 안에서 `update_edge` 를
+  부르는 길은 별개다). 팩 쓰기가 `update_edges_batch` 를 부르는 곳은 없다. 다른 호출자는
+  `owner_pack_id` 에 대해 `write_gate.authorize` 를 먼저 불러야 한다. `tests/test_edge_update_gate_guard.py` 는 두 이름을 가리키는 프로덕션 참조가
   허용표 밖에 있거나 빌더 안의 참조가 `authorize` 뒤에 있지 않으면 실패한다. 한계가 둘 있다.
   실행 중에 조립한 이름은 정적 검사로 볼 수 없고, 패키지 밖 호출자는 이 문서 계약으로만
   묶인다.
