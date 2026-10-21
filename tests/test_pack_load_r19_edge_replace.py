@@ -298,6 +298,25 @@ class TestRefusals:
         assert ("update_edge", "EdgeIdentityConflict") in rec.raised
         assert _stored_edges(tmp_path) == before
 
+    def test_stale_type_snapshot_is_not_replaced(self, live, tmp_path, monkeypatch):
+        builder, graph, docs, id_map = _setup(live, tmp_path)
+        f1 = _edges_file(tmp_path, "e1.jsonl", [_edge(note="a")])
+        _load("pack-a", f1, builder, id_map, replace_changed=True)
+        # 저장된 끝점 타입 스냅샷이 현재 노드 타입과 어긋난 행을 만든다.
+        graph._conn.execute("UPDATE graph_edges SET from_type='File'")
+        graph._conn.commit()
+        before = _stored_edges(tmp_path)
+
+        rec = _Recorder(monkeypatch, graph)
+        counters: Counter = Counter()
+        f2 = _edges_file(tmp_path, "e2.jsonl", [_edge(note="b")])
+        res = _load("pack-a", f2, builder, id_map, replace_changed=True, counters=counters)
+
+        assert res == (0, 0, 1)
+        assert counters["replaced"] == 0
+        assert rec.count("update_edge") == 0, "스냅샷 불일치 행에 교체를 시도했다"
+        assert _stored_edges(tmp_path) == before
+
     def test_stale_digest_fails_the_row_and_keeps_the_key_protected(
             self, live, tmp_path, monkeypatch, pack_sql):
         builder, graph, docs, id_map = _setup(live, tmp_path, node_ids=("n1", "n2", "n3"))
