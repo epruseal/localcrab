@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+from opencrab.grammar.manifest import SPACES
 from opencrab.stores.backup import backup_sqlite, verify_sqlite
 
 EXIT_OK = 0
@@ -111,6 +112,7 @@ class _Selection:
     pack_id: str
     node_type: str
     ids: frozenset[str] | None
+    support_types: frozenset[str] | None = None
 
 
 _PREFIX_SELECTION = _Selection("openclaw", "Evidence", None)
@@ -133,8 +135,8 @@ def _selection_scope(selection: _Selection) -> Iterator[None]:
 
 
 def _claim_source_types() -> set[str]:
-    """생존 Claim 근거는 기본 Evidence와 선택 타입을 받는다. 삭제 후보 타입과 생존 근거 타입은 다를 수 있다."""
-    return {"Evidence", _SELECTION.node_type}
+    """승인 run에 동결한 생존 근거 타입을 쓴다. 구 ID run은 Evidence와 선택 타입을 유지한다."""
+    return set(_SELECTION.support_types) if _SELECTION.support_types is not None else {"Evidence", _SELECTION.node_type}
 
 
 def _ids_digest(ids: Any) -> str:
@@ -168,7 +170,7 @@ def _parse_approved_ids(data: dict[str, Any]) -> _Selection:
         raise CleanupRefusedError("approved ids must be a non-empty list of non-empty strings")
     if len(set(ids)) != len(ids):
         raise CleanupRefusedError("approved ids contain duplicates")
-    return _Selection(data["pack_id"], data["node_type"], frozenset(ids))
+    return _Selection(data["pack_id"], data["node_type"], frozenset(ids), frozenset(SPACES[EVIDENCE_SPACE]["node_types"]) | {data["node_type"]})
 
 
 def _selection_record(selection: _Selection) -> dict[str, Any]:
@@ -181,6 +183,7 @@ def _selection_record(selection: _Selection) -> dict[str, Any]:
         "node_type": selection.node_type,
         "approved_count": len(selection.ids),
         "approved_ids_sha256": _ids_digest(selection.ids),
+        "support_types": sorted(selection.support_types or {"Evidence", selection.node_type}),
     }
 
 
@@ -198,12 +201,24 @@ def _selection_from_manifest(manifest: dict[str, Any], candidate_ids: list[str])
         if set(record) != {"mode"}:
             raise CleanupRefusedError("manifest selection is invalid")
         return _PREFIX_SELECTION
-    if record.get("mode") != "id-set" or set(record) != {"mode", "pack_id", "node_type", "approved_count", "approved_ids_sha256"}:
+    keys = {"mode", "pack_id", "node_type", "approved_count", "approved_ids_sha256"}
+    if record.get("mode") != "id-set" or set(record) not in (keys, keys | {"support_types"}):
         raise CleanupRefusedError("manifest selection is invalid")
     _check_selection_fields(record["pack_id"], record["node_type"])
     if record["approved_count"] != len(candidate_ids) or record["approved_ids_sha256"] != _ids_digest(candidate_ids):
         raise CleanupRefusedError("manifest selection does not match the candidate file")
-    return _Selection(record["pack_id"], record["node_type"], frozenset(candidate_ids))
+    support_types = record.get("support_types")
+    if "support_types" in record:
+        if (
+            not isinstance(support_types, list) or not support_types
+            or any(not isinstance(item, str) or not item for item in support_types)
+            or len(set(support_types)) != len(support_types)
+            or not {"Evidence", record["node_type"]}.issubset(support_types)
+            or _RESERVED_NODE_TYPES.intersection(support_types)
+        ):
+            raise CleanupRefusedError("manifest selection support_types is invalid")
+    # 구 ID manifest는 당시 보호 범위를 유지한다.
+    return _Selection(record["pack_id"], record["node_type"], frozenset(candidate_ids), frozenset(support_types) if support_types is not None else None)
 
 
 def _file_sha(path: Path) -> str:

@@ -4524,7 +4524,7 @@ def test_approved_ids_dry_run_selects_exactly_the_approved_set_without_writes(id
     lines = (run / "candidates.jsonl").read_text(encoding="utf-8").splitlines()
     assert sorted(json.loads(line)["id"] for line in lines) == sorted([_ART_A, _ART_B])
     selection = _load(run / "manifest.json")["selection"]
-    assert selection == {"mode": "id-set", "pack_id": "pack-a", "node_type": "TextUnit", "approved_count": 2, "approved_ids_sha256": cleanup._ids_digest([_ART_A, _ART_B])}
+    assert selection == {"mode": "id-set", "pack_id": "pack-a", "node_type": "TextUnit", "approved_count": 2, "approved_ids_sha256": cleanup._ids_digest([_ART_A, _ART_B]), "support_types": sorted(cleanup.SPACES["evidence"]["node_types"])}
     assert _all_db_bytes(id_world) == before
     # 기본 선택은 종전 그대로이며 선택 기록은 prefix다.
     prefix_run = tmp_path / "prefix-run"
@@ -4749,13 +4749,13 @@ def test_load_run_reads_legacy_manifest_without_selection_as_prefix(world: Path,
         candidates.close()
 
 
-def _mixed_claim_setup(world: Path) -> tuple[str, str]:
+def _mixed_claim_setup(world: Path, survivor_type: str = "Evidence") -> tuple[str, str]:
     """TextUnit 후보와 Evidence 비후보가 graph와 registry에서 같은 Claim을 지지한다."""
     survivor, claim = "evidence:mixed:keep", "claim:mixed"
-    _add(world, survivor, "surviving evidence", pack="pack-a", node_type="Evidence")
+    _add(world, survivor, "surviving evidence", pack="pack-a", node_type=survivor_type)
     with _db(world / "graph.db") as conn:
         conn.execute("INSERT INTO graph_nodes VALUES (?,?,?,?)", ("Claim", claim, "claim", "{}"))
-        for kind, node_id in (("TextUnit", _ART_A), ("Evidence", survivor)):
+        for kind, node_id in (("TextUnit", _ART_A), (survivor_type, survivor)):
             conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", (kind, node_id, "supports", "Claim", claim, "{}"))
     with _db(world / "opencrab.db") as conn:
         conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("claim", "Claim", claim))
@@ -4764,9 +4764,10 @@ def _mixed_claim_setup(world: Path) -> tuple[str, str]:
     return survivor, claim
 
 
+@pytest.mark.parametrize("survivor_type", cleanup.SPACES["evidence"]["node_types"])
 @pytest.mark.parametrize("interrupt", [False, True])
-def test_cli_mixed_claim_support_survives_apply_resume_and_rollback(id_world: Path, tmp_path: Path, interrupt: bool):
-    survivor, claim = _mixed_claim_setup(id_world)
+def test_cli_mixed_claim_support_survives_apply_resume_and_rollback(id_world: Path, tmp_path: Path, interrupt: bool, survivor_type: str):
+    survivor, claim = _mixed_claim_setup(id_world, survivor_type)
     before = _all_db_rows(id_world)
     survivor_before = _survivor_raw(id_world, survivor, claim)
     claim_before = _survivor_raw(id_world, claim)
@@ -4790,8 +4791,9 @@ def test_cli_mixed_claim_support_survives_apply_resume_and_rollback(id_world: Pa
 
 
 @pytest.mark.parametrize("fault", ["source-pack", "graph-space", "registry-type", "edge-type", "last-support"])
-def test_mixed_claim_support_refuses_invalid_survivor(id_world: Path, tmp_path: Path, fault: str):
-    survivor, claim = _mixed_claim_setup(id_world)
+@pytest.mark.parametrize("survivor_type", cleanup.SPACES["evidence"]["node_types"])
+def test_mixed_claim_support_refuses_invalid_survivor(id_world: Path, tmp_path: Path, fault: str, survivor_type: str):
+    survivor, claim = _mixed_claim_setup(id_world, survivor_type)
     if fault == "source-pack":
         _set_one_axis_pack(id_world, survivor, "source-pack-only", "pack-b")
     elif fault == "graph-space":
@@ -4799,10 +4801,10 @@ def test_mixed_claim_support_refuses_invalid_survivor(id_world: Path, tmp_path: 
             conn.execute("UPDATE graph_nodes SET space_id='concept' WHERE node_id=?", (survivor,))
     elif fault == "registry-type":
         with _db(id_world / "opencrab.db") as conn:
-            conn.execute("UPDATE ontology_nodes SET node_type='TextUnit' WHERE node_id=?", (survivor,))
+            conn.execute("UPDATE ontology_nodes SET node_type=? WHERE node_id=?", ("Evidence" if survivor_type != "Evidence" else "TextUnit", survivor))
     elif fault == "edge-type":
         with _db(id_world / "graph.db") as conn:
-            conn.execute("UPDATE graph_edges SET from_type='TextUnit' WHERE from_id=?", (survivor,))
+            conn.execute("UPDATE graph_edges SET from_type=? WHERE from_id=?", ("Evidence" if survivor_type != "Evidence" else "TextUnit", survivor))
     else:
         with _db(id_world / "graph.db") as conn:
             conn.execute("DELETE FROM graph_edges WHERE from_id=?", (survivor,))
@@ -4813,3 +4815,43 @@ def test_mixed_claim_support_refuses_invalid_survivor(id_world: Path, tmp_path: 
     assert result["eligible"] is False, result
     assert "Claim support" in " ".join(result["errors"])
     assert not (run / "manifest.json").exists()
+
+
+def test_legacy_id_manifest_preserves_old_support_types(id_world: Path, tmp_path: Path):
+    run = tmp_path / "run"
+    cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_A]))
+    manifest = _load(run / "manifest.json")
+    del manifest["selection"]["support_types"]
+    (run / "manifest.json").write_bytes(cleanup._canon(manifest))
+    candidates, loaded = cleanup._load_run(run)
+    try:
+        with cleanup._selection_scope(loaded.selection):
+            assert cleanup._claim_source_types() == {"Evidence", "TextUnit"}
+    finally:
+        candidates.close()
+
+
+@pytest.mark.parametrize("support_types", [None, [], "Evidence", ["Evidence", "TextUnit", "TextUnit"], ["Evidence", "TextUnit", "Claim"], ["TextUnit"], ["Evidence", 1]])
+def test_manifest_refuses_invalid_frozen_support_types(id_world: Path, tmp_path: Path, support_types):
+    run = tmp_path / "run"
+    cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_A]))
+    manifest = _load(run / "manifest.json")
+    manifest["selection"]["support_types"] = support_types
+    (run / "manifest.json").write_bytes(cleanup._canon(manifest))
+    with pytest.raises(cleanup.CleanupRefusedError, match="support_types"):
+        cleanup._load_run(run)
+
+
+def test_logentry_survivor_change_refuses_resume(id_world: Path, tmp_path: Path):
+    survivor, _claim = _mixed_claim_setup(id_world, "LogEntry")
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_A]))
+    approval = _id_approval(tmp_path, run)
+    _id_interrupted_apply(id_world, tmp_path, run, approval, backup, "before-graph")
+    with _db(id_world / "doc_store.db") as conn:
+        conn.execute("UPDATE doc_sources SET text='changed' WHERE source_id=?", (survivor,))
+    before = _all_db_rows(id_world)
+    resumed = _cli_main(tmp_path, "logentry-changed", [*_id_base(id_world, run), "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)])
+    assert resumed.returncode == 2
+    assert "protected set changed" in resumed.stderr
+    assert _all_db_rows(id_world) == before
