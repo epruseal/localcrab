@@ -70,3 +70,22 @@ def test_vector_identity_resolves_symlink_alias(tmp_path):
     finally:
         vec2.close()
         vec3.close()
+
+
+def test_verify_recovery_row_rejects_real_int8_vector_type(tmp_path):
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+    vec = SqliteVecStore(
+        db_path=str(tmp_path / "vectors.db"),
+        embedding_function=MockEF(32),
+        dim=4,
+        collection_name="int8_vectors",
+    )
+    try:
+        vec._conn.execute("DROP TABLE int8_vectors")
+        vec._conn.execute("CREATE VIRTUAL TABLE int8_vectors USING vec0(node_id TEXT PRIMARY KEY, pack_id TEXT partition key, embedding int8[4], +document TEXT, +metadata TEXT)")
+        vec._conn.execute("INSERT INTO int8_vectors(node_id, pack_id, embedding, document, metadata) VALUES (?, ?, vec_int8(?), ?, ?)", ("id-a", "pack-a", "[1,2,3,4]", "source", '{"pack_id":"pack-a"}'))
+        vec._conn.commit()
+        assert vec.verify_recovery_row("id-a") is False
+    finally:
+        vec.close()

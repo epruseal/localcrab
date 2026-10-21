@@ -45,12 +45,15 @@ class SourceReader:
     """Read one current source row through a fresh SQLite mode=ro connection."""
 
     def __init__(self, data_dir: Path) -> None:
-        self._path = data_dir / "doc_store.db"
+        self._path = (data_dir / "doc_store.db").resolve(strict=False)
 
     def get_source(self, source_id: str) -> SourceRow | None:
-        uri = f"file:{self._path}?mode=ro"
+        uri = self._path.as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
         try:
+            main_path = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve(strict=False)
+            if main_path != self._path:
+                raise RecoveryError("source reader opened an unexpected database")
             row = conn.execute(
                 "SELECT source_id, text, metadata FROM doc_sources WHERE source_id=?",
                 (source_id,),

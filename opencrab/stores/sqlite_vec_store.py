@@ -1089,12 +1089,14 @@ class SqliteVecStore(_SqliteConnMixin):
         self._require_available()
         try:
             row = self._conn.execute(
-                f"SELECT vec_to_json(embedding) FROM {self._table} WHERE node_id=?",
+                f"SELECT vec_type(embedding), vec_to_json(embedding) FROM {self._table} WHERE node_id=?",
                 (node_id,),
             ).fetchone()
             if row is None:
                 return False
-            values = json.loads(row[0])
+            if row[0] != "float32":
+                return False
+            values = json.loads(row[1])
             if (not isinstance(values, list) or len(values) != self._dim
                     or any(not isinstance(value, (int, float)) or not math.isfinite(value)
                            for value in values)):

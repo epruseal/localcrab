@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -405,4 +406,46 @@ def test_unsupported_settings_refuse_before_dependencies(tmp_path, monkeypatch):
     monkeypatch.setattr(recovery, "require_local_principal", lambda: calls.append("principal"))
     path = approved(tmp_path, "id-a")
     assert recovery._main(["--approved", str(path), "--run-dir", str(tmp_path / "run")]) == 1
+    assert calls == []
+
+@pytest.mark.parametrize("name", ["space name.db", "hash#q?percent%.db", "한글.db"])
+def test_source_reader_encodes_special_path_and_is_read_only(tmp_path, name):
+    db = tmp_path / name
+    writer = recovery.sqlite3.connect(db)
+    writer.execute("CREATE TABLE doc_sources (source_id TEXT PRIMARY KEY, text TEXT, metadata TEXT)")
+    writer.execute("INSERT INTO doc_sources VALUES (?, ?, ?)", ("id-a", "source", '{"pack_id":"pack-a"}'))
+    writer.commit()
+    writer.close()
+    reader = recovery.SourceReader(db.parent)
+    reader._path = db.resolve()
+    row = reader.get_source("id-a")
+    assert row is not None and row.text == "source"
+    uri = db.resolve().as_uri() + "?mode=ro"
+    conn = recovery.sqlite3.connect(uri, uri=True)
+    try:
+        with pytest.raises(recovery.sqlite3.OperationalError):
+            conn.execute("CREATE TABLE must_fail (x TEXT)")
+        actual = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        assert actual == db.resolve()
+    finally:
+        conn.close()
+
+@pytest.mark.parametrize(
+    ("mode", "backend"),
+    [
+        ("local", "chroma"), ("local", "pgvector"),
+        ("docker", "sqlite-vec"), ("docker", "chroma"), ("docker", "pgvector"),
+        ("kuzu", "sqlite-vec"), ("kuzu", "chroma"), ("kuzu", "pgvector"),
+        ("pg", "sqlite-vec"), ("pg", "chroma"), ("pg", "pgvector"),
+    ],
+)
+def test_main_refuses_unsupported_settings_before_principal(tmp_path, monkeypatch, mode, backend):
+    import opencrab.config
+
+    settings = type("Settings", (), {"storage_mode": mode, "vector_backend_resolved": backend})()
+    monkeypatch.setattr(opencrab.config, "get_settings", lambda: settings)
+    calls = []
+    monkeypatch.setattr(recovery, "require_local_principal", lambda: calls.append("principal"))
+    file = approved(tmp_path, "id-a")
+    assert recovery._main(["--approved", str(file), "--run-dir", str(tmp_path / "run")]) == 1
     assert calls == []
