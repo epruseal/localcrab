@@ -685,6 +685,27 @@ class TestExcludeAndSpace:
         free[data] = 10 << 30
         bk._require_free_space(dest, data, 1000, [ext])
 
+    def test_the_estimate_counts_the_wal_beside_a_symlinked_database(self, tmp_path: Path) -> None:
+        real_dir, data = tmp_path / "real", tmp_path / "data"
+        real_dir.mkdir()
+        data.mkdir()
+        keeper = sqlite3.connect(str(real_dir / "store.db"), isolation_level=None)
+        try:
+            keeper.execute("PRAGMA journal_mode=WAL")
+            keeper.execute("PRAGMA wal_autocheckpoint=0")
+            keeper.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            keeper.execute("BEGIN")
+            keeper.executemany("INSERT INTO t VALUES (?, ?)", [(i, "x" * 2000) for i in range(2000)])
+            keeper.execute("COMMIT")
+            wal = real_dir / "store.db-wal"
+            assert wal.stat().st_size > 1 << 20, "precondition: the data must sit in the WAL"
+            (data / "store.db").symlink_to(real_dir / "store.db")
+            target = bk.BackupTarget("store.db", "store.db", "sqlite", "test")
+            estimate = bk._estimate_bytes([target], data)
+            assert estimate >= (real_dir / "store.db").stat().st_size + wal.stat().st_size
+        finally:
+            keeper.close()
+
     def test_the_external_vector_directory_is_among_the_checked_sources(
         self, tmp_path: Path, live_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -702,8 +702,10 @@ def _estimate_bytes(targets: Iterable[BackupTarget], data_dir: Path) -> int:
         if not source.exists():
             continue
         if target.kind == "sqlite":
-            total += source.resolve().stat().st_size
-            wal = Path(str(source) + "-wal")
+            # SQLite puts the -wal beside the resolved database, not beside a link to it.
+            resolved = source.resolve()
+            total += resolved.stat().st_size
+            wal = Path(str(resolved) + "-wal")
             if wal.is_file():
                 total += wal.stat().st_size
         else:
