@@ -173,8 +173,9 @@ _SNAPSHOT_OPEN_TIMEOUT = 5.0
 _MIN_COPY_BYTES_PER_SECOND = 1 << 20
 
 #: A pinned copy is flushed to disk every this many bytes while it is written.
-#: Measured: one fsync of a whole large copy at the end paused the service's
-#: reads and writes for about a second; stepwise flushing removed the pause.
+#: In one measurement, flushing a whole large copy once at the end coincided with
+#: the service's reads and writes pausing for about a second; flushing in steps
+#: removed the pause. The single fsync is the likely cause; that was not confirmed.
 _COPY_FLUSH_BYTES = 32 << 20
 
 #: Free space that must remain on the destination volume (and on the data
@@ -455,10 +456,11 @@ def backup_sqlite(
                 flush_pages = 0
                 if flush_every > 0:
                     # Paced flush: SQLite would otherwise fsync the whole copy in
-                    # one commit at the end. Measured on a large copy, that
-                    # paused the service's own commits for about a second (the
-                    # single fsync is the likely cause). The caller owns the
-                    # final fsync of the finished file.
+                    # one commit at the end. In one measurement on a large copy,
+                    # that coincided with the service's commits pausing for
+                    # about a second; the single fsync is the likely cause, not
+                    # confirmed. The caller owns the final fsync of the finished
+                    # file.
                     dst_conn.execute("PRAGMA synchronous=OFF")
                     page_size = int(src_conn.execute("PRAGMA page_size").fetchone()[0])
                     flush_pages = max(1, flush_every // page_size)
