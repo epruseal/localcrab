@@ -103,6 +103,11 @@ ALLOWED: dict[tuple[str, str], str] = {
         "deletes need an operator approval line, and every write is a "
         "compare-and-set against the recorded candidate state"
     ),
+    ("scripts/recover_source_vectors.py", "apply"): (
+        "approved local recovery writer; explicit apply requires verified backup, "
+        "principal and ready-pack authorize, manifest-bound approved IDs, "
+        "write.lock rechecks, and source-vector readback verification"
+    ),
     ("scripts/bench_graph_backends.py", "ingest_to_store"): "developer benchmark",
     ("scripts/seed_ontology.py", "seed"): "operator seeding tool, binds a principal",
     ("scripts/import_obsidian_vault.py", "_import_vault_unlocked"): (
