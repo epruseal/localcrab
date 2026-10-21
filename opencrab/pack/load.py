@@ -2692,8 +2692,27 @@ def load_edges(
     id_map: dict[str, tuple[str, str]],
     applied: set | None = None,
     reasons: Counter | None = None,
+    *,
+    replace_changed: bool = False,
+    counters: Counter | None = None,
 ) -> tuple[int, int, int]:
     """엣지 적재. 반환: (ok, skip, err)
+
+    `replace_changed=True`(키워드 전용, 기본 False)는 이 팩이 소유한 기존 엣지와 키
+    (from_id, relation, to_id)가 같고 속성만 다른 행을 CAS 로 교체한다. 기본값에서는
+    종전과 같이 그 행이 `EdgeIdentityConflict` 로 err 에 센다. 행마다
+    `builder.add_edge(..., replace_own=True)` 로 보내며, 인가와 소유 팩 확인은 엣지 생성과
+    같은 경로(`add_edge` 안의 `authorize`)가 맡는다. 교체는 저장된 속성 전체를 파일
+    행의 속성으로 덮어쓴다. 소유 팩이 다른 엣지, `pack_id` 없는 엣지, digest 가 그새
+    바뀐 엣지는 교체하지 않고 err 또는 skip 으로 센다.
+
+    같은 호출 안에서 최종 키가 같은 행이 둘 이상이면(`normalize.REL_MAP` 이 여러 원라벨을
+    한 관계로 접는다) 첫 행만 교체 후보다. 뒤 행은 `replace_own=False` 로 보내 종전과 같이
+    충돌을 err 로 드러낸다. 이렇게 하지 않으면 두 행이 실행마다 서로를 교체한다.
+
+    `counters`는 출력 인자다(`applied`, `reasons`와 같은 관용). 교체한 행 수를
+    `counters["replaced"]`에 더한다. 교체 행은 ok 에도 센다(replaced 는 ok 의 부분집합).
+    교체가 있으면 요약 한 줄을 출력한다.
 
     skip·err 사유를 (종류, 원라벨, from_space, to_space)로 집계해 **호출부와 무관하게** 요약을
     출력한다 — 사유가 log.debug 뿐이라 미적재 엣지가 카운트만 남고 원인이 증발하던 것을 막는다
@@ -2703,9 +2722,10 @@ def load_edges(
     reasons를 넘기면 집계 Counter를 그대로 돌려받는다(호출부 추가 가공용).
     """
     require_live_data("load_edges")
-    ok = skip = err = 0
+    ok = skip = err = n_replaced = 0
     if reasons is None:
         reasons = Counter()
+    handled_keys: set[tuple[str, str, str]] = set()
 
     _require_bound_principal()
     for row in iter_jsonl(edges_file):  # shard-aware 논리 스트림
@@ -2757,9 +2777,15 @@ def load_edges(
             props["origin_pack_id"] = props["pack_id"]
         apply_pack_tag(props, pack_name)   # 폐기 별칭도 함께 정리한다(#171)
 
+        # 같은 호출에서 이미 처리한 최종 키는 교체 후보가 아니다(위 docstring).
+        edge_key = (src_id, relation, tgt_id)
+        replace_own = replace_changed and edge_key not in handled_keys
+        handled_keys.add(edge_key)
+
         try:
             res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id,
-                                     properties=props, pack_id=pack_name, origin="server")
+                                     properties=props, pack_id=pack_name, origin="server",
+                                     replace_own=replace_own)
             # **영수증을 본다.** `add_edge`도 `add_node`와 같은 계약이다 — 스토어
             # 실패를 예외로 올리지 않고 반환 dict에 적으므로, 호출자가 이것을 불러야
             # 실제 성공 여부를 안다(`builder.store_write_failures()` docstring).
@@ -2771,6 +2797,8 @@ def load_edges(
                             src_id[:8], tgt_id[:8], raw_label, relation, "; ".join(fails))
             else:
                 ok += 1
+                if isinstance(res, dict) and res.get("replaced"):
+                    n_replaced += 1
         except ValueError as ve:
             skip += 1
             reasons[('grammar 위반', f'{raw_label}→{relation}', from_space, to_space)] += 1
@@ -2780,6 +2808,11 @@ def load_edges(
             # err도 사유를 남긴다 — skip만 집계하면 예외 경로가 감시 밖에 남는다
             reasons[('예외', f'{raw_label}: {type(exc).__name__}', from_space, to_space)] += 1
             log.warning("엣지 오류 %s->%s: %s", src_id[:8], tgt_id[:8], exc)
+
+    if n_replaced:
+        if counters is not None:
+            counters["replaced"] += n_replaced
+        print(f"    [{pack_name}] 엣지 교체 {n_replaced}건", flush=True)
 
     if skip or err:
         # 사유는 log.debug라 조작자에게 보이지 않는다 — 상위 사유를 노출한다.

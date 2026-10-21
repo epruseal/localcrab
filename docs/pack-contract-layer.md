@@ -305,6 +305,52 @@ SELECT COUNT(*) FROM graph_nodes
 
 같은 종류의 공백이던 `incremental_finalize` 와 `delete_pack` 은 #434 에서 닫혔다(아래 6절의 삭제 진입점 게이트).
 
+### 3-2. `load_edges(..., replace_changed=True)` 는 같은 키, 다른 속성인 엣지를 CAS 로 교체한다(#523, #524)
+
+종전에는 라이브에 이미 있는 엣지와 키 `(from_id, relation, to_id)` 가 같고 속성만 다른 행이
+`upsert_edge` 의 `EdgeIdentityConflict` 로 err 에 셌고, 엣지 속성 수정은 증분 적재로 반영되지
+않았다. 노드는 `_expected_current_digest` 로 CAS 교체되지만 엣지에는 그 경로가 없었다.
+
+- **옵트인**: `replace_changed` 는 키워드 전용이고 기본값이 False 다. 기본값의 동작은 종전과 같다.
+  증분 적재 호출자가 켠다.
+- **경로**: 행마다 `builder.add_edge(..., replace_own=True)` 를 부른다. `add_edge` 는 평소처럼
+  `current_principal()`, `authorize`, 스탬프, 끝점 소유 팩 확인, `edge_identity_conflict` 를 거친
+  뒤 `upsert_edge` 를 먼저 시도한다. `EdgeIdentityConflict` 가 나면 그때서야 `get_edge_digest` 로
+  현재 digest 를 읽고 `update_edge(expected_current_digest=..., owner_pack_id=팩)` 를 부른다.
+  변경 없는 행의 비용은 종전과 같다.
+- **CAS 가 지키는 것**: `update_edge` 는 한 트랜잭션 안에서 끝점 타입, 저장된 엣지의 `pack_id` 가
+  이 팩인지, 저장된 digest 가 읽은 값과 같은지를 다시 확인한다. 읽은 뒤 쓰기까지의 변경은
+  잡지만 실행 시작 시점의 상태를 고정하지는 않는다.
+- **거부**: 미바인딩 principal 은 `add_edge` 의 `current_principal()`(`LookupError`)이나 `load_edges`
+  진입의 `RuntimeError` 로, 비소유 principal 은 `authorize` 로 거부된다. 둘 다 그래프 스토어
+  호출 전에 끝난다. 다른 팩 소유 엣지는 `edge_identity_conflict` 가 슬롯을 읽고 거부하므로 교체
+  경로에 닿지 않는다. `pack_id` 없는 레거시 엣지, 읽은 뒤 digest 가 바뀐 엣지는
+  `EdgeIdentityConflict` 로 남아 err 에 센다.
+- **속성 전체 교체**: 교체는 저장된 속성을 파일 행의 속성으로 통째로 덮어쓴다. 파일 행에 없는
+  라이브 전용 속성은 사라진다. 노드 교체와 같다.
+- **같은 호출 안의 중복 키**: `normalize.REL_MAP` 이 여러 원라벨을 한 관계로 접으므로 한 파일에
+  최종 키가 같은 행이 둘 이상 나올 수 있다. 첫 행만 교체 후보이고 뒤 행은 종전처럼 충돌을
+  err 로 드러낸다. 그렇지 않으면 두 행이 실행마다 서로를 교체한다.
+- **반환과 카운터**: 반환은 종전과 같은 `(ok, skip, err)` 세 값이다. 교체 행은 ok 에도 센다.
+  `counters=Counter()` 를 넘기면 `counters["replaced"]` 에 교체 건수가 더해지고, 교체가 있으면
+  요약 한 줄을 출력한다.
+- **노드와 엣지의 순서**: 같은 실행에서 노드 적재를 먼저, 엣지 적재를 뒤에 둔다. `update_node` 와
+  `reclassify_node` 는 인접 엣지의 타입 스냅샷을 같은 트랜잭션에서 다시 쓰므로, 뒤이은 엣지
+  교체는 새 끝점 타입으로 digest 를 읽는다. `applied` 는 쓰기 전에 키를 담으므로 교체했든 실패했든
+  `incremental_finalize` 가 그 엣지를 지우지 않는다.
+- **Neo4j**: 이 경로의 Cypher 는 시험에서 실행하지 않았다. `update_edge` 가 저장된
+  `edge_digest` 속성을 요구하므로 그 속성이 없는 옛 엣지는 교체되지 않고 err 로 남는다.
+- **#524, 갱신 메서드의 인가 계약**: `update_edge` 와 `update_edges_batch` 는 저장소 계층이라
+  principal 이나 등록부를 읽지 않는다(`upsert_edge`, `delete_edge`, `update_node` 와 같다). 패키지
+  안의 인가 지점은 `OntologyBuilder.add_edge(replace_own=True)` 한 곳이며, 호출 앞에 최상위
+  `authorize` 문장이 있다. 다른 호출자는 `owner_pack_id` 에 대해 `write_gate.authorize` 를 먼저
+  불러야 한다. `tests/test_edge_update_gate_guard.py` 는 두 이름을 가리키는 프로덕션 참조가
+  허용표 밖에 있거나 빌더 안의 참조가 `authorize` 뒤에 있지 않으면 실패한다. 한계가 둘 있다.
+  실행 중에 조립한 이름은 정적 검사로 볼 수 없고, 패키지 밖 호출자는 이 문서 계약으로만
+  묶인다.
+
+재현 명령: `pytest tests/test_pack_load_r19_edge_replace.py tests/test_edge_update_gate_guard.py -q`.
+
 ### 4. 앵커 판정은 **한 곳에서만** 정의한다
 
 Python 술어와 SQL 조각을 같은 정의에서 낸다. 두 벌로 두면 갈린다. 두 함정이 실측됐다.

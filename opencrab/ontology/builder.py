@@ -560,6 +560,7 @@ class OntologyBuilder:
         pack_id: str,
         origin: str = "client",
         fork_copy: bool = False,
+        replace_own: bool = False,
     ) -> dict[str, Any]:
         """
         Add a directed edge between two nodes.
@@ -593,6 +594,21 @@ class OntologyBuilder:
             (``write_gate.authorize_fork_copy``), same restriction to the
             pack's own fork-reserved ``creating`` window. There is no
             vector leg on an edge, so no ``write_vector`` counterpart here.
+        replace_own:
+            Opt-in for the pack loader's replay (``origin="server"``, not
+            ``fork_copy``). When the edge slot already holds an edge with
+            different properties, ``upsert_edge`` raises
+            ``EdgeIdentityConflict``. With ``replace_own`` the builder then
+            reads the stored digest and writes the new properties through
+            the graph's ``update_edge`` CAS. ``update_edge`` re-checks, inside
+            its transaction, the endpoint types, that the stored edge belongs
+            to ``pack_id``, and that the digest still matches. An edge of
+            another pack, an edge without ``pack_id``, and a digest that
+            changed since the read all stay ``EdgeIdentityConflict``. The
+            replacement overwrites all properties of the stored edge. The
+            result then carries ``"replaced": True``. This is the only
+            in-package route to ``update_edge``, and ``authorize`` has
+            already run when it is reached.
 
         Returns
         -------
@@ -601,10 +617,16 @@ class OntologyBuilder:
         Raises
         ------
         ValueError
-            If the edge relation is invalid for the given spaces.
+            If the edge relation is invalid for the given spaces, or
+            ``replace_own`` is combined with ``origin="client"`` or
+            ``fork_copy``.
         """
         edge_result = validate_edge(from_space, to_space, relation)
         edge_result.raise_if_invalid()
+        if replace_own and (origin != "server" or fork_copy):
+            raise ValueError(
+                "replace_own is only for the pack loader's server-origin replay"
+            )
 
         from opencrab.auth import current_principal
 
@@ -765,7 +787,25 @@ class OntologyBuilder:
             output["missing_nodes"] = missing
         elif self._neo4j is not None and self._neo4j.available:
             try:
-                ok = self._neo4j.upsert_edge(from_type, from_id, relation, to_type, to_id, props)
+                try:
+                    ok = self._neo4j.upsert_edge(from_type, from_id, relation, to_type, to_id, props)
+                except EdgeIdentityConflict:
+                    if not replace_own:
+                        raise
+                    # The slot holds an edge whose digest differs. Replace it
+                    # only through the CAS write: the digest read here is the
+                    # expected value, and update_edge compares it again inside
+                    # its transaction together with the owner pack.
+                    expected = self._neo4j.get_edge_digest(
+                        from_id, relation, to_id, from_type=from_type, to_type=to_type,
+                    )
+                    if expected is None:
+                        raise
+                    ok = self._neo4j.update_edge(
+                        from_type, from_id, relation, to_type, to_id, props,
+                        expected_current_digest=expected, owner_pack_id=pack_id,
+                    )
+                    output["replaced"] = bool(ok)
                 output["stores"]["graph"] = "ok" if ok else "no match"
             except (
                 NodeIdentityConflict,

@@ -336,6 +336,18 @@ class GraphStore(Protocol):
         expected_current_digest: str, owner_pack_id: str,
         return_receipt: bool = False,
     ) -> bool | EdgeWriteReceipt:
+        """Replace all properties of one edge by expected current digest.
+
+        Authorization contract: this layer checks the CAS digest, the endpoint
+        types and that the stored and new ``pack_id`` equal ``owner_pack_id``.
+        It does not read a principal and does not consult the pack registry,
+        like ``upsert_edge`` and ``delete_edge``. The in-package gate is
+        ``OntologyBuilder.add_edge(replace_own=True)``, which runs
+        ``write_gate.authorize`` before it reaches this method. Any other
+        caller must call ``write_gate.authorize`` for ``owner_pack_id`` first.
+        ``tests/test_edge_update_gate_guard.py`` fails when production code
+        outside the listed places references this method.
+        """
         ...
 
     def get_node_digest(self, node_id: str, *, node_type: str | None = None) -> str | None:
@@ -821,6 +833,19 @@ class GraphStoreExtended(Protocol):
         ...
 
     def update_edges_batch(self, edges: list[dict[str, Any]], *, return_receipt: bool = False) -> int | tuple[EdgeWriteReceipt, ...]:
+        """Batch form of ``update_edge``; each item carries its own
+        ``expected_current_digest`` and ``owner_pack_id``.
+
+        Authorization contract: this layer checks the CAS digest, the endpoint
+        types and that the stored and new ``pack_id`` equal ``owner_pack_id``.
+        It does not read a principal and does not consult the pack registry,
+        like ``upsert_edge`` and ``delete_edge``. The in-package gate is
+        ``OntologyBuilder.add_edge(replace_own=True)``, which runs
+        ``write_gate.authorize`` before it reaches this method. Any other
+        caller must call ``write_gate.authorize`` for ``owner_pack_id`` first.
+        ``tests/test_edge_update_gate_guard.py`` fails when production code
+        outside the listed places references this method.
+        """
         ...
 
     # ------------------------------------------------------------------

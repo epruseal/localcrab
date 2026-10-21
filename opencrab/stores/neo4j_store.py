@@ -989,6 +989,8 @@ class Neo4jStore:
         return self._run_write(write)
 
     def update_edge(self, from_type: str, from_id: str, relation: str, to_type: str, to_id: str, properties: dict[str, Any] | None = None, *, expected_current_digest: str, owner_pack_id: str, return_receipt: bool = False) -> bool | EdgeWriteReceipt:
+        """CAS replace of one edge. No principal or registry check at this layer;
+        see ``GraphStore.update_edge`` for the authorization contract."""
         self._require_schema_ready()
         validate_digest(expected_current_digest, edge=True)
         from_type, to_type, relation = self._label(from_type), self._label(to_type), self._label(relation)
@@ -2028,6 +2030,8 @@ class Neo4jStore:
         return self._run_write(write)
 
     def update_edges_batch(self, edges: list[dict[str, Any]], *, return_receipt: bool = False) -> int | tuple[EdgeWriteReceipt, ...]:
+        """Batch CAS replace. No principal or registry check at this layer;
+        see ``GraphStore.update_edges_batch`` for the authorization contract."""
         self._require_schema_ready()
         if not edges:
             return () if return_receipt else 0
