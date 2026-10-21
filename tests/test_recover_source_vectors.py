@@ -449,3 +449,80 @@ def test_main_refuses_unsupported_settings_before_principal(tmp_path, monkeypatc
     file = approved(tmp_path, "id-a")
     assert recovery._main(["--approved", str(file), "--run-dir", str(tmp_path / "run")]) == 1
     assert calls == []
+
+class ConnectionProxy:
+    def __init__(self, conn):
+        self._conn = conn
+        self.closed = 0
+        self.write_rejected = False
+        self.main_path = None
+
+    def execute(self, sql, *args):
+        if sql == "PRAGMA database_list":
+            row = self._conn.execute(sql, *args).fetchone()
+            self.main_path = row[2]
+            with pytest.raises(recovery.sqlite3.OperationalError):
+                self._conn.execute("CREATE TABLE must_fail (x TEXT)")
+            self.write_rejected = True
+            return _SingleRow(row)
+        if sql.startswith("CREATE TABLE"):
+            with pytest.raises(recovery.sqlite3.OperationalError):
+                self._conn.execute(sql, *args)
+            self.write_rejected = True
+            raise recovery.sqlite3.OperationalError("readonly")
+        return self._conn.execute(sql, *args)
+
+    def close(self):
+        self.closed += 1
+        self._conn.close()
+
+
+class _SingleRow:
+    def __init__(self, row):
+        self.row = row
+
+    def fetchone(self):
+        return self.row
+
+
+def test_source_reader_actual_connection_is_encoded_read_only_and_closed(tmp_path, monkeypatch):
+    original_connect = recovery.sqlite3.connect
+    for name in ("space name.db", "hash#q?percent%.db", "한글.db"):
+        db = tmp_path / name
+        writer = original_connect(db)
+        writer.execute("CREATE TABLE doc_sources (source_id TEXT PRIMARY KEY, text TEXT, metadata TEXT)")
+        writer.execute("INSERT INTO doc_sources VALUES (?, ?, ?)", ("id-a", "source", '{"pack_id":"pack-a"}'))
+        writer.commit()
+        writer.close()
+        observed = []
+        def wrapped(database, *, uri=False):
+            assert uri is True
+            proxy = ConnectionProxy(original_connect(database, uri=True))
+            observed.append((database, proxy))
+            return proxy
+        monkeypatch.setattr(recovery.sqlite3, "connect", wrapped)
+        row = recovery.SourceReader(db.parent)
+        row._path = db.resolve()
+        assert row.get_source("id-a").text == "source"
+        uri, proxy = observed.pop()
+        assert uri == db.resolve().as_uri() + "?mode=ro"
+        assert Path(proxy.main_path).resolve() == db.resolve()
+        assert proxy.closed == 1
+        assert proxy.write_rejected is True
+        monkeypatch.setattr(recovery.sqlite3, "connect", original_connect)
+
+
+def test_main_supported_pair_enters_only_supported_dependencies(tmp_path, monkeypatch):
+    import opencrab.config
+    settings = type("Settings", (), {"storage_mode": "local", "vector_backend_resolved": "sqlite-vec", "local_data_dir": str(tmp_path)})()
+    monkeypatch.setattr(opencrab.config, "get_settings", lambda: settings)
+    calls = []
+    monkeypatch.setattr(recovery, "require_local_principal", lambda: calls.append("principal") or principal())
+    monkeypatch.setattr(recovery, "SourceReader", lambda path: calls.append("reader") or object())
+    import opencrab.stores.factory
+    monkeypatch.setattr(opencrab.stores.factory, "make_sql_store", lambda _: calls.append("sql") or object())
+    monkeypatch.setattr(opencrab.stores.factory, "make_vector_store", lambda _: calls.append("vector") or object())
+    monkeypatch.setattr(recovery, "plan", lambda *_args: calls.append("plan") or {"targets": []})
+    file = approved(tmp_path, "id-a")
+    assert recovery._main(["--approved", str(file), "--run-dir", str(tmp_path / "run")]) == 0
+    assert calls == ["principal", "reader", "sql", "vector", "plan"]
