@@ -56,15 +56,17 @@ until that caller releases it, which can be after this function returns, so
    reads and writes pause together for about a second; flushing in steps
    removed the pause. The cause is probably the single large fsync; that was
    not confirmed directly.
-3. Every SQLite copy made by this run is verified with ``integrity_check``
-   (directory targets are not, except a copied chroma catalog), and
-   ``MANIFEST.json`` records sizes, sha256, how each SQLite file was captured
-   and how long the lock block lasted. ``verify_backup_set()`` re-checks a set
+3. Every inventory SQLite copy is verified with ``integrity_check`` after the
+   lock block ends. A directory copy is not verified, except that its
+   top-level ``chroma.sqlite3`` is checked inside the lock block when it is a
+   regular file (a link is skipped). ``MANIFEST.json`` records sizes and
+   sha256, how each inventory SQLite target was captured, and how long the
+   lock block lasted. ``verify_backup_set()`` re-checks a set
    later without writing to it. Its checks are limited: see its docstring.
 
 While a snapshot connection is open the WAL file of that database grows,
-because a checkpoint cannot pass the snapshot; it is checkpointed again after
-the close. The disk check in ``backup_data_dir`` keeps room for that.
+because a checkpoint cannot pass the snapshot. After the close a checkpoint can
+pass that point again, when the service next attempts one. The disk check in ``backup_data_dir`` keeps room for that.
 
 TARGET LIST (#123)
 ------------------
@@ -154,8 +156,8 @@ _SET_PREFIX = "backup."
 _STAGING_PREFIX = ".backup-staging."
 _EXTERNAL_DIR = "external-vector"
 
-#: The set's own description: file sizes, sha256, how each SQLite file was
-#: captured, and how long this function's write.lock block lasted (#510).
+#: The set's own description: file sizes, sha256, how each inventory SQLite
+#: target was captured, and how long this function's write.lock block lasted (#510).
 MANIFEST_NAME = "MANIFEST.json"
 _MANIFEST_FORMAT = 1
 
@@ -1236,10 +1238,15 @@ def backup_data_dir(
 
         leftovers = _leftover_stagings(dest)
         for p in leftovers:
-            # Another run's interrupted staging. Reported, never deleted: it is
-            # not this run's to remove, and destroying someone else's partial
-            # backup is worse than leaving a directory behind.
-            say(f"! leftover staging from an interrupted backup, check and remove manually: {p}")
+            # Another run's staging: interrupted, kept after a failed publish,
+            # left by a failed cleanup, or still in use. The name cannot tell.
+            # Reported, never deleted: it is not this run's to remove, and
+            # destroying someone else's partial backup is worse than leaving a
+            # directory behind.
+            say(
+                "! staging directory left by an earlier run or in use by another backup; "
+                f"make sure none is using it, then remove it manually: {p}"
+            )
 
         set_id = _new_set_id()
         staging = dest / f"{_STAGING_PREFIX}{set_id}"
@@ -1399,7 +1406,9 @@ def _run_targets(
     Directory and opaque targets, and SQLite files that are not in WAL mode,
     are copied here. A WAL SQLite file is only pinned (a read snapshot is
     opened) and queued in ``jobs``; its bytes are copied after this function's
-    lock block ends. Every SQLite copy is verified later, from ``jobs``.
+    lock block ends. Every inventory SQLite copy is verified later, from ``jobs``.
+    A directory copy checks its top-level ``chroma.sqlite3`` inside the lock block,
+    when that is a regular file.
     """
     outcome = BackupOutcome(set_dir=final)
     # Keyed on (resolved source, destination), NOT the source alone. Deduping
@@ -1511,8 +1520,8 @@ def _finish_jobs(
     say: Callable[[str], None],
     timeout: float,
 ) -> None:
-    """Copy the pinned snapshots, then verify every SQLite copy. Runs after this function's lock block
-    has ended; a lock the caller holds itself stays held.
+    """Copy the pinned snapshots, then verify the inventory SQLite copies in ``jobs``.
+    Runs after this function's lock block has ended; a lock the caller holds itself stays held.
 
     Each snapshot connection is closed as soon as its copy ends, so the WAL of
     that database can be checkpointed again while the others are still being
