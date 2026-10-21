@@ -1849,6 +1849,37 @@ def live_pack_state(pack_name: str, graph, docs, vec) -> dict:
     }
 
 
+def _same_pack_source(docs, source_id: str, pack_name: str) -> bool:
+    """Return whether `source_id` names this pack's authoritative source.
+
+    This mirrors `_doc_owner_pred`: a non-empty string `pack_id` is the
+    owner. Only missing/null/false/numeric-zero/empty-string scalar values
+    use the string `source` fallback. Unknown source shapes stop the caller
+    instead of permitting a node vector overwrite.
+    """
+    getter = getattr(docs, "get_source", None)
+    if not callable(getter):
+        raise RuntimeError("doc store cannot read a source for vector collision protection")
+    record = getter(source_id)
+    if record is None:
+        return False
+    if not isinstance(record, dict) or record.get("property_decode_error"):
+        raise RuntimeError("doc source is malformed for vector collision protection")
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("doc source metadata is malformed for vector collision protection")
+    pack_id = metadata.get("pack_id")
+    if isinstance(pack_id, str):
+        if pack_id:
+            return pack_id == pack_name
+        return isinstance(metadata.get("source"), str) and metadata["source"] == pack_name
+    if pack_id is None or pack_id is False:
+        return isinstance(metadata.get("source"), str) and metadata["source"] == pack_name
+    if isinstance(pack_id, (int, float)) and not isinstance(pack_id, bool) and pack_id == 0:
+        return isinstance(metadata.get("source"), str) and metadata["source"] == pack_name
+    return False
+
+
 def _require_bound_principal():
     """바인딩된 principal 을 돌려준다. 이 로더들은 principal 을 **스스로
     바인딩하지 않는다**(#148).
@@ -2510,6 +2541,12 @@ def load_nodes_incremental(
         # observed by a read-only migration or recovery path.
         stale_typed = (live[0], live[1] or space) if (live and live[0] != node_type) else None
 
+        # Read the source before the broad write try. A missing source reader,
+        # source error, or malformed result must stop before this node can
+        # overwrite a same-id chunk vector. Earlier rows keep the loader's
+        # existing row-at-a-time commits.
+        shared_source = _same_pack_source(docs, node_id, pack_name)
+
         try:
             # Qualified graph identity makes ``upsert_node`` a
             # create-or-verify write: an existing row with a different
@@ -2531,6 +2568,7 @@ def load_nodes_incremental(
                         raise RuntimeError(f"current node digest unavailable: {node_id}")
             res = builder.add_node(space, node_type, node_id, properties=props,
                                      pack_id=pack_name, origin="server",
+                                     write_vector=not shared_source,
                                      _expected_current_digest=expected_current_digest)
             # **영수증을 본다.** `add_node` 는 스토어 실패를 예외로 올리지 않고 반환
             # dict 에 적는다 — `builder.store_write_failures()` 의 docstring 이

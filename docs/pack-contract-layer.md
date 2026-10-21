@@ -285,6 +285,26 @@ SELECT COUNT(*) FROM graph_nodes
 파일 쪽 키가 비교에 남아 반복 `chg` 가 될 수 있다. graph 와 doc 쓰기는 원자적이지
 않으므로 자동 owner 수렴은 별도 기능으로 설계해야 한다(#378).
 
+### 3-0. 공유 ID source가 있으면 노드 증분은 벡터를 쓰지 않는다(#529)
+
+노드 ID와 source ID가 같을 때 노드 writer가 벡터 슬롯을 쓰면 source의 document,
+embedding, metadata를 노드 값으로 바꾼다. `load_nodes_incremental`은 실제 node write
+직전에 `docs.get_source(node_id)`를 읽는다. 그 source가 현재 팩 소유이면
+`add_node(..., write_vector=False)`를 써서 graph, node doc, registry는 갱신하고 vector
+leg만 건너뛴다. 청크 writer가 그 슬롯의 유일한 writer다.
+
+소유 판정은 doc source의 기존 소유 술어와 같다. 비어 있지 않은 문자열 `pack_id`를
+먼저 본다. 키 부재, null, false, 숫자 0, 빈 문자열에서만 문자열 `source`를 폴백으로
+본다. 배열과 객체는 폴백하지 않는다. source reader가 없거나 읽기가 실패하거나 결과
+형태가 손상되면 해당 node write와 뒤 행의 node write 전에 적재를 중단한다. 앞 행의
+row-at-a-time 기록은 되돌리지 않는다.
+
+이 경로는 새 덮어쓰기를 막는다. 기존에 잘못된 vector가 있으나 source가 same인 상태를
+검출하거나 복구하지는 않는다. node와 chunk phase는 현재 호출자의 순차 실행을 전제로
+한다. 이 함수들은 공통 writer lock을 잡지 않는다.
+
+재현: `pytest tests/test_issue529_shared_vector_slot.py -q`.
+
 ### 3-1. `load_nodes_incremental(..., sql=)` 도 **필수**다(#424)
 
 `sql` 은 팩 등록부 `SQLStore` 이고 `builder` 에 물린 것과 같은 인스턴스를 넘긴다. 이 함수는
