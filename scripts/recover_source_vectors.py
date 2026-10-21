@@ -229,6 +229,28 @@ def verify_current_target(vector: Any, ident: str, source: SourceRow, pack_id: s
     return row
 
 
+def validate_manifest_targets(manifest: dict[str, Any], approved_ids: list[str]) -> list[dict[str, Any]]:
+    targets = manifest.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise RecoveryError("recovery manifest has invalid targets")
+    required = {"id", "pack_id", "source_digest", "vector_digest", "state"}
+    checked: list[dict[str, Any]] = []
+    for target in targets:
+        if not isinstance(target, dict) or set(target) != required:
+            raise RecoveryError("recovery manifest target is malformed")
+        if (not isinstance(target["id"], str) or not target["id"].strip()
+                or not isinstance(target["pack_id"], str) or not target["pack_id"]
+                or not isinstance(target["source_digest"], str) or not target["source_digest"]
+                or not isinstance(target["vector_digest"], str) or not target["vector_digest"]
+                or target["state"] not in {"planned", "written", "verified", "refused"}):
+            raise RecoveryError("recovery manifest target is malformed")
+        checked.append(target)
+    target_ids = [target["id"] for target in checked]
+    if target_ids != approved_ids or len(target_ids) != len(set(target_ids)):
+        raise RecoveryError("approved file does not match dry-run manifest")
+    return checked
+
+
 def apply(
     approved: Path,
     run_dir: Path,
@@ -244,13 +266,12 @@ def apply(
     manifest_path = run_dir / "manifest.json"
     manifest = load_manifest(manifest_path)
     ids, raw_digest, semantic_digest = read_approved(approved)
-    target_ids = [target.get("id") for target in manifest.get("targets", []) if isinstance(target, dict)]
     if (raw_digest != manifest.get("approved_raw_digest")
             or semantic_digest != manifest.get("approved_semantic_digest")
             or ids != manifest.get("approved_ids")
-            or target_ids != ids
             or not ids):
         raise RecoveryError("approved file does not match dry-run manifest")
+    targets = validate_manifest_targets(manifest, ids)
     if manifest.get("principal_digest") != _digest({"user_id": principal.user_id, "is_local": principal.is_local}):
         raise RecoveryError("principal does not match dry-run manifest")
     if manifest.get("vector_identity") != vector_identity(vector):
@@ -267,17 +288,21 @@ def apply(
             raise RecoveryError("principal changed before apply lock")
         if manifest.get("vector_identity") != vector_identity(vector):
             raise RecoveryError("vector store changed before apply lock")
-        for target in manifest["targets"]:
+        for target in targets:
             _event(event, "source_read")
             source, pack_id, source_digest = checked_source(reader, target["id"])
             _event(event, "authorized")
             authorize(sql, principal, pack_id)
             _event(event, "vector_read")
             _before, vector_digest = checked_vector(vector, target["id"], pack_id)
-            if target["state"] == "verified":
+            if target["state"] == "refused":
+                raise RecoveryError("recovery manifest target was refused")
+            if target["state"] in {"written", "verified"}:
                 if source_digest != target["source_digest"]:
-                    raise RecoveryError("verified source changed")
+                    raise RecoveryError("written source changed")
                 verify_current_target(vector, target["id"], source, pack_id)
+                target["state"] = "verified"
+                write_manifest(manifest_path, manifest)
                 continue
             if source_digest != target["source_digest"] or vector_digest != target["vector_digest"]:
                 raise RecoveryError("approved source or vector changed after dry-run")
@@ -290,6 +315,10 @@ def apply(
             target["state"] = "verified"
             write_manifest(manifest_path, manifest)
     return manifest
+
+
+def _supported_settings(settings: Any) -> bool:
+    return settings.storage_mode == "local" and settings.vector_backend_resolved == "sqlite-vec"
 
 
 def _main(argv: list[str] | None = None) -> int:
@@ -306,6 +335,9 @@ def _main(argv: list[str] | None = None) -> int:
     from opencrab.stores.factory import make_sql_store, make_vector_store
 
     settings = get_settings()
+    if not _supported_settings(settings):
+        print("refused: local sqlite-vec recovery is required", file=sys.stderr)
+        return 1
     principal = require_local_principal()
     reader = SourceReader(Path(settings.local_data_dir))
     sql = make_sql_store(settings)

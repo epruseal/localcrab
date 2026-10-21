@@ -227,7 +227,7 @@ def test_manifest_target_list_must_match_approved_input(tmp_path, auth):
     manifest = recovery.load_manifest(manifest_path)
     manifest["targets"].append({"id": "id-b", "state": "planned"})
     recovery.write_manifest(manifest_path, manifest)
-    with pytest.raises(recovery.RecoveryError, match="approved file"):
+    with pytest.raises(recovery.RecoveryError, match="manifest"):
         recovery.apply(file, tmp_path / "run", reader, vec, object(), principal(), tmp_path / "backup", lambda _: {"verified": True}, contextlib.nullcontext)
     assert vec.calls == []
 
@@ -342,3 +342,67 @@ def test_missing_representation_verifier_refuses_before_verified(tmp_path, auth)
     with pytest.raises(recovery.RecoveryError, match="verifier"):
         recovery.apply(file, tmp_path / "run", reader, vec, object(), principal(), tmp_path / "backup", lambda _: {"verified": True}, contextlib.nullcontext)
     assert recovery.load_manifest(tmp_path / "run" / "manifest.json")["targets"][0]["state"] == "written"
+
+@pytest.mark.parametrize("bad_target", [None, {"id": "id-a"}, {"id": "id-a", "pack_id": "pack-a", "source_digest": "s", "vector_digest": "v", "state": "unknown"}])
+def test_manifest_malformed_target_refuses_before_backup(tmp_path, auth, bad_target):
+    reader = FakeReader({"id-a": source()})
+    vec = FakeVector(vector())
+    file = approved(tmp_path, "id-a")
+    recovery.plan(file, tmp_path / "run", reader, vec, object(), principal())
+    path = tmp_path / "run" / "manifest.json"
+    manifest = recovery.load_manifest(path)
+    manifest["targets"] = [bad_target]
+    recovery.write_manifest(path, manifest)
+    calls = []
+    with pytest.raises(recovery.RecoveryError, match="manifest"):
+        recovery.apply(file, tmp_path / "run", reader, vec, object(), principal(), tmp_path / "backup", lambda _: calls.append("backup"), contextlib.nullcontext)
+    assert calls == []
+    assert vec.calls == []
+
+
+def test_written_target_resumes_without_second_upsert(tmp_path, auth):
+    reader = FakeReader({"id-a": source(text="authority")})
+    vec = FakeVector(vector(text="old"))
+    vec.verify_ok = False
+    file = approved(tmp_path, "id-a")
+    recovery.plan(file, tmp_path / "run", reader, vec, object(), principal())
+    with pytest.raises(recovery.RecoveryError, match="embedding"):
+        recovery.apply(file, tmp_path / "run", reader, vec, object(), principal(), tmp_path / "backup", lambda _: {"verified": True}, contextlib.nullcontext)
+    assert len(vec.calls) == 1
+    vec.verify_ok = True
+    recovery.apply(file, tmp_path / "run", reader, vec, object(), principal(), tmp_path / "backup", lambda _: {"verified": True}, contextlib.nullcontext)
+    assert len(vec.calls) == 1
+    assert recovery.load_manifest(tmp_path / "run" / "manifest.json")["targets"][0]["state"] == "verified"
+
+@pytest.mark.parametrize(
+    ("mode", "backend", "want"),
+    [
+        ("local", "sqlite-vec", True),
+        ("local", "chroma", False),
+        ("local", "pgvector", False),
+        ("docker", "sqlite-vec", False),
+        ("docker", "chroma", False),
+        ("docker", "pgvector", False),
+        ("kuzu", "sqlite-vec", False),
+        ("kuzu", "chroma", False),
+        ("kuzu", "pgvector", False),
+        ("pg", "sqlite-vec", False),
+        ("pg", "chroma", False),
+        ("pg", "pgvector", False),
+    ],
+)
+def test_supported_settings_matrix(mode, backend, want):
+    settings = type("Settings", (), {"storage_mode": mode, "vector_backend_resolved": backend})()
+    assert recovery._supported_settings(settings) is want
+
+
+def test_unsupported_settings_refuse_before_dependencies(tmp_path, monkeypatch):
+    import opencrab.config
+
+    settings = type("Settings", (), {"storage_mode": "kuzu", "vector_backend_resolved": "sqlite-vec"})()
+    monkeypatch.setattr(opencrab.config, "get_settings", lambda: settings)
+    calls = []
+    monkeypatch.setattr(recovery, "require_local_principal", lambda: calls.append("principal"))
+    path = approved(tmp_path, "id-a")
+    assert recovery._main(["--approved", str(path), "--run-dir", str(tmp_path / "run")]) == 1
+    assert calls == []
