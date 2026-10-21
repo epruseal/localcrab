@@ -161,8 +161,9 @@ _EXTERNAL_DIR = "external-vector"
 MANIFEST_NAME = "MANIFEST.json"
 _MANIFEST_FORMAT = 1
 
-#: Busy wait, in seconds, when opening a source for a snapshot. Spent while
-#: write.lock is held, so it is short on purpose.
+#: Upper bound of the busy wait, in seconds, when opening a source for a
+#: snapshot. Spent while write.lock is held, so it is short on purpose; the
+#: caller's lock budget lowers it further (``min(this, lock_timeout)``).
 _SNAPSHOT_OPEN_TIMEOUT = 5.0
 
 #: The copy of a pinned snapshot gets ``max(lock_timeout, bytes / this)``
@@ -580,7 +581,10 @@ class _SnapshotPins:
     to the running service, not a cosmetic leak.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, open_timeout: float = _SNAPSHOT_OPEN_TIMEOUT) -> None:
+        # Busy wait of each open, spent while write.lock is held. The caller
+        # caps it at its own lock budget.
+        self._open_timeout = open_timeout
         self._open: list[sqlite3.Connection] = []
 
     def open_snapshot(self, source: Path) -> tuple[str, _Snapshot | None]:
@@ -595,7 +599,7 @@ class _SnapshotPins:
             conn = sqlite3.connect(
                 _rw_uri(source),
                 uri=True,
-                timeout=_SNAPSHOT_OPEN_TIMEOUT,
+                timeout=self._open_timeout,
                 isolation_level=None,
             )
         except (sqlite3.Error, OSError) as exc:
@@ -706,8 +710,14 @@ def _estimate_bytes(targets: Iterable[BackupTarget], data_dir: Path) -> int:
     return total
 
 
-def _require_free_space(dest: Path, data_dir: Path, needed: int) -> None:
-    """Refuse before writing anything when the volumes cannot take the copy."""
+def _require_free_space(
+    dest: Path, data_dir: Path, needed: int, source_dirs: Iterable[Path] = ()
+) -> None:
+    """Refuse before writing anything when the volumes cannot take the copy.
+
+    ``source_dirs`` are the directories of the pinned WAL sources: the WAL of each
+    grows on its own volume while the snapshot is open.
+    """
     reserve = _FREE_SPACE_RESERVE
     dest_free = shutil.disk_usage(dest).free
     if dest_free < needed + reserve:
@@ -715,12 +725,19 @@ def _require_free_space(dest: Path, data_dir: Path, needed: int) -> None:
             f"not enough free space on the destination volume: the backup needs about "
             f"{needed} bytes plus a {reserve} byte reserve, {dest_free} bytes are free"
         )
-    if os.stat(dest).st_dev != os.stat(data_dir).st_dev:
-        # While a snapshot connection is open the WAL files grow on the data volume.
-        data_free = shutil.disk_usage(data_dir).free
-        if data_free < reserve:
+    dest_dev = os.stat(dest).st_dev
+    checked = {dest_dev}
+    # While a snapshot connection is open the WAL files grow on the volume of
+    # their source: the data volume, and any other volume a source lives on.
+    for label, directory in [("data", data_dir), *(("source", d) for d in source_dirs)]:
+        dev = os.stat(directory).st_dev
+        if dev in checked:
+            continue
+        checked.add(dev)
+        free = shutil.disk_usage(directory).free
+        if free < reserve:
             raise BackupError(
-                f"not enough free space on the data volume: {data_free} bytes are free, "
+                f"not enough free space on the {label} volume: {free} bytes are free, "
                 f"{reserve} bytes are kept in reserve for WAL growth during the backup"
             )
 
@@ -1236,7 +1253,16 @@ def backup_data_dir(
                 "module cannot stand behind."
             )
 
-        _require_free_space(dest, data_dir, _estimate_bytes(targets, data_dir))
+        _require_free_space(
+            dest,
+            data_dir,
+            _estimate_bytes(targets, data_dir),
+            [
+                _source_for(t, data_dir).resolve().parent
+                for t in targets
+                if t.kind == "sqlite" and _source_for(t, data_dir).exists()
+            ],
+        )
 
         leftovers = _leftover_stagings(dest)
         for p in leftovers:
@@ -1257,7 +1283,7 @@ def backup_data_dir(
         if final.exists() or final.is_symlink():
             raise BackupError(f"backup set already exists, refusing to overwrite: {final}")
 
-        pins = _SnapshotPins()
+        pins = _SnapshotPins(min(_SNAPSHOT_OPEN_TIMEOUT, timeout))
         jobs: list[_Job] = []
         staging_owned = False
         wait_started = time.monotonic()

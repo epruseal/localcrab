@@ -650,6 +650,92 @@ class TestExcludeAndSpace:
         with pytest.raises(bk.BackupError, match="not enough free space on the data volume"):
             bk._require_free_space(dest, data, 1000)
 
+    def test_every_volume_holding_a_pinned_wal_is_checked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pinned WAL grows on its own volume, so a third volume needs its reserve too."""
+        dest, data, ext = tmp_path / "dest", tmp_path / "data", tmp_path / "ext"
+        for d in (dest, data, ext):
+            d.mkdir()
+        free = {dest: 10 << 30, data: 10 << 30, ext: 1}
+        dev = {dest: 1, data: 2, ext: 3}
+
+        class _Usage:
+            def __init__(self, n: int) -> None:
+                self.free = n
+
+        class _Stat:
+            def __init__(self, n: int) -> None:
+                self.st_dev = n
+
+        real_stat = os.stat
+        monkeypatch.setattr(bk.shutil, "disk_usage", lambda p: _Usage(free[Path(p)]))
+        monkeypatch.setattr(
+            bk.os,
+            "stat",
+            lambda p, *a, **k: _Stat(dev[Path(p)]) if Path(p) in dev else real_stat(p, *a, **k),
+        )
+        with pytest.raises(bk.BackupError, match="not enough free space on the source volume"):
+            bk._require_free_space(dest, data, 1000, [ext])
+        # Controls: enough room on the third volume, or the source shares the data volume.
+        free[ext] = 10 << 30
+        bk._require_free_space(dest, data, 1000, [ext])
+        free[ext] = 1
+        dev[ext] = dev[data]
+        free[data] = 10 << 30
+        bk._require_free_space(dest, data, 1000, [ext])
+
+    def test_the_external_vector_directory_is_among_the_checked_sources(
+        self, tmp_path: Path, live_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        external = tmp_path / "elsewhere"
+        external.mkdir()
+        _wal_db(external / "extvec.db", rows=50)
+        seen: list[list[Path]] = []
+        real = bk._require_free_space
+
+        def spy(dest: Path, data_dir: Path, needed: int, source_dirs: Any = ()) -> None:
+            seen.append(list(source_dirs))
+            real(dest, data_dir, needed, source_dirs)
+
+        monkeypatch.setattr(bk, "_require_free_space", spy)
+        bk.backup_data_dir(
+            live_dir, settings=_Settings(vector_db_file=str(external / "extvec.db"))
+        )
+        assert external.resolve() in seen[0]
+        assert live_dir.resolve() in seen[0]
+
+
+class TestSnapshotOpenTimeout:
+    """Opening a snapshot waits while write.lock is held, so it obeys the lock budget."""
+
+    @staticmethod
+    def _open_timeouts(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        seen: list[float] = []
+        real_connect = sqlite3.connect
+
+        def recording(database: Any, *a: Any, **k: Any) -> sqlite3.Connection:
+            if "isolation_level" in k and "timeout" in k:  # the snapshot opens
+                seen.append(float(k["timeout"]))
+            return real_connect(database, *a, **k)
+
+        monkeypatch.setattr(sqlite3, "connect", recording)
+        return seen
+
+    def test_a_small_lock_timeout_caps_the_busy_wait(
+        self, live_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = self._open_timeouts(monkeypatch)
+        bk.backup_data_dir(live_dir, settings=_Settings(), lock_timeout=0.2)
+        assert seen and max(seen) <= 0.2
+
+    def test_control_a_large_lock_timeout_keeps_the_short_default(
+        self, live_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = self._open_timeouts(monkeypatch)
+        bk.backup_data_dir(live_dir, settings=_Settings(), lock_timeout=60.0)
+        assert seen and set(seen) == {bk._SNAPSHOT_OPEN_TIMEOUT}
+
 
 # ---------------------------------------------------------------------------
 # T7c: snapshot connections are closed on every path
