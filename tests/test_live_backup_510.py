@@ -707,7 +707,7 @@ class TestExcludeAndSpace:
 
 
 class TestSnapshotOpenTimeout:
-    """Opening a snapshot waits while write.lock is held, so it obeys the lock budget."""
+    """The backup waits to open a snapshot while it holds write.lock, so the wait obeys the lock budget."""
 
     @staticmethod
     def _open_timeouts(monkeypatch: pytest.MonkeyPatch) -> list[float]:

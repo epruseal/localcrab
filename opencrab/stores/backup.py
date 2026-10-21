@@ -161,9 +161,10 @@ _EXTERNAL_DIR = "external-vector"
 MANIFEST_NAME = "MANIFEST.json"
 _MANIFEST_FORMAT = 1
 
-#: Upper bound of the busy wait, in seconds, when opening a source for a
-#: snapshot. Spent while write.lock is held, so it is short on purpose; the
-#: caller's lock budget lowers it further (``min(this, lock_timeout)``).
+#: Upper bound of the busy wait, in seconds, when the backup opens a source for
+#: a snapshot. The backup waits while it holds write.lock, so the bound is short
+#: on purpose. The caller's lock budget lowers it further
+#: (``min(this, lock_timeout)``).
 _SNAPSHOT_OPEN_TIMEOUT = 5.0
 
 #: The copy of a pinned snapshot gets ``max(lock_timeout, bytes / this)``
@@ -582,8 +583,8 @@ class _SnapshotPins:
     """
 
     def __init__(self, open_timeout: float = _SNAPSHOT_OPEN_TIMEOUT) -> None:
-        # Busy wait of each open, spent while write.lock is held. The caller
-        # caps it at its own lock budget.
+        # Busy wait of each open. The backup waits while it holds write.lock,
+        # and the caller caps the wait at its own lock budget.
         self._open_timeout = open_timeout
         self._open: list[sqlite3.Connection] = []
 
@@ -624,7 +625,7 @@ class _SnapshotPins:
         # Same wording contract as backup_sqlite: no raw-copy fallback.
         return BackupError(
             f"{source} could not be opened for a snapshot ({exc}). "
-            "It is not a usable SQLite database; refusing to report a raw copy as a backup."
+            "It may be corrupt or locked by another writer; refusing to report a raw copy as a backup."
         )
 
     def release(self, conn: sqlite3.Connection) -> bool:
@@ -715,8 +716,9 @@ def _require_free_space(
 ) -> None:
     """Refuse before writing anything when the volumes cannot take the copy.
 
-    ``source_dirs`` are the directories of the pinned WAL sources: the WAL of each
-    grows on its own volume while the snapshot is open.
+    ``source_dirs`` are the directories of the SQLite sources. Planning does not
+    know the journal mode yet, so a rollback-journal source is checked too. The
+    WAL of a pinned source grows on its own volume while the snapshot is open.
     """
     reserve = _FREE_SPACE_RESERVE
     dest_free = shutil.disk_usage(dest).free
