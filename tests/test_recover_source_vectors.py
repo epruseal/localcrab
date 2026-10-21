@@ -439,15 +439,28 @@ def test_source_reader_encodes_special_path_and_is_read_only(tmp_path, name):
         ("pg", "sqlite-vec"), ("pg", "chroma"), ("pg", "pgvector"),
     ],
 )
-def test_main_refuses_unsupported_settings_before_principal(tmp_path, monkeypatch, mode, backend):
+def test_main_refuses_unsupported_settings_before_dependencies(tmp_path, monkeypatch, mode, backend):
     import opencrab.config
+    import opencrab.stores.factory
 
-    settings = type("Settings", (), {"storage_mode": mode, "vector_backend_resolved": backend})()
-    monkeypatch.setattr(opencrab.config, "get_settings", lambda: settings)
+    settings = type("Settings", (), {
+        "storage_mode": mode,
+        "vector_backend_resolved": backend,
+        "local_data_dir": str(tmp_path),
+    })()
     calls = []
+    monkeypatch.setattr(opencrab.config, "get_settings", lambda: settings)
     monkeypatch.setattr(recovery, "require_local_principal", lambda: calls.append("principal"))
+    monkeypatch.setattr(recovery, "SourceReader", lambda *_: calls.append("reader"))
+    monkeypatch.setattr(opencrab.stores.factory, "make_sql_store", lambda *_: calls.append("sql"))
+    monkeypatch.setattr(opencrab.stores.factory, "make_vector_store", lambda *_: calls.append("vector"))
+    monkeypatch.setattr(recovery, "write_lock", lambda *_args, **_kwargs: calls.append("lock"))
+    monkeypatch.setattr(recovery.subprocess, "run", lambda *_args, **_kwargs: calls.append("backup"))
     file = approved(tmp_path, "id-a")
-    assert recovery._main(["--approved", str(file), "--run-dir", str(tmp_path / "run")]) == 1
+    assert recovery._main([
+        "--approved", str(file), "--run-dir", str(tmp_path / "run"),
+        "--apply", "--backup-to", str(tmp_path / "backup"),
+    ]) == 1
     assert calls == []
 
 class ConnectionProxy:
