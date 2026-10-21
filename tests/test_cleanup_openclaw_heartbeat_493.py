@@ -4747,3 +4747,69 @@ def test_load_run_reads_legacy_manifest_without_selection_as_prefix(world: Path,
         assert loaded.selection == cleanup._PREFIX_SELECTION
     finally:
         candidates.close()
+
+
+def _mixed_claim_setup(world: Path) -> tuple[str, str]:
+    """TextUnit 후보와 Evidence 비후보가 graph와 registry에서 같은 Claim을 지지한다."""
+    survivor, claim = "evidence:mixed:keep", "claim:mixed"
+    _add(world, survivor, "surviving evidence", pack="pack-a", node_type="Evidence")
+    with _db(world / "graph.db") as conn:
+        conn.execute("INSERT INTO graph_nodes VALUES (?,?,?,?)", ("Claim", claim, "claim", "{}"))
+        for kind, node_id in (("TextUnit", _ART_A), ("Evidence", survivor)):
+            conn.execute("INSERT INTO graph_edges VALUES (?,?,?,?,?,?)", (kind, node_id, "supports", "Claim", claim, "{}"))
+    with _db(world / "opencrab.db") as conn:
+        conn.execute("INSERT INTO ontology_nodes(space,node_type,node_id) VALUES (?,?,?)", ("claim", "Claim", claim))
+        for node_id in (_ART_A, survivor):
+            conn.execute("INSERT INTO ontology_edges(from_space,from_id,relation,to_space,to_id) VALUES (?,?,?,?,?)", ("evidence", node_id, "supports", "claim", claim))
+    return survivor, claim
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_cli_mixed_claim_support_survives_apply_resume_and_rollback(id_world: Path, tmp_path: Path, interrupt: bool):
+    survivor, claim = _mixed_claim_setup(id_world)
+    before = _all_db_rows(id_world)
+    survivor_before = _survivor_raw(id_world, survivor, claim)
+    claim_before = _survivor_raw(id_world, claim)
+    run, backup = tmp_path / "run", tmp_path / "backup"
+    result = cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_A]))
+    assert result["eligible"] is True, result
+    approval = _id_approval(tmp_path, run)
+    if interrupt:
+        _id_interrupted_apply(id_world, tmp_path, run, approval, backup, "before-graph")
+    applied = _cli_main(tmp_path, "mixed-apply", [*_id_base(id_world, run), "--apply", "--approved-manifest", str(approval), "--backup-dir", str(backup)])
+    assert applied.returncode == 0, applied.stderr
+    _assert_candidate_absent(id_world, _ART_A)
+    assert _survivor_raw(id_world, survivor, claim) == survivor_before
+    assert _survivor_raw(id_world, claim) == claim_before
+    base = _id_base(id_world, run)
+    prepared = _cli_main(tmp_path, "mixed-prepare", [*base, "--prepare-rollback", "--backup-dir", str(backup)])
+    assert prepared.returncode == 0, prepared.stderr
+    rolled = _cli_main(tmp_path, "mixed-rollback", [*base, "--rollback", "--backup-dir", str(backup)])
+    assert rolled.returncode == 0, rolled.stderr
+    assert _all_db_rows(id_world) == before
+
+
+@pytest.mark.parametrize("fault", ["source-pack", "graph-space", "registry-type", "edge-type", "last-support"])
+def test_mixed_claim_support_refuses_invalid_survivor(id_world: Path, tmp_path: Path, fault: str):
+    survivor, claim = _mixed_claim_setup(id_world)
+    if fault == "source-pack":
+        _set_one_axis_pack(id_world, survivor, "source-pack-only", "pack-b")
+    elif fault == "graph-space":
+        with _db(id_world / "graph.db") as conn:
+            conn.execute("UPDATE graph_nodes SET space_id='concept' WHERE node_id=?", (survivor,))
+    elif fault == "registry-type":
+        with _db(id_world / "opencrab.db") as conn:
+            conn.execute("UPDATE ontology_nodes SET node_type='TextUnit' WHERE node_id=?", (survivor,))
+    elif fault == "edge-type":
+        with _db(id_world / "graph.db") as conn:
+            conn.execute("UPDATE graph_edges SET from_type='TextUnit' WHERE from_id=?", (survivor,))
+    else:
+        with _db(id_world / "graph.db") as conn:
+            conn.execute("DELETE FROM graph_edges WHERE from_id=?", (survivor,))
+        with _db(id_world / "opencrab.db") as conn:
+            conn.execute("DELETE FROM ontology_edges WHERE from_id=?", (survivor,))
+    run = tmp_path / "run"
+    result = cleanup.dry_run(id_world, run, TABLE, _ids_file(tmp_path, [_ART_A]))
+    assert result["eligible"] is False, result
+    assert "Claim support" in " ".join(result["errors"])
+    assert not (run / "manifest.json").exists()
