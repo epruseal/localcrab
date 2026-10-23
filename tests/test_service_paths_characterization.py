@@ -872,8 +872,10 @@ class TestQueryResponseHTTP:
         monkeypatch.setattr(ctx.hybrid, "query", lambda **_kwargs: QueryOutcome([result], []))
         response = http_client.post("/api/query", json={"question": "x"}, headers=http_auth)
         assert response.status_code == 200
-        assert response.content == api_module._query_response_bytes(response.json())
-        metadata = response.json()["results"][0]["metadata"]
+        response_value = response.json()
+        assert response.content == api_module._query_response_bytes(response_value)
+        assert response_value["results"][0]["score"] == 1e-7
+        metadata = response_value["results"][0]["metadata"]
         assert metadata["created_at"] == "2026-01-01T00:00:00Z"
         assert metadata["_safe"] == "keep"
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -644,24 +646,28 @@ def ingest_text(
 
 
 def _query_response_bytes(response: dict[str, Any]) -> bytes:
-    """Serialize query data with the default FastAPI response field."""
-    from asyncio import run
-
+    """Serialize query data with the active default FastAPI route contract."""
+    from fastapi.datastructures import DefaultPlaceholder
     from fastapi.routing import serialize_response
 
     route = next(route for route in app.routes if getattr(route, "path", None) == "/api/query")
-    return run(
-        serialize_response(
-            field=route.response_field,
-            response_content=response,
-            by_alias=True,
-            exclude_unset=False,
-            exclude_defaults=False,
-            exclude_none=False,
-            is_coroutine=False,
-            dump_json=True,
-        )
-    )
+    options = {
+        "field": route.response_field,
+        "response_content": response,
+        "by_alias": True,
+        "exclude_unset": False,
+        "exclude_defaults": False,
+        "exclude_none": False,
+        "is_coroutine": False,
+    }
+    if "dump_json" in inspect.signature(serialize_response).parameters:
+        return asyncio.run(serialize_response(**options, dump_json=True))
+
+    content = asyncio.run(serialize_response(**options))
+    response_class = route.response_class
+    if isinstance(response_class, DefaultPlaceholder):
+        response_class = response_class.value
+    return response_class(content).body
 
 
 @app.post("/api/query")
