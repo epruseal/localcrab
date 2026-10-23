@@ -875,6 +875,13 @@ class TestQueryResponseHTTP:
         )
         assert resp.status_code == 422
 
+    @pytest.mark.parametrize("offset", [-1, True])
+    def test_query_offset_validation_422(self, http_client, http_auth, offset):
+        resp = http_client.post(
+            "/api/query", json={"question": "x", "offset": offset}, headers=http_auth
+        )
+        assert resp.status_code == 422
+
     def test_query_empty_question_422(self, http_client, http_auth):
         resp = http_client.post("/api/query", json={"question": ""}, headers=http_auth)
         assert resp.status_code == 422

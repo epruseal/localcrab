@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(REPO_ROOT / "apps" / ".env", override=False)
@@ -59,6 +60,7 @@ class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, description="Natural language query.")
     spaces: list[str] | None = Field(default=None, description="Optional space filter.")
     limit: int = Field(default=10, ge=1, le=25, description="Maximum result count.")
+    offset: StrictInt = Field(default=0, ge=0, description="Start index in the fixed result window.")
     graph_depth: int = Field(default=1, ge=1, le=4, description="Neighborhood expansion depth.")
     pack_ids: list[str] | None = Field(default=None, description="Restrict search to these content packs.")
     auto_pack: bool = Field(default=False, description="Auto-select the best-matching pack for the question.")
@@ -671,10 +673,11 @@ def query_ontology(
         graph_depth=payload.graph_depth,
         pack_ids=selection.effective_pack_ids,
     )
-    results = outcome.results
+    primary_results = outcome.results
+    results = primary_results[payload.offset:payload.limit]
 
     keyword_fallback: list[dict[str, Any]] = []
-    if not results:
+    if not primary_results:
         # #147: the CALLER'S FULL readable scope, not selection.effective_pack_ids.
         # This fallback only fires when the primary (pack-filtered) search came
         # up empty, and its job is to widen the search -- narrowing it to the
@@ -696,13 +699,22 @@ def query_ontology(
     if selection.warnings:
         pack_filter["warnings"] = [mcp_warning_text(w) for w in selection.warnings]
 
+    from opencrab.services import result_caps
+
     response = {
         "question": payload.question,
         "spaces_filter": payload.spaces,
         "total": len(results),
-        "results": [result.to_dict() for result in results],
-        "keyword_fallback": keyword_fallback,
-        "selected_packs": selection.selected_packs,
+        "results": [
+            result_caps.cap_query_item(result.to_dict(), folded=bool(result.folded_count))
+            for result in results
+        ],
+        "keyword_fallback": [
+            result_caps.cap_keyword_fallback(item) for item in keyword_fallback
+        ],
+        "selected_packs": [
+            result_caps.cap_selected_pack(item) for item in selection.selected_packs
+        ],
         "pack_filter": pack_filter,
     }
     # #51: spaces 필터의 과도기 경고를 MCP(response["spaces_filter_warnings"])와
@@ -710,6 +722,13 @@ def query_ontology(
     # 스레드풀에서 동시 요청이 몰려도 서로의 경고를 훔쳐보지 않는다.
     if outcome.warnings:
         response["spaces_filter_warnings"] = list(outcome.warnings)
+    response = result_caps.apply_response_budget(
+        response,
+        offset=payload.offset,
+        measure=lambda value: len(
+            json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        ),
+    )
     _log_event(
         ctx.docs,
         "query",

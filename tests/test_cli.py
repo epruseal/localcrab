@@ -672,6 +672,11 @@ class TestQuery:
         }
         assert envelope["total"] == 0
 
+    def test_negative_offset_is_rejected(self, bootstrapped, cli_env, runner, mock_vector_store):
+        result = runner.invoke(main, ["query", "zzz", "--offset", "-1"])
+        assert result.exit_code == 2
+        assert "Invalid value for '--offset'" in result.output
+
     def test_json_envelope_takes_priority_over_json_output(
         self, bootstrapped, cli_env, runner, mock_vector_store
     ):
