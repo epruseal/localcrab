@@ -16,7 +16,6 @@ MCP 도구 `ontology_query`는 결과 항목의 본문(`text`)과 `metadata`, `g
 - CLI `query`와 REST `/api/query`. 두 표면은 `QueryResult.to_dict()`의 값을 그대로 쓰고 이 변경의 대상이 아니다.
 - `ontology_get_node`, `ontology_list_nodes`와 그 밖 도구의 응답 크기.
 - 점수, 정렬, 접기 규칙, 검색 leg의 후보 선택.
-- 전송 직렬화의 `ensure_ascii` 설정. 서버는 `ensure_ascii=True`로 직렬화하고 한글 한 글자는 안쪽 문자열에서 6글자, 봉투 안에서 7글자다. 이 설정을 바꾸면 모든 도구의 전송 형태가 달라지므로 후속 후보로 올린다.
 
 ## 소스에서 읽은 사실: 크기를 키우는 자리
 
@@ -56,7 +55,7 @@ MCP 도구 `ontology_query`는 결과 항목의 본문(`text`)과 `metadata`, `g
 
 두 값은 모듈 상수다. 설정으로 열지 않는다.
 
-글자당 길이(예산 단위, 빈 문자열 대비 증가량): 일반 ASCII 1, 따옴표 4, 역슬래시 4, 줄바꿈 3, NUL 7, BMP 비ASCII 문자(한글 포함) 7, 보충 평면 문자 14. 한글 4000자 문자열 하나는 예산 단위에서 28,000글자다. 그래프 leg 항목에서 `text`와 `metadata.text`가 같은 한글 본문 4000자를 싣는 경우 이 두 문자열의 합은 56,000글자다. 결과 항목의 다른 필드는 이 합에 들지 않는다.
+문자당 바이트 증가량(예산 단위, 빈 문자열 대비 증가량): 일반 ASCII 1, 따옴표 4, 역슬래시 4, 줄바꿈 3, NUL 7, 한글 3, 보충 평면 문자 4다. 한글 4000자 문자열 하나는 예산 단위에서 12,000바이트다. 그래프 leg 항목에서 `text`와 `metadata.text`가 같은 한글 본문 4000자를 싣는 경우 이 두 문자열의 합은 24,000바이트다. 결과 항목의 다른 필드는 이 합에 들지 않는다.
 
 ## 알고리즘
 
@@ -121,7 +120,7 @@ MCP 도구 `ontology_query`는 결과 항목의 본문(`text`)과 `metadata`, `g
 
 ### 응답 예산의 단위
 
-서버는 도구 결과를 `content_text = json.dumps(result, ensure_ascii=True, default=str)`로 문자열로 만든 뒤 그 문자열을 응답 봉투의 `content[].text`에 넣고 봉투를 다시 직렬화한다(`opencrab/mcp/server.py`의 호출 둘과 stdio 출력 호출, HTTP `JSONResponse`). 안쪽 문자열의 따옴표와 역슬래시가 봉투 직렬화에서 다시 이스케이프된다. 예산의 단위는 봉투 안에서의 길이 `L(x) = len(json.dumps(json.dumps(x, ensure_ascii=True, default=str)))`다. 요청 id, `jsonrpc`, `content` 틀, `_meta`의 길이는 세지 않는다. 전체 전송 봉투의 길이는 이 단위가 아니다. HTTP 배치 요청에는 응답마다 이 예산을 적용한다.
+서버는 도구 결과를 UTF-8 JSON 문자열로 만든 뒤 그 문자열을 응답 봉투의 `content[].text`에 넣고 다시 직렬화한다. 안쪽 문자열의 따옴표와 역슬래시는 봉투 직렬화에서 다시 이스케이프된다. 예산의 단위는 이 문자열이 outer JSON string에서 차지하는 UTF-8 바이트 길이 `L(x) = len(json.dumps(serialize_tool_result(x), ensure_ascii=False).encode("utf-8"))`다. 요청 id, `jsonrpc`, `content` 틀, `_meta`, batch frame의 길이는 세지 않는다. 전체 전송 봉투의 길이는 이 단위가 아니다. HTTP batch 요청에는 응답마다 이 예산을 적용한다.
 
 ### 응답 예산 `apply_response_budget(response, *, budget)`
 
@@ -148,7 +147,7 @@ MCP 도구 `ontology_query`는 결과 항목의 본문(`text`)과 `metadata`, `g
 }
 ```
 
-`message`는 모듈 상수 문자열이다. 문구: "응답 길이가 응답 예산(500000자)을 넘고, 결과를 덜어 내어도 예산 안에 드는 응답을 만들 수 없다. pack_ids나 spaces로 범위를 좁히거나 limit을 줄여 다시 호출하라. 개별 노드는 ontology_get_node로 읽는다." 이 문구는 결과의 개수와 초과 원인을 서술하지 않는다. 호출자 입력, 저장 데이터, 가변 수치를 문구에 넣지 않는다.
+`message`는 모듈 상수 문자열이다. 문구: "응답 길이가 응답 예산(500000바이트)을 넘고, 결과를 덜어 내어도 예산 안에 드는 응답을 만들 수 없다. pack_ids나 spaces로 범위를 좁히거나 limit을 줄여 다시 호출하라. 개별 노드는 ontology_get_node로 읽는다." 이 문구는 결과의 개수와 초과 원인을 서술하지 않는다. 호출자 입력, 저장 데이터, 가변 수치를 문구에 넣지 않는다.
 
 행 B에서 덜어 낸 결과는 응답에 싣지 않는다. 접힌 구성원은 대표 결과와 함께 덜어 낸다. 응답은 덜어 낸 결과의 수를 `omitted_results`로 싣고 어떤 결과인지는 싣지 않는다.
 
@@ -169,7 +168,7 @@ MCP 도구 `ontology_query`는 결과 항목의 본문(`text`)과 `metadata`, `g
 - `QueryResult.to_dict()` 호출자: MCP `ontology_query`(이 변경 대상), CLI `query`, REST `/api/query`, 접기 단계(`to_result`). 접기와 점수 계산은 항목 상한 적용 전의 원본 값을 쓴다. 항목 상한은 응답 직전 한 곳에서 걸린다. 접기 키(저장 본문의 집합)는 항목 상한 적용 전에 정해진다.
 - CLI와 REST는 같은 `to_dict()` 값을 쓰고 이 함수들을 거치지 않는다.
 - `selected_packs`를 만드는 호출자는 `resolve_packs`이고 CLI도 쓴다. 항목 상한은 MCP 응답을 만드는 자리에서만 건다.
-- 서버는 도구 결과를 두 자리(`opencrab/mcp/server.py`의 `ensure_ascii=True` 호출 둘: legacy 경로와 modern 경로)에서 문자열로 만들고, 전송 경로(stdio, HTTP)가 봉투를 다시 직렬화한다.
+- 서버는 legacy와 modern 도구 호출에서 같은 UTF-8 결과 문자열을 만들고, stdio와 HTTP 전송 경로가 JSON-RPC 봉투를 직렬화한다.
 - 새 오류 응답은 기존 오류 응답과 같은 최상위 키 `error`를 쓰고 값이 문자열이다. modern 경로는 이를 `isError=true`로 표시하고 legacy 경로는 본문에 싣는다(기존 동작).
 
 ## 전체 본문 경로의 범위

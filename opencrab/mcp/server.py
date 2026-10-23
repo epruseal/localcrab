@@ -22,6 +22,7 @@ import sys
 from typing import Any
 
 from opencrab.auth import current_principal
+from opencrab.common.json_transport import serialize_jsonrpc_response, serialize_tool_result
 from opencrab.config import get_settings
 from opencrab.mcp import protocol
 from opencrab.mcp.protocol import ProtocolValidationError
@@ -102,8 +103,14 @@ class MCPServer:
 
             response = self._handle_raw(raw_line)
             if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
+                text = serialize_jsonrpc_response(response) + "\n"
+                stdout_buffer = getattr(sys.stdout, "buffer", None)
+                if stdout_buffer is None:
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                else:
+                    stdout_buffer.write(text.encode("utf-8"))
+                    stdout_buffer.flush()
 
         logger.info("OpenCrab MCP server shutting down (EOF).")
 
@@ -399,7 +406,7 @@ class MCPServer:
         is_error = (isinstance(result, dict) and "error" in result) or _is_partial_pack_ingest(
             name, result
         )
-        content_text = json.dumps(result, ensure_ascii=True, default=str)
+        content_text = serialize_tool_result(result)
         return {
             "resultType": "complete",
             "content": [{"type": "text", "text": content_text}],
@@ -547,9 +554,7 @@ class MCPServer:
         # A legacy pack_ingest partial is the narrow compatibility exception.
         # Retain the receipt for outbox users.
         # Add a retry acknowledgement for outbox users.
-        # Use ensure_ascii=True to avoid invalid Unicode surrogates (e.g. from
-        # Korean/CJK data) crashing the Claude API JSON parser.
-        content_text = json.dumps(result, ensure_ascii=True, default=str)
+        content_text = serialize_tool_result(result)
         response = {
             "content": [
                 {

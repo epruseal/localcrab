@@ -984,9 +984,9 @@ CLI `query`와 REST `/api/query`는 이 처리를 거치지 않는다.
 ### 응답 예산
 
 응답 길이가 `QUERY_RESPONSE_CHAR_BUDGET`을 넘으면 `results`의 뒤쪽 결과를 덜어 낸다.
-길이의 단위는 서버가 도구 결과를 문자열로 만들고(`ensure_ascii=True`) 전송 봉투가
-그 문자열을 다시 직렬화한 길이다(`result_caps._wire_length`). 한글 한 글자는 이
-단위에서 7글자다.
+길이의 단위는 도구 결과 문자열이 outer JSON string에서 차지하는 UTF-8 바이트
+길이다(`result_caps._wire_length`). JSON-RPC frame, request ID와 batch frame은
+이 단위에 들지 않는다.
 
 | 조건 | 응답 |
 | --- | --- |
@@ -1001,8 +1001,8 @@ CLI `query`와 REST `/api/query`는 이 처리를 거치지 않는다.
 
 - 두 상수는 모듈 상수이고 설정으로 열지 않는다. 대상 클라이언트의 수용 한도는
   측정하지 못했다.
-- 서버는 `ensure_ascii=True`로 직렬화하므로 한글 한 글자가 안쪽 문자열에서 6글자,
-  전송 봉투에서 7글자다. 이 설정은 이 변경의 범위 밖이다.
+- 응답 예산은 `content[].text`의 UTF-8 바이트 기여분만 센다. JSON-RPC frame과
+  request ID와 batch frame은 예산에 들지 않는다.
 - 덜어 낸 결과를 이어서 받는 방법(페이지 넘기기)은 없다.
 
 ### 재현 명령

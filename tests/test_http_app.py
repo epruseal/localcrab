@@ -106,6 +106,25 @@ class TestAuthValidToken:
         assert resp.status_code == 200
         assert "tools" in resp.json()["result"]
 
+    def test_tool_response_uses_utf8_content_and_keeps_surrogate_id_escape(
+        self, client, bootstrapped
+    ):
+        _, _, secret = bootstrapped
+        request = (
+            b'{"jsonrpc":"2.0","id":"\\ud800","method":"tools/call",'
+            b'"params":{"name":"tool","arguments":{}}}'
+        )
+        with patch("opencrab.mcp.server.dispatch_tool", return_value={"text": "한\ud800"}):
+            resp = client.post("/mcp", content=request, headers=_auth(secret))
+
+        assert resp.status_code == 200
+        assert "한".encode() in resp.content
+        assert "�".encode() in resp.content
+        assert b"\\ud800" in resp.content
+        assert json_module.loads(resp.content)["id"] == "\ud800"
+        content = json_module.loads(resp.content)["result"]["content"][0]["text"]
+        assert json_module.loads(content) == {"text": "한�"}
+
     def test_healthz_always_open(self, client):
         resp = client.get("/healthz")
         assert resp.status_code == 200

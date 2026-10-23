@@ -388,11 +388,11 @@ class TestResponseBudget:
         assert out["omitted_results"] == 1 and out["results_truncated"] is True
 
     def test_row_b_sum_of_results_under_the_item_limit(self):
-        response = _response([{"node_id": f"n{i}", "text": "한" * LIMIT} for i in range(40)])
+        response = _response([{"node_id": f"n{i}", "text": "한" * LIMIT} for i in range(70)])
         assert caps._wire_length(response) > BUDGET
         out = apply_response_budget(response)
-        assert 0 < out["total"] < 40
-        assert out["total"] + out["omitted_results"] == 40
+        assert 0 < out["total"] < 70
+        assert out["total"] + out["omitted_results"] == 70
         assert caps._wire_length(out) <= BUDGET
         assert caps._wire_length(_r(response, out["total"] + 1)) > BUDGET
 
@@ -463,7 +463,7 @@ class TestResponseBudget:
 
     @pytest.mark.parametrize(
         ("ch", "increment"),
-        [("a", 1), ('"', 4), ("\\", 4), ("\n", 3), ("\x00", 7), ("한", 7), ("😀", 14)],
+        [("a", 1), ('"', 4), ("\\", 4), ("\n", 3), ("\x00", 7), ("한", 3), ("😀", 4)],
     )
     def test_wire_length_per_character(self, ch, increment):
         base = caps._wire_length({"a": ""})
@@ -511,7 +511,7 @@ class TestWireUnitMatchesServer:
                  "params": {"name": "t1", "arguments": {}}}
             )
         text = response["result"]["content"][0]["text"]
-        assert len(json.dumps(text)) == caps._wire_length(_PAYLOAD)
+        assert len(json.dumps(text, ensure_ascii=False).encode("utf-8")) == caps._wire_length(_PAYLOAD)
 
     def test_modern_tools_call(self, server):
         meta = {
@@ -524,7 +524,7 @@ class TestWireUnitMatchesServer:
                  "params": {"name": "t1", "arguments": {}, "_meta": meta}}
             )
         text = response["result"]["content"][0]["text"]
-        assert len(json.dumps(text)) == caps._wire_length(_PAYLOAD)
+        assert len(json.dumps(text, ensure_ascii=False).encode("utf-8")) == caps._wire_length(_PAYLOAD)
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,8 @@ import json
 import logging
 from typing import Any
 
+from opencrab.common.json_transport import serialize_tool_result
+
 logger = logging.getLogger(__name__)
 
 # The graph leg's ``_property_text`` already cuts ``text`` at this length.
@@ -37,7 +39,7 @@ _FOLD_KEY = "folded_duplicates"
 _GRAPH_CONTEXT_SKIP = ("anchor_id", "edge_endpoints", "edge")
 
 RESPONSE_TOO_LARGE_MESSAGE = (
-    f"응답 길이가 응답 예산({QUERY_RESPONSE_CHAR_BUDGET}자)을 넘고, 결과를 덜어 내어도 "
+    f"응답 길이가 응답 예산({QUERY_RESPONSE_CHAR_BUDGET}바이트)을 넘고, 결과를 덜어 내어도 "
     "예산 안에 드는 응답을 만들 수 없다. pack_ids나 spaces로 범위를 좁히거나 limit을 "
     "줄여 다시 호출하라. 개별 노드는 ontology_get_node로 읽는다."
 )
@@ -166,14 +168,14 @@ def cap_selected_pack(
 
 
 def _wire_length(value: Any) -> int:
-    """Length of ``value`` inside the transport envelope.
+    """Return the UTF-8 byte contribution of tool content in its outer JSON string.
 
-    The server turns a tool result into a string with
-    ``json.dumps(result, ensure_ascii=True, default=str)`` and the transport
-    serializes that string again. Quotes and backslashes are escaped twice. The
-    request id and the envelope frame are not counted.
+    The server turns a tool result into UTF-8 JSON text. The transport serializes
+    that text once more. The JSON-RPC frame, request ID and batch frame are not
+    counted.
     """
-    return len(json.dumps(json.dumps(value, ensure_ascii=True, default=str)))
+    text = serialize_tool_result(value)
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
 
 
 def _truncated_response(response: dict[str, Any], k: int, n: int) -> dict[str, Any]:
@@ -218,13 +220,13 @@ def apply_response_budget(
             chosen = _truncated_response(response, fits, n)
             if _wire_length(chosen) <= budget:
                 logger.warning(
-                    "ontology_query response over budget: chars=%d results=%d kept=%d",
+                    "ontology_query response over budget: bytes=%d results=%d kept=%d",
                     length, n, fits,
                 )
                 return chosen
 
     logger.warning(
-        "ontology_query response over budget with no fitting result: chars=%d results=%d",
+        "ontology_query response over budget with no fitting result: bytes=%d results=%d",
         length, n,
     )
     return response_too_large_error()
