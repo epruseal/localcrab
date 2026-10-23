@@ -989,7 +989,7 @@ docstring은 이 절을 가리킨다.
 - MCP는 도구 결과 문자열이 outer JSON string에서 차지하는 UTF-8 바이트 길이
   (`result_caps._wire_length`)를 쓴다. JSON-RPC frame, request ID와 batch frame은
   이 단위에 들지 않는다.
-- REST는 `/api/query`의 명시된 `JSONResponse` body UTF-8 바이트를 쓴다.
+- REST는 `/api/query`의 기본 FastAPI/Pydantic 직렬화 경로에서 사용하는 `response_field`를 `serialize_response(..., dump_json=True)`에 전달해 얻은 실제 응답 본문의 바이트 길이를 쓴다.
 - CLI `--json-envelope`은 들여쓴 UTF-8 JSON과 마지막 줄바꿈을 쓴다.
 - CLI `--json-output`은 기존 ASCII escape JSON list와 마지막 줄바꿈을 쓴다.
 
