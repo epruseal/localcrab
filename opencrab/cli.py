@@ -989,10 +989,11 @@ def query(
 
     # --- Legacy list JSON output (must remain unchanged in shape) ---
     if json_output and not json_envelope:
-        if len(json.dumps(result_dicts, indent=2, ensure_ascii=False, default=str).encode("utf-8")) + 1 > result_caps.QUERY_RESPONSE_CHAR_BUDGET:
-            click.echo(json.dumps(result_caps.response_too_large_error(), ensure_ascii=False))
+        legacy_json = json.dumps(result_dicts, indent=2, ensure_ascii=True, default=str)
+        if len(legacy_json.encode("utf-8")) + 1 > result_caps.QUERY_RESPONSE_CHAR_BUDGET:
+            click.echo(json.dumps(result_caps.response_too_large_error(), ensure_ascii=True))
         else:
-            click.echo(json.dumps(result_dicts, indent=2, ensure_ascii=False, default=str))
+            click.echo(legacy_json)
         return
 
     # --- New envelope output ---

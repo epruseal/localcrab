@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -11,7 +10,9 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, StrictInt
 
@@ -644,7 +645,7 @@ def ingest_text(
     return result
 
 
-@app.post("/api/query")
+@app.post("/api/query", response_class=JSONResponse)
 def query_ontology(
     payload: QueryRequest,
     auth: AuthContext = Depends(require_auth),
@@ -722,12 +723,11 @@ def query_ontology(
     # 스레드풀에서 동시 요청이 몰려도 서로의 경고를 훔쳐보지 않는다.
     if outcome.warnings:
         response["spaces_filter_warnings"] = list(outcome.warnings)
+    response = jsonable_encoder(response, sqlalchemy_safe=False)
     response = result_caps.apply_response_budget(
         response,
         offset=payload.offset,
-        measure=lambda value: len(
-            json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-        ),
+        measure=lambda value: len(JSONResponse(value).body),
     )
     _log_event(
         ctx.docs,
