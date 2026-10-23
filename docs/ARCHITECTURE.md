@@ -984,9 +984,14 @@ docstring은 이 절을 가리킨다.
 ### 응답 예산
 
 응답 길이가 `QUERY_RESPONSE_CHAR_BUDGET`을 넘으면 `results`의 뒤쪽 결과를 덜어 낸다.
-길이의 단위는 도구 결과 문자열이 outer JSON string에서 차지하는 UTF-8 바이트
-길이다(`result_caps._wire_length`). JSON-RPC frame, request ID와 batch frame은
-이 단위에 들지 않는다.
+길이의 단위는 표면마다 실제 직렬화 형식을 따른다.
+
+- MCP는 도구 결과 문자열이 outer JSON string에서 차지하는 UTF-8 바이트 길이
+  (`result_caps._wire_length`)를 쓴다. JSON-RPC frame, request ID와 batch frame은
+  이 단위에 들지 않는다.
+- REST는 `/api/query`의 명시된 `JSONResponse` body UTF-8 바이트를 쓴다.
+- CLI `--json-envelope`은 들여쓴 UTF-8 JSON과 마지막 줄바꿈을 쓴다.
+- CLI `--json-output`은 기존 ASCII escape JSON list와 마지막 줄바꿈을 쓴다.
 
 | 조건 | 응답 |
 | --- | --- |
@@ -1013,9 +1018,10 @@ CLI `--json-output`은 기존 list 형식을 예산 안에서 유지한다. list
 
 - 두 상수는 모듈 상수이고 설정으로 열지 않는다. 대상 클라이언트의 수용 한도는
   측정하지 못했다.
-- 응답 예산은 `content[].text`의 UTF-8 바이트 기여분만 센다. JSON-RPC frame과
-  request ID와 batch frame은 예산에 들지 않는다.
-- 덜어 낸 결과를 이어서 받는 방법(페이지 넘기기)은 없다.
+- 표면별 serializer가 바뀌면 byte budget 측정도 그 serializer에 맞춰 바뀌어야 한다.
+- `next_offset` pagination은 같은 query input과 fixed `limit`으로 만든 static
+  result window에만 적용한다. 데이터, readable scope, selected packs, 또는 ranking이
+  바뀐 요청 사이에는 snapshot consistency를 보장하지 않는다.
 
 ### 재현 명령
 
