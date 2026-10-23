@@ -857,7 +857,7 @@ class TestQueryResponseHTTP:
         }
 
     def test_query_response_encodes_datetime_and_keeps_private_metadata(
-        self, http_client, http_auth, monkeypatch
+        self, http_client, http_auth, monkeypatch, api_module
     ):
         from opencrab.ontology.query import QueryOutcome, QueryResult
 
@@ -872,11 +872,9 @@ class TestQueryResponseHTTP:
         monkeypatch.setattr(ctx.hybrid, "query", lambda **_kwargs: QueryOutcome([result], []))
         response = http_client.post("/api/query", json={"question": "x"}, headers=http_auth)
         assert response.status_code == 200
-        assert response.content == __import__("json").dumps(
-            response.json(), ensure_ascii=False, allow_nan=False, separators=(",", ":")
-        ).encode("utf-8")
+        assert response.content == api_module._query_response_bytes(response.json())
         metadata = response.json()["results"][0]["metadata"]
-        assert metadata["created_at"] == "2026-01-01T00:00:00+00:00"
+        assert metadata["created_at"] == "2026-01-01T00:00:00Z"
         assert metadata["_safe"] == "keep"
 
     def test_query_requires_auth(self, http_client):

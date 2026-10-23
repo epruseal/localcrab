@@ -10,9 +10,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, StrictInt
 
@@ -645,7 +643,28 @@ def ingest_text(
     return result
 
 
-@app.post("/api/query", response_class=JSONResponse)
+def _query_response_bytes(response: dict[str, Any]) -> bytes:
+    """Serialize query data with the default FastAPI response field."""
+    from asyncio import run
+
+    from fastapi.routing import serialize_response
+
+    route = next(route for route in app.routes if getattr(route, "path", None) == "/api/query")
+    return run(
+        serialize_response(
+            field=route.response_field,
+            response_content=response,
+            by_alias=True,
+            exclude_unset=False,
+            exclude_defaults=False,
+            exclude_none=False,
+            is_coroutine=False,
+            dump_json=True,
+        )
+    )
+
+
+@app.post("/api/query")
 def query_ontology(
     payload: QueryRequest,
     auth: AuthContext = Depends(require_auth),
@@ -723,11 +742,10 @@ def query_ontology(
     # 스레드풀에서 동시 요청이 몰려도 서로의 경고를 훔쳐보지 않는다.
     if outcome.warnings:
         response["spaces_filter_warnings"] = list(outcome.warnings)
-    response = jsonable_encoder(response, sqlalchemy_safe=False)
     response = result_caps.apply_response_budget(
         response,
         offset=payload.offset,
-        measure=lambda value: len(JSONResponse(value).body),
+        measure=lambda value: len(_query_response_bytes(value)),
     )
     _log_event(
         ctx.docs,
