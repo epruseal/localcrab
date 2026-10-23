@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from opencrab.common.json_transport import serialize_tool_result
@@ -167,6 +168,27 @@ def cap_selected_pack(
     return {**new_entry, "truncation": {"limit_chars": limit, "fields": cuts}}
 
 
+def cap_keyword_fallback(
+    entry: dict[str, Any], *, limit: int = QUERY_FIELD_CHAR_LIMIT
+) -> dict[str, Any]:
+    """Cut non-identifier strings in one REST keyword fallback entry."""
+    node = entry.get("node")
+    cuts: list[dict[str, Any]] = []
+    new_node, changed = _cap(
+        node,
+        ["node"],
+        limit,
+        cuts,
+        ("id", "node_id", "pack_id", "space"),
+    )
+    if not changed:
+        return entry
+    out = dict(entry)
+    out["node"] = new_node
+    out["truncation"] = {"limit_chars": limit, "fields": cuts}
+    return out
+
+
 def _wire_length(value: Any) -> int:
     """Return the UTF-8 byte contribution of tool content in its outer JSON string.
 
@@ -178,8 +200,10 @@ def _wire_length(value: Any) -> int:
     return len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
 
 
-def _truncated_response(response: dict[str, Any], k: int, n: int) -> dict[str, Any]:
-    """``R(k)``: the first ``k`` results, with the omitted count after ``results``."""
+def _truncated_response(
+    response: dict[str, Any], k: int, n: int, offset: int = 0
+) -> dict[str, Any]:
+    """``R(k)``: the first ``k`` results and continuation metadata."""
     out: dict[str, Any] = {}
     for key, value in response.items():
         if key == "total":
@@ -188,13 +212,18 @@ def _truncated_response(response: dict[str, Any], k: int, n: int) -> dict[str, A
             out[key] = value[:k]
             out["results_truncated"] = True
             out["omitted_results"] = n - k
+            out["next_offset"] = offset + k
         else:
             out[key] = value
     return out
 
 
 def apply_response_budget(
-    response: dict[str, Any], *, budget: int = QUERY_RESPONSE_CHAR_BUDGET
+    response: dict[str, Any],
+    *,
+    budget: int = QUERY_RESPONSE_CHAR_BUDGET,
+    offset: int = 0,
+    measure: Callable[[Any], int] = _wire_length,
 ) -> dict[str, Any]:
     """Return the response to send. See the decision table in the design doc.
 
@@ -203,22 +232,22 @@ def apply_response_budget(
     """
     results = response["results"]
     n = len(results)
-    length = _wire_length(response)
+    length = measure(response)
     if length <= budget:
         return response
 
     if n >= 2:
-        first = _truncated_response(response, 1, n)
-        if _wire_length(first) <= budget:
+        first = _truncated_response(response, 1, n, offset)
+        if measure(first) <= budget:
             fits, over = 1, n
             while over - fits > 1:
                 middle = (fits + over) // 2
-                if _wire_length(_truncated_response(response, middle, n)) <= budget:
+                if measure(_truncated_response(response, middle, n, offset)) <= budget:
                     fits = middle
                 else:
                     over = middle
-            chosen = _truncated_response(response, fits, n)
-            if _wire_length(chosen) <= budget:
+            chosen = _truncated_response(response, fits, n, offset)
+            if measure(chosen) <= budget:
                 logger.warning(
                     "ontology_query response over budget: bytes=%d results=%d kept=%d",
                     length, n, fits,

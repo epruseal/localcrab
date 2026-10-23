@@ -861,6 +861,7 @@ def extract(
 @click.argument("question")
 @click.option("--spaces", "-s", default=None, help="Comma-separated space IDs to filter.")
 @click.option("--limit", "-n", default=10, show_default=True)
+@click.option("--offset", type=click.IntRange(min=0), default=0, show_default=True)
 @click.option("--json-output", is_flag=True, default=False, help="Output raw JSON (legacy list format).")
 @click.option(
     "--pack-id",
@@ -895,6 +896,7 @@ def query(
     question: str,
     spaces: str | None,
     limit: int,
+    offset: int,
     json_output: bool,
     pack_ids: tuple[str, ...],
     auto_pack: bool,
@@ -907,6 +909,7 @@ def query(
     from opencrab.config import get_settings
     from opencrab.ontology.query import HybridQuery
     from opencrab.pack.read_scope import assert_registry_covers_graph, read_scope
+    from opencrab.services import result_caps
     from opencrab.services.pack_selection import cli_warning_text, resolve_packs
 
     # #147: CLI query is a read entry point like the MCP/REST ones and must
@@ -972,15 +975,25 @@ def query(
         limit=limit,
         pack_ids=effective_pack_ids,
     )
-    results = outcome.results
+    results = outcome.results[offset:limit]
     # #51: spaces 필터의 과도기 경고(백필 전 기존 벡터 제외)를 pack 경고와 동일하게 echo.
     # outcome.warnings 는 query() 의 반환값(지역 변수)이라 인스턴스 상태 경합이 없다.
     for warning in outcome.warnings:
         click.echo(f"warning: {warning}", err=True)
 
+    result_dicts = [
+        result_caps.cap_query_item(result.to_dict(), folded=bool(result.folded_count))
+        for result in results
+    ]
+    selected_packs = [result_caps.cap_selected_pack(pack) for pack in selected_packs]
+
     # --- Legacy list JSON output (must remain unchanged in shape) ---
     if json_output and not json_envelope:
-        click.echo(json.dumps([r.to_dict() for r in results], indent=2, default=str))
+        legacy_json = json.dumps(result_dicts, indent=2, ensure_ascii=True, default=str)
+        if len(legacy_json.encode("utf-8")) + 1 > result_caps.QUERY_RESPONSE_CHAR_BUDGET:
+            click.echo(json.dumps(result_caps.response_too_large_error(), ensure_ascii=True))
+        else:
+            click.echo(legacy_json)
         return
 
     # --- New envelope output ---
@@ -995,8 +1008,15 @@ def query(
             },
             "selected_packs": selected_packs,
             "total": len(results),
-            "results": [r.to_dict() for r in results],
+            "results": result_dicts,
         }
+        envelope = result_caps.apply_response_budget(
+            envelope,
+            offset=offset,
+            measure=lambda value: len(
+                (json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+            ),
+        )
         click.echo(json.dumps(envelope, indent=2, ensure_ascii=False, default=str))
         return
 

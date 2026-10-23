@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -855,6 +856,29 @@ class TestQueryResponseHTTP:
             "include_unpackaged": False,
         }
 
+    def test_query_response_encodes_datetime_and_keeps_private_metadata(
+        self, http_client, http_auth, monkeypatch, api_module
+    ):
+        from opencrab.ontology.query import QueryOutcome, QueryResult
+
+        result = QueryResult(
+            source="vector",
+            node_id="n1",
+            score=1e-7,
+            text="short",
+            metadata={"pack_id": "p", "created_at": datetime(2026, 1, 1, tzinfo=UTC), "_safe": "keep"},
+        )
+        ctx = http_client.app.state.context
+        monkeypatch.setattr(ctx.hybrid, "query", lambda **_kwargs: QueryOutcome([result], []))
+        response = http_client.post("/api/query", json={"question": "x"}, headers=http_auth)
+        assert response.status_code == 200
+        response_value = response.json()
+        assert response.content == api_module._query_response_bytes(response_value)
+        assert response_value["results"][0]["score"] == 1e-7
+        metadata = response_value["results"][0]["metadata"]
+        assert metadata["created_at"] == "2026-01-01T00:00:00Z"
+        assert metadata["_safe"] == "keep"
+
     def test_query_requires_auth(self, http_client):
         resp = http_client.post("/api/query", json={"question": "x"})
         assert resp.status_code == 401
@@ -872,6 +896,13 @@ class TestQueryResponseHTTP:
         # QueryRequest.limit le=25 → 초과 시 pydantic 422.
         resp = http_client.post(
             "/api/query", json={"question": "x", "limit": 999}, headers=http_auth
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.parametrize("offset", [-1, True])
+    def test_query_offset_validation_422(self, http_client, http_auth, offset):
+        resp = http_client.post(
+            "/api/query", json={"question": "x", "offset": offset}, headers=http_auth
         )
         assert resp.status_code == 422
 

@@ -951,9 +951,9 @@ docstring은 이 절을 가리킨다.
 
 ## 11. 질의 응답 크기 처리 (#511)
 
-이 절은 MCP `ontology_query` 응답의 크기 처리 계약의 정본이다. 설계와 결정표는
+이 절은 MCP `ontology_query`, REST `/api/query`, CLI `query --json-envelope` 응답의 크기 처리 계약의 정본이다. 설계와 결정표는
 `docs/issue-511-query-text-cap.md`에 있고 코드는 `opencrab/services/result_caps.py`다.
-CLI `query`와 REST `/api/query`는 이 처리를 거치지 않는다.
+세 구조화 응답은 같은 항목 상한을 적용한다.
 
 ### 항목 상한
 
@@ -984,9 +984,14 @@ CLI `query`와 REST `/api/query`는 이 처리를 거치지 않는다.
 ### 응답 예산
 
 응답 길이가 `QUERY_RESPONSE_CHAR_BUDGET`을 넘으면 `results`의 뒤쪽 결과를 덜어 낸다.
-길이의 단위는 도구 결과 문자열이 outer JSON string에서 차지하는 UTF-8 바이트
-길이다(`result_caps._wire_length`). JSON-RPC frame, request ID와 batch frame은
-이 단위에 들지 않는다.
+길이의 단위는 표면마다 실제 직렬화 형식을 따른다.
+
+- MCP는 도구 결과 문자열이 outer JSON string에서 차지하는 UTF-8 바이트 길이
+  (`result_caps._wire_length`)를 쓴다. JSON-RPC frame, request ID와 batch frame은
+  이 단위에 들지 않는다.
+- REST는 `/api/query`의 기본 FastAPI/Pydantic 직렬화 경로와 같은 response-field 직렬화를 쓴다. FastAPI가 `dump_json` capability를 제공하면 그 byte 결과를 쓰고, 제공하지 않으면 route의 기본 response class body bytes를 쓴다.
+- CLI `--json-envelope`은 들여쓴 UTF-8 JSON과 마지막 줄바꿈을 쓴다.
+- CLI `--json-output`은 기존 ASCII escape JSON list와 마지막 줄바꿈을 쓴다.
 
 | 조건 | 응답 |
 | --- | --- |
@@ -995,15 +1000,28 @@ CLI `query`와 REST `/api/query`는 이 처리를 거치지 않는다.
 | 예산 초과, 결과 한 건도 담을 수 없음(결과 0건이거나 `results` 밖 필드만으로 초과하는 경우 포함) | `{"error": "response_too_large", "message": ...}` (고정 문구) |
 
 `total`의 의미는 반환한 결과 수로 유지한다. 덜어 낸 결과는 응답에 싣지 않는다.
-접힌 구성원은 대표 결과와 함께 덜어 낸다.
+접힌 구성원은 대표 결과와 함께 덜어 낸다. 결과가 덜어졌으면 `next_offset`은
+다음 결과의 시작 위치를 담는다. 호출자는 최초 호출과 같은 `limit` 및 동일한 질의
+입력으로 이 값을 `offset`에 넣어 재개한다. `offset:limit` 페이지를 합치면 데이터,
+읽기 범위, 선택 팩, 순위 구현이 바뀌지 않은 조건에서 최초 결과 창과 같은 순서가
+된다. 이 계약은 snapshot 일관성을 제공하지 않는다.
+
+REST의 `keyword_fallback`은 기존처럼 primary 결과가 없을 때 caller의 전체 readable
+scope에서 검색한다. fallback 문자열은 상한을 적용하되 node 식별자(`id`, `node_id`,
+`pack_id`, `space`)와 label은 유지한다. fallback만으로 예산을 넘으면 재개 정보 없이
+고정 오류를 반환한다.
+
+CLI `--json-output`은 기존 list 형식을 예산 안에서 유지한다. list가 예산을 넘으면
+고정 오류를 반환한다. 이어받기가 필요한 CLI 호출자는 `--json-envelope`를 사용한다.
 
 ### 알려진 한계
 
 - 두 상수는 모듈 상수이고 설정으로 열지 않는다. 대상 클라이언트의 수용 한도는
   측정하지 못했다.
-- 응답 예산은 `content[].text`의 UTF-8 바이트 기여분만 센다. JSON-RPC frame과
-  request ID와 batch frame은 예산에 들지 않는다.
-- 덜어 낸 결과를 이어서 받는 방법(페이지 넘기기)은 없다.
+- 표면별 serializer가 바뀌면 byte budget 측정도 그 serializer에 맞춰 바뀌어야 한다.
+- `next_offset` pagination은 같은 query input과 fixed `limit`으로 만든 static
+  result window에만 적용한다. 데이터, readable scope, selected packs, 또는 ranking이
+  바뀐 요청 사이에는 snapshot consistency를 보장하지 않는다.
 
 ### 재현 명령
 

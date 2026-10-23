@@ -32,8 +32,9 @@ logger = logging.getLogger(__name__)
             "and the synthesized text of BM25 and plain node vectors can differ from "
             "the original. When the response would pass its size budget, "
             "results are dropped from the tail: `total` is the number of results "
-            "returned, `results_truncated` is true and `omitted_results` is the number "
-            "dropped. If no result can be returned within the budget, the response is "
+            "returned, `results_truncated` is true, `omitted_results` is the number "
+            "dropped, and `next_offset` resumes the same query window. If no result can be "
+            "returned within the budget, the response is "
             "{\"error\": \"response_too_large\", \"message\": ...}. (#511)"
         ),
         "inputSchema": {
@@ -49,6 +50,12 @@ logger = logging.getLogger(__name__)
                     "type": "integer",
                     "description": "Maximum number of results (default 10).",
                     "default": 10,
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Start index in the fixed result window (default 0).",
+                    "default": 0,
                 },
                 "use_bm25": {
                     "type": "boolean",
@@ -107,6 +114,7 @@ def ontology_query(
     question: str,
     spaces: list[str] | None = None,
     limit: int = 10,
+    offset: int = 0,
     use_bm25: bool = True,
     use_rerank: bool = True,
     use_fts: bool = True,
@@ -130,6 +138,9 @@ def ontology_query(
     with no explicit grant (#143's explicit prohibition). subject_id is
     therefore never forwarded to ``hybrid.query`` here, client-supplied or
     not -- #145 removed it as a tool argument entirely.
+
+    ``offset`` starts a page inside the fixed ``limit`` result window. Reuse the
+    same query input and limit with ``next_offset`` to resume an over-budget page.
 
     Response size (#511): a string inside a result's ``text``, ``metadata`` or
     ``graph_context`` (and inside ``selected_packs``) that is longer than
@@ -188,6 +199,9 @@ def ontology_query(
     from opencrab.services.canonical_ids import enrich as enrich_canonical
     from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be an integer >= 0")
+
     ctx = _get_context()
     cfg = get_settings()
     principal = current_principal()
@@ -221,7 +235,7 @@ def ontology_query(
             use_fts=use_fts,
             pack_ids=effective_pack_ids,
         )
-        results = outcome.results
+        results = outcome.results[offset:limit]
         # This is a store write (billing_events INSERT), but ontology_query stays
         # writes=False. NOT because the insert is idempotent (issue #105: it
         # isn't -- BillingHooks.emit mints a fresh UUID per call, so
@@ -309,7 +323,7 @@ def ontology_query(
                 response["pack_filter"]["warnings"] = pack_filter_warnings
         # #511: drop results from the tail when the response is over budget.
         return result_caps.apply_response_budget(
-            response, budget=result_caps.QUERY_RESPONSE_CHAR_BUDGET
+            response, budget=result_caps.QUERY_RESPONSE_CHAR_BUDGET, offset=offset
         )
     except Exception as exc:
         logger.error("ontology_query failed: %s", exc)

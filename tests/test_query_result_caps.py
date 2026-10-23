@@ -375,7 +375,7 @@ class TestResponseBudget:
         assert caps._wire_length(out) <= budget
         assert k == n - 1 or caps._wire_length(_r(response, k + 1)) > budget
         assert list(out) == [
-            "question", "total", "results", "results_truncated", "omitted_results", "selected_packs"
+            "question", "total", "results", "results_truncated", "omitted_results", "next_offset", "selected_packs"
         ]
         assert out["question"] == "q" and out["selected_packs"] == []
 
@@ -478,6 +478,45 @@ class TestResponseBudget:
         budget = (inner + wire) // 2
         out = apply_response_budget(response, budget=budget)
         assert out is not response and out["omitted_results"] == 1
+
+
+class TestContinuationAndSurfaceBytes:
+    def test_budget_adds_next_offset_before_it_measures(self):
+        response = _response(_results(3, 100))
+
+        def only_one_result_fits(value: dict[str, Any]) -> int:
+            if "next_offset" not in value:
+                return 2
+            assert value["next_offset"] == 7 + len(value["results"])
+            return 1 if len(value["results"]) == 1 else 2
+
+        out = apply_response_budget(response, budget=1, offset=7, measure=only_one_result_fits)
+        assert [item["node_id"] for item in out["results"]] == ["n0"]
+        assert out["total"] == 1
+        assert out["omitted_results"] == 2
+        assert out["next_offset"] == 8
+
+    def test_fallback_cap_keeps_identifiers_and_cuts_body(self):
+        fallback = {
+            "node": {
+                "id": "i" * (LIMIT + 1),
+                "node_id": "n" * (LIMIT + 1),
+                "pack_id": "p" * (LIMIT + 1),
+                "space": "s" * (LIMIT + 1),
+                "text": "한" * (LIMIT + 1),
+            },
+            "label": "L" * (LIMIT + 1),
+        }
+        out = caps.cap_keyword_fallback(fallback, limit=LIMIT)
+        assert out["node"]["id"] == fallback["node"]["id"]
+        assert out["node"]["node_id"] == fallback["node"]["node_id"]
+        assert out["node"]["pack_id"] == fallback["node"]["pack_id"]
+        assert out["node"]["space"] == fallback["node"]["space"]
+        assert out["label"] == fallback["label"]
+        assert out["node"]["text"] == "한" * LIMIT
+        assert out["truncation"]["fields"] == [
+            {"path": ["node", "text"], "original_chars": LIMIT + 1}
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +712,24 @@ class TestOntologyQueryHandler:
     def test_first_result_over_budget_is_the_fixed_error(self, monkeypatch):
         monkeypatch.setattr(caps, "QUERY_RESPONSE_CHAR_BUDGET", 100)
         assert _query([_qr("n1", "x" * 500)]) == response_too_large_error()
+
+    def test_continuation_uses_fixed_limit_and_next_offset(self, monkeypatch):
+        results = [_qr(f"n{i}", "한" * 20, score=1 - i / 10) for i in range(4)]
+        full = _query(results, limit=4)
+        monkeypatch.setattr(
+            caps, "QUERY_RESPONSE_CHAR_BUDGET", caps._wire_length(full) - 1
+        )
+        first = _query(results, limit=4)
+        second = _query(results, limit=4, offset=first["next_offset"])
+        assert first["next_offset"] == first["total"]
+        assert [item["node_id"] for item in first["results"] + second["results"]] == [
+            "n0", "n1", "n2", "n3"
+        ]
+
+    @pytest.mark.parametrize("offset", [-1, True, "0"])
+    def test_invalid_offset_is_rejected_by_handler(self, offset):
+        with pytest.raises(ValueError, match="offset must be an integer >= 0"):
+            _query([_qr("n1", "t")], offset=offset)
 
 
 # ---------------------------------------------------------------------------
