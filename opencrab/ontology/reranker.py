@@ -84,6 +84,21 @@ def _intent_boost(query: str, item: dict[str, Any]) -> float:
 def _merge_duplicate(existing: dict[str, Any], item: dict[str, Any]) -> None:
     """Merge duplicate node hits so consensus survives reranking."""
     existing_sources = set(existing.get("sources") or [existing.get("source", "hybrid")])
+    source_mixed = item.get("source", "hybrid") not in existing_sources
+    # Private provenance (see opencrab/ontology/query.py) survives a merge only
+    # when both hits carry the same proof for the same text. Any other merge
+    # invalidates it so a changed body can never keep a locator.
+    existing_proof = existing.get("_query_provenance")
+    item_proof = item.get("_query_provenance")
+    same_source_text = (
+        isinstance(existing_proof, dict)
+        and existing_proof == item_proof
+        and existing.get("text") == item.get("text")
+    )
+    if existing_proof is not None or item_proof is not None:
+        if not same_source_text:
+            existing.pop("_query_provenance", None)
+            existing["_query_provenance_invalidated"] = True
     existing_sources.add(item.get("source", "hybrid"))
     existing["sources"] = sorted(str(s) for s in existing_sources if s)
     if len(existing["sources"]) > 1:
@@ -102,7 +117,11 @@ def _merge_duplicate(existing: dict[str, Any], item: dict[str, Any]) -> None:
     old_text = existing.get("text") or ""
     new_text = item.get("text") or ""
     if new_text and new_text not in old_text:
-        existing["text"] = f"{old_text}\n{new_text}".strip()[:4000]
+        merged_text = f"{old_text}\n{new_text}".strip()
+        existing["text"] = merged_text[:4000]
+        existing["_query_text_transformed"] = True
+    elif source_mixed and (old_text or new_text):
+        existing["_query_text_transformed"] = True
 
     # #57: leg 병합 순서(vector < bm25 < fts < graph)는 값의 신뢰도와 무관하다.
     # 무조건 update() 하면 후순위 leg 의 falsy 값(빈 문자열, None 등)이 앞선

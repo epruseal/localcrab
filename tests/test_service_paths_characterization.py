@@ -1160,3 +1160,82 @@ class TestNodeEdgeWriteHTTP:
             json={"space": "subject", "node_type": "User", "node_id": "u1"},
         )
         assert resp.status_code == 401
+
+
+# ===========================================================================
+# #516: REST query surface over real HybridQuery legs (G7)
+# ===========================================================================
+
+from tests import _issue516_flow as flow  # noqa: E402
+
+
+@pytest.mark.parametrize("cell", flow.CELLS)
+def test_rest_pre_cap_unavailable_no_private_fields(
+    http_client, http_auth, local_principal, local_stores, monkeypatch, cell
+):
+    from opencrab.pack.ownership import ensure_default_pack
+
+    spec = flow.cell_spec(cell)
+    user_id, _secret = local_principal
+    pack_id = ensure_default_pack(local_stores["sql"], user_id)
+    ctx = http_client.app.state.context
+    # The same doc-store wiring the MCP and CLI entry points apply.
+    ctx.hybrid._doc_store = ctx.docs
+    flow.seed_source_rows(ctx.docs, pack_id, ["fx:1"], spec["source"])
+    flow.install_vector_leg(ctx.vector, monkeypatch, pack_id, ["fx:1"], spec["vector"])
+
+    recorded = []
+    original = ctx.hybrid.query
+
+    def recording_query(**kwargs):
+        outcome = original(**kwargs)
+        recorded.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(ctx.hybrid, "query", recording_query)
+    response = http_client.post("/api/query", json={"question": flow.NEEDLE}, headers=http_auth)
+    assert response.status_code == 200
+    # The real rerank output is asserted before any surface is inspected.
+    assert len(recorded) == 1
+    flow.assert_pre_surface(recorded[0], cell, folded=False)
+    body = response.json()
+    assert body["total"] == 1
+    flow.assert_public_unavailable(body["results"][0], cell)
+    assert flow.find_reserved(body) == []
+    assert len(response.content) <= 500_000
+
+
+def test_empty_primary_keyword_fallback_sanitizes_private_fields(
+    http_client, http_auth, local_principal, local_stores
+):
+    from opencrab.pack.ownership import create_pack, ensure_default_pack
+
+    user_id, _secret = local_principal
+    ensure_default_pack(local_stores["sql"], user_id)
+    create_pack(local_stores["sql"], user_id, "pack-fb")
+    ctx = http_client.app.state.context
+    props = {
+        "id": "fb:1",
+        "pack_id": "pack-fb",
+        "space": "evidence",
+        "text": "fbtoken " + "한" * 6000,
+        "source_integrity": {"version": 1, "state": "complete"},
+        "nested": {
+            "_source_classification": {"complete": True},
+            "rows": [{"_query_provenance": {"source_id": "s"}, "kept": "yes"}],
+        },
+    }
+    ctx.graph.upsert_node("TextUnit", "fb:1", props, "evidence")
+    response = http_client.post("/api/query", json={"question": "fbtoken"}, headers=http_auth)
+    assert response.status_code == 200
+    body = response.json()
+    # The primary search finds nothing in the default pack, so the fallback runs.
+    assert body["results"] == [] and body["total"] == 0
+    assert len(body["keyword_fallback"]) == 1
+    entry = body["keyword_fallback"][0]
+    assert entry["node"]["id"] == "fb:1" and entry["node"]["pack_id"] == "pack-fb"
+    assert len(entry["node"]["text"]) == flow.LIMIT
+    assert entry["truncation"]["fields"][0]["original_chars"] == len(props["text"])
+    assert entry["node"]["nested"]["rows"] == [{"kept": "yes"}]
+    assert flow.find_reserved(body) == []
+    assert len(response.content) <= 500_000

@@ -26,6 +26,7 @@ from opencrab.common.pack_tags import canonicalize_pack_alias
 from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.ontology.text_cues import QUERY_MULTIHOP_CUES as _MULTIHOP_QUERY_CUES
 from opencrab.ontology.text_cues import RELATION_CUES as _RELATION_QUERY_CUES
+from opencrab.stores._source_integrity import validate_source_row_payload
 from opencrab.stores.chroma_store import ChromaStore
 from opencrab.stores.neo4j_store import Neo4jStore
 
@@ -130,6 +131,13 @@ class QueryResult:
     # and keeps its top-level keys. Callers use this field to tell a fold
     # block from a caller-written metadata key of the same name.
     folded_count: int = 0
+    # Private evidence is kept outside public metadata. It crosses the query
+    # pipeline only through ``to_cap_item`` and never through ``to_dict``.
+    provenance: dict[str, str] | None = field(default=None, repr=False)
+    provenance_invalidated: bool = field(default=False, repr=False)
+    text_transformed: bool = field(default=False, repr=False)
+    folded_members: list[QueryResult] = field(default_factory=list, repr=False)
+    source_id: str | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,6 +149,27 @@ class QueryResult:
             "graph_context": self.graph_context,
             "raw_score": self.raw_score,
         }
+
+    def to_cap_item(self) -> dict[str, Any]:
+        """Build the private item consumed by the result cap.
+
+        No transport caller may serialize this value before ``cap_query_item``
+        removes its reserved fields.
+        """
+        item = self.to_dict()
+        if self.folded_members:
+            metadata = dict(item["metadata"])
+            block = dict(metadata.get(_FOLD_METADATA_KEY) or {})
+            block["members"] = [member.to_cap_item() for member in self.folded_members]
+            metadata[_FOLD_METADATA_KEY] = block
+            item["metadata"] = metadata
+        if self.provenance is not None:
+            item[_PRIVATE_PROVENANCE] = dict(self.provenance)
+        if self.provenance_invalidated:
+            item[_PRIVATE_PROVENANCE_INVALIDATED] = True
+        if self.text_transformed:
+            item[_PRIVATE_TRANSFORMED] = True
+        return item
 
 
 @dataclass
@@ -286,6 +315,60 @@ def _ordered_unique(values: list[str | None], limit: int) -> list[str]:
 _FOLD_BODIES = "_fold_bodies"
 _FOLDED_MEMBERS = "_folded_members"
 _FOLD_METADATA_KEY = "folded_duplicates"
+_PRIVATE_PROVENANCE = "_query_provenance"
+_PRIVATE_PROVENANCE_INVALIDATED = "_query_provenance_invalidated"
+_PRIVATE_TRANSFORMED = "_query_text_transformed"
+
+
+def _source_provenance(
+    doc_store: Any,
+    source_id: Any,
+    text: Any,
+    *,
+    permitted_packs: set[str],
+) -> dict[str, str] | None:
+    """Return private proof only for one unchanged, scoped source row.
+
+    The row-payload judgment is one shared G1 function. This function only
+    reads the scoped row and shapes the proof.
+    """
+    if not isinstance(source_id, str) or not isinstance(text, str) or not permitted_packs:
+        return None
+    read_exact = getattr(doc_store, "get_source_scoped_exact", None)
+    if not callable(read_exact):
+        return None
+    try:
+        row = read_exact(source_id, sorted(permitted_packs))
+    except Exception:
+        logger.debug("Exact source proof read failed", exc_info=True)
+        return None
+    validated = validate_source_row_payload(
+        row,
+        permitted_packs=permitted_packs,
+        expected_source_id=source_id,
+        expected_text=text,
+    )
+    if validated is None:
+        return None
+    proof_source_id, pack_id, _text, digest = validated
+    return {"source_id": proof_source_id, "pack_id": pack_id, "source_digest": digest}
+
+
+def _add_provenance(
+    item: dict[str, Any],
+    doc_store: Any,
+    source_id: Any,
+    permitted_packs: set[str],
+) -> dict[str, Any]:
+    """Attach non-public evidence to a source result without mutating it."""
+    proof = _source_provenance(
+        doc_store, source_id, item.get("text"), permitted_packs=permitted_packs
+    )
+    if proof is None:
+        return item
+    out = dict(item)
+    out[_PRIVATE_PROVENANCE] = proof
+    return out
 
 
 def _tag_fold_bodies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -850,6 +933,7 @@ class HybridQuery:
         question: str,
         *,
         pack_ids: list[str],
+        full_scope: set[str] | None = None,
         spaces: list[str] | None = None,
         limit: int = 10,
         graph_depth: int = 1,
@@ -908,6 +992,10 @@ class HybridQuery:
         result_lists: list[list[dict[str, Any]]] = []
         include_unpackaged = False
         profile = _profile_for_query(question, limit, graph_depth)
+        # A locator is private proof of a source row inside the caller's full
+        # readable scope AND the searched packs. An absent full scope leaves
+        # the searched packs as the only bound.
+        proof_packs = set(pack_ids) & (full_scope if full_scope is not None else set(pack_ids))
 
         # #51: 벡터 store 는 "space" 키가 없는 메타데이터를 매치 실패로 처리한다(무시가
         # 아님 — Chroma missing-key 시맨틱의 의도적 복제, sqlite_vec_store.py 참조).
@@ -971,7 +1059,17 @@ class HybridQuery:
             pack_ids=pack_ids, include_unpackaged=include_unpackaged,
         )
         if vector_hits:
-            result_lists.append(_tag_fold_bodies([r.to_dict() for r in vector_hits]))
+            vector_items = [r.to_dict() for r in vector_hits]
+            for result, item in zip(vector_hits, vector_items):
+                proof = _source_provenance(
+                    self._doc_store,
+                    result.source_id,
+                    result.text,
+                    permitted_packs=proof_packs,
+                )
+                if proof is not None:
+                    item[_PRIVATE_PROVENANCE] = proof
+            result_lists.append(_tag_fold_bodies(vector_items))
 
         # --- Stage 2: BM25 keyword search ---
         bm25_hits: list[dict[str, Any]] = []
@@ -992,6 +1090,10 @@ class HybridQuery:
                 pack_ids=pack_ids, include_unpackaged=include_unpackaged,
             )
             if fts_hits:
+                fts_hits = [
+                    _add_provenance(hit, self._doc_store, hit.get("source_id"), proof_packs)
+                    for hit in fts_hits
+                ]
                 result_lists.append(_tag_fold_bodies(fts_hits))
 
         # --- Stage 3: Graph expansion from vector/BM25/FTS anchor nodes ---
@@ -1054,6 +1156,9 @@ class HybridQuery:
                             kept[_FOLD_BODIES] = (
                                 kept.get(_FOLD_BODIES, frozenset()) | item[_FOLD_BODIES]
                             )
+                        # The flat merge keeps the first leg's item unchanged, so
+                        # its proof still matches its own text. The dropped
+                        # occurrence adds no text and needs no invalidation.
                         continue
                     seen[item.get("node_id")] = item
                     item["raw_score"] = item.get("score", 0.0)
@@ -1084,11 +1189,13 @@ class HybridQuery:
                 if pid:
                     metadata["pack_id"] = pid
             members = item.get(_FOLDED_MEMBERS) or []
+            member_results = [to_result(member) for member in members]
             if members:
                 metadata[_FOLD_METADATA_KEY] = {
                     "count": len(members),
-                    "members": [to_result(member).to_dict() for member in members],
+                    "members": [member.to_dict() for member in member_results],
                 }
+            provenance = item.get(_PRIVATE_PROVENANCE)
             return QueryResult(
                 source=item.get("source", "hybrid"),
                 node_id=item.get("node_id"),
@@ -1101,6 +1208,11 @@ class HybridQuery:
                 # score, so this is None for use_rerank=True results.
                 raw_score=item.get("raw_score"),
                 folded_count=len(members),
+                provenance=dict(provenance) if isinstance(provenance, dict) else None,
+                provenance_invalidated=bool(item.get(_PRIVATE_PROVENANCE_INVALIDATED)),
+                text_transformed=bool(item.get(_PRIVATE_TRANSFORMED)),
+                folded_members=member_results,
+                source_id=item.get("source_id"),
             )
 
         # Convert back to QueryResult
@@ -1352,6 +1464,7 @@ class HybridQuery:
         for h in hits:
             out.append({
                 "source": "keyword",
+                "source_id": h.get("source_id"),
                 "node_id": h.get("node_id"),
                 "score": h.get("score", 0.0),
                 "text": h.get("text"),
@@ -1394,6 +1507,7 @@ class HybridQuery:
             pid: [
                 {
                     "source": "keyword",
+                    "source_id": h.get("source_id"),
                     "node_id": h.get("node_id"),
                     "score": h.get("score", 0.0),
                     "text": h.get("text"),
@@ -1537,6 +1651,7 @@ class HybridQuery:
                         score=score,
                         text=hit.get("document"),
                         metadata=meta,
+                        source_id=hit.get("id"),
                     )
                 )
             return results

@@ -966,20 +966,18 @@ docstring은 이 절을 가리킨다.
 ```json
 {"limit_chars": 4000,
  "fields": [{"path": ["text"], "original_chars": 380000}],
- "full_text_tool": "ontology_get_node"}
+ "source_locator": {"version": "1", "source_id": "...", "pack_id": "...", "source_digest": "..."},
+ "full_text_tool": "ontology_get_source_range"}
 ```
 
 - 잘린 문자열이 없는 항목에는 `truncation`이 없고 변경 전 응답과 같은 값을 싣는다.
 - 식별자 자리(`node_id`, `canonical`, `graph_context`의 `anchor_id`와
   `edge_endpoints`와 `edge`, `selected_packs[i].pack_id`)와 객체 키는 자르지 않는다.
-- 전체 본문은 `ontology_get_node(node_id)`로 읽는다. 이 도구가 원문을 돌려주지
-  못하는 경우가 있다: 노드 id 한도를 넘는 소스 id로 적재해 그래프 노드가 없는
-  소스(`found=false`), `metadata.node_id`가 없는 id를 가리키는 소스(`found=false`),
-  `metadata.node_id`가 다른 기존 노드를 가리키는 소스(그 노드를 돌려준다),
-  속성 해독 오류(`property_decode_error`)가 있는 노드(`found=true`이지만 속성이
-  원문을 담지 않는다).
-  BM25 leg와 일반 노드 벡터의 `text`는 합성 문자열이므로 원래 값은 노드의
-  `properties`에서 읽는다.
+- `source_locator`는 현재 정확한 source row가 존재하고, 실제 row의 string `metadata.pack_id`가 읽기 범위와 질의 팩 범위에 있으며, backend-owned complete state의 digest와 본문이 일치하고, 잘리기 전 결과 본문도 source 본문과 바이트 단위로 같을 때만 붙는다. 이 판정은 `opencrab/stores/_source_integrity.py`의 `validate_source_row_payload` 한 곳이 맡는다.
+- locator가 있으면 `ontology_get_source_range(source_locator, offset_bytes, length_bytes)`가 strict UTF-8 byte range를 반환한다. offset은 0 이상 정수이고 length는 양의 정수여야 한다. 시작점과 끝점은 UTF-8 코드포인트 경계여야 한다.
+- 증거가 없거나 본문이 변형됐으면 `truncation.full_text_unavailable`이 true다. BM25, graph, 혼합 또는 rerank 변형 결과는 locator를 받지 않는다. 변형된 본문은 4000자 이하여도 `truncation`을 받는다.
+- 응답에는 private 증거(`_query_provenance` 계열 키, `source_integrity`, `_source_classification`)가 어느 깊이에도 실리지 않는다. 모든 공개 cap(결과 항목, 접힌 member, `selected_packs`, REST keyword fallback)은 같은 재귀 sanitizer를 거친다.
+- `ontology_get_node(node_id)`의 graph-scoped 동작은 바뀌지 않는다. 이 도구는 locator의 원문 읽기 경로가 아니다.
 
 ### 응답 예산
 

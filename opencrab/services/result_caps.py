@@ -35,9 +35,20 @@ QUERY_FIELD_CHAR_LIMIT = 4000
 # was not measured.
 QUERY_RESPONSE_CHAR_BUDGET = 500_000
 
-_FULL_TEXT_TOOL = "ontology_get_node"
+_FULL_TEXT_TOOL = "ontology_get_source_range"
+_SOURCE_LOCATOR_VERSION = "1"
 _FOLD_KEY = "folded_duplicates"
 _GRAPH_CONTEXT_SKIP = ("anchor_id", "edge_endpoints", "edge")
+_PRIVATE_PROVENANCE = "_query_provenance"
+_PRIVATE_PROVENANCE_INVALIDATED = "_query_provenance_invalidated"
+_PRIVATE_TRANSFORMED = "_query_text_transformed"
+_PRIVATE_KEYS = (
+    _PRIVATE_PROVENANCE,
+    _PRIVATE_PROVENANCE_INVALIDATED,
+    _PRIVATE_TRANSFORMED,
+    "source_integrity",
+    "_source_classification",
+)
 
 RESPONSE_TOO_LARGE_MESSAGE = (
     f"응답 길이가 응답 예산({QUERY_RESPONSE_CHAR_BUDGET}바이트)을 넘고, 결과를 덜어 내어도 "
@@ -93,28 +104,93 @@ def _cap(
     return value, False
 
 
+def _sanitize_public(value: Any) -> tuple[Any, bool]:
+    """Remove private evidence at every depth; leave public values unchanged.
+
+    The one recursive sanitizer of every public cap entry. Returns
+    ``(value, changed)``; an unchanged container is the same object.
+    """
+    if isinstance(value, dict):
+        rebuilt: dict[Any, Any] = {}
+        changed = False
+        for key, child in value.items():
+            if key in _PRIVATE_KEYS:
+                changed = True
+                continue
+            public_child, child_changed = _sanitize_public(child)
+            rebuilt[key] = public_child
+            changed = changed or child_changed
+        return (rebuilt, True) if changed else (value, False)
+    if isinstance(value, (list, tuple)):
+        items = []
+        changed = False
+        for child in value:
+            public_child, child_changed = _sanitize_public(child)
+            items.append(public_child)
+            changed = changed or child_changed
+        if not changed:
+            return value, False
+        return (tuple(items) if isinstance(value, tuple) else items), True
+    return value, False
+
+
+def _capture_evidence(item: Any, *, folded: bool) -> tuple[Any, bool, bool, tuple[Any, ...]]:
+    """Consume cap-local proof from a private item before it is sanitized."""
+    if not isinstance(item, dict):
+        return None, False, False, ()
+    members: tuple[Any, ...] = ()
+    if folded:
+        metadata = item.get("metadata")
+        block = metadata.get(_FOLD_KEY) if isinstance(metadata, dict) else None
+        raw_members = block.get("members") if isinstance(block, dict) else None
+        if isinstance(raw_members, list):
+            members = tuple(_capture_evidence(member, folded=False) for member in raw_members)
+    return (
+        item.get(_PRIVATE_PROVENANCE),
+        bool(item.get(_PRIVATE_PROVENANCE_INVALIDATED)),
+        bool(item.get(_PRIVATE_TRANSFORMED)),
+        members,
+    )
+
+
+def _valid_locator(provenance: Any) -> dict[str, str] | None:
+    if not isinstance(provenance, dict):
+        return None
+    keys = ("source_id", "pack_id", "source_digest")
+    if not all(isinstance(provenance.get(key), str) for key in keys):
+        return None
+    return {"version": _SOURCE_LOCATOR_VERSION, **{key: provenance[key] for key in keys}}
+
+
 def cap_query_item(
     item: dict[str, Any],
     *,
     limit: int = QUERY_FIELD_CHAR_LIMIT,
     folded: bool = False,
+    evidence: tuple[Any, bool, bool, tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
-    """Cut the long strings of one ``QueryResult.to_dict()`` item.
+    """Cut the long strings of one ``QueryResult.to_cap_item()`` item.
 
-    ``folded`` is true when the item carries a real fold block
-    (``QueryResult.folded_count``). Its members are items too and get their own
-    ``truncation``. A caller-written ``folded_duplicates`` value is a plain
-    value when ``folded`` is false.
+    Private proof is consumed first, then the public tree is sanitized, then
+    long strings are cut. ``folded`` is true when the item carries a real fold
+    block (``QueryResult.folded_count``). Its members are items too and get
+    their own ``truncation``. A caller-written ``folded_duplicates`` value is a
+    plain value when ``folded`` is false.
     """
+    if evidence is None:
+        evidence = _capture_evidence(item, folded=folded)
+    provenance, invalidated, transformed, member_evidence = evidence
+    public_item, private_present = _sanitize_public(item)
     cuts: list[dict[str, Any]] = []
     updates: dict[str, Any] = {}
 
-    if "text" in item:
-        new_text, changed = _cap(item["text"], ["text"], limit, cuts)
-        if changed:
+    text_changed = False
+    if "text" in public_item:
+        new_text, text_changed = _cap(public_item["text"], ["text"], limit, cuts)
+        if text_changed:
             updates["text"] = new_text
 
-    metadata = item.get("metadata")
+    metadata = public_item.get("metadata")
     metadata_skip = (_FOLD_KEY,) if folded else ()
     new_metadata, metadata_changed = _cap(
         metadata, ["metadata"], limit, cuts, metadata_skip
@@ -122,7 +198,7 @@ def cap_query_item(
     if metadata_changed:
         updates["metadata"] = new_metadata
 
-    graph_context = item.get("graph_context")
+    graph_context = public_item.get("graph_context")
     new_context, context_changed = _cap(
         graph_context, ["graph_context"], limit, cuts, _GRAPH_CONTEXT_SKIP
     )
@@ -135,7 +211,13 @@ def cap_query_item(
         members = block.get("members") if isinstance(block, dict) else None
         if isinstance(members, list):
             new_members = [
-                cap_query_item(member, limit=limit, folded=False) for member in members
+                cap_query_item(
+                    member,
+                    limit=limit,
+                    folded=False,
+                    evidence=member_evidence[index] if index < len(member_evidence) else None,
+                )
+                for index, member in enumerate(members)
             ]
             if any(new is not old for new, old in zip(new_members, members)):
                 members_changed = True
@@ -144,16 +226,23 @@ def cap_query_item(
                     _FOLD_KEY: {**block, "members": new_members},
                 }
 
-    if not cuts and not members_changed:
+    if not cuts and not members_changed and not private_present and not transformed:
         return item
-    out = dict(item)
+    out = dict(public_item)
     out.update(updates)
-    if cuts:
-        out["truncation"] = {
-            "limit_chars": limit,
-            "fields": cuts,
-            "full_text_tool": _FULL_TEXT_TOOL,
-        }
+    if cuts or transformed:
+        truncation: dict[str, Any] = {"limit_chars": limit, "fields": cuts}
+        locator = (
+            _valid_locator(provenance)
+            if text_changed and not invalidated and not transformed
+            else None
+        )
+        if locator is not None:
+            truncation["source_locator"] = locator
+            truncation["full_text_tool"] = _FULL_TEXT_TOOL
+        elif text_changed or transformed:
+            truncation["full_text_unavailable"] = True
+        out["truncation"] = truncation
     return out
 
 
@@ -161,10 +250,11 @@ def cap_selected_pack(
     entry: dict[str, Any], *, limit: int = QUERY_FIELD_CHAR_LIMIT
 ) -> dict[str, Any]:
     """Cut the long strings of one ``selected_packs`` entry; ``pack_id`` stays."""
+    public_entry, private_present = _sanitize_public(entry)
     cuts: list[dict[str, Any]] = []
-    new_entry, changed = _cap(entry, [], limit, cuts, ("pack_id",))
+    new_entry, changed = _cap(public_entry, [], limit, cuts, ("pack_id",))
     if not changed:
-        return entry
+        return public_entry if private_present else entry
     return {**new_entry, "truncation": {"limit_chars": limit, "fields": cuts}}
 
 
@@ -172,7 +262,8 @@ def cap_keyword_fallback(
     entry: dict[str, Any], *, limit: int = QUERY_FIELD_CHAR_LIMIT
 ) -> dict[str, Any]:
     """Cut non-identifier strings in one REST keyword fallback entry."""
-    node = entry.get("node")
+    public_entry, private_present = _sanitize_public(entry)
+    node = public_entry.get("node")
     cuts: list[dict[str, Any]] = []
     new_node, changed = _cap(
         node,
@@ -182,8 +273,8 @@ def cap_keyword_fallback(
         ("id", "node_id", "pack_id", "space"),
     )
     if not changed:
-        return entry
-    out = dict(entry)
+        return public_entry if private_present else entry
+    out = dict(public_entry)
     out["node"] = new_node
     out["truncation"] = {"limit_chars": limit, "fields": cuts}
     return out

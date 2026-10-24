@@ -431,7 +431,12 @@ from .pack import (  # noqa: E402
     pack_ingest,
     pack_publish,
 )
-from .query import ontology_impact, ontology_lever_simulate, ontology_query  # noqa: E402
+from .query import (  # noqa: E402
+    ontology_get_source_range,
+    ontology_impact,
+    ontology_lever_simulate,
+    ontology_query,
+)
 from .schema import (  # noqa: E402
     schema_pack_install,
     schema_pack_list,
@@ -463,6 +468,7 @@ __all__ = [
     "ontology_add_edge",
     "ontology_add_node",
     "ontology_get_node",
+    "ontology_get_source_range",
     "ontology_impact",
     "ontology_lever_simulate",
     "ontology_list_edges",

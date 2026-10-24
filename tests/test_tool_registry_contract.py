@@ -51,6 +51,7 @@ GOLDEN_TOOL_NAMES = [
     "pack_fork",
     "tool_search",
     "pack_diagnose_residue",
+    "ontology_get_source_range",
 ]
 
 

@@ -27,6 +27,7 @@ from _vec_helpers import build_vector_store
 from click.testing import CliRunner
 
 from opencrab.cli import main
+from tests import _issue516_flow as _flow
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -671,6 +672,70 @@ class TestQuery:
             "results",
         }
         assert envelope["total"] == 0
+
+    @staticmethod
+    def _run_flow_cell(bootstrapped, runner, mock_vector_store, monkeypatch, cell, flag):
+        """Run the real CLI query over controlled storage legs for one cell."""
+        from opencrab import cli as cli_module
+        from opencrab.config import get_settings
+        from opencrab.ontology.query import HybridQuery
+        from opencrab.pack.ownership import create_pack
+        from opencrab.stores.factory import make_sql_store
+        from tests import _issue516_flow as flow
+
+        spec = flow.cell_spec(cell)
+        create_pack(make_sql_store(get_settings()), bootstrapped, "pack-a", title="Pack A")
+        stores = cli_module._make_stores(
+            get_settings(), graph=True, vector=True, doc=True, sql=True
+        )
+        assert stores.doc.supports_keyword
+        flow.seed_source_rows(stores.doc, "pack-a", ["fx:1"], spec["source"])
+        flow.install_vector_leg(mock_vector_store, monkeypatch, "pack-a", ["fx:1"], spec["vector"])
+
+        recorded = []
+        original = HybridQuery.query
+
+        def recording_query(self, *args, **kwargs):
+            outcome = original(self, *args, **kwargs)
+            recorded.append(outcome)
+            return outcome
+
+        monkeypatch.setattr(HybridQuery, "query", recording_query)
+        result = runner.invoke(main, ["query", flow.NEEDLE, "--pack-id", "pack-a", flag])
+        assert result.exit_code == 0, result.output
+        # The real rerank output is asserted before any surface is inspected.
+        assert len(recorded) == 1
+        flow.assert_pre_surface(recorded[0], cell, folded=False)
+        return json.loads(result.stdout), len(result.stdout.encode("utf-8"))
+
+    @pytest.mark.parametrize("cell", _flow.CELLS)
+    def test_legacy_json_pre_cap_unavailable_no_private_fields(
+        self, bootstrapped, cli_env, runner, mock_vector_store, monkeypatch, cell
+    ):
+        from opencrab.services import result_caps
+        from tests import _issue516_flow as flow
+
+        items, size = self._run_flow_cell(
+            bootstrapped, runner, mock_vector_store, monkeypatch, cell, "--json-output"
+        )
+        assert isinstance(items, list) and len(items) == 1
+        flow.assert_public_unavailable(items[0], cell)
+        assert size <= result_caps.QUERY_RESPONSE_CHAR_BUDGET
+
+    @pytest.mark.parametrize("cell", _flow.CELLS)
+    def test_envelope_json_pre_cap_unavailable_no_private_fields(
+        self, bootstrapped, cli_env, runner, mock_vector_store, monkeypatch, cell
+    ):
+        from opencrab.services import result_caps
+        from tests import _issue516_flow as flow
+
+        envelope, size = self._run_flow_cell(
+            bootstrapped, runner, mock_vector_store, monkeypatch, cell, "--json-envelope"
+        )
+        assert envelope["total"] == 1 and len(envelope["results"]) == 1
+        flow.assert_public_unavailable(envelope["results"][0], cell)
+        assert flow.find_reserved(envelope) == []
+        assert size <= result_caps.QUERY_RESPONSE_CHAR_BUDGET
 
     def test_negative_offset_is_rejected(self, bootstrapped, cli_env, runner, mock_vector_store):
         result = runner.invoke(main, ["query", "zzz", "--offset", "-1"])

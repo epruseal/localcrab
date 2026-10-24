@@ -367,3 +367,34 @@ def test_rerank_path_keeps_its_result_cap():
     bm25 = [_bm(f"b{i:03d}", f"distinct {i}", float(200 - i)) for i in range(cap + 40)]
     out = _hq_with_legs(bm25=bm25).query("question", pack_ids=[PACK], use_rerank=True, limit=limit)
     assert len(out) == cap
+
+
+# ---------------------------------------------------------------------------
+# #516: a transformed folded member stays unavailable and carries no marker
+# ---------------------------------------------------------------------------
+
+from . import _issue516_flow as flow  # noqa: E402
+
+
+@pytest.mark.parametrize("cell", flow.CELLS)
+def test_pre_cap_fold_member_unavailable_no_private_marker(cell):
+    from opencrab.services import result_caps
+
+    spec = flow.cell_spec(cell)
+    node_ids = ["fx:1", "fx:2"]
+    vectors = [_vec(node_id, spec["vector"], 0.9 - index * 0.1) for index, node_id in enumerate(node_ids)]
+    keywords = [
+        {"source": "keyword", "node_id": node_id, "score": 1.0 - index * 0.1,
+         "text": spec["source"], "metadata": {"node_id": node_id, "pack_id": PACK}}
+        for index, node_id in enumerate(node_ids)
+    ]
+    # Real query, real Reranker, real fold and real QueryResult conversion.
+    outcome = _run(_hq_with_legs(vector=vectors, fts=keywords), rerank=True)
+    flow.assert_pre_surface(outcome, cell, folded=True)
+
+    item = result_caps.cap_query_item(outcome.results[0].to_cap_item(), folded=True)
+    flow.assert_public_unavailable(item, cell)
+    members = item["metadata"]["folded_duplicates"]["members"]
+    assert len(members) == 1
+    flow.assert_public_unavailable(members[0], cell)
+    assert flow.find_reserved(item) == []

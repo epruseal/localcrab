@@ -22,6 +22,7 @@ from opencrab.services.result_caps import (
     response_too_large_error,
 )
 
+from . import _issue516_flow as flow
 from ._vec_helpers import build_vector_store
 from .test_mcp_pack_aware import _real_sql_with_owned_pack, _stub_context
 
@@ -188,7 +189,7 @@ class TestItemHandling:
         assert out["truncation"] == {
             "limit_chars": LIMIT,
             "fields": [{"path": ["text"], "original_chars": 380_000}],
-            "full_text_tool": "ontology_get_node",
+            "full_text_unavailable": True,
         }
         assert list(out)[-1] == "truncation"
         assert list(out)[:-1] == list(item)
@@ -639,13 +640,28 @@ class TestOntologyQueryDescription:
     @pytest.mark.parametrize(
         "token",
         ["4000", "truncation", "results_truncated", "omitted_results", "response_too_large",
-         "ontology_get_node"],
+         "ontology_get_source_range", "full_text_unavailable"],
     )
     def test_description_names_the_new_contract(self, token):
         assert token in self._description()
 
 
 class TestOntologyQueryHandler:
+    @pytest.mark.parametrize("cell", flow.CELLS)
+    def test_pre_cap_unavailable_mcp_shape(self, stack, monkeypatch, cell):
+        spec = flow.cell_spec(cell)
+        flow.install_vector_leg(stack["vec"], monkeypatch, PACK, ["fx:1"], spec["vector"])
+        flow.seed_source_rows(stack["docs"], PACK, ["fx:1"], spec["source"])
+        outcome = stack["hybrid"].query(
+            question=flow.NEEDLE, pack_ids=[PACK], full_scope={PACK},
+            use_rerank=True, use_bm25=False, limit=5,
+        )
+        flow.assert_pre_surface(outcome, cell, folded=False)
+        response = _ask(stack, flow.NEEDLE, use_rerank=True, use_bm25=False)
+        assert response["total"] == 1
+        flow.assert_public_unavailable(response["results"][0], cell)
+        assert caps._wire_length(response) <= BUDGET
+
     def test_short_results_serialize_as_before(self):
         results = [
             _qr(f"n{i}", f"text {i}", score=score) for i, score in enumerate((0.5, 0.4, 0.3))
@@ -753,6 +769,7 @@ def stack(tmp_path):
     hybrid._doc_store = docs
     ctx = _stub_context(hybrid, sql=sql)
     ctx["neo4j"] = graph
+    ctx["mongo"] = docs
     try:
         yield {"vec": vec, "docs": docs, "graph": graph, "sql": sql, "hybrid": hybrid, "ctx": ctx}
     finally:
@@ -803,6 +820,28 @@ def _by_id(response, node_id):
     return next(r for r in response["results"] if r["node_id"] == node_id)
 
 
+def _read_source(stack, locator: dict[str, Any], step: int = 3000) -> str:
+    """Reassemble a source by actual range calls and join the UTF-8 bytes."""
+    from opencrab.mcp import tools
+
+    collected = b""
+    offset = 0
+    while True:
+        length = step
+        while True:
+            with patch.object(tools, "_get_context", return_value=stack["ctx"]):
+                chunk = tools.ontology_get_source_range(locator, offset, length)
+            if chunk.get("error") == "invalid_source_range" and length > 1:
+                length -= 1  # a cut inside a code point: shorten to a boundary
+                continue
+            break
+        assert "error" not in chunk, chunk
+        collected += chunk["text"].encode("utf-8")
+        offset += chunk["length_bytes"]
+        if "next_offset_bytes" not in chunk:
+            return collected.decode("utf-8")
+
+
 def _assert_bounded(response: dict[str, Any]) -> None:
     for item in response["results"]:
         assert _long_strings(item, LIMIT, folded="folded_duplicates" in (item.get("metadata") or {})) == []
@@ -810,16 +849,78 @@ def _assert_bounded(response: dict[str, Any]) -> None:
 
 
 class TestRealStores:
-    def test_vector_leg_is_cut_and_the_full_body_is_read_with_get_node(self, stack):
+    def test_vector_leg_locator_reassembles_the_full_source(self, stack):
         _write(stack, BIG, "src:big")
         response = _ask(stack, "alpha beta", limit=1, use_bm25=False, use_fts=False)
         assert response["total"] == 1
         item = response["results"][0]
         assert item["node_id"] == "src:big"
         assert item["truncation"]["fields"][0] == {"path": ["text"], "original_chars": len(BIG)}
-        assert item["truncation"]["full_text_tool"] == "ontology_get_node"
+        assert item["truncation"]["full_text_tool"] == "ontology_get_source_range"
+        assert item["truncation"]["source_locator"]["source_id"] == "src:big"
+        assert flow.find_reserved(item) == []
         _assert_bounded(response)
+        assert _read_source(stack, item["truncation"]["source_locator"]) == BIG
         node = _get(stack, item["node_id"])
+        assert node["found"] is True and node["properties"]["text"] == BIG
+
+    def test_same_node_two_sources_never_keeps_a_locator(self, stack, monkeypatch):
+        node_id = "dup:node"
+        flow.seed_source_rows(stack["docs"], PACK, ["src:a", "src:b"], BIG)
+        hits = [
+            {"id": source_id, "document": BIG, "distance": 0.1 + index / 100,
+             "metadata": {"pack_id": PACK, "space": "evidence", "node_id": node_id}}
+            for index, source_id in enumerate(["src:a", "src:b"])
+        ]
+        monkeypatch.setattr(
+            stack["vec"], "query",
+            lambda **_kwargs: [{**hit, "metadata": dict(hit["metadata"])} for hit in hits],
+        )
+        outcome = stack["hybrid"].query(
+            question="alpha", pack_ids=[PACK], full_scope={PACK},
+            use_rerank=True, use_bm25=False, use_fts=False, limit=5,
+        )
+        assert len(outcome.results) == 1
+        result = outcome.results[0]
+        assert result.text == BIG  # identical bodies are not concatenated
+        assert result.provenance is None and result.provenance_invalidated is True
+        item = caps.cap_query_item(result.to_cap_item())
+        assert "source_locator" not in item["truncation"]
+        assert item["truncation"]["full_text_unavailable"] is True
+
+    def test_query_proof_is_bounded_by_full_scope(self, stack, monkeypatch):
+        flow.seed_source_rows(stack["docs"], "p2", ["src:x"], BIG)
+        flow.install_vector_leg(stack["vec"], monkeypatch, "p2", ["src:x"], BIG)
+        kwargs = dict(
+            question="alpha", pack_ids=[PACK, "p2"], use_rerank=False,
+            use_bm25=False, use_fts=False, limit=5,
+        )
+        inside = stack["hybrid"].query(full_scope={PACK, "p2"}, **kwargs)
+        narrow = stack["hybrid"].query(full_scope={PACK}, **kwargs)
+        assert inside.results[0].provenance is not None
+        assert narrow.results[0].provenance is None
+
+    def test_graphless_locator_roundtrip(self, stack):
+        long_id = "J" * 300
+        receipt = _write(stack, "graphless zzgraphless " + BIG, long_id)
+        assert receipt["stores"]["graph"].startswith("skipped")
+        response = _ask(stack, "zzgraphless", use_bm25=False, use_fts=False)
+        item = _by_id(response, long_id)
+        locator = item["truncation"]["source_locator"]
+        assert locator["source_id"] == long_id
+        assert _read_source(stack, locator) == "graphless zzgraphless " + BIG
+        assert _get(stack, long_id)["found"] is False
+
+    def test_display_id_mismatch_reads_exact_source(self, stack):
+        _node(stack, "src:real", BIG)  # graph node only: no vector, no source row
+        other = "other zzother " + BIG
+        _write(stack, other, "src:other", node_id="src:real")
+        response = _ask(stack, "zzother", use_bm25=False, use_fts=False)
+        item = _by_id(response, "src:real")
+        locator = item["truncation"]["source_locator"]
+        assert locator["source_id"] == "src:other" and item["node_id"] == "src:real"
+        assert _read_source(stack, locator) == other
+        node = _get(stack, "src:real")
         assert node["found"] is True and node["properties"]["text"] == BIG
 
     def test_bm25_leg_is_cut(self, stack):
@@ -836,6 +937,8 @@ class TestRealStores:
         item = _by_id(response, "fts:big")
         assert item["source"] == "keyword"
         assert item["truncation"]["fields"][0]["path"] == ["text"]
+        assert item["truncation"]["source_locator"]["source_id"] == "fts:big"
+        assert _read_source(stack, item["truncation"]["source_locator"]) == "ftstoken " + BIG
         _assert_bounded(response)
 
     def test_graph_leg_metadata_text_is_cut(self, stack):
@@ -888,3 +991,39 @@ class TestRealStores:
         node = _get(stack, item["node_id"])
         assert node["found"] is True and node["properties"]["text"] == BIG
         assert node["properties"]["text"] != "other zzother " + BIG
+
+
+def _private_tree() -> dict[str, Any]:
+    return {
+        "_query_provenance": {"source_id": "s", "pack_id": "p", "source_digest": "d"},
+        "source_integrity": {"version": 1, "state": "complete"},
+        "keep": "public",
+        "nested": {"_source_classification": {"complete": True}, "deep": [
+            {"_query_text_transformed": True, "ok": 1},
+            ({"_query_provenance_invalidated": True, "ok": 2},),
+        ]},
+    }
+
+
+@pytest.mark.parametrize("path", ["query", "folded", "selected", "fallback"])
+def test_all_public_cap_paths_share_recursive_sanitizer(path):
+    private = _private_tree()
+    if path == "query":
+        out = cap_query_item(_item(metadata={"pack_id": PACK, **private}))
+        public = out["metadata"]
+    elif path == "folded":
+        member = _item(node_id="m1", metadata={"pack_id": PACK, **private})
+        rep = _item(metadata={"pack_id": PACK, "folded_duplicates": {"count": 1, "members": [member]}})
+        out = cap_query_item(rep, folded=True)
+        public = out["metadata"]["folded_duplicates"]["members"][0]["metadata"]
+    elif path == "selected":
+        out = caps.cap_selected_pack({"pack_id": PACK, "score": 1.0, **private})
+        public = out
+    else:
+        out = caps.cap_keyword_fallback({"node": {"id": "n1", "pack_id": PACK, **private}})
+        public = out["node"]
+    assert flow.find_reserved(out) == []
+    assert public["keep"] == "public"
+    assert public["nested"]["deep"][0] == {"ok": 1}
+    assert public["nested"]["deep"][1] == ({"ok": 2},)
+    assert private["nested"]["deep"][0]["_query_text_transformed"] is True  # input untouched
