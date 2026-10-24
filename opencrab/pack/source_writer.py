@@ -198,11 +198,10 @@ def write_source(
     forbids for a fork; the original vector is imported raw elsewhere instead.
 
     ``source_copy_state``, default None, is a backend state that the caller
-    verified. When it is not None, ``write_source`` runs the one doc-store write
-    inside ``source_copy_context`` with this state, and the doc store compares the
-    text and the digest with the state again before it stores a complete or an
-    unknown state. When it is None, ``write_source`` sets no context, and the doc
-    store reads any context that an outer caller already set.
+    verified. When it is not None, a doc store stores a complete state for this
+    write only when the state says complete and its text and digest equal the
+    written text and digest. When ``source_copy_state`` is None, ``write_source``
+    sets no context.
 
     A doc-store *error* stops the vector write: a vector row pointing at a
     source that failed to record is an orphan no read path can hydrate. A doc
@@ -287,7 +286,6 @@ def write_source(
     if _docs_available(docs):
         try:
             if source_copy_state is not None:
-                # #516 G3: the verified backend state rides the one public write.
                 with source_copy_context(source_copy_state):
                     created = docs.upsert_source(source_id, text, meta)
             else:

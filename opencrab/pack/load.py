@@ -1590,10 +1590,7 @@ def delete_pack(
                 {"done": not any_doc_failed, "clean": not any_doc_failed},
             )
 
-        # ── 2. doc_node_extra_and_sources: 고아 doc_nodes 벌크 삭제 + doc_sources
-        # (청크) + FTS. node_twin_loop 의 done 여부와 무관하게(게이팅 없음, 리드
-        # 재정의 실행 순서) 항상 시도한다 — 이 축 자신은 `done` 하나로만 재실행을
-        # 막는다.
+        # ── 2. doc_node_extra_and_sources: 고아 doc_nodes 와 doc_sources 행(청크, helper, FTS)을 삭제한다.
         if not _axis_done("doc_node_extra_and_sources") or live_docs or doc_nodes_live:
             # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
             # 위 조회와 동일하게 `pack_id` 단일 소유 키만 본다(위 주석의
@@ -1620,8 +1617,7 @@ def delete_pack(
 
             chunk_sql_del = 0
             for batch in _batched(src_ids):
-                # #516 G4: source, helper state and FTS rows leave in one store
-                # transaction. A failure rolls the batch back and surfaces here.
+                # 삭제 경계의 예외는 이 함수 밖으로 전파된다.
                 delete_sources = getattr(docs, "delete_sources_with_state", None)
                 if not callable(delete_sources):
                     raise RuntimeError("doc store lacks source-state delete boundary")
@@ -2977,9 +2973,11 @@ def load_chunks_incremental(
     sql,
     recover_vectors: bool = False,
 ) -> tuple[int, int, int, int, int, set, int]:
-    """청크 증분 적재. 텍스트 불변·메타만 변경된 행은 임베딩 없이 upsert_source만 호출.
+    """청크 증분 적재.
 
     반환: (c_new, c_txt, c_meta, c_same, err, bypack_ids, vec_unrecovered)
+    - c_meta: 텍스트 불변·메타 변경 행 중 `rewrite_source_metadata` 가 정상 반환한 행만 센다.
+    - err: 처리하지 못한 청크 수.
 
     열거 실패(#425): 시작 열거가 백엔드 오류로 실패하면 `_live_vec_ids_or_unconfirmed`
     가 "벡터 상태 미확인"으로 접는다. 적재는 끝까지 가고, 열거 결과로 존재를
@@ -3119,22 +3117,8 @@ def load_chunks_incremental(
                 b_metas.append(meta)
                 b_kinds.append("txt")
             elif strip_retired_keys(live[1]) != meta:
-                # 텍스트 불변, 메타만 변경 — 임베딩은 재계산하지 않는다(텍스트가 같으므로).
-                #
-                # **벡터를 먼저 고치고, 성공했을 때만 doc 기준을 옮긴다.** 형제(flush·
-                # flush_single)는 이미 벡터 먼저·doc 나중 순서다. 종전엔 이 메타 전용
-                # 분기만 `doc_sources`를 **먼저** 커밋하고 그 뒤에 벡터를 고쳤는데,
-                # `doc_sources`는 **다음 증분의 비교 기준**이라 벡터 수리가 실패해도
-                # 기준이 갱신돼 다음 실행이 "동일"로 넘어간다 — **영구 불일치**가 된다
-                # (2026-08-11 리뷰 지적). 벡터를 못 고치는 백엔드면 조용히 넘기지 않고
-                # 텍스트 경로로 보내 재임베딩시킨다 — 이때 doc은 옛 메타 그대로 두어
-                # 재시도 가능성을 보존한다(비교 기준을 섣불리 옮기지 않는다).
                 try:
                     if _vec_meta_update(vec, chunk_id, meta, pack_name):
-                        # #516 G3: 메타 재작성은 읽은 상태를 그대로 두고 메타만 바꾼다.
-                        # 두 메서드가 없는 doc store 는 상태를 읽을 수 없으므로 일반
-                        # upsert 로 쓰지 않고 거부한다. 거부는 아래 except 가 오류로
-                        # 세고, doc 은 옛 메타로 남아 다음 증분이 같은 분기를 다시 탄다.
                         state_reader = getattr(docs, "read_source_state_exact", None)
                         metadata_rewriter = getattr(docs, "rewrite_source_metadata", None)
                         if not (callable(state_reader) and callable(metadata_rewriter)):
@@ -3142,7 +3126,6 @@ def load_chunks_incremental(
                         metadata_rewriter(chunk_id, meta, state_reader(chunk_id))
                         c_meta += 1
                     else:
-                        # 벡터 메타를 못 고쳤다 — 재임베딩으로라도 맞춘다.
                         b_ids.append(chunk_id)
                         b_texts.append(row["text"])
                         b_metas.append(meta)
@@ -3359,7 +3342,7 @@ def incremental_finalize(
     chunk_del_list = list(chunk_del_candidates)
     for batch in _batched(chunk_del_list):
         try:
-            # #516 G4: source, helper state and FTS rows leave in one store transaction.
+            # 삭제 경계의 예외는 경고로 남기고 계속한다.
             delete_sources = getattr(docs, "delete_sources_with_state", None)
             if not callable(delete_sources):
                 raise RuntimeError("doc store lacks source-state delete boundary")

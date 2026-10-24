@@ -452,8 +452,10 @@ def migrate_docs(
     주의:
       - _id 필드는 JSON 직렬화 불가능하므로 제외
       - node_id 없는 문서는 skip + 경고
-      - 대상에 write_source_copy가 없으면 변경 없는 complete 원본만 upsert_source로 쓰고 나머지는 건너뛴다.
-      - source_id가 문자열이 아니거나 text가 문자열이 아닌 문서는 건너뛴다.
+      - 건너뛰는 source 문서: source_id가 없거나 문자열이 아닌 것, 재조회가 없거나
+        source_id가 다른 것, text가 UTF-8 문자열이 아닌 것.
+      - write_source_copy가 callable이 아닌 대상에서는 complete이고 열거·재조회의 ID·본문
+        digest·integrity 값이 같은 source만 upsert_source로 쓴다. 나머지는 건너뛴다.
     반환: {"nodes": N, "sources": M, "audit_events": K}
     """
     total_nodes = 0

@@ -6,7 +6,7 @@ store is limited to read-only source inspection until its global-identity
 mapping and target writer qualification are complete; a graph apply attempt
 raises ``GraphMigrationFixtureOnlyError`` before opening the target.
 
-WHAT THIS DOES: row-for-row copy for the document, SQL, and vector stores,
+WHAT THIS DOES: copy of the document, SQL, and vector stores,
 widening TEXT-JSON columns to JSONB and TEXT timestamps to TIMESTAMPTZ. Graph
 selection is inspection-only until its apply qualification is complete. NO
 re-embedding - the vector table's raw
@@ -22,14 +22,11 @@ SOURCE SAFETY: unlike migrate_add_binary_quantization.py (which rebuilds the
 source table in place and therefore REQUIRES --backup-to), this script reads
 the source SQLite files with SELECT statements. The doc_sources copy also sends
 BEGIN and ROLLBACK to fix one read snapshot. The script issues no data write
-against the source files. The originals are guaranteed unmodified
-by construction; there is deliberately no --backup-to flag here. Instead,
-pass --verify to have the script assert (exit non-zero on mismatch) that the
-target holds what the source did after loading. SQL-store tables with a natural
-key are checked by key rather than by count, because upserting into a target
-that already held rows of its own makes it a superset — a count comparison
-would call that a failure, while a genuine drop offset by a pre-existing row
-would pass. Everything else is still compared by count.
+against the source files. There is deliberately no --backup-to flag here.
+Pass --verify to check the target after loading; a mismatch exits non-zero.
+``--verify`` compares keys for SQL-store tables with a natural key and row counts
+for the tables in ``source_counts``. It skips a table that is absent from the
+source. It does not compare helper rows.
 
 IDEMPOTENCY: re-running is safe, but how differs by table.
 
@@ -47,12 +44,11 @@ case.
 
 The doc_nodes and audit_log copies skip a table when the target row count
 equals the source row count and the count is above zero. The vector copy keeps
-its own equal-count skip. The doc_sources copy has no count skip. When the run
-is not a dry run, it reads the source rows and their helper rows in one SQLite
-snapshot, deletes the target helper row of every copied source, and writes a
-helper row only for a source that had one. A written helper state is complete
-only when the shared strict decoder and the stored text digest both confirm it.
-Every other helper value is written as unknown.
+its own equal-count skip. The doc_sources copy has no count skip. A copied
+source whose helper row is absent in the source database ends with no target
+helper row. A helper row is not copied as it is: its state is written as
+complete only when the shared strict decoder and the stored text digest both
+confirm it, and every other helper value is written as unknown.
 
 SCHEMA CREATION: graph apply does not construct a target store. For the
 document store this script imports and instantiates PgDocStore (its constructor
@@ -111,9 +107,8 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def _migration_helper_state(text: str, raw: Any) -> str:
     """Return the helper JSON to write for one source row.
 
-    The shared strict decoder and classifier decide. Only a well-formed complete
-    state whose digest matches ``text`` stays complete. Every other value,
-    including a malformed or ambiguous one, becomes unknown.
+    Only a well-formed complete state whose digest matches ``text`` stays complete.
+    Every other value, including a malformed or ambiguous one, becomes unknown.
     """
     value = decode_integrity_value(raw, encoded_json=True)
     complete, digest = classify_integrity(
@@ -326,9 +321,7 @@ def migrate_doc(
         "ON CONFLICT (source_id) DO UPDATE SET source_integrity=EXCLUDED.source_integrity"
     )
     helper_delete_sql = text(f"DELETE FROM {t}.doc_source_integrity WHERE source_id=:source_id")
-    # #516 G4: the table-presence check and every source/helper read share one
-    # SQLite snapshot. BEGIN is deferred, so the first read below fixes the snapshot.
-    # Target writes stay per batch; a count-based skip would keep a stale helper.
+    # BEGIN is deferred: the first read after it fixes the snapshot.
     copied_sources = 0
     src.execute("BEGIN")
     try:

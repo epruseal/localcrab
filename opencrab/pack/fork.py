@@ -604,12 +604,13 @@ def _verified_source_copy_state(
 ) -> tuple[SourceCopyState | None, str | None]:
     """Return ``(state, None)`` for a verified origin, else ``(None, failure)``.
 
-    Two exact reads must agree with each other and with the record text. A doc
-    store without the exact reader gets an unknown legacy state, so a copy never
-    gains a complete state the origin did not prove. ``failure`` is
-    ``"state read failed (<exception type>)"`` when a read raised and
-    ``"state mismatch"`` when the reads or the record disagree. The exception
-    text stays in the operator log (#168).
+    A doc store without ``read_source_state_exact`` gets an unknown legacy state
+    and ``None``. ``failure`` is ``"state read failed (<exception type>)"`` when a
+    read raised. ``failure`` is ``"state mismatch"`` when the first read is not a
+    ``SourceCopyState``, the two reads differ, the state id or text differs from
+    the record, or a complete state has a digest that differs from the record
+    text. The response carries the exception type only; the exception text goes
+    to the operator log (#168).
     """
     reader = getattr(docs, "read_source_state_exact", None)
     if not callable(reader):
@@ -1706,15 +1707,9 @@ def _fork_pack_inner(
                 text = record.get("text") or ""
                 if not text:
                     # Defense against a backend returning an incomplete row.
-                    # Fall back to a direct fetch before treating this
-                    # source as empty.
                     fetched = docs.get_source(old_id) if hasattr(docs, "get_source") else None
                     if isinstance(fetched, dict):
                         text = fetched.get("text") or ""
-                # #516 G3: read the origin state twice. The fork refuses an
-                # origin that differs between the reads or from the record. After
-                # the final read the fork copies this verified snapshot, even if
-                # the origin changes later.
                 source_state, state_failure = _verified_source_copy_state(docs, old_id, text)
                 if source_state is None:
                     tier2_failure = f"source {old_id!r} -> {new_id!r} {state_failure}"
