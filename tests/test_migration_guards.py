@@ -484,7 +484,9 @@ class TestForwardMainGuard:
 # ---------------------------------------------------------------------------
 
 
-def _doc_source_db(path: Path, *, helper_state: object | None, with_helper_table: bool) -> str:
+def _doc_source_db(
+    path: Path, *, helper_state: object | None, with_helper_table: bool, null_row: bool = False
+) -> str:
     """A WAL source database with one source row and, if asked, its helper row."""
     conn = sqlite3.connect(str(path))
     try:
@@ -501,6 +503,8 @@ def _doc_source_db(path: Path, *, helper_state: object | None, with_helper_table
             conn.execute("CREATE TABLE doc_source_integrity (source_id TEXT PRIMARY KEY, source_integrity TEXT)")
             if helper_state is not None:
                 conn.execute("INSERT INTO doc_source_integrity VALUES ('source', ?)", (helper_state,))
+            elif null_row:
+                conn.execute("INSERT INTO doc_source_integrity VALUES ('source', NULL)")
         conn.commit()
     finally:
         conn.close()
@@ -668,7 +672,7 @@ def _canonical_helper_cases():
     unknown = {"version": 1, "state": "unknown"}
     return {
         "duplicate-key": (
-            '{"version": 1, "state": "complete", "text_digest": "' + digest + '", "state": "unknown"}',
+            '{"version": 1, "state": "unknown", "state": "complete", "text_digest": "' + digest + '"}',
             unknown,
         ),
         "float-version": (
@@ -698,11 +702,52 @@ def test_migration_helper_state_is_decided_by_the_strict_decoder(case: str) -> N
     assert json.loads(written) == expected
 
 
+@pytest.mark.parametrize(
+    "case", ["sql-null", "table-present-row-absent", "table-absent", "valid-complete"]
+)
+def test_migrate_doc_helper_row_matrix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str) -> None:
+    """The real migrate_doc separates a SQL NULL helper value, a present helper table
+    without this source's row, an absent helper table and a valid complete row.
+    The recording engine keeps each target statement and its parameters."""
+    from opencrab.stores._source_integrity import complete_integrity, strict_utf8_digest
+
+    complete_state = json.dumps(complete_integrity(strict_utf8_digest("old body")))
+    options = {
+        "sql-null": dict(helper_state=None, with_helper_table=True, null_row=True),
+        "table-present-row-absent": dict(helper_state=None, with_helper_table=True),
+        "table-absent": dict(helper_state=None, with_helper_table=False),
+        "valid-complete": dict(helper_state=complete_state, with_helper_table=True),
+    }[case]
+    db = _doc_source_db(tmp_path / "matrix.db", **options)
+    monkeypatch.setattr("opencrab.stores.pg_doc_store.PgDocStore", _FakePgDocStore)
+    engine = _RecordingEngine()
+
+    fwd.migrate_doc(db, engine, "public", batch=10, limit=None, dry_run=False)
+
+    deletes = [
+        params for statement, params in engine.log
+        if 'DELETE FROM "public".doc_source_integrity' in statement
+    ]
+    inserts = [
+        params for statement, params in engine.log
+        if 'INTO "public".doc_source_integrity' in statement and "INSERT" in statement and params
+    ]
+    assert deletes == [[{"source_id": "source"}]], "the target helper row is removed for every copied source"
+    if case == "valid-complete":
+        assert len(inserts) == 1 and len(inserts[0]) == 1
+        assert json.loads(inserts[0][0]["source_integrity"]) == json.loads(complete_state)
+    elif case == "sql-null":
+        assert len(inserts) == 1 and len(inserts[0]) == 1
+        assert json.loads(inserts[0][0]["source_integrity"]) == {"version": 1, "state": "unknown"}
+    else:
+        assert inserts == [], "a source without a helper row writes no helper row"
+
+
 @pytest.mark.skipif(
     not os.environ.get("OPENCRAB_PG_TEST_URL"),
     reason="OPENCRAB_PG_TEST_URL not set - needs a real PostgreSQL target (implemented-unrun)",
 )
-@pytest.mark.parametrize("case", [*_canonical_helper_cases(), "absence"])
+@pytest.mark.parametrize("case", [*_canonical_helper_cases(), "absence", "null-helper", "row-absent"])
 def test_malformed_helper_jsonb_retry(tmp_path: Path, case: str) -> None:
     """A real PostgreSQL target that already holds a complete state is corrected by
     migrate_doc, and a second run gives the same canonical state."""
@@ -712,9 +757,17 @@ def test_malformed_helper_jsonb_retry(tmp_path: Path, case: str) -> None:
 
     from opencrab.stores.pg_doc_store import PgDocStore
 
-    raw, expected = (None, None) if case == "absence" else _canonical_helper_cases()[case]
+    if case == "absence":
+        raw, expected, table, null_row = None, None, False, False
+    elif case == "null-helper":
+        raw, expected, table, null_row = None, {"version": 1, "state": "unknown"}, True, True
+    elif case == "row-absent":
+        raw, expected, table, null_row = None, None, True, False
+    else:
+        raw, expected = _canonical_helper_cases()[case]
+        table, null_row = True, False
     schema = f"t{uuid.uuid4().hex[:12]}_mig"
-    db = _doc_source_db(tmp_path / "source.db", helper_state=raw, with_helper_table=raw is not None)
+    db = _doc_source_db(tmp_path / "source.db", helper_state=raw, with_helper_table=table, null_row=null_row)
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE doc_sources SET text='body' WHERE source_id='source'")
     engine = create_engine(os.environ["OPENCRAB_PG_TEST_URL"])

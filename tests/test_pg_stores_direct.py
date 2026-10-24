@@ -699,11 +699,35 @@ class TestPgNonFiniteJsonRejection:
 # ---------------------------------------------------------------------------
 
 
+def _stop_threads(started, events, timeout=5):
+    """Release every event, join the started threads with a bound, return the live ones."""
+    for event in events:
+        event.set()
+    for thread in started:
+        thread.join(timeout)
+    return [thread for thread in started if thread.is_alive()]
+
+
+def _lock_waiter_seen(pg_engine, schema: str) -> bool:
+    """True while some backend waits on a lock in a FOR UPDATE statement of this schema."""
+    with pg_engine.connect() as conn:
+        count = conn.execute(
+            text(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE wait_event_type='Lock' AND pid <> pg_backend_pid() "
+                "AND query ILIKE :pattern"
+            ),
+            {"pattern": f"%{schema}%doc_sources%FOR UPDATE%"},
+        ).scalar_one()
+    return count > 0
+
+
 class TestPgDocSourceIntegrityLifecycle:
     def test_locked_metadata_rewrite_rejects_concurrent_state_change(self, pg_engine):
         """RW-PG-01. The writer and the rewrite run in two threads with two
         connections. The rewrite lock attempt is taken from the statement hook of
-        the rewrite thread only, so a writer statement cannot stand in for it."""
+        the rewrite thread only. The main thread then observes the waiting backend in
+        pg_stat_activity, so the block is seen and not inferred from elapsed time."""
         from sqlalchemy import event
 
         schema = f"t{uuid.uuid4().hex[:12]}_rw"
@@ -716,6 +740,8 @@ class TestPgDocSourceIntegrityLifecycle:
         errors: list[BaseException] = []
         thread_ids: dict[str, int] = {}
         hook_seen: list[tuple[str, bool]] = []
+        started: list[threading.Thread] = []
+        listening = False
 
         def observe_lock(_conn, _cursor, statement, _params, _context, _many):
             if "FOR UPDATE" in statement and "doc_sources" in statement:
@@ -729,6 +755,7 @@ class TestPgDocSourceIntegrityLifecycle:
             stale = store.read_source_state_exact("source")
             assert stale is not None and stale.complete
             event.listen(pg_engine, "before_cursor_execute", observe_lock)
+            listening = True
 
             def writer():
                 thread_ids["writer"] = threading.get_ident()
@@ -736,7 +763,7 @@ class TestPgDocSourceIntegrityLifecycle:
                     with pg_engine.begin() as conn:
                         conn.execute(text(f'SELECT source_id FROM "{schema}".doc_sources WHERE source_id=\'source\' FOR UPDATE'))
                         writer_locked.set()
-                        assert release_writer.wait(3)
+                        assert release_writer.wait(10)
                         conn.execute(
                             text(f'UPDATE "{schema}".doc_source_integrity SET source_integrity=CAST(:state AS jsonb) WHERE source_id=\'source\''),
                             {"state": json.dumps({"version": 1, "state": "unknown"})},
@@ -757,18 +784,24 @@ class TestPgDocSourceIntegrityLifecycle:
                     rewrite_done.set()
 
             writer_thread = threading.Thread(target=writer)
-            rewrite_thread = threading.Thread(target=rewrite)
             writer_thread.start()
-            assert writer_locked.wait(3)
+            started.append(writer_thread)
+            assert writer_locked.wait(10)
+            rewrite_thread = threading.Thread(target=rewrite)
             rewrite_thread.start()
-            assert rewrite_lock_attempted.wait(3), hook_seen
-            assert not rewrite_done.wait(0.05), "the rewrite must wait on the writer's row lock"
+            started.append(rewrite_thread)
+            assert rewrite_lock_attempted.wait(10), hook_seen
+            poll = threading.Event()
+            for _ in range(1000):
+                if _lock_waiter_seen(pg_engine, schema):
+                    break
+                poll.wait(0.01)
+            else:
+                pytest.fail("no backend was seen waiting on the writer's row lock")
+            assert not rewrite_done.is_set(), "the rewrite must wait on the writer's row lock"
             release_writer.set()
-            assert writer_committed.wait(3)
-            assert rewrite_done.wait(3)
-            writer_thread.join(3)
-            rewrite_thread.join(3)
-            assert not writer_thread.is_alive() and not rewrite_thread.is_alive()
+            assert writer_committed.wait(10)
+            assert rewrite_done.wait(10)
             assert not errors
             assert thread_ids["writer"] != thread_ids["rewrite"]
             assert any(not from_rewrite for _statement, from_rewrite in hook_seen), "the writer lock was seen"
@@ -776,9 +809,12 @@ class TestPgDocSourceIntegrityLifecycle:
             assert current is not None and current.complete is False
             assert store.get_source("source")["metadata"]["pack_id"] == "pack"
         finally:
-            release_writer.set()
-            event.remove(pg_engine, "before_cursor_execute", observe_lock)
-            _drop_schema(pg_engine, schema)
+            alive = _stop_threads(started, [release_writer])
+            if listening:
+                event.remove(pg_engine, "before_cursor_execute", observe_lock)
+            if not alive:
+                _drop_schema(pg_engine, schema)
+        assert not alive, "a test thread is still alive; the schema was kept"
 
 
 class TestPgDocSourceIntegritySnapshot:
@@ -789,55 +825,93 @@ class TestPgDocSourceIntegritySnapshot:
         return SourceCopyState("postgresql", "source", "body", None, False)
 
     def test_same_text_different_pack_unknown_to_complete_has_no_mixed_reader_version(self, pg_engine):
-        """PG-SNAP-01. While a writer holds uncommitted changes, the one-statement
-        reader returns the whole old version. After the commit it returns the whole
-        new version. The reader is never blocked by the writer."""
+        """PG-SNAP-01. The reader thread calls the product reader. The statement hook
+        of the reader thread waits after the first source or helper SELECT until the
+        writer has committed the new pack and the complete state. A reader that is
+        split into two SELECTs would read the new helper in the second SELECT and
+        return a mixed tuple. The one-statement reader returns the whole old version,
+        and the statement count of the reader thread is one."""
         import hashlib
+
+        from sqlalchemy import event
 
         schema = f"t{uuid.uuid4().hex[:12]}_snap"
         store = PgDocStore(pg_engine, schema=schema)
-        writer_locked = threading.Event()
-        release_writer = threading.Event()
+        first_select_done = threading.Event()
         writer_committed = threading.Event()
+        reader_ids: dict[str, int] = {}
+        reader_statements: list[str] = []
+        results: dict[str, object] = {}
+        errors: list[BaseException] = []
+        started: list[threading.Thread] = []
+        listening = False
+
+        def observe(_conn, _cursor, statement, _params, _context, _many):
+            if threading.get_ident() != reader_ids.get("reader"):
+                return
+            if "doc_sources" not in statement and "doc_source_integrity" not in statement:
+                return
+            reader_statements.append(statement)
+            if len(reader_statements) == 1:
+                first_select_done.set()
+                assert writer_committed.wait(10), "the writer did not commit"
+
         try:
             store.write_source_copy("source", "body", {"pack_id": "old-pack"}, self._unknown_copy_state())
+            event.listen(pg_engine, "after_cursor_execute", observe)
+            listening = True
+
+            def reader():
+                reader_ids["reader"] = threading.get_ident()
+                try:
+                    results["old"] = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                    first_select_done.set()
 
             def writer():
-                with pg_engine.begin() as conn:
-                    conn.execute(text(f'SELECT source_id FROM "{schema}".doc_sources WHERE source_id=\'source\' FOR UPDATE'))
-                    writer_locked.set()
-                    assert release_writer.wait(3)
-                    conn.execute(
-                        text(f'UPDATE "{schema}".doc_sources SET metadata=CAST(:metadata AS jsonb) WHERE source_id=\'source\''),
-                        {"metadata": json.dumps({"pack_id": "new-pack"})},
-                    )
-                    conn.execute(
-                        text(f'UPDATE "{schema}".doc_source_integrity SET source_integrity=CAST(:state AS jsonb) WHERE source_id=\'source\''),
-                        {"state": json.dumps({"version": 1, "state": "complete", "text_digest": hashlib.sha256(b"body").hexdigest()})},
-                    )
-                writer_committed.set()
+                try:
+                    assert first_select_done.wait(10)
+                    with pg_engine.begin() as conn:
+                        conn.execute(
+                            text(f'UPDATE "{schema}".doc_sources SET metadata=CAST(:metadata AS jsonb) WHERE source_id=\'source\''),
+                            {"metadata": json.dumps({"pack_id": "new-pack"})},
+                        )
+                        conn.execute(
+                            text(f'UPDATE "{schema}".doc_source_integrity SET source_integrity=CAST(:state AS jsonb) WHERE source_id=\'source\''),
+                            {"state": json.dumps({"version": 1, "state": "complete", "text_digest": hashlib.sha256(b"body").hexdigest()})},
+                        )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                finally:
+                    writer_committed.set()
 
-            thread = threading.Thread(target=writer)
-            thread.start()
-            assert writer_locked.wait(3)
-            old = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+            for target in (writer, reader):
+                thread = threading.Thread(target=target)
+                thread.start()
+                started.append(thread)
+            for thread in started:
+                thread.join(15)
+            assert not errors, errors
+            assert len(reader_statements) == 1, reader_statements
+            old = results["old"]
             assert old is not None
             assert (old["metadata"]["pack_id"], old["_source_classification"]["complete"]) == ("old-pack", False)
-            release_writer.set()
-            assert writer_committed.wait(3)
-            thread.join(3)
-            assert not thread.is_alive()
             new = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
             assert new is not None
             assert (new["metadata"]["pack_id"], new["_source_classification"]["complete"]) == ("new-pack", True)
         finally:
-            release_writer.set()
-            _drop_schema(pg_engine, schema)
+            alive = _stop_threads(started, [first_select_done, writer_committed])
+            if listening:
+                event.remove(pg_engine, "after_cursor_execute", observe)
+            if not alive:
+                _drop_schema(pg_engine, schema)
+        assert not alive, "a test thread is still alive; the schema was kept"
 
-    def test_split_read_counterexample_between_source_and_helper(self, pg_engine):
-        """A reader that reads the source row and the helper row in two statements
-        can see a tuple that no writer ever committed. This is the counterexample
-        that the one-statement JOIN of the store avoids."""
+    def test_two_statement_read_can_mix_versions_premise(self, pg_engine):
+        """Premise check, not a product check. Under READ COMMITTED, a reader that reads
+        the source row and the helper row in two statements can see a tuple that no
+        writer ever committed. The product reader is checked by the test above."""
         import hashlib
 
         schema = f"t{uuid.uuid4().hex[:12]}_split"

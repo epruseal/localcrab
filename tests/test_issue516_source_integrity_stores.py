@@ -571,3 +571,32 @@ def test_local_sources_get_list_non_dict_rows(local_store):
         assert local_store.get_source_scoped_exact(source_id, ["pack"]) is None
     with open(path, "rb") as handle:
         assert handle.read() == before
+
+
+def test_source_copy_context_resets_after_error(sql_store):
+    """#516 G1 ledger row: a failing write inside the copy context leaves no bound state."""
+    from opencrab.stores._source_integrity import (
+        SourceCopyState,
+        current_source_copy_state,
+        source_copy_context,
+        strict_utf8_digest,
+    )
+
+    state = SourceCopyState("sqlite", "source", "body", strict_utf8_digest("body"), False)
+    seen = []
+    real_upsert = sql_store.upsert_source
+
+    def failing_upsert(source_id, text, metadata):
+        seen.append(current_source_copy_state())
+        raise RuntimeError("forced write failure")
+
+    sql_store.upsert_source = failing_upsert  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="forced write failure"):
+        with source_copy_context(state):
+            sql_store.upsert_source("source", "body", {"pack_id": "pack"})
+
+    assert seen == [state], "the state was bound while the write ran"
+    assert current_source_copy_state() is None
+    sql_store.upsert_source = real_upsert  # type: ignore[method-assign]
+    sql_store.upsert_source("source", "body", {"pack_id": "pack"})
+    assert sql_store.read_source_state_exact("source").complete is True, "no state leaked into the next write"

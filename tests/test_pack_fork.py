@@ -4212,6 +4212,7 @@ class TestSourceIntegritySnapshot:
 
         assert len(reads) == 2 and reads[0] != reads[1], "the fork must read the origin state twice"
         assert out["status"] == "partial", out
+        assert "state mismatch" in out["error"], out
         assert out["copied"]["sources"] == 0
         assert self._copied(stack, out) == [], "no source is copied from a moving origin"
 
@@ -4251,6 +4252,26 @@ class TestSourceIntegritySnapshot:
         assert len(reads) == 2 and reads[0] == reads[1] and reads[0].complete is False
         assert out["status"] == "partial", out
         assert self._copied(stack, out) == [], "an unknown state with another text is not copied"
+
+    def test_state_read_exception_reports_the_type_name_only(self, stack, monkeypatch):
+        """A failing state read is not a mismatch. The response names only the exception type."""
+        src = _seed_pack(stack, ALICE, "src-snap-7", node_count=1, with_edge=False, with_source=True)
+        real = type(stack["docs"]).read_source_state_exact
+
+        def failing(self, source_id):
+            if source_id == "s0":
+                raise RuntimeError("secret body fragment from the store")
+            return real(self, source_id)
+
+        monkeypatch.setattr(type(stack["docs"]), "read_source_state_exact", failing, raising=True)
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert out["status"] == "partial", out
+        assert "state read failed (RuntimeError)" in out["error"], out
+        assert "state mismatch" not in out["error"], out
+        assert "secret body fragment" not in str(out), "the exception text must stay out of the response"
+        assert self._copied(stack, out) == []
 
     def test_state_change_between_reads_refuses(self, stack, monkeypatch):
         """The text stays the same. Only the classification changes between the reads."""

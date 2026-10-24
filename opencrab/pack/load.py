@@ -1619,7 +1619,6 @@ def delete_pack(
             src_ids = [docs._row_get(r, "source_id") for r in src_rows]
 
             chunk_sql_del = 0
-            fts_del = 0
             for batch in _batched(src_ids):
                 # #516 G4: source, helper state and FTS rows leave in one store
                 # transaction. A failure rolls the batch back and surfaces here.
@@ -1628,7 +1627,6 @@ def delete_pack(
                     raise RuntimeError("doc store lacks source-state delete boundary")
                 deleted = delete_sources(batch)
                 chunk_sql_del += deleted
-                fts_del += deleted if docs._dialect.name == "sqlite" else 0
             _commit_axis(
                 "doc_node_extra_and_sources",
                 {"done": True, "count": doc_node_extra_del + chunk_sql_del},
@@ -1636,7 +1634,6 @@ def delete_pack(
         else:
             doc_node_extra_del = 0
             chunk_sql_del = 0
-            fts_del = 0
 
         # ── 3. 게이팅: node_twin_loop 이 done 이어야만 graph_nodes 축에 진입한다 ──
         # `or rows`: 위 node_twin_loop 축과 동일한 이유(#327 재리뷰 P1, id
@@ -1714,7 +1711,7 @@ def delete_pack(
         prior_unknown = " 이전 부분 실행이 있었으며 그 건수는 알 수 없음." if resumed else ""
         print(
             f"  [{pack_name}] {resume_tag}삭제: 노드+엣지 {node_del}개(doc_nodes 보강 {doc_node_extra_del}), "
-            f"doc_sources {chunk_sql_del}개(fts {fts_del}), 벡터({vec_backend}) {vec_shown}개."
+            f"doc_sources {chunk_sql_del}개, 벡터({vec_backend}) {vec_shown}개."
             f"{prior_unknown}",
             flush=True,
         )
@@ -3135,12 +3132,14 @@ def load_chunks_incremental(
                 try:
                     if _vec_meta_update(vec, chunk_id, meta, pack_name):
                         # #516 G3: 메타 재작성은 읽은 상태를 그대로 두고 메타만 바꾼다.
+                        # 두 메서드가 없는 doc store 는 상태를 읽을 수 없으므로 일반
+                        # upsert 로 쓰지 않고 거부한다. 거부는 아래 except 가 오류로
+                        # 세고, doc 은 옛 메타로 남아 다음 증분이 같은 분기를 다시 탄다.
                         state_reader = getattr(docs, "read_source_state_exact", None)
                         metadata_rewriter = getattr(docs, "rewrite_source_metadata", None)
-                        if callable(state_reader) and callable(metadata_rewriter):
-                            metadata_rewriter(chunk_id, meta, state_reader(chunk_id))
-                        else:
-                            docs.upsert_source(chunk_id, row["text"], meta)
+                        if not (callable(state_reader) and callable(metadata_rewriter)):
+                            raise RuntimeError("doc store lacks source-state rewrite boundary")
+                        metadata_rewriter(chunk_id, meta, state_reader(chunk_id))
                         c_meta += 1
                     else:
                         # 벡터 메타를 못 고쳤다 — 재임베딩으로라도 맞춘다.

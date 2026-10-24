@@ -447,11 +447,13 @@ def migrate_docs(
     소스: MongoDB db["nodes"], db["sources"], db["audit_log"]
     대상: LocalDocStore 또는 LocalSQLDocStore
           .upsert_node_doc(space, node_type, node_id, properties)
-          .upsert_source(source_id, text, metadata)
+          .write_source_copy(source_id, text, metadata, source_copy_state)
           .log_event(event_type, subject_id, details)
     주의:
       - _id 필드는 JSON 직렬화 불가능하므로 제외
       - node_id 없는 문서는 skip + 경고
+      - 대상에 write_source_copy가 없으면 변경 없는 complete 원본만 upsert_source로 쓰고 나머지는 건너뛴다.
+      - source_id가 문자열이 아니거나 text가 문자열이 아닌 문서는 건너뛴다.
     반환: {"nodes": N, "sources": M, "audit_events": K}
     """
     total_nodes = 0
@@ -486,8 +488,11 @@ def migrate_docs(
         sources = mongo_db["sources"]
         for candidate in sources.find({}, {"_id": 0}):
             source_id = candidate.get("source_id")
-            if not isinstance(source_id, str) or not source_id:
+            if source_id is None or source_id == "":
                 log.warning("source_id 없는 MongoDB 문서 스킵")
+                continue
+            if not isinstance(source_id, str):
+                log.warning("문자열이 아닌 source_id의 MongoDB 문서 스킵: %s", type(source_id).__name__)
                 continue
             origin = sources.find_one(_mongo_source_query(source_id), {"_id": 0})
             if not isinstance(origin, dict) or origin.get("source_id") != source_id:

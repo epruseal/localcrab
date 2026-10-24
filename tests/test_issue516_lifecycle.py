@@ -81,3 +81,20 @@ def test_incremental_finalize_chunk_delete_removes_helper_and_fts(seeded):
     assert _present(docs, "pk-gone-1") == {"source": False, "helper": False, "fts": False}
     assert _present(docs, "pk-keep") == {"source": True, "helper": True, "fts": True}
     assert _present(docs, "other-s1") == {"source": True, "helper": True, "fts": True}
+
+
+def test_delete_pack_progress_line_names_only_counted_axes(seeded, capsys):
+    """#516 G4: the progress line gives the source count that the store returned.
+    It carries no FTS count, because the delete boundary does not count FTS rows."""
+    sql, graph, docs = seeded
+
+    with principal_scope(_gate._principal(_gate.OWNER)):
+        pack_load.delete_pack("pk", graph, docs, _gate._NoVec(), sql=sql)
+
+    lines = [
+        line for line in capsys.readouterr().out.splitlines()
+        if "삭제:" in line and "doc_sources" in line
+    ]
+    assert len(lines) == 1, lines
+    assert "doc_sources 3개" in lines[0], lines[0]
+    assert "fts" not in lines[0].lower(), lines[0]

@@ -127,6 +127,84 @@ def test_rewrite_state_change_rolls_back_without_overwrite(tmp_path):
         store_b.close()
 
 
+def test_scoped_exact_reader_reads_source_and_helper_in_one_statement(tmp_path):
+    """#516 F2 twin of the PG snapshot test. The reader thread traces its own
+    connection. If the product reader issues a second source or helper SELECT, the
+    trace waits there until the writer thread has committed the new pack and the
+    complete state. A one-statement reader never reaches that point, so the writer
+    runs after the read. The reader must return the whole old version from one
+    statement, and the second call must return the whole new version."""
+    from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    store = LocalSQLDocStore(str(tmp_path / "snapshot.db"))
+    store.write_source_copy(
+        "source", "body", {"pack_id": "old-pack"},
+        SourceCopyState("sqlite", "source", "body", strict_utf8_digest("body"), False),
+    )
+    statements: list[str] = []
+    writer_go = threading.Event()
+    writer_done = threading.Event()
+    results: dict[str, object] = {}
+    errors: list[BaseException] = []
+    connections: dict[str, int] = {}
+
+    def trace(sql: str) -> None:
+        text = " ".join(sql.split())
+        if text.startswith("SELECT") and ("doc_sources" in text or "doc_source_integrity" in text):
+            statements.append(text)
+            if len(statements) >= 2:
+                writer_go.set()
+                assert writer_done.wait(5), "the writer did not commit"
+
+    def reader() -> None:
+        try:
+            conn = store._conn
+            connections["reader"] = id(conn)
+            conn.set_trace_callback(trace)
+            try:
+                results["old"] = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+            finally:
+                conn.set_trace_callback(None)
+        except BaseException as exc:  # pragma: no cover - reported by the assertions below
+            errors.append(exc)
+            writer_go.set()
+
+    def writer() -> None:
+        try:
+            assert writer_go.wait(10)
+            connections["writer"] = id(store._conn)
+            store.upsert_source("source", "body", {"pack_id": "new-pack"})
+        except BaseException as exc:  # pragma: no cover - reported by the assertions below
+            errors.append(exc)
+        finally:
+            writer_done.set()
+
+    started = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    try:
+        for thread in started:
+            thread.start()
+        started[1].join(15)
+        writer_go.set()
+        started[0].join(15)
+    finally:
+        writer_go.set()
+        writer_done.set()
+        for thread in started:
+            thread.join(5)
+    assert not any(thread.is_alive() for thread in started)
+    assert errors == [], errors
+    assert connections["reader"] != connections["writer"], "the two threads use two connections"
+    assert len(statements) == 1, statements
+    old = results["old"]
+    assert old is not None
+    assert (old["metadata"]["pack_id"], old["_source_classification"]["complete"]) == ("old-pack", False)
+    new = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+    assert new is not None
+    assert (new["metadata"]["pack_id"], new["_source_classification"]["complete"]) == ("new-pack", True)
+    store.close()
+
+
 def test_delete_failure_rolls_back_source_helper_and_fts(store):
     """#516 G4: one failing statement leaves source, helper and FTS rows as they were."""
     if not store._fts_ok:

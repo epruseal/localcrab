@@ -599,29 +599,34 @@ def fork_pack(
         return rejected.response
 
 
-def _verified_source_copy_state(docs: Any, source_id: str, text: str) -> SourceCopyState | None:
-    """The origin state to copy, or ``None`` when the origin cannot be verified.
+def _verified_source_copy_state(
+    docs: Any, source_id: str, text: str
+) -> tuple[SourceCopyState | None, str | None]:
+    """Return ``(state, None)`` for a verified origin, else ``(None, failure)``.
 
     Two exact reads must agree with each other and with the record text. A doc
     store without the exact reader gets an unknown legacy state, so a copy never
-    gains a complete state the origin did not prove.
+    gains a complete state the origin did not prove. ``failure`` is
+    ``"state read failed (<exception type>)"`` when a read raised and
+    ``"state mismatch"`` when the reads or the record disagree. The exception
+    text stays in the operator log (#168).
     """
     reader = getattr(docs, "read_source_state_exact", None)
     if not callable(reader):
-        return SourceCopyState("legacy", source_id, text, None, False)
+        return SourceCopyState("legacy", source_id, text, None, False), None
     try:
         first = reader(source_id)
         final = reader(source_id)
     except Exception as exc:  # noqa: BLE001 -- #168: only the type name leaves this function
         logger.error("pack_fork: source state read failed for %r: %s", source_id, exc, exc_info=True)
-        return None
+        return None, f"state read failed ({type(exc).__name__})"
     if not isinstance(first, SourceCopyState) or first != final:
-        return None
+        return None, "state mismatch"
     if final.source_id != source_id or final.text != text:
-        return None
+        return None, "state mismatch"
     if final.complete and final.text_digest != strict_utf8_digest(text):
-        return None
-    return final
+        return None, "state mismatch"
+    return final, None
 
 
 def _fork_pack_inner(
@@ -1710,9 +1715,9 @@ def _fork_pack_inner(
                 # origin that differs between the reads or from the record. After
                 # the final read the fork copies this verified snapshot, even if
                 # the origin changes later.
-                source_state = _verified_source_copy_state(docs, old_id, text)
+                source_state, state_failure = _verified_source_copy_state(docs, old_id, text)
                 if source_state is None:
-                    tier2_failure = f"source {old_id!r} -> {new_id!r} state mismatch"
+                    tier2_failure = f"source {old_id!r} -> {new_id!r} {state_failure}"
                     break
                 receipt = write_source(
                     sql, hybrid, docs, vector, graph=graph,

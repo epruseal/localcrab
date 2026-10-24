@@ -347,6 +347,36 @@ class TestMigrateDocs:
         assert doc_store.get_source("src-1") is None
         assert db["sources"].requested_source_ids == ["src-1"]
 
+    def test_missing_and_non_string_source_id_warn_differently(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        docs = [
+            {"text": "no key", "metadata": {}},
+            {"source_id": None, "text": "null id", "metadata": {}},
+            {"source_id": "", "text": "empty id", "metadata": {}},
+            {"source_id": 123, "text": "int id", "metadata": {}},
+            {"source_id": False, "text": "bool id", "metadata": {}},
+        ]
+        db = _make_mongo_db_mock([], docs, [])
+        doc_store = LocalDocStore(data_dir=str(tmp_path / "ids-source"))
+        logger = logging.getLogger("mig-id-warn")
+
+        with caplog.at_level(logging.WARNING, logger="mig-id-warn"):
+            result = mig.migrate_docs(db, doc_store, batch_size=100, log=logger)
+
+        messages = [r.getMessage() for r in caplog.records if r.name == "mig-id-warn"]
+        missing = [m for m in messages if "source_id 없는" in m]
+        non_string = [m for m in messages if "문자열이 아닌 source_id" in m]
+        assert len(missing) == 3, messages
+        assert len(non_string) == 2, messages
+        assert any(m.endswith(": int") for m in non_string), non_string
+        assert any(m.endswith(": bool") for m in non_string), non_string
+        assert "123" not in " ".join(messages), "the id value stays out of the warning"
+        assert result["sources"] == 0
+        assert db["sources"].requested_source_ids == []
+
 
 # ---------------------------------------------------------------------------
 # Test: migrate_vectors — HTTP Chroma → local Chroma

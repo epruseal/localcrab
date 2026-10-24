@@ -19,9 +19,10 @@ has no binary 2-stage path (its HNSW index already serves global search at
 p95 6.44ms, see docs/vector-backends.md, pgvector section).
 
 SOURCE SAFETY: unlike migrate_add_binary_quantization.py (which rebuilds the
-source table in place and therefore REQUIRES --backup-to), this script only
-ever opens the source SQLite files with plain SELECT statements — it never
-issues a single write against them. The originals are guaranteed unmodified
+source table in place and therefore REQUIRES --backup-to), this script reads
+the source SQLite files with SELECT statements. The doc_sources copy also sends
+BEGIN and ROLLBACK to fix one read snapshot. The script issues no data write
+against the source files. The originals are guaranteed unmodified
 by construction; there is deliberately no --backup-to flag here. Instead,
 pass --verify to have the script assert (exit non-zero on mismatch) that the
 target holds what the source did after loading. SQL-store tables with a natural
@@ -44,8 +45,14 @@ and reported rather than blindly re-inserted, which would duplicate history.
 Operators should inspect and clear them manually before re-running in that edge
 case.
 
-The doc/vector migrations still skip on equal counts. Their rows are not
-credentials, and reworking them is outside this script's SQL-store scope.
+The doc_nodes and audit_log copies skip a table when the target row count
+equals the source row count and the count is above zero. The vector copy keeps
+its own equal-count skip. The doc_sources copy has no count skip. When the run
+is not a dry run, it reads the source rows and their helper rows in one SQLite
+snapshot, deletes the target helper row of every copied source, and writes a
+helper row only for a source that had one. A written helper state is complete
+only when the shared strict decoder and the stored text digest both confirm it.
+Every other helper value is written as unknown.
 
 SCHEMA CREATION: graph apply does not construct a target store. For the
 document store this script imports and instantiates PgDocStore (its constructor
