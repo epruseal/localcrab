@@ -136,6 +136,9 @@ class QueryResult:
     provenance: dict[str, str] | None = field(default=None, repr=False)
     provenance_invalidated: bool = field(default=False, repr=False)
     text_transformed: bool = field(default=False, repr=False)
+    # Length of the proven source text when ``text`` is its exact 4000 character
+    # prefix left by a merge. None otherwise.
+    source_chars: int | None = field(default=None, repr=False)
     folded_members: list[QueryResult] = field(default_factory=list, repr=False)
     source_id: str | None = field(default=None, repr=False)
 
@@ -169,6 +172,8 @@ class QueryResult:
             item[_PRIVATE_PROVENANCE_INVALIDATED] = True
         if self.text_transformed:
             item[_PRIVATE_TRANSFORMED] = True
+        if self.source_chars is not None:
+            item[_PRIVATE_SOURCE_CHARS] = self.source_chars
         return item
 
 
@@ -318,6 +323,7 @@ _FOLD_METADATA_KEY = "folded_duplicates"
 _PRIVATE_PROVENANCE = "_query_provenance"
 _PRIVATE_PROVENANCE_INVALIDATED = "_query_provenance_invalidated"
 _PRIVATE_TRANSFORMED = "_query_text_transformed"
+_PRIVATE_SOURCE_CHARS = "_query_text_source_chars"
 
 
 def _source_provenance(
@@ -1196,6 +1202,9 @@ class HybridQuery:
                     "members": [member.to_dict() for member in member_results],
                 }
             provenance = item.get(_PRIVATE_PROVENANCE)
+            source_chars = item.get(_PRIVATE_SOURCE_CHARS)
+            if isinstance(source_chars, bool) or not isinstance(source_chars, int):
+                source_chars = None
             return QueryResult(
                 source=item.get("source", "hybrid"),
                 node_id=item.get("node_id"),
@@ -1211,6 +1220,7 @@ class HybridQuery:
                 provenance=dict(provenance) if isinstance(provenance, dict) else None,
                 provenance_invalidated=bool(item.get(_PRIVATE_PROVENANCE_INVALIDATED)),
                 text_transformed=bool(item.get(_PRIVATE_TRANSFORMED)),
+                source_chars=source_chars,
                 folded_members=member_results,
                 source_id=item.get("source_id"),
             )

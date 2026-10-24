@@ -15,7 +15,15 @@ import pytest
 from opencrab.services import result_caps as caps
 from opencrab.stores._source_integrity import strict_utf8_digest
 from tests import test_query_result_caps as _caps
-from tests.test_query_result_caps import BIG, PACK, _ask, _by_id, _node, _write
+from tests.test_query_result_caps import (
+    BIG,
+    PACK,
+    _ask,
+    _ask_defaults,
+    _by_id,
+    _node,
+    _write,
+)
 
 # Reuse the real-store fixture from the query cap tests. Assigning it keeps the
 # fixture visible to pytest without an import that the test arguments shadow.
@@ -31,8 +39,9 @@ def _range(stack, locator: Any, offset: Any, length: Any) -> dict[str, Any]:
         return tools.ontology_get_source_range(locator, offset, length)
 
 
+@pytest.mark.parametrize("mode", ["flat", "defaults"])
 @pytest.mark.parametrize("case", ["graphless", "display-id", "multilingual"])
-def test_utf8_byte_roundtrip_from_actual_query(stack, case):
+def test_utf8_byte_roundtrip_from_actual_query(stack, case, mode):
     if case == "graphless":
         source_id = node_id = "J" * 300
         text = "graphless zzrt " + BIG
@@ -48,8 +57,14 @@ def test_utf8_byte_roundtrip_from_actual_query(stack, case):
         text = "multi zzrt " + "한글🙂 " * 4000
         _write(stack, text, source_id)
 
-    response = _ask(stack, "zzrt", use_bm25=False, use_fts=False)
-    locator = _by_id(response, node_id)["truncation"]["source_locator"]
+    if mode == "flat":
+        response = _ask(stack, "zzrt", use_bm25=False, use_fts=False)
+    else:
+        # No use_* argument: rerank, bm25 and fts all run, as for a real caller.
+        response = _ask_defaults(stack, "zzrt")
+    truncation = _by_id(response, node_id)["truncation"]
+    assert "source_locator" in truncation, truncation
+    locator = truncation["source_locator"]
     assert locator["source_id"] == source_id
     assert locator["source_digest"] == strict_utf8_digest(text)
 
@@ -155,3 +170,37 @@ def test_range_refuses_an_unknown_source_state(stack):
         {"sid": "src:one", "value": '{"version": 1, "state": "unknown"}'},
     )
     assert _range(stack, locator, 0, 100) == {"error": "full_text_unavailable"}
+
+
+def test_range_response_over_budget_is_refused(stack, monkeypatch):
+    locator = _one_source(stack)
+    normal = _range(stack, locator, 0, 100)
+    assert "error" not in normal
+    size = caps._wire_length(normal)
+    # One character under the wire length of the normal response: refused.
+    monkeypatch.setattr(caps, "QUERY_RESPONSE_CHAR_BUDGET", size - 1)
+    refused = _range(stack, locator, 0, 100)
+    assert refused["error"] == "response_too_large"
+    assert "length_bytes" in refused["message"]
+    # The query response text stays as it was.
+    assert refused["message"] != caps.RESPONSE_TOO_LARGE_MESSAGE
+    assert caps.response_too_large_error()["message"] == caps.RESPONSE_TOO_LARGE_MESSAGE
+    # Exactly the wire length: allowed (boundary control).
+    monkeypatch.setattr(caps, "QUERY_RESPONSE_CHAR_BUDGET", size)
+    assert _range(stack, locator, 0, 100) == normal
+
+
+@pytest.mark.parametrize("value", ["01", "2", "1.0", ""])
+def test_range_rejects_locator_version_values(stack, value):
+    # A string that is not exactly "1" passes the string and UTF-8 checks.
+    # Only the version comparison of the locator validation rejects it.
+    locator = {**_one_source(stack), "version": value}
+    assert _range(stack, locator, 0, 100) == {"error": "invalid_source_locator"}
+
+
+@pytest.mark.parametrize("value", [True, 1, 1.0, None])
+def test_range_rejects_locator_version_types(stack, value):
+    # Both the version comparison and the string check reject these values, so
+    # no single mutation separates them. This is a behavior boundary test.
+    locator = {**_one_source(stack), "version": value}
+    assert _range(stack, locator, 0, 100) == {"error": "invalid_source_locator"}

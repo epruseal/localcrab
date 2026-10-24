@@ -1170,7 +1170,7 @@ from tests import _issue516_flow as flow  # noqa: E402
 
 
 @pytest.mark.parametrize("cell", flow.CELLS)
-def test_rest_pre_cap_unavailable_no_private_fields(
+def test_rest_pre_cap_flow_no_private_fields(
     http_client, http_auth, local_principal, local_stores, monkeypatch, cell
 ):
     from opencrab.pack.ownership import ensure_default_pack
@@ -1200,7 +1200,7 @@ def test_rest_pre_cap_unavailable_no_private_fields(
     flow.assert_pre_surface(recorded[0], cell, folded=False)
     body = response.json()
     assert body["total"] == 1
-    flow.assert_public_unavailable(body["results"][0], cell)
+    flow.assert_public_cell(body["results"][0], cell)
     assert flow.find_reserved(body) == []
     assert len(response.content) <= 500_000
 

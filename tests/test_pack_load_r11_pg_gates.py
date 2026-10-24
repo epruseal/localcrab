@@ -406,7 +406,10 @@ class _PgShapeViolationError(AssertionError):
     """PG형 fake 가 sqlite 방언 누출·bare 테이블명·qmark·FTS 문장을 검출했을 때."""
 
 
-_KNOWN_TABLES = ("graph_nodes", "graph_edges", "doc_nodes", "doc_sources", "doc_sources_fts", "audit_log")
+_KNOWN_TABLES = (
+    "graph_nodes", "graph_edges", "doc_nodes", "doc_sources", "doc_sources_fts",
+    "doc_source_integrity", "audit_log",
+)
 
 
 def _validate_pg_shape(sql: str, schema: str) -> None:
@@ -598,6 +601,26 @@ class _PgFakeDocStore(_SqlDocStoreBase):
         self._raw.commit()
         return cur.rowcount
 
+    def _exec_write_many(self, statements):
+        # 실제 PgDocStore._exec_write_many 와 같은 계약: 한 쓰기 트랜잭션에서 입력
+        # 순서대로 실행하고 문장별 rowcount 를 같은 순서로 돌려준다. 어느 문장이든
+        # 실패하면 앞선 문장의 효과까지 모두 되돌리고 같은 예외를 올린다.
+        # 문장마다 검증하고 바로 실행한다(검증을 모아서 먼저 하면 첫 쓰기 뒤의
+        # 실패를 흉내 낼 수 없어 rollback 누락이 가려진다).
+        counts = []
+        try:
+            for sql, params in statements:
+                _validate_pg_shape(sql, self._schema)
+                cur = self._raw.execute(
+                    _translate_for_sqlite_execution(sql, self._schema), params
+                )
+                counts.append(cur.rowcount)
+        except BaseException:
+            self._raw.rollback()
+            raise
+        self._raw.commit()
+        return counts
+
     def _row_get(self, row, name):
         # 실제 PgDocStore 와 동일식(`row._mapping[name]`) — sqlite3.Row 는
         # 문자열 키 인덱싱을 지원하므로 `_mapping` 이 그 Row 자체를 돌려주면
@@ -775,3 +798,86 @@ class TestCountMalformedPropertiesPgConstantZero:
             docs._table("doc_nodes"): 0,
         }
         assert calls == [], "PG branch must not scan any table"
+
+
+# ---------------------------------------------------------------------------
+# #516: the fake's _exec_write_many keeps the contract of the real stores
+# ---------------------------------------------------------------------------
+
+
+def _integrity_statements(store, kind: str):
+    """Statements on the helper table, spelled with the store's own table name."""
+    table = store._table("doc_source_integrity")
+    insert = f"INSERT INTO {table} (source_id, source_integrity) VALUES (:id, :v)"
+    if kind == "counts":
+        return [
+            (f"DELETE FROM {table} WHERE source_id = :id", {"id": "absent"}),
+            (f"UPDATE {table} SET source_integrity = :v", {"v": "updated"}),
+            (f"DELETE FROM {table} WHERE source_id = :id", {"id": "a"}),
+        ]
+    if kind == "duplicate-key":
+        return [(insert, {"id": "z", "v": "1"}), (insert, {"id": "z", "v": "2"})]
+    raise AssertionError(kind)
+
+
+def _seed_integrity(store) -> None:
+    table = store._table("doc_source_integrity")
+    for source_id in ("a", "b", "c"):
+        store._exec_write(
+            f"INSERT INTO {table} (source_id, source_integrity) VALUES (:id, :v)",
+            {"id": source_id, "v": "seed"},
+        )
+
+
+def _integrity_count(store) -> int:
+    table = store._table("doc_source_integrity")
+    return store._fetch_one(f"SELECT COUNT(*) FROM {table}", {})[0]
+
+
+class TestPgFakeExecWriteMany:
+    def test_rowcounts_in_statement_order(self):
+        _graph, docs = _pg_fakes()
+        _seed_integrity(docs)
+        counts = docs._exec_write_many(_integrity_statements(docs, "counts"))
+        # A reversed result would read [1, 3, 0].
+        assert counts == [0, 3, 1]
+        assert _integrity_count(docs) == 2
+
+    def test_failure_after_a_write_rolls_everything_back(self):
+        _graph, docs = _pg_fakes()
+        with pytest.raises(sqlite3.IntegrityError):
+            docs._exec_write_many(_integrity_statements(docs, "duplicate-key"))
+        # The first insert ran, the second failed during execution. No row stays.
+        assert _integrity_count(docs) == 0
+
+    def test_shape_rejection_after_a_write_rolls_everything_back(self):
+        _graph, docs = _pg_fakes()
+        table = docs._table("doc_source_integrity")
+        statements = [
+            (f"INSERT INTO {table} (source_id, source_integrity) VALUES (:id, :v)",
+             {"id": "z", "v": "1"}),
+            ("INSERT INTO doc_source_integrity (source_id) VALUES (:id)", {"id": "y"}),
+        ]
+        with pytest.raises(_PgShapeViolationError):
+            docs._exec_write_many(statements)
+        assert _integrity_count(docs) == 0
+
+    def test_matches_the_real_local_store(self, tmp_path):
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        _graph, fake = _pg_fakes()
+        real = LocalSQLDocStore(str(tmp_path / "doc.db"))
+        try:
+            for store in (fake, real):
+                _seed_integrity(store)
+            fake_counts = fake._exec_write_many(_integrity_statements(fake, "counts"))
+            real_counts = real._exec_write_many(_integrity_statements(real, "counts"))
+            assert fake_counts == real_counts == [0, 3, 1]
+            outcomes = []
+            for store in (fake, real):
+                with pytest.raises(sqlite3.IntegrityError):
+                    store._exec_write_many(_integrity_statements(store, "duplicate-key"))
+                outcomes.append(_integrity_count(store))
+            assert outcomes == [2, 2]  # b and c stay from the first call, z was rolled back
+        finally:
+            real.close()

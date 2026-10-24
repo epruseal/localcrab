@@ -202,16 +202,18 @@ def test_postgres_upsert_single_column_conflict():
 
 def test_render_ddl_sqlite_statement_count_and_order():
     stmts = SQLITE.render_ddl(DOC_STORE_SCHEMA)
-    # 3 tables + 4 indexes. The two doc_nodes composite indexes serve
-    # unfiltered and space-filtered list_nodes ordering separately.
-    assert len(stmts) == 7
+    # 4 tables + 4 indexes. The two doc_nodes composite indexes serve
+    # unfiltered and space-filtered list_nodes ordering separately. The
+    # doc_source_integrity helper table follows doc_sources (#516).
+    assert len(stmts) == 8
     assert stmts[0].startswith("CREATE TABLE IF NOT EXISTS doc_nodes")
     assert stmts[1].startswith("CREATE INDEX IF NOT EXISTS idx_doc_nodes_updated")
     assert stmts[2].startswith("CREATE INDEX IF NOT EXISTS idx_doc_nodes_updated_tiebreak")
     assert stmts[3].startswith("CREATE INDEX IF NOT EXISTS idx_doc_nodes_space_updated_tiebreak")
     assert stmts[4].startswith("CREATE TABLE IF NOT EXISTS doc_sources")
-    assert stmts[5].startswith("CREATE TABLE IF NOT EXISTS audit_log")
-    assert stmts[6].startswith("CREATE INDEX IF NOT EXISTS idx_audit_ts")
+    assert stmts[5].startswith("CREATE TABLE IF NOT EXISTS doc_source_integrity")
+    assert stmts[6].startswith("CREATE TABLE IF NOT EXISTS audit_log")
+    assert stmts[7].startswith("CREATE INDEX IF NOT EXISTS idx_audit_ts")
 
 
 def test_render_ddl_sqlite_types_and_defaults():
@@ -225,7 +227,11 @@ def test_render_ddl_sqlite_types_and_defaults():
     doc_sources_ddl = stmts[4]
     assert "source_id TEXT PRIMARY KEY" in doc_sources_ddl
 
-    audit_log_ddl = stmts[5]
+    integrity_ddl = stmts[5]
+    assert "source_id TEXT PRIMARY KEY NOT NULL" in integrity_ddl
+    assert "source_integrity TEXT" in integrity_ddl
+
+    audit_log_ddl = stmts[6]
     assert "event_id TEXT PRIMARY KEY" in audit_log_ddl
     # subject_id is nullable: no NOT NULL, no DEFAULT
     assert "subject_id TEXT," in audit_log_ddl or "subject_id TEXT\n" in audit_log_ddl

@@ -152,13 +152,14 @@ def ontology_query(
     ``QUERY_FIELD_CHAR_LIMIT`` is cut, and the item gets a ``truncation`` key.
     Identifier places (a result's ``node_id`` and ``canonical``, the
     ``graph_context`` keys ``anchor_id``, ``edge_endpoints`` and ``edge``,
-    ``selected_packs[i].pack_id``) and object keys are not cut. The full body is
-    read with ``ontology_get_node(node_id)`` when that tool finds the graph node
-    in the readable scope and the node's properties hold the body; a source
-    without a graph node, a source whose ``metadata.node_id`` names another
-    node, a node with ``property_decode_error`` and the synthesized text of
-    BM25 and plain node vectors can differ from the original. When the response
-    is over
+    ``selected_packs[i].pack_id``) and object keys are not cut. When the shown
+    text is the proven source text or its exact first 4000 characters, the
+    item's ``truncation`` carries ``source_locator``; read the whole source with
+    ``ontology_get_source_range(source_locator, offset_bytes, length_bytes)``.
+    When the text was joined with other text or no proof exists,
+    ``truncation.full_text_unavailable`` is true and no locator is given.
+    ``ontology_get_node(node_id)`` keeps its graph-node meaning and is not the
+    way to read the source text. When the response is over
     ``QUERY_RESPONSE_CHAR_BUDGET``, results are dropped from the tail and the
     response carries ``results_truncated`` and ``omitted_results``; ``total``
     is the number of results returned. Contract: docs/ARCHITECTURE.md, "질의
@@ -491,9 +492,15 @@ def _valid_locator(locator: Any) -> dict[str, str] | None:
     return values
 
 
+_RANGE_TOO_LARGE_MESSAGE = (
+    "The range response is larger than the response budget. "
+    "Lower length_bytes and call again with the same offset_bytes."
+)
+
+
 def _range_response(value: dict[str, Any]) -> dict[str, Any]:
     if result_caps._wire_length(value) > result_caps.QUERY_RESPONSE_CHAR_BUDGET:
-        return result_caps.response_too_large_error()
+        return {"error": "response_too_large", "message": _RANGE_TOO_LARGE_MESSAGE}
     return value
 
 

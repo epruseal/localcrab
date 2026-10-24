@@ -648,7 +648,7 @@ class TestOntologyQueryDescription:
 
 class TestOntologyQueryHandler:
     @pytest.mark.parametrize("cell", flow.CELLS)
-    def test_pre_cap_unavailable_mcp_shape(self, stack, monkeypatch, cell):
+    def test_pre_cap_flow_mcp_shape(self, stack, monkeypatch, cell):
         spec = flow.cell_spec(cell)
         flow.install_vector_leg(stack["vec"], monkeypatch, PACK, ["fx:1"], spec["vector"])
         flow.seed_source_rows(stack["docs"], PACK, ["fx:1"], spec["source"])
@@ -659,7 +659,7 @@ class TestOntologyQueryHandler:
         flow.assert_pre_surface(outcome, cell, folded=False)
         response = _ask(stack, flow.NEEDLE, use_rerank=True, use_bm25=False)
         assert response["total"] == 1
-        flow.assert_public_unavailable(response["results"][0], cell)
+        flow.assert_public_cell(response["results"][0], cell)
         assert caps._wire_length(response) <= BUDGET
 
     def test_short_results_serialize_as_before(self):
@@ -809,6 +809,14 @@ def _ask(stack, question: str, **kw: Any) -> dict[str, Any]:
         return tools.ontology_query(question=question, pack_ids=[PACK], **kw)
 
 
+def _ask_defaults(stack, question: str) -> dict[str, Any]:
+    """Call ontology_query with no use_* argument, so every default leg runs."""
+    from opencrab.mcp import tools
+
+    with patch.object(tools, "_get_context", return_value=stack["ctx"]):
+        return tools.ontology_query(question=question, pack_ids=[PACK])
+
+
 def _get(stack, node_id: str) -> dict[str, Any]:
     from opencrab.mcp import tools
 
@@ -863,6 +871,21 @@ class TestRealStores:
         assert _read_source(stack, item["truncation"]["source_locator"]) == BIG
         node = _get(stack, item["node_id"])
         assert node["found"] is True and node["properties"]["text"] == BIG
+
+    def test_default_args_graph_node_source_gets_prefix_locator(self, stack):
+        # A source with a graph node: the BM25 leg adds the node text, and the
+        # merge slice keeps exactly the first 4000 characters of the vector body.
+        _write(stack, BIG, "src:big")
+        response = _ask_defaults(stack, "alpha beta")
+        item = _by_id(response, "src:big")
+        assert "truncation" in item
+        assert item["text"] == BIG[:flow.LIMIT]
+        assert item["truncation"]["fields"][0] == {"path": ["text"], "original_chars": len(BIG)}
+        assert item["truncation"]["source_locator"]["source_id"] == "src:big"
+        assert item["truncation"]["full_text_tool"] == "ontology_get_source_range"
+        assert _read_source(stack, item["truncation"]["source_locator"]) == BIG
+        assert flow.find_reserved(item) == []
+        _assert_bounded(response)
 
     def test_same_node_two_sources_never_keeps_a_locator(self, stack, monkeypatch):
         node_id = "dup:node"
@@ -997,9 +1020,10 @@ def _private_tree() -> dict[str, Any]:
     return {
         "_query_provenance": {"source_id": "s", "pack_id": "p", "source_digest": "d"},
         "source_integrity": {"version": 1, "state": "complete"},
+        "_query_text_source_chars": 25011,
         "keep": "public",
         "nested": {"_source_classification": {"complete": True}, "deep": [
-            {"_query_text_transformed": True, "ok": 1},
+            {"_query_text_transformed": True, "_query_text_source_chars": 4001, "ok": 1},
             ({"_query_provenance_invalidated": True, "ok": 2},),
         ]},
     }

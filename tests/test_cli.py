@@ -709,7 +709,7 @@ class TestQuery:
         return json.loads(result.stdout), len(result.stdout.encode("utf-8"))
 
     @pytest.mark.parametrize("cell", _flow.CELLS)
-    def test_legacy_json_pre_cap_unavailable_no_private_fields(
+    def test_legacy_json_pre_cap_flow_no_private_fields(
         self, bootstrapped, cli_env, runner, mock_vector_store, monkeypatch, cell
     ):
         from opencrab.services import result_caps
@@ -719,11 +719,11 @@ class TestQuery:
             bootstrapped, runner, mock_vector_store, monkeypatch, cell, "--json-output"
         )
         assert isinstance(items, list) and len(items) == 1
-        flow.assert_public_unavailable(items[0], cell)
+        flow.assert_public_cell(items[0], cell)
         assert size <= result_caps.QUERY_RESPONSE_CHAR_BUDGET
 
     @pytest.mark.parametrize("cell", _flow.CELLS)
-    def test_envelope_json_pre_cap_unavailable_no_private_fields(
+    def test_envelope_json_pre_cap_flow_no_private_fields(
         self, bootstrapped, cli_env, runner, mock_vector_store, monkeypatch, cell
     ):
         from opencrab.services import result_caps
@@ -733,7 +733,7 @@ class TestQuery:
             bootstrapped, runner, mock_vector_store, monkeypatch, cell, "--json-envelope"
         )
         assert envelope["total"] == 1 and len(envelope["results"]) == 1
-        flow.assert_public_unavailable(envelope["results"][0], cell)
+        flow.assert_public_cell(envelope["results"][0], cell)
         assert flow.find_reserved(envelope) == []
         assert size <= result_caps.QUERY_RESPONSE_CHAR_BUDGET
 

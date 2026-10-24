@@ -16,6 +16,7 @@ RESERVED_KEYS = (
     "_query_provenance",
     "_query_provenance_invalidated",
     "_query_text_transformed",
+    "_query_text_source_chars",
     "source_integrity",
     "_source_classification",
 )
@@ -28,7 +29,10 @@ def cell_spec(cell: str) -> dict[str, Any]:
     total = LIMIT - 1 if boundary == "below" else LIMIT
     if kind == "concat":
         old = "a" * (total - 1 - len(NEEDLE))
-        return {"vector": old, "source": NEEDLE, "expected": f"{old}\n{NEEDLE}", "total": total}
+        return {
+            "vector": old, "source": NEEDLE, "expected": f"{old}\n{NEEDLE}",
+            "total": total, "transformed": True,
+        }
     if kind == "strip":
         count = total - 1 - len(NEEDLE)
         return {
@@ -36,9 +40,14 @@ def cell_spec(cell: str) -> dict[str, Any]:
             "source": NEEDLE + " ",
             "expected": "a" * count + "\n" + NEEDLE,
             "total": total,
+            "transformed": True,
         }
+    # mix: both legs carry the same body, so the merge leaves the text as it is.
     body = NEEDLE + " " + "b" * (total - len(NEEDLE) - 1)
-    return {"vector": body, "source": body, "expected": body, "total": total}
+    return {
+        "vector": body, "source": body, "expected": body,
+        "total": total, "transformed": False,
+    }
 
 
 def install_vector_leg(vector_store: Any, monkeypatch: Any, pack: str, node_ids: list[str], text: str) -> None:
@@ -78,12 +87,12 @@ def assert_pre_surface(outcome: Any, cell: str, *, folded: bool) -> None:
     if cell.startswith("strip"):
         assert result.text == result.text.strip()
         assert spec["vector"] != result.text and spec["source"] != result.text
-    assert result.text_transformed is True, cell
+    assert result.text_transformed is spec["transformed"], cell
     if folded:
         assert result.folded_count == 1, cell
         member = result.folded_members[0]
         assert member.text == spec["expected"], cell
-        assert member.text_transformed is True, cell
+        assert member.text_transformed is spec["transformed"], cell
         assert member.node_id != result.node_id
     else:
         assert result.folded_count == 0, cell
@@ -101,6 +110,23 @@ def find_reserved(value: Any, path: tuple[Any, ...] = ()) -> list[tuple[Any, ...
         for index, child in enumerate(value):
             found.extend(find_reserved(child, (*path, index)))
     return found
+
+
+def assert_public_unchanged(item: dict[str, Any], cell: str) -> None:
+    """Assert one public item of an untransformed cell carries its body and no cut."""
+    spec = cell_spec(cell)
+    assert item["text"] == spec["expected"], cell
+    assert len(item["text"]) == spec["total"], cell
+    assert "truncation" not in item, cell
+    assert find_reserved(item) == [], cell
+
+
+def assert_public_cell(item: dict[str, Any], cell: str) -> None:
+    """Assert the public item matches the cell: unavailable if transformed, else unchanged."""
+    if cell_spec(cell)["transformed"]:
+        assert_public_unavailable(item, cell)
+    else:
+        assert_public_unchanged(item, cell)
 
 
 def assert_public_unavailable(item: dict[str, Any], cell: str) -> None:

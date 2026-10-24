@@ -42,10 +42,12 @@ _GRAPH_CONTEXT_SKIP = ("anchor_id", "edge_endpoints", "edge")
 _PRIVATE_PROVENANCE = "_query_provenance"
 _PRIVATE_PROVENANCE_INVALIDATED = "_query_provenance_invalidated"
 _PRIVATE_TRANSFORMED = "_query_text_transformed"
+_PRIVATE_SOURCE_CHARS = "_query_text_source_chars"
 _PRIVATE_KEYS = (
     _PRIVATE_PROVENANCE,
     _PRIVATE_PROVENANCE_INVALIDATED,
     _PRIVATE_TRANSFORMED,
+    _PRIVATE_SOURCE_CHARS,
     "source_integrity",
     "_source_classification",
 )
@@ -134,10 +136,13 @@ def _sanitize_public(value: Any) -> tuple[Any, bool]:
     return value, False
 
 
-def _capture_evidence(item: Any, *, folded: bool) -> tuple[Any, bool, bool, tuple[Any, ...]]:
+_Evidence = tuple[Any, bool, bool, Any, tuple[Any, ...]]
+
+
+def _capture_evidence(item: Any, *, folded: bool) -> _Evidence:
     """Consume cap-local proof from a private item before it is sanitized."""
     if not isinstance(item, dict):
-        return None, False, False, ()
+        return None, False, False, None, ()
     members: tuple[Any, ...] = ()
     if folded:
         metadata = item.get("metadata")
@@ -149,6 +154,7 @@ def _capture_evidence(item: Any, *, folded: bool) -> tuple[Any, bool, bool, tupl
         item.get(_PRIVATE_PROVENANCE),
         bool(item.get(_PRIVATE_PROVENANCE_INVALIDATED)),
         bool(item.get(_PRIVATE_TRANSFORMED)),
+        item.get(_PRIVATE_SOURCE_CHARS),
         members,
     )
 
@@ -167,7 +173,7 @@ def cap_query_item(
     *,
     limit: int = QUERY_FIELD_CHAR_LIMIT,
     folded: bool = False,
-    evidence: tuple[Any, bool, bool, tuple[Any, ...]] | None = None,
+    evidence: _Evidence | None = None,
 ) -> dict[str, Any]:
     """Cut the long strings of one ``QueryResult.to_cap_item()`` item.
 
@@ -179,16 +185,35 @@ def cap_query_item(
     """
     if evidence is None:
         evidence = _capture_evidence(item, folded=folded)
-    provenance, invalidated, transformed, member_evidence = evidence
+    provenance, invalidated, transformed, source_chars, member_evidence = evidence
     public_item, private_present = _sanitize_public(item)
     cuts: list[dict[str, Any]] = []
     updates: dict[str, Any] = {}
 
     text_changed = False
     if "text" in public_item:
-        new_text, text_changed = _cap(public_item["text"], ["text"], limit, cuts)
+        shown = public_item["text"]
+        new_text, text_changed = _cap(shown, ["text"], limit, cuts)
         if text_changed:
             updates["text"] = new_text
+        if (
+            isinstance(shown, str)
+            and isinstance(source_chars, int)
+            and not isinstance(source_chars, bool)
+            and len(shown) < source_chars
+            and _valid_locator(provenance) is not None
+            and not invalidated
+            and not transformed
+        ):
+            # A merge left exactly the first characters of the proven source text.
+            # Report the cut against the whole source and let the locator apply.
+            for cut in cuts:
+                if cut["path"] == ["text"]:
+                    cut["original_chars"] = source_chars
+                    break
+            else:
+                cuts.append({"path": ["text"], "original_chars": source_chars})
+            text_changed = True
 
     metadata = public_item.get("metadata")
     metadata_skip = (_FOLD_KEY,) if folded else ()
