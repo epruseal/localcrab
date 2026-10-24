@@ -422,6 +422,8 @@ def test_local_json_duplicate_integrity_file_never_promotes(tmp_path, case, dupl
     assert state is not None and state.complete is False, case
     scoped = store.get_source_scoped_exact("duplicate", ["pack"])
     assert scoped is not None
+    assert scoped["source_integrity"] == {"version": 1, "state": "unknown"}
+    assert scoped["_source_classification"]["state_kind"] == "unknown"
     assert scoped["_source_classification"]["complete"] is False
     assert store.read_source_state_exact("normal").complete is True
     public_rows = [store.get_source("normal"), *store.list_sources()]
