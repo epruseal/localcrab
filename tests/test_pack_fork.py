@@ -4180,6 +4180,8 @@ class TestSourceIntegritySnapshot:
         real = type(stack["docs"]).read_source_state_exact
 
         def spy(self, source_id):
+            if source_id == "s0" and not reads and hooks.get(0) is not None:
+                hooks[0]()
             state = real(self, source_id)
             if source_id == "s0":
                 reads.append(state)
@@ -4212,6 +4214,66 @@ class TestSourceIntegritySnapshot:
         assert out["status"] == "partial", out
         assert out["copied"]["sources"] == 0
         assert self._copied(stack, out) == [], "no source is copied from a moving origin"
+
+    def test_origin_change_before_first_read_refuses(self, stack, monkeypatch):
+        """Both reads agree with each other but not with the record the fork enumerated."""
+        src = _seed_pack(stack, ALICE, "src-snap-4", node_count=1, with_edge=False, with_source=True)
+        reads = self._spy(
+            stack, monkeypatch, {0: lambda: self._change_origin(stack, "origin moved before the first read")}
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert len(reads) == 2 and reads[0] == reads[1], "the two reads agree with each other"
+        assert out["status"] == "partial", out
+        assert out["copied"]["sources"] == 0
+        assert self._copied(stack, out) == [], "a state that differs from the record is not copied"
+
+    def test_unknown_origin_text_differing_from_record_refuses(self, stack, monkeypatch):
+        """Both reads agree and the state is unknown, so only the text comparison can refuse."""
+        from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
+
+        src = _seed_pack(stack, ALICE, "src-snap-6", node_count=1, with_edge=False, with_source=True)
+        docs = stack["docs"]
+        row = docs.get_source("s0")
+        moved = "origin moved to unknown text"
+
+        def move_to_unknown():
+            docs.write_source_copy(
+                "s0", moved, row["metadata"],
+                SourceCopyState("sqlite", "s0", moved, strict_utf8_digest(moved), False),
+            )
+
+        reads = self._spy(stack, monkeypatch, {0: move_to_unknown})
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert len(reads) == 2 and reads[0] == reads[1] and reads[0].complete is False
+        assert out["status"] == "partial", out
+        assert self._copied(stack, out) == [], "an unknown state with another text is not copied"
+
+    def test_state_change_between_reads_refuses(self, stack, monkeypatch):
+        """The text stays the same. Only the classification changes between the reads."""
+        from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
+
+        src = _seed_pack(stack, ALICE, "src-snap-5", node_count=1, with_edge=False, with_source=True)
+        docs = stack["docs"]
+        row = docs.get_source("s0")
+        text = row["text"]
+
+        def make_unknown():
+            docs.write_source_copy(
+                "s0", text, row["metadata"],
+                SourceCopyState("sqlite", "s0", text, strict_utf8_digest(text), False),
+            )
+
+        reads = self._spy(stack, monkeypatch, {1: make_unknown})
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert len(reads) == 2 and reads[0].complete is True and reads[1].complete is False
+        assert out["status"] == "partial", out
+        assert self._copied(stack, out) == [], "a moving classification is not copied"
 
     def test_final_unknown_writes_unknown_target(self, stack, monkeypatch):
         from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
