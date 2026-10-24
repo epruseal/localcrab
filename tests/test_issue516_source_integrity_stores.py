@@ -171,6 +171,72 @@ def test_sql_legacy_positional_row_has_no_helper_state(sql_store):
     assert state is not None and state.complete is True
 
 
+@pytest.mark.parametrize(
+    ("case", "record_change", "scope", "expected_id", "expected_text"),
+    [
+        ("complete", {}, {"pack"}, "source", "text"),
+        ("legacy", {"_source_classification": {"state_kind": "legacy_absent"}}, {"pack"}, "source", "text"),
+        ("row-id", {"source_id": "other"}, {"pack"}, "source", "text"),
+        ("classification-id", {"_source_classification": {"source_id": "other"}}, {"pack"}, "source", "text"),
+        ("expected-id", {}, {"pack"}, "other", "text"),
+        ("row-text", {"text": "other"}, {"pack"}, "source", "text"),
+        ("classification-text", {"_source_classification": {"text": "other"}}, {"pack"}, "source", "text"),
+        ("expected-text", {}, {"pack"}, "source", "other"),
+        ("metadata-pack", {"metadata": {"pack_id": "other"}}, {"pack"}, "source", "text"),
+        ("classification-pack", {"_source_classification": {"pack_id": "other"}}, {"pack"}, "source", "text"),
+        ("scope-out", {}, {"other"}, "source", "text"),
+        ("scope-string", {}, "pack", "source", "text"),
+        ("scope-mapping", {}, {"pack": True}, "source", "text"),
+        ("scope-nonstring", {}, {1}, "source", "text"),
+        ("digest", {"_source_classification": {"text_digest": "0" * 64}}, {"pack"}, "source", "text"),
+        ("complete-equals", {"_source_classification": {"complete": 1}}, {"pack"}, "source", "text"),
+        ("unknown", {"_source_classification": {"complete": True, "state_kind": "unknown"}}, {"pack"}, "source", "text"),
+        ("malformed", {"_source_classification": {"complete": True, "state_kind": "malformed"}}, {"pack"}, "source", "text"),
+        ("unsupported", {"_source_classification": {"complete": True, "state_kind": "unsupported_version"}}, {"pack"}, "source", "text"),
+        ("present-null", {"_source_classification": {"complete": True, "state_kind": "present_null"}}, {"pack"}, "source", "text"),
+        ("absent", {"_source_classification": {"complete": True, "state_kind": "absent"}}, {"pack"}, "source", "text"),
+    ],
+)
+def test_validate_source_row_payload(case, record_change, scope, expected_id, expected_text):
+    from opencrab.stores._source_integrity import (
+        strict_utf8_digest,
+        validate_source_row_payload,
+    )
+
+    text = "text"
+    digest = strict_utf8_digest(text)
+    assert digest is not None
+    record = {
+        "source_id": "source",
+        "text": text,
+        "metadata": {"pack_id": "pack"},
+        "_source_classification": {
+            "source_id": "source",
+            "text": text,
+            "pack_id": "pack",
+            "text_digest": digest,
+            "complete": True,
+            "state_kind": "complete",
+        },
+    }
+    for key, value in record_change.items():
+        if key == "_source_classification":
+            record[key].update(value)
+        else:
+            record[key] = value
+
+    result = validate_source_row_payload(
+        record,
+        permitted_packs=scope,
+        expected_source_id=expected_id,
+        expected_text=expected_text,
+    )
+    if case in {"complete", "legacy"}:
+        assert result == ("source", "pack", text, digest)
+    else:
+        assert result is None, case
+
+
 def test_local_sql_delete_reuse_has_no_stale_helper(sql_store):
     sql_store.upsert_source("source", "first", {"pack_id": "pack"})
     assert sql_store.delete_sources_with_state(["source"]) == 1

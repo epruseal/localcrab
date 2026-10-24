@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import Any
 
 _SOURCE_INTEGRITY_VERSION = 1
 _HEX_DIGEST_LENGTH = 64
+_UNSET = object()
 
 
 class _JsonObject(dict[str, Any]):
@@ -234,3 +236,64 @@ def source_classification(
         "complete": complete,
         "state_kind": state_kind,
     }
+
+
+def validate_source_row_payload(
+    record: Any,
+    *,
+    permitted_packs: Any,
+    expected_source_id: Any,
+    expected_text: Any = _UNSET,
+) -> tuple[str, str, str, str] | None:
+    """Return one exact scoped source payload without a backend lookup."""
+    if (
+        not isinstance(record, Mapping)
+        or not isinstance(expected_source_id, str)
+        or strict_utf8_digest(expected_source_id) is None
+        or isinstance(permitted_packs, (str, bytes, Mapping))
+    ):
+        return None
+    try:
+        scope = set(permitted_packs)
+    except TypeError:
+        return None
+    if not scope or any(
+        not isinstance(pack_id, str) or strict_utf8_digest(pack_id) is None
+        for pack_id in scope
+    ):
+        return None
+    source_id = record.get("source_id")
+    text = record.get("text")
+    metadata = record.get("metadata")
+    classification = record.get("_source_classification")
+    if (
+        not isinstance(source_id, str)
+        or strict_utf8_digest(source_id) is None
+        or source_id != expected_source_id
+        or not isinstance(text, str)
+        or strict_utf8_digest(text) is None
+        or not isinstance(metadata, Mapping)
+        or not isinstance(classification, Mapping)
+    ):
+        return None
+    if expected_text is not _UNSET and (
+        not isinstance(expected_text, str)
+        or strict_utf8_digest(expected_text) is None
+        or text != expected_text
+    ):
+        return None
+    pack_id = metadata.get("pack_id")
+    digest = strict_utf8_digest(text)
+    if (
+        not isinstance(pack_id, str)
+        or strict_utf8_digest(pack_id) is None
+        or pack_id not in scope
+        or classification.get("source_id") != source_id
+        or classification.get("text") != text
+        or classification.get("pack_id") != pack_id
+        or classification.get("text_digest") != digest
+        or classification.get("complete") is not True
+        or classification.get("state_kind") not in {"complete", "legacy_absent"}
+    ):
+        return None
+    return source_id, pack_id, text, digest
