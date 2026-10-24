@@ -776,17 +776,25 @@ def test_malformed_helper_jsonb_retry(tmp_path: Path, case: str) -> None:
         target.upsert_source("source", "body", {"pack_id": "pack"})
         assert target.read_source_state_exact("source").complete is True
 
-        def helper_value():
+        def helper_row():
+            """Return (row exists, decoded value): a missing row, a SQL NULL and a JSON null differ."""
             with engine.connect() as conn:
                 row = conn.execute(
                     text(f'SELECT source_integrity FROM "{schema}".doc_source_integrity WHERE source_id=\'source\'')
                 ).fetchone()
-            value = row[0] if row is not None else None
-            return json.loads(value) if isinstance(value, str) else value
+            if row is None:
+                return False, None
+            value = row[0]
+            return True, (json.loads(value) if isinstance(value, str) else value)
 
         for _attempt in range(2):
             fwd.migrate_doc(db, engine, schema, batch=10, limit=None, dry_run=False)
-            assert helper_value() == expected
+            if case in ("absence", "row-absent"):
+                assert helper_row() == (False, None), "the target helper row must be gone"
+            elif case == "null-helper":
+                assert helper_row() == (True, {"version": 1, "state": "unknown"})
+            else:
+                assert helper_row() == (True, expected)
     finally:
         with engine.begin() as conn:
             conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))

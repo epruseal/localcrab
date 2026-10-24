@@ -204,3 +204,27 @@ def test_range_rejects_locator_version_types(stack, value):
     # no single mutation separates them. This is a behavior boundary test.
     locator = {**_one_source(stack), "version": value}
     assert _range(stack, locator, 0, 100) == {"error": "invalid_source_locator"}
+
+
+@pytest.mark.parametrize("case", ["scalar", "list-id", "int-id", "other-id"])
+def test_query_and_range_require_same_scalar_source_id(case):
+    """MID-02. The query proof and the range handler judge one scoped row alike."""
+    from opencrab.ontology import query as query_mod
+    from tests import test_issue516_source_range as rows_mod
+
+    row = rows_mod._row()
+    if case == "list-id":
+        row["source_id"] = ["s1"]
+    elif case == "int-id":
+        row["source_id"] = 1
+    elif case == "other-id":
+        row["source_id"] = "s2"
+        row["_source_classification"]["source_id"] = "s2"
+    reader = rows_mod._Reader(row)
+    proof = query_mod._source_provenance(reader, "s1", rows_mod.TEXT, permitted_packs={rows_mod.PACK})
+    response = rows_mod._range(reader)
+    if case == "scalar":
+        assert proof is not None and response["text"] == rows_mod.TEXT
+    else:
+        assert proof is None
+        assert response == {"error": "full_text_unavailable"}

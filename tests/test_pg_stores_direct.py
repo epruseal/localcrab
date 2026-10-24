@@ -722,6 +722,20 @@ def _lock_waiter_seen(pg_engine, schema: str) -> bool:
     return count > 0
 
 
+def _lock_waiter_on(pg_engine, schema: str, table: str) -> bool:
+    """True while some backend waits on a lock in a statement that names this schema and table."""
+    with pg_engine.connect() as conn:
+        count = conn.execute(
+            text(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE wait_event_type='Lock' AND pid <> pg_backend_pid() "
+                "AND query ILIKE :pattern"
+            ),
+            {"pattern": f"%{schema}%{table}%"},
+        ).scalar_one()
+    return count > 0
+
+
 class TestPgDocSourceIntegrityLifecycle:
     def test_locked_metadata_rewrite_rejects_concurrent_state_change(self, pg_engine):
         """RW-PG-01. The writer and the rewrite run in two threads with two
@@ -815,6 +829,300 @@ class TestPgDocSourceIntegrityLifecycle:
             if not alive:
                 _drop_schema(pg_engine, schema)
         assert not alive, "a test thread is still alive; the schema was kept"
+
+    # ------------------------------------------------------------------
+    # #516 PG-DEL-01..03: PgDocStore.delete_sources_with_state
+    #
+    # These cases need a real PostgreSQL. They stay skipped without
+    # OPENCRAB_PG_TEST_URL. Each case names its threads, keeps every wait
+    # bounded, releases every event in ``finally`` and keeps the schema when a
+    # thread is still alive.
+    # ------------------------------------------------------------------
+
+    def test_source_delete_writer_same_id_has_no_orphan_helper(self, pg_engine):
+        """PG-DEL-01. The deleter removes the source row first and pauses before it
+        removes the helper row. A writer for the same ID starts then. The writer
+        INSERT waits on the deleted row, so the helper of the old row cannot be
+        removed after the writer has stored a new helper. The final source and helper
+        are the writer's whole new state and no helper row lacks a source row."""
+        import hashlib
+
+        from sqlalchemy import event
+
+        schema = f"t{uuid.uuid4().hex[:12]}_dw"
+        store = PgDocStore(pg_engine, schema=schema)
+        deleter_paused = threading.Event()
+        release_deleter = threading.Event()
+        deleter_done = threading.Event()
+        writer_done = threading.Event()
+        errors: list[BaseException] = []
+        thread_ids: dict[str, int] = {}
+        deleted: list[int] = []
+        started: list[threading.Thread] = []
+        listening = False
+        new_text = "new body"
+
+        def pause_before_helper_delete(_conn, _cursor, statement, _params, _context, _many):
+            if (
+                threading.get_ident() == thread_ids.get("deleter")
+                and statement.lstrip().upper().startswith("DELETE")
+                and "doc_source_integrity" in statement
+            ):
+                deleter_paused.set()
+                assert release_deleter.wait(10), "the deleter was never released"
+
+        try:
+            store.upsert_source("source", "old body", {"pack_id": "pack"})
+            event.listen(pg_engine, "before_cursor_execute", pause_before_helper_delete)
+            listening = True
+
+            def deleter():
+                thread_ids["deleter"] = threading.get_ident()
+                try:
+                    deleted.append(store.delete_sources_with_state(["source"]))
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                finally:
+                    deleter_done.set()
+
+            def writer():
+                thread_ids["writer"] = threading.get_ident()
+                try:
+                    store.upsert_source("source", new_text, {"pack_id": "pack"})
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                finally:
+                    writer_done.set()
+
+            deleter_thread = threading.Thread(target=deleter, name="pgdel01-deleter")
+            deleter_thread.start()
+            started.append(deleter_thread)
+            assert deleter_paused.wait(10), "the deleter never reached the helper delete"
+            writer_thread = threading.Thread(target=writer, name="pgdel01-writer")
+            writer_thread.start()
+            started.append(writer_thread)
+            poll = threading.Event()
+            for _ in range(1000):
+                if _lock_waiter_on(pg_engine, schema, "doc_sources"):
+                    break
+                poll.wait(0.01)
+            else:
+                pytest.fail("the writer was not seen waiting on the deleted source row")
+            assert not writer_done.is_set(), "the writer must wait for the delete to finish"
+            release_deleter.set()
+            assert deleter_done.wait(10) and writer_done.wait(10)
+            assert not errors, errors
+            assert thread_ids["deleter"] != thread_ids["writer"]
+            assert deleted == [1]
+            with pg_engine.connect() as conn:
+                source_text = conn.execute(
+                    text(f'SELECT text FROM "{schema}".doc_sources WHERE source_id=\'source\'')
+                ).scalar_one()
+                orphans = conn.execute(
+                    text(
+                        f'SELECT count(*) FROM "{schema}".doc_source_integrity i '
+                        f'LEFT JOIN "{schema}".doc_sources s ON s.source_id = i.source_id '
+                        "WHERE s.source_id IS NULL"
+                    )
+                ).scalar_one()
+            assert source_text == new_text
+            assert orphans == 0
+            state = store.read_source_state_exact("source")
+            assert state is not None and state.complete is True
+            assert state.text == new_text
+            assert state.text_digest == hashlib.sha256(new_text.encode("utf-8")).hexdigest()
+        finally:
+            alive = _stop_threads(started, [release_deleter])
+            if listening:
+                event.remove(pg_engine, "before_cursor_execute", pause_before_helper_delete)
+            if not alive:
+                _drop_schema(pg_engine, schema)
+        assert not alive, "a test thread is still alive; the schema was kept"
+
+    def test_absent_delete_does_not_remove_new_helper(self, pg_engine):
+        """PG-DEL-02. The ID has no source row. The deleter's source DELETE removes
+        nothing and the deleter pauses. A writer then stores a new source and helper
+        for that ID. When the deleter continues it must not touch the helper, because
+        it deleted no source row."""
+        from sqlalchemy import event
+
+        schema = f"t{uuid.uuid4().hex[:12]}_ad"
+        store = PgDocStore(pg_engine, schema=schema)
+        source_delete_done = threading.Event()
+        release_deleter = threading.Event()
+        deleter_done = threading.Event()
+        errors: list[BaseException] = []
+        thread_ids: dict[str, int] = {}
+        deleted: list[int] = []
+        started: list[threading.Thread] = []
+        listening = False
+
+        def pause_after_source_delete(_conn, _cursor, statement, _params, _context, _many):
+            if (
+                threading.get_ident() == thread_ids.get("deleter")
+                and statement.lstrip().upper().startswith("DELETE")
+                and "doc_sources" in statement
+            ):
+                source_delete_done.set()
+                assert release_deleter.wait(10), "the deleter was never released"
+
+        try:
+            event.listen(pg_engine, "after_cursor_execute", pause_after_source_delete)
+            listening = True
+
+            def deleter():
+                thread_ids["deleter"] = threading.get_ident()
+                try:
+                    deleted.append(store.delete_sources_with_state(["fresh"]))
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                finally:
+                    deleter_done.set()
+
+            deleter_thread = threading.Thread(target=deleter, name="pgdel02-deleter")
+            deleter_thread.start()
+            started.append(deleter_thread)
+            assert source_delete_done.wait(10), "the deleter never ran its source DELETE"
+            store.upsert_source("fresh", "fresh body", {"pack_id": "pack"})
+            release_deleter.set()
+            assert deleter_done.wait(10)
+            assert not errors, errors
+            assert deleted == [0]
+            with pg_engine.connect() as conn:
+                helper_rows = conn.execute(
+                    text(f'SELECT count(*) FROM "{schema}".doc_source_integrity WHERE source_id=\'fresh\'')
+                ).scalar_one()
+                source_rows = conn.execute(
+                    text(f'SELECT count(*) FROM "{schema}".doc_sources WHERE source_id=\'fresh\'')
+                ).scalar_one()
+            assert (source_rows, helper_rows) == (1, 1)
+            state = store.read_source_state_exact("fresh")
+            assert state is not None and state.complete is True
+        finally:
+            alive = _stop_threads(started, [release_deleter])
+            if listening:
+                event.remove(pg_engine, "after_cursor_execute", pause_after_source_delete)
+            if not alive:
+                _drop_schema(pg_engine, schema)
+        assert not alive, "a test thread is still alive; the schema was kept"
+
+    @pytest.mark.parametrize("failure", ["deadlock", "serialization"])
+    def test_source_helper_deadlock_or_serialization_rolls_back_and_raises(self, pg_engine, failure):
+        """PG-DEL-03. The product deletes the source before the helper, so the real
+        deadlock cannot arise from this store alone. The case injects the PostgreSQL
+        error at the helper DELETE of the second ID. It checks that the error reaches
+        the caller and that the transaction restores every row of both IDs."""
+        import psycopg2.errors as pg_errors
+        from sqlalchemy import event
+        from sqlalchemy.exc import OperationalError
+
+        error_type = {
+            "deadlock": pg_errors.DeadlockDetected,
+            "serialization": pg_errors.SerializationFailure,
+        }[failure]
+        schema = f"t{uuid.uuid4().hex[:12]}_df"
+        store = PgDocStore(pg_engine, schema=schema)
+        injected: list[str] = []
+        listening = False
+
+        def fail_second_helper_delete(_conn, _cursor, statement, params, _context, _many):
+            if (
+                statement.lstrip().upper().startswith("DELETE")
+                and "doc_source_integrity" in statement
+                and isinstance(params, dict)
+                and params.get("source_id") == "b"
+            ):
+                injected.append(failure)
+                raise OperationalError(statement, params, error_type(f"injected {failure}"))
+
+        def counts():
+            with pg_engine.connect() as conn:
+                return tuple(
+                    conn.execute(
+                        text(f'SELECT count(*) FROM "{schema}".{table} WHERE source_id IN (\'a\', \'b\')')
+                    ).scalar_one()
+                    for table in ("doc_sources", "doc_source_integrity")
+                )
+
+        try:
+            store.upsert_source("a", "text a", {"pack_id": "pack"})
+            store.upsert_source("b", "text b", {"pack_id": "pack"})
+            assert counts() == (2, 2)
+            event.listen(pg_engine, "before_cursor_execute", fail_second_helper_delete)
+            listening = True
+            with pytest.raises(OperationalError) as raised:
+                store.delete_sources_with_state(["a", "b"])
+            assert isinstance(raised.value.orig, error_type)
+            assert injected == [failure]
+            # The first ID's source and helper deletes were in the same transaction.
+            assert counts() == (2, 2)
+            for source_id in ("a", "b"):
+                state = store.read_source_state_exact(source_id)
+                assert state is not None and state.complete is True
+            event.remove(pg_engine, "before_cursor_execute", fail_second_helper_delete)
+            listening = False
+            # The store stays usable: the same call now succeeds and removes everything.
+            assert store.delete_sources_with_state(["a", "b"]) == 2
+            assert counts() == (0, 0)
+        finally:
+            if listening:
+                event.remove(pg_engine, "before_cursor_execute", fail_second_helper_delete)
+            _drop_schema(pg_engine, schema)
+
+
+class TestPgDocSourceIntegrityBootstrap:
+    def test_legacy_doc_sources_adds_integrity_before_source_state_reads(self, pg_engine):
+        """FIX-PG-01. A schema that holds only the pre-helper tables gets the helper
+        table when the store opens. A legacy row without a helper row reads as the
+        backend legacy state, and a new write creates its helper row."""
+        from opencrab.stores._sql_dialect import POSTGRES
+        from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA
+
+        schema = f"t{uuid.uuid4().hex[:12]}_bs"
+        try:
+            with pg_engine.begin() as conn:
+                conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+                for ddl in POSTGRES.render_ddl(DOC_STORE_SCHEMA, schema_name=schema):
+                    if "doc_source_integrity" not in ddl:
+                        conn.execute(text(ddl))
+                conn.execute(
+                    text(
+                        f'INSERT INTO "{schema}".doc_sources (source_id, text, metadata, ingested_at) '
+                        "VALUES ('legacy', 'old text', CAST(:metadata AS jsonb), now())"
+                    ),
+                    {"metadata": json.dumps({"pack_id": "pack"})},
+                )
+                before = conn.execute(
+                    text("SELECT to_regclass(:name)"), {"name": f'"{schema}".doc_source_integrity'}
+                ).scalar_one()
+            assert before is None, "the fixture must start without the helper table"
+
+            store = PgDocStore(pg_engine, schema=schema)
+            assert store.available
+            with pg_engine.connect() as conn:
+                after = conn.execute(
+                    text("SELECT to_regclass(:name)"), {"name": f'"{schema}".doc_source_integrity'}
+                ).scalar_one()
+            assert after is not None, "opening the store must create the helper table"
+
+            def helper_ids():
+                with pg_engine.connect() as conn:
+                    return {
+                        row[0]
+                        for row in conn.execute(
+                            text(f'SELECT source_id FROM "{schema}".doc_source_integrity')
+                        ).fetchall()
+                    }
+
+            assert helper_ids() == set()
+            state = store.read_source_state_exact("legacy")
+            assert state is not None and state.text == "old text"
+            assert state.complete is True, "helper absence is the SQL legacy complete state"
+            store.upsert_source("fresh", "fresh text", {"pack_id": "pack"})
+            assert helper_ids() == {"fresh"}
+            assert store.read_source_state_exact("legacy").complete is True
+        finally:
+            _drop_schema(pg_engine, schema)
 
 
 class TestPgDocSourceIntegritySnapshot:

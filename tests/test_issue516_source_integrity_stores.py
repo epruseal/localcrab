@@ -600,3 +600,148 @@ def test_source_copy_context_resets_after_error(sql_store):
     sql_store.upsert_source = real_upsert  # type: ignore[method-assign]
     sql_store.upsert_source("source", "body", {"pack_id": "pack"})
     assert sql_store.read_source_state_exact("source").complete is True, "no state leaked into the next write"
+
+
+# ---------------------------------------------------------------------------
+# #516 ledger gap: Local JSON file rows through the actual query and range paths
+# ---------------------------------------------------------------------------
+
+_DUP_PACK = "pack"
+_DUP_TEXT = "duplicate row text " * 300  # more than the 4000 character query cap
+
+
+def _helper_variants(digest: str) -> dict[str, str]:
+    """Raw JSON for the source_integrity member of a row, keyed by duplicate kind."""
+    complete = '"version": 1, "state": "complete", "text_digest": "DIGEST"'
+    variants = {
+        "version": '"source_integrity": {"version": 9, "version": 1, "state": "complete", "text_digest": "DIGEST"}',
+        "state": '"source_integrity": {"version": 1, "state": "unknown", "state": "complete", "text_digest": "DIGEST"}',
+        "text_digest": '"source_integrity": {"version": 1, "state": "complete", "text_digest": "ZERO", "text_digest": "DIGEST"}',
+        "same-value": '"source_integrity": {"version": 1, "version": 1, "state": "complete", "text_digest": "DIGEST"}',
+        "helper-key": '"source_integrity": {"version": 1, "state": "unknown"}, "source_integrity": {' + complete + "}",
+        "nested": '"source_integrity": {' + complete + ', "extra": {"a": 1, "a": 2}}',
+    }
+    return {kind: raw.replace("DIGEST", digest).replace("ZERO", "0" * 64) for kind, raw in variants.items()}
+
+
+def _row_json(source_id: str, text: str, helper_json: str | None) -> str:
+    fields = [
+        '"source_id": ' + json.dumps(source_id),
+        '"text": ' + json.dumps(text),
+        '"metadata": ' + json.dumps({"pack_id": _DUP_PACK, "space": "evidence", "node_id": source_id}),
+    ]
+    if helper_json is not None:
+        fields.append(helper_json)
+    return json.dumps(source_id) + ": {" + ", ".join(fields) + "}"
+
+
+def _complete_helper(text: str) -> str:
+    from opencrab.stores._source_integrity import strict_utf8_digest
+
+    return '"source_integrity": ' + json.dumps(
+        {"version": 1, "state": "complete", "text_digest": strict_utf8_digest(text)}
+    )
+
+
+@pytest.mark.usefixtures("bind_test_principal")
+def test_local_json_file_query_and_range_controls(tmp_path, monkeypatch):
+    """Rows with a duplicate key inside the helper never get a locator.
+
+    sources.json is raw text with the duplicate keys kept, so the actual file read,
+    ``HybridQuery.query`` and the range handler all see it. The controls are a normal complete
+    row and a helper-free legacy row below the Local JSON limit (a locator that reads back the
+    text) and legacy rows at and above the limit (no locator)."""
+    from opencrab.stores._source_integrity import strict_utf8_digest
+    from tests import _issue516_flow as flow
+
+    stack = flow.build_stack(tmp_path, _DUP_PACK, "local")
+    try:
+        rows, texts = [], {}
+        for kind in _helper_variants("0"):
+            # A distinct body per row: equal bodies would fold into one result.
+            source_id, text = f"dup-{kind}", f"{_DUP_TEXT}{kind} "
+            rows.append(_row_json(source_id, text, _helper_variants(strict_utf8_digest(text))[kind]))
+            texts[source_id] = text
+        normal_text = "normal complete row " * 300
+        rows.append(_row_json("normal", normal_text, _complete_helper(normal_text)))
+        texts["normal"] = normal_text
+        for length in (4095, 4096, 4097):
+            text = ("legacy " * 700)[:length]
+            rows.append(_row_json(f"legacy-{length}", text, None))
+            texts[f"legacy-{length}"] = text
+        with open(stack["docs"]._collection_path("sources"), "w", encoding="utf-8") as handle:
+            handle.write("{" + ", ".join(rows) + "}")
+
+        items = flow.query_rows(stack, monkeypatch, _DUP_PACK, texts)
+        for source_id, text in texts.items():
+            truncation = items[source_id]["truncation"]
+            if source_id in ("normal", "legacy-4095"):
+                locator = truncation["source_locator"]
+                assert locator["source_id"] == source_id, source_id
+                chunk = flow.range_call(stack, locator, 64)
+                assert chunk["text"] == text[:64], source_id
+                assert chunk["total_bytes"] == len(text.encode("utf-8")), source_id
+            else:
+                assert truncation["full_text_unavailable"] is True, source_id
+                assert "source_locator" not in truncation and "full_text_tool" not in truncation, source_id
+                refused = flow.range_call(stack, flow.hand_locator(_DUP_PACK, source_id, text))
+                assert refused == {"error": "full_text_unavailable"}, source_id
+    finally:
+        flow.close_stack(stack)
+
+
+def test_local_json_integrity_normalization_preserves_rows_and_public_shape(tmp_path):
+    """Reading changes no byte. A later write keeps every other row and stores the affected
+    helper as an explicit unknown. Public rows are plain data."""
+    from opencrab.stores._source_integrity import strict_utf8_digest
+    from opencrab.stores.local_doc_store import LocalDocStore
+
+    data_dir = tmp_path / "local"
+    data_dir.mkdir()
+    dup_text = "dup row text"
+    digest = strict_utf8_digest(dup_text)
+    normal = {
+        "source_id": "normal",
+        "text": "normal row",
+        "metadata": {"pack_id": _DUP_PACK, "note": "keep"},
+        "source_integrity": {"version": 1, "state": "complete", "text_digest": strict_utf8_digest("normal row")},
+    }
+    raw = "{" + ", ".join([
+        _row_json("dup", dup_text, _helper_variants(digest)["helper-key"]),
+        json.dumps("normal") + ": " + json.dumps(normal),
+    ]) + "}"
+    path = data_dir / "sources.json"
+    path.write_text(raw, encoding="utf-8")
+    before = path.read_bytes()
+
+    store = LocalDocStore(str(data_dir))
+    assert store.read_source_state_exact("dup").complete is False
+    assert store.read_source_state_exact("normal").complete is True
+    assert store.get_source_scoped_exact("dup", [_DUP_PACK])["_source_classification"]["complete"] is False
+
+    def plain(value):
+        if isinstance(value, dict):
+            assert type(value) is dict
+            return all(plain(child) for child in value.values())
+        if isinstance(value, list):
+            assert type(value) is list
+            return all(plain(child) for child in value)
+        return True
+
+    public = [store.get_source("dup"), store.get_source("normal"), *store.list_sources()]
+    assert len(public) >= 4
+    for row in public:
+        assert isinstance(row, dict) and plain(row)
+        assert "source_integrity" not in row
+        assert not any(key.startswith("_") for key in row), list(row)
+    assert path.read_bytes() == before, "reading must not rewrite the file"
+
+    store.upsert_source("other", "other row", {"pack_id": _DUP_PACK})
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["dup"]["text"] == dup_text
+    assert stored["dup"]["metadata"] == {"pack_id": _DUP_PACK, "space": "evidence", "node_id": "dup"}
+    assert stored["dup"]["source_integrity"] == {"version": 1, "state": "unknown"}
+    assert stored["normal"] == normal
+    assert stored["other"]["text"] == "other row"
+    assert stored["other"]["source_integrity"]["state"] == "complete"
+    assert store.read_source_state_exact("dup").complete is False

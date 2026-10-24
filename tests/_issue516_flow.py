@@ -138,3 +138,130 @@ def assert_public_unavailable(item: dict[str, Any], cell: str) -> None:
     assert "source_locator" not in truncation, cell
     assert "full_text_tool" not in truncation, cell
     assert find_reserved(item) == [], cell
+
+
+# ---- #516 ledger-gap helpers (appended to tests/_issue516_flow.py) ----
+
+def build_stack(tmp_path: Any, pack: str, backend: str, document: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Real query stack over one doc-store backend: local JSON, local SQL or a mocked Mongo collection."""
+    from opencrab.ontology.query import HybridQuery
+    from opencrab.stores.local_graph_store import LocalGraphStore
+    from tests._vec_helpers import build_vector_store
+    from tests.test_mcp_pack_aware import _real_sql_with_owned_pack, _stub_context
+
+    harness = None
+    if backend == "local":
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        docs = LocalDocStore(str(tmp_path / "local"))
+    elif backend == "sql":
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
+    else:
+        from tests.test_mongo_unit import _CasHarness
+
+        harness = _CasHarness(document)
+        docs = harness.store
+    vec = build_vector_store("sqlite-vec", tmp_path)
+    graph = LocalGraphStore(str(tmp_path / "graph.db"))
+    sql = _real_sql_with_owned_pack(pack)
+    hybrid = HybridQuery(vec, graph)
+    hybrid._doc_store = docs
+    ctx = _stub_context(hybrid, sql=sql)
+    ctx["neo4j"] = graph
+    ctx["mongo"] = docs
+    return {
+        "vec": vec, "docs": docs, "graph": graph, "sql": sql, "hybrid": hybrid,
+        "ctx": ctx, "harness": harness, "backend": backend,
+    }
+
+
+def close_stack(stack: dict[str, Any]) -> None:
+    stack["vec"].close()
+    stack["graph"].close()
+    close = getattr(stack["docs"], "close", None)
+    if stack["backend"] != "mongo" and callable(close):
+        close()
+    stack["sql"]._engine.dispose()
+
+
+def query_rows(stack: dict[str, Any], monkeypatch: Any, pack: str, texts: dict[str, str]) -> dict[str, dict[str, Any]]:
+    """Run the real ``HybridQuery.query`` with a vector leg that returns every row of ``texts``."""
+    from opencrab.services import result_caps as caps
+
+    hits = [
+        {
+            "id": source_id,
+            "document": text,
+            "metadata": {"pack_id": pack, "space": "evidence", "node_id": source_id},
+            "distance": 0.1 + index / 100,
+        }
+        for index, (source_id, text) in enumerate(texts.items())
+    ]
+    monkeypatch.setattr(
+        stack["vec"], "query",
+        lambda **_kwargs: [{**hit, "metadata": dict(hit["metadata"])} for hit in hits],
+    )
+    outcome = stack["hybrid"].query(
+        question="alpha", pack_ids=[pack], full_scope={pack},
+        use_rerank=False, use_bm25=False, use_fts=False, limit=len(texts) + 2,
+    )
+    items = {result.node_id: caps.cap_query_item(result.to_cap_item()) for result in outcome.results}
+    assert set(items) == set(texts), "every row must reach the public result"
+    return items
+
+
+def range_call(stack: dict[str, Any], locator: Any, length: int = 64) -> dict[str, Any]:
+    from unittest.mock import patch
+
+    from opencrab.mcp import tools
+
+    with patch.object(tools, "_get_context", return_value=stack["ctx"]):
+        return tools.ontology_get_source_range(locator, 0, length)
+
+
+def hand_locator(pack: str, source_id: str, text: str) -> dict[str, str]:
+    from opencrab.stores._source_integrity import strict_utf8_digest
+
+    return {"version": "1", "source_id": source_id, "pack_id": pack, "source_digest": strict_utf8_digest(text)}
+
+
+def merge_then_cap(cell: str, pack: str = "p1") -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Run the real ``_merge_duplicate`` and ``cap_query_item`` on one cell (no marker is set by hand)."""
+    from opencrab.ontology.reranker import _merge_duplicate
+    from opencrab.services.result_caps import cap_query_item
+
+    spec = cell_spec(cell)
+    proof = {"source_id": "s1", "pack_id": pack, "source_digest": "d1"}
+
+    def hit(source: str, text: str) -> dict[str, Any]:
+        return {
+            "source": source, "node_id": "n1", "score": 1.0, "text": text,
+            "metadata": {"pack_id": pack}, "graph_context": None, "raw_score": 1.0,
+            "_query_provenance": dict(proof),
+        }
+
+    existing = hit("vector", spec["vector"])
+    _merge_duplicate(existing, hit("bm25", spec["source"]))
+    return spec, existing, cap_query_item(existing)
+
+
+def assert_merge_cap_cell(cell: str) -> None:
+    spec, merged, capped = merge_then_cap(cell)
+    assert merged["text"] == spec["expected"], cell
+    assert len(merged["text"]) == spec["total"], cell
+    assert (len(merged["text"]) < LIMIT) == cell.endswith("below"), cell
+    if cell.startswith("strip"):
+        assert merged["text"] == merged["text"].strip(), cell
+    assert merged.get("_query_text_transformed", False) is spec["transformed"], cell
+    assert capped["text"] == spec["expected"], cell
+    assert find_reserved(capped) == [], cell
+    if spec["transformed"]:
+        truncation = capped["truncation"]
+        assert truncation["full_text_unavailable"] is True, cell
+        assert "source_locator" not in truncation, cell
+        assert "full_text_tool" not in truncation, cell
+    else:
+        # The same body from two legs is not a transformation: nothing is cut, nothing is hidden.
+        assert "truncation" not in capped, cell

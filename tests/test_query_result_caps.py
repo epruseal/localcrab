@@ -319,6 +319,25 @@ class TestItemHandling:
         assert cap_selected_pack(entry, limit=LIMIT) is entry
         assert _json(entry) == before
 
+    def test_invalidated_proof_marks_cut_text_unavailable(self):
+        """B8-CUT. A valid proof alone gives a locator for cut text. The same item marked
+        invalidated gives no locator and is reported unavailable."""
+        from opencrab.stores._source_integrity import strict_utf8_digest
+
+        text = "y" * (LIMIT + 50)
+        proof = {"source_id": "s1", "pack_id": PACK, "source_digest": strict_utf8_digest(text)}
+        valid = cap_query_item(_item(text=text, _query_provenance=dict(proof)))
+        assert valid["truncation"]["source_locator"]["source_id"] == "s1"
+        assert valid["truncation"]["full_text_tool"] == "ontology_get_source_range"
+        invalid = cap_query_item(
+            _item(text=text, _query_provenance=dict(proof), _query_provenance_invalidated=True)
+        )
+        assert len(invalid["text"]) == LIMIT
+        assert invalid["truncation"]["full_text_unavailable"] is True
+        assert "source_locator" not in invalid["truncation"]
+        assert "full_text_tool" not in invalid["truncation"]
+        assert flow.find_reserved(invalid) == []
+
 
 # ---------------------------------------------------------------------------
 # Table: response budget
@@ -1051,3 +1070,11 @@ def test_all_public_cap_paths_share_recursive_sanitizer(path):
     assert public["nested"]["deep"][0] == {"ok": 1}
     assert public["nested"]["deep"][1] == ({"ok": 2},)
     assert private["nested"]["deep"][0]["_query_text_transformed"] is True  # input untouched
+
+
+def test_pre_cap_concat_below_limit_marks_unavailable():
+    flow.assert_merge_cap_cell("concat-below")
+
+
+def test_pre_cap_concat_at_limit_marks_unavailable():
+    flow.assert_merge_cap_cell("concat-at")

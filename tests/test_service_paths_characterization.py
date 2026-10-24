@@ -1239,3 +1239,48 @@ def test_empty_primary_keyword_fallback_sanitizes_private_fields(
     assert entry["node"]["nested"]["rows"] == [{"kept": "yes"}]
     assert flow.find_reserved(body) == []
     assert len(response.content) <= 500_000
+
+
+def test_empty_primary_keyword_fallback_tuple_input_unchanged(
+    http_client, http_auth, local_principal, local_stores, monkeypatch
+):
+    """The fallback sanitizer must neither leak private keys from a tuple nor change its input."""
+    import copy
+
+    from opencrab.pack.ownership import create_pack, ensure_default_pack
+
+    user_id, _secret = local_principal
+    ensure_default_pack(local_stores["sql"], user_id)
+    create_pack(local_stores["sql"], user_id, "pack-fb")
+    ctx = http_client.app.state.context
+    props = {
+        "id": "fb:2",
+        "pack_id": "pack-fb",
+        "space": "evidence",
+        "text": "fbtuple " + "한" * 6000,
+        "nested": {
+            "_source_classification": {"complete": True},
+            "rows": [{"_query_provenance": {"source_id": "s"}, "kept": "yes"}],
+        },
+    }
+    ctx.graph.upsert_node("TextUnit", "fb:2", props, "evidence")
+    real = ctx.hybrid.keyword_search
+    seen: dict = {}
+
+    def wrapped(**kwargs):
+        items = real(**kwargs)
+        for item in items:
+            item["node"]["nested"]["rows"] = tuple(item["node"]["nested"]["rows"])
+        seen["items"] = items
+        seen["before"] = copy.deepcopy(items)
+        return items
+
+    monkeypatch.setattr(ctx.hybrid, "keyword_search", wrapped)
+    response = http_client.post("/api/query", json={"question": "fbtuple"}, headers=http_auth)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["keyword_fallback"]) == 1
+    assert body["keyword_fallback"][0]["node"]["nested"]["rows"] == [{"kept": "yes"}]
+    assert flow.find_reserved(body) == []
+    assert seen["items"], "the wrapped keyword_search must have run"
+    assert repr(seen["items"]) == repr(seen["before"]), "the sanitizer must not change its input"
