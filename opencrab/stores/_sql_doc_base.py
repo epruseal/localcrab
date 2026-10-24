@@ -67,8 +67,10 @@ from opencrab.stores._source_integrity import (
     SourceCopyState,
     classify_integrity,
     complete_integrity,
+    decode_integrity_value,
     require_original_source,
     source_classification,
+    strict_utf8_digest,
     unknown_integrity,
 )
 from opencrab.stores._sql_dialect import (
@@ -744,6 +746,10 @@ class _SqlDocStoreBase(abc.ABC):
         ])
         return source_id
 
+    def _decode_integrity_raw(self, value: Any) -> Any:
+        """Decode only helper state with the G1 strict integrity boundary."""
+        return decode_integrity_value(value, encoded_json=self._dialect.name == "sqlite")
+
     def _source_state_join(self, where: str) -> str:
         return (
             f"SELECT s.source_id, s.text, s.metadata, s.ingested_at, "
@@ -763,7 +769,7 @@ class _SqlDocStoreBase(abc.ABC):
         raw_state = self._row_get(row, "source_integrity")
         complete, digest = classify_integrity(
             text,
-            self._decode_properties_raw(raw_state) if helper_present and raw_state is not None else None,
+            self._decode_integrity_raw(raw_state) if helper_present else None,
             helper_present=helper_present,
             legacy_complete=not helper_present,
         )
@@ -883,7 +889,10 @@ class _SqlDocStoreBase(abc.ABC):
         self, source_id: str, pack_ids: list[str]
     ) -> dict[str, Any] | None:
         self._require_available()
-        if not pack_ids:
+        if not pack_ids or any(
+            not isinstance(pack_id, str) or strict_utf8_digest(pack_id) is None
+            for pack_id in pack_ids
+        ):
             return None
         predicate, transform = _json_str_in(self._dialect, "s.metadata", "pack_id", ":sc_packs")
         row = self._fetch_one(
@@ -893,20 +902,26 @@ class _SqlDocStoreBase(abc.ABC):
         if row is None:
             return None
         entry = self._row_to_source(row)
+        if entry.get("property_decode_error"):
+            return None
+        metadata = entry.get("metadata")
+        normalized_scope = set(pack_ids)
+        pack_id = metadata.get("pack_id") if isinstance(metadata, dict) else None
+        if (
+            not isinstance(pack_id, str)
+            or strict_utf8_digest(pack_id) is None
+            or pack_id not in normalized_scope
+        ):
+            return None
         helper_present = self._row_get(row, "integrity_source_id") is not None
-        raw_state = (
-            self._decode_properties_raw(self._row_get(row, "source_integrity"))
-            if helper_present and self._row_get(row, "source_integrity") is not None
-            else None
-        )
+        raw_state = self._decode_integrity_raw(self._row_get(row, "source_integrity")) if helper_present else None
         # Keep this private compatibility field for existing scoped readers.
         # Classification below remains the only locator and range authority.
         entry["source_integrity"] = raw_state
-        metadata = entry.get("metadata")
         entry["_source_classification"] = source_classification(
             entry.get("source_id"),
             entry.get("text"),
-            metadata.get("pack_id") if isinstance(metadata, dict) else None,
+            pack_id,
             raw_state,
             helper_present=helper_present,
             legacy_complete=not helper_present,

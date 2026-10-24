@@ -97,6 +97,10 @@ class LocalDocStore:
         try:
             with open(path, encoding="utf-8") as f:
                 data = load_source_json(f) if collection == "sources" else json.load(f)
+            if not isinstance(data, dict):
+                reason = f"top-level value is {type(data).__name__}, not an object"
+                logger.error("Corrupt %s.json: %s", collection, reason)
+                raise CorruptCollectionError(collection, path, reason)
             if collection == "sources":
                 data = normalize_source_rows(data)
         except UnicodeDecodeError as exc:

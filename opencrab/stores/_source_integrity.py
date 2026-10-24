@@ -52,32 +52,55 @@ def source_json_object_pairs_hook(pairs: list[tuple[str, Any]]) -> _JsonObject:
 
 def load_source_json(stream: Any) -> dict[str, Any]:
     """Load sources JSON while preserving duplicate keys until normalization."""
-    return json.load(stream, object_pairs_hook=source_json_object_pairs_hook, parse_constant=_reject_nonfinite)
+    return json.load(stream, object_pairs_hook=source_json_object_pairs_hook)
 
 
-def _reject_nonfinite(value: str) -> None:
-    raise ValueError(f"non-finite JSON value: {value}")
+def decode_integrity_value(value: Any, *, encoded_json: bool) -> Any:
+    """Decode one backend helper value without changing metadata decoding."""
+    if encoded_json and isinstance(value, str):
+        try:
+            value = json.loads(value, object_pairs_hook=source_json_object_pairs_hook)
+        except (TypeError, ValueError):
+            return value
+    if _has_json_duplicates(value) or not _is_strict_json_value(value):
+        return unknown_integrity()
+    return _normalize_json_value(value)
 
 
 def normalize_source_rows(data: dict[str, Any]) -> dict[str, Any]:
-    """Convert duplicated source integrity helpers to canonical unknown values."""
-    for row in data.values():
-        if not isinstance(row, _JsonObject):
-            continue
-        helper = row.get("source_integrity")
-        if "source_integrity" in row.duplicate_keys or _has_json_duplicates(helper):
-            row["source_integrity"] = unknown_integrity()
-        _normalize_json_value(row)
+    """Convert source helper duplicates and remove temporary JSON wrappers."""
+    for source_id in list(data):
+        row = data[source_id]
+        if isinstance(row, _JsonObject):
+            helper = row.get("source_integrity")
+            if "source_integrity" in row.duplicate_keys:
+                row["source_integrity"] = unknown_integrity()
+            elif "source_integrity" in row:
+                row["source_integrity"] = decode_integrity_value(
+                    helper, encoded_json=False
+                )
+        data[source_id] = _normalize_json_value(row)
+    if isinstance(data, _JsonObject):
+        plain_root = dict(data)
+        del data
+        return plain_root
     return data
 
 
 def _normalize_json_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        for key, child in tuple(value.items()):
-            value[key] = _normalize_json_value(child)
-    elif isinstance(value, list):
+    if isinstance(value, list):
         for index, child in enumerate(value):
             value[index] = _normalize_json_value(child)
+        return value
+    if isinstance(value, _JsonObject):
+        for key in list(value):
+            value[key] = _normalize_json_value(value[key])
+        plain_value = dict(value)
+        del value
+        return plain_value
+    if isinstance(value, dict):
+        for key in list(value):
+            value[key] = _normalize_json_value(value[key])
     return value
 
 
@@ -293,7 +316,9 @@ def validate_source_row_payload(
         or classification.get("pack_id") != pack_id
         or classification.get("text_digest") != digest
         or classification.get("complete") is not True
-        or classification.get("state_kind") not in {"complete", "legacy_absent"}
     ):
+        return None
+    state_kind = classification.get("state_kind")
+    if not isinstance(state_kind, str) or state_kind not in {"complete", "legacy_absent"}:
         return None
     return source_id, pack_id, text, digest

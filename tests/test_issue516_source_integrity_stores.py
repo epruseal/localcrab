@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 
 import pytest
@@ -195,6 +196,8 @@ def test_sql_legacy_positional_row_has_no_helper_state(sql_store):
         ("unsupported", {"_source_classification": {"complete": True, "state_kind": "unsupported_version"}}, {"pack"}, "source", "text"),
         ("present-null", {"_source_classification": {"complete": True, "state_kind": "present_null"}}, {"pack"}, "source", "text"),
         ("absent", {"_source_classification": {"complete": True, "state_kind": "absent"}}, {"pack"}, "source", "text"),
+        ("state-kind-list", {"_source_classification": {"state_kind": []}}, {"pack"}, "source", "text"),
+        ("state-kind-mapping", {"_source_classification": {"state_kind": {}}}, {"pack"}, "source", "text"),
     ],
 )
 def test_validate_source_row_payload(case, record_change, scope, expected_id, expected_text):
@@ -235,6 +238,67 @@ def test_validate_source_row_payload(case, record_change, scope, expected_id, ex
         assert result == ("source", "pack", text, digest)
     else:
         assert result is None, case
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", "1"])
+def test_local_sources_non_object_stays_corrupt_and_blocks_write(local_store, raw):
+    from opencrab.stores.local_doc_store import CorruptCollectionError
+
+    path = local_store._collection_path("sources")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(raw)
+    before = open(path, "rb").read()
+
+    with pytest.raises(CorruptCollectionError):
+        local_store.get_source("source")
+    with pytest.raises(CorruptCollectionError):
+        local_store.upsert_source("source", "text", {"pack_id": "pack"})
+
+    assert open(path, "rb").read() == before
+
+
+def test_local_helper_strictness_preserves_metadata_nonfinite(local_store):
+    from opencrab.stores._source_integrity import strict_utf8_digest
+
+    text = "text"
+    local_store._collection_path("sources")
+    path = local_store._collection_path("sources")
+    path_data = {
+        "normal": {
+            "source_id": "normal",
+            "text": text,
+            "metadata": {"pack_id": "pack", "value": float("nan")},
+            "source_integrity": {
+                "version": 1,
+                "state": "complete",
+                "text_digest": strict_utf8_digest(text),
+            },
+        },
+        "bad-helper": {
+            "source_id": "bad-helper",
+            "text": text,
+            "metadata": {"pack_id": "pack"},
+            "source_integrity": {"version": 1, "state": "complete", "text_digest": float("nan")},
+        },
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(path_data, handle, allow_nan=True)
+
+    store_row = local_store.get_source("normal")
+    assert store_row is not None
+    assert math.isnan(store_row["metadata"]["value"])
+    assert local_store.read_source_state_exact("normal").complete is True
+    assert local_store.read_source_state_exact("bad-helper").complete is False
+
+
+def test_sql_scoped_exact_rejects_decoded_metadata_without_owned_pack(sql_store):
+    sql_store.upsert_source("source", "text", {"pack_id": "pack"})
+    sql_store._exec_write(
+        "UPDATE doc_sources SET metadata=:metadata WHERE source_id=:source_id",
+        {"source_id": "source", "metadata": '{"pack_id":"pack","pack_id":"pack"}'},
+    )
+
+    assert sql_store.get_source_scoped_exact("source", ["pack"]) is None
 
 
 def test_local_sql_delete_reuse_has_no_stale_helper(sql_store):
@@ -323,14 +387,26 @@ def test_local_json_duplicate_integrity_file_never_promotes(tmp_path, case, dupl
     }
     assert digest is not None
     assert normal["source_integrity"]["text_digest"] is not None
-    duplicate = ", ".join(
-        (
-            json.dumps("source_id") + ": " + json.dumps("duplicate"),
-            json.dumps("text") + ": " + json.dumps(text),
-            json.dumps("metadata") + ": " + json.dumps({"pack_id": "pack"}),
-            json.dumps("source_integrity") + ": " + helper.replace("DIGEST", digest),
+    helper_value = helper.replace("DIGEST", digest)
+    duplicate_fields = [
+        json.dumps("source_id") + ": " + json.dumps("duplicate"),
+        json.dumps("text") + ": " + json.dumps(text),
+        json.dumps("metadata") + ": " + json.dumps({"pack_id": "pack"}),
+    ]
+    if case == "helper-key":
+        duplicate_fields.extend(
+            (
+                json.dumps("source_integrity") + ": " + json.dumps({"version": 1, "state": "unknown"}),
+                json.dumps("source_integrity") + ": " + json.dumps({
+                    "version": 1,
+                    "state": "complete",
+                    "text_digest": digest,
+                }),
+            )
         )
-    )
+    else:
+        duplicate_fields.append(json.dumps("source_integrity") + ": " + helper_value)
+    duplicate = ", ".join(duplicate_fields)
     raw = "{" + json.dumps("duplicate") + ": {" + duplicate + "}, " + json.dumps("normal") + ": " + json.dumps(normal) + "}"
     assert json.loads(raw)["normal"] == normal
     parsed_pairs = json.loads(raw, object_pairs_hook=lambda pairs: pairs)
@@ -338,7 +414,9 @@ def test_local_json_duplicate_integrity_file_never_promotes(tmp_path, case, dupl
     assert duplicate_key in duplicate_keys(pairs_by_key["duplicate"]), case
     assert duplicate_keys(pairs_by_key["normal"]) == set()
 
-    (data_dir / "sources.json").write_text(raw, encoding="utf-8")
+    source_path = data_dir / "sources.json"
+    source_path.write_text(raw, encoding="utf-8")
+    before = source_path.read_bytes()
     store = LocalDocStore(str(data_dir))
     state = store.read_source_state_exact("duplicate")
     assert state is not None and state.complete is False, case
@@ -346,3 +424,8 @@ def test_local_json_duplicate_integrity_file_never_promotes(tmp_path, case, dupl
     assert scoped is not None
     assert scoped["_source_classification"]["complete"] is False
     assert store.read_source_state_exact("normal").complete is True
+    public_rows = [store.get_source("normal"), *store.list_sources()]
+    for row in public_rows:
+        assert isinstance(row, dict)
+        assert type(row["metadata"]) is dict
+    assert source_path.read_bytes() == before
