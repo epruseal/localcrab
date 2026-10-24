@@ -367,4 +367,3 @@ def test_rerank_path_keeps_its_result_cap():
     bm25 = [_bm(f"b{i:03d}", f"distinct {i}", float(200 - i)) for i in range(cap + 40)]
     out = _hq_with_legs(bm25=bm25).query("question", pack_ids=[PACK], use_rerank=True, limit=limit)
     assert len(out) == cap
-

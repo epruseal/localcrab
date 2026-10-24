@@ -27,14 +27,16 @@ logger = logging.getLogger(__name__)
     {
         "description": (
             "Hybrid vector + BM25 + graph search with RRF reranking. "
-            "A string inside a result's text, metadata or graph_context that is longer "
-            "than 4000 characters is cut; the result then carries a `truncation` key "
-            "with the cut paths and original lengths. Identifier places (a result's "
+            "A string inside a result's text, metadata or graph_context is cut only "
+            "when it is longer than 4000 characters; a `truncation` key with the cut "
+            "paths and original lengths appears only on a result with a cut or a "
+            "transformed text. Identifier places (a result's "
             "node_id and canonical, graph_context anchor_id, edge_endpoints and edge) "
             "and object keys are not cut. A cut source result has a source locator only "
-            "when its current scoped source row proves that it retains the full text; "
-            "ontology_get_source_range reads that source by UTF-8 byte range. "
-            "Other cut text sets full_text_unavailable. "
+            "when its current scoped source row proves that it retains the full text. "
+            "Use ontology_get_source_range to read that source by UTF-8 byte range. "
+            "full_text_unavailable appears only on a result whose text is cut or "
+            "transformed and that has no locator. "
             "When the response would pass its size budget, "
             "results are dropped from the tail: `total` is the number of results "
             "returned, `results_truncated` is true, `omitted_results` is the number "
@@ -147,17 +149,20 @@ def ontology_query(
     ``offset`` starts a page inside the fixed ``limit`` result window. Reuse the
     same query input and limit with ``next_offset`` to resume an over-budget page.
 
-    Response size (#511): a string inside a result's ``text``, ``metadata`` or
-    ``graph_context`` (and inside ``selected_packs``) that is longer than
-    ``QUERY_FIELD_CHAR_LIMIT`` is cut, and the item gets a ``truncation`` key.
-    Identifier places (a result's ``node_id`` and ``canonical``, the
-    ``graph_context`` keys ``anchor_id``, ``edge_endpoints`` and ``edge``,
-    ``selected_packs[i].pack_id``) and object keys are not cut. When the shown
-    text is the proven source text or its exact first 4000 characters, the
-    item's ``truncation`` carries ``source_locator``; read the whole source with
+    Response size (#511): the cap cuts a string inside a result's ``text``,
+    ``metadata`` or ``graph_context`` (and inside ``selected_packs``) only when
+    it is longer than ``QUERY_FIELD_CHAR_LIMIT``. An item's ``truncation`` key
+    appears only when a string was cut (by the cap, or by the merge that kept the
+    first 4000 characters of a longer proven text) or its ``text`` was
+    transformed. Identifier places (a result's ``node_id`` and ``canonical``,
+    the ``graph_context`` keys ``anchor_id``, ``edge_endpoints`` and ``edge``,
+    ``selected_packs[i].pack_id``) and object keys are not cut.
+    ``truncation.source_locator`` appears only when the ``text`` is cut, the
+    shown text is the proven source text or its exact first 4000 characters,
+    and the proof is neither missing nor invalidated. Read the whole source with
     ``ontology_get_source_range(source_locator, offset_bytes, length_bytes)``.
-    When the text was joined with other text or no proof exists,
-    ``truncation.full_text_unavailable`` is true and no locator is given.
+    ``truncation.full_text_unavailable`` appears only on an item whose ``text``
+    is cut or transformed and that carries no locator.
     ``ontology_get_node(node_id)`` keeps its graph-node meaning and is not the
     way to read the source text. When the response is over
     ``QUERY_RESPONSE_CHAR_BUDGET``, results are dropped from the tail and the
@@ -548,6 +553,13 @@ def ontology_get_source_range(
 
     The row judgment is the shared G1 ``validate_source_row_payload``. This
     handler only reads the scoped row and assembles the fixed error shapes.
+
+    It returns one of: a range (``source_id``, ``offset_bytes``,
+    ``length_bytes``, ``total_bytes``, ``source_digest``, ``text`` and
+    ``next_offset_bytes`` when more bytes follow), or an error object whose
+    ``error`` is ``invalid_source_locator``, ``invalid_source_range``,
+    ``source_not_found``, ``full_text_unavailable``, ``stale_source_locator``
+    or ``response_too_large``.
     """
     from opencrab.mcp.tools import _current_read_scope, _get_context
 

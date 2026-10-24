@@ -137,3 +137,34 @@ def test_trailing_space_prefix_keeps_a_locator_and_reassembles(stack):
     assert locator["source_id"] == source_id
     assert _caps._read_source(stack, locator) == text
     assert flow.find_reserved(item) == []
+
+
+def test_prefix_cut_below_the_merge_slice_reports_the_source_length(stack):
+    # A cap limit below the merge slice (4000) makes the cap cut the text itself.
+    # The cut record that the cap makes (original_chars 4000) must then carry the
+    # length of the whole source (4001).
+    source_id = "src:trail-cut"
+    text = "a" * LIMIT + " "
+    stack["docs"].upsert_source(
+        source_id, text, {"pack_id": _caps.PACK, "space": "evidence"}
+    )
+    proof = query_mod._source_provenance(
+        stack["docs"], source_id, text, permitted_packs={_caps.PACK}
+    )
+    assert proof is not None
+    existing = {
+        "source": "vector", "sources": ["vector"], "node_id": source_id, "score": 1.0,
+        "text": text, "metadata": {"pack_id": _caps.PACK}, "_query_provenance": proof,
+    }
+    _merge_duplicate(existing, _hit("keyword", "\t") | {"node_id": source_id})
+    assert existing["text"] == "a" * LIMIT
+    assert existing["_query_text_source_chars"] == LIMIT + 1
+
+    item = caps.cap_query_item(existing, limit=1000)
+    assert item["text"] == text[:1000]
+    assert item["truncation"]["limit_chars"] == 1000
+    assert item["truncation"]["fields"][0] == {"path": ["text"], "original_chars": LIMIT + 1}
+    locator = item["truncation"]["source_locator"]
+    assert locator["source_id"] == source_id
+    assert _caps._read_source(stack, locator) == text
+    assert flow.find_reserved(item) == []
