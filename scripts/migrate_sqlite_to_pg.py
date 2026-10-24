@@ -25,8 +25,8 @@ BEGIN and ROLLBACK to fix one read snapshot. The script issues no data write
 against the source files. There is deliberately no --backup-to flag here.
 Pass --verify to check the target after loading; a mismatch exits non-zero.
 ``--verify`` compares keys for SQL-store tables with a natural key and row counts
-for the tables in ``source_counts``. It skips a table that is absent from the
-source. It does not compare helper rows.
+for the other tables in ``source_counts``. It skips a table that is absent from
+the source. It does not compare helper rows.
 
 IDEMPOTENCY: re-running is safe, but how differs by table.
 
