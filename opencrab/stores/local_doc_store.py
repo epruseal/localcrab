@@ -327,11 +327,19 @@ class LocalDocStore:
             )
             return result
 
+    @staticmethod
+    def _public_source(row: Any) -> Any:
+        """Hide the private helper from a dict row; return any other value
+        unchanged, as the stores did before the helper existed."""
+        if not isinstance(row, dict):
+            return row
+        return {key: value for key, value in row.items() if key != "source_integrity"}
+
     def get_source(self, source_id: str) -> dict[str, Any] | None:
         row = self._load("sources").get(source_id)
         if row is None:
             return None
-        return {key: value for key, value in row.items() if key != "source_integrity"}
+        return self._public_source(row)
 
     def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
         """``limit <= 0``: returns ``[]`` -- same contract as ``list_nodes``
@@ -339,7 +347,7 @@ class LocalDocStore:
         if limit <= 0:
             return []
         return [
-            {key: value for key, value in row.items() if key != "source_integrity"}
+            self._public_source(row)
             for row in list(self._load("sources").values())[:limit]
         ]
 

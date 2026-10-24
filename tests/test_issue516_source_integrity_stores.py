@@ -25,7 +25,7 @@ def sql_store(tmp_path):
 
 
 def test_local_new_write_persists_full_text_and_hides_integrity(local_store):
-    text = "x" * 4096
+    text = "x" * 5000
     local_store.upsert_source("source", text, {"pack_id": "pack"})
 
     assert local_store.get_source("source")["text"] == text
@@ -347,12 +347,12 @@ def test_sql_integrity_write_rolls_back_with_fts(sql_store):
 @pytest.mark.parametrize(
     ("case", "duplicate_key", "helper"),
     [
-        ("version", "version", '{"version": 0, "version": 1, "state": "complete", "text_digest": "DIGEST"}'),
-        ("state", "state", '{"version": 1, "state": "unknown", "state": "complete", "text_digest": "DIGEST"}'),
-        ("text_digest", "text_digest", '{"version": 1, "state": "complete", "text_digest": "0", "text_digest": "DIGEST"}'),
-        ("same-value", "version", '{"version": 1, "version": 1, "state": "complete", "text_digest": "DIGEST"}'),
-        ("helper-key", "source_integrity", '{"source_integrity": {"version": 1, "state": "unknown"}, "source_integrity": {"version": 1, "state": "complete", "text_digest": "DIGEST"}}'),
-        ("nested", "key", '{"version": 1, "state": "complete", "text_digest": "DIGEST", "extra": {"key": 1, "key": 2}}'),
+        pytest.param("version", "version", '{"version": 0, "version": 1, "state": "complete", "text_digest": "DIGEST"}', id="version"),
+        pytest.param("state", "state", '{"version": 1, "state": "unknown", "state": "complete", "text_digest": "DIGEST"}', id="state"),
+        pytest.param("text_digest", "text_digest", '{"version": 1, "state": "complete", "text_digest": "0", "text_digest": "DIGEST"}', id="text_digest"),
+        pytest.param("same-value", "version", '{"version": 1, "version": 1, "state": "complete", "text_digest": "DIGEST"}', id="same-value"),
+        pytest.param("helper-key", "source_integrity", '{"source_integrity": {"version": 1, "state": "unknown"}, "source_integrity": {"version": 1, "state": "complete", "text_digest": "DIGEST"}}', id="helper-key"),
+        pytest.param("nested", "key", '{"version": 1, "state": "complete", "text_digest": "DIGEST", "extra": {"key": 1, "key": 2}}', id="nested"),
     ],
 )
 def test_local_json_duplicate_integrity_file_never_promotes(tmp_path, case, duplicate_key, helper):
@@ -431,3 +431,143 @@ def test_local_json_duplicate_integrity_file_never_promotes(tmp_path, case, dupl
         assert isinstance(row, dict)
         assert type(row["metadata"]) is dict
     assert source_path.read_bytes() == before
+
+
+_VALID_HELPER = '{"version": 1, "state": "complete", "text_digest": "DIGEST"}'
+
+
+@pytest.mark.parametrize(
+    ("backend", "helper", "text_length", "state_kind", "complete"),
+    [
+        pytest.param("local", _VALID_HELPER, 100, "complete", True, id="local-complete-valid"),
+        pytest.param("local", '{"version": 1, "state": "unknown"}', 100, "unknown", False, id="local-unknown-valid"),
+        pytest.param("local", "null", 100, "present_null", False, id="local-present-null"),
+        pytest.param("local", _VALID_HELPER.replace('"version": 1', '"version": true'), 100, "malformed", False, id="local-version-bool"),
+        pytest.param("local", _VALID_HELPER.replace('"version": 1', '"version": 1.0'), 100, "malformed", False, id="local-version-float"),
+        pytest.param("local", _VALID_HELPER.replace('"version": 1', '"version": 1e0'), 100, "malformed", False, id="local-version-1e0"),
+        pytest.param("local", _VALID_HELPER.replace('"version": 1', '"version": 2'), 100, "unsupported_version", False, id="local-version-unsupported"),
+        pytest.param("local", _VALID_HELPER.replace("}", ', "extra": 1}'), 100, "malformed", False, id="local-keyset-complete-extra"),
+        pytest.param("local", '{"version": 1, "state": "unknown", "extra": 1}', 100, "malformed", False, id="local-keyset-unknown-extra"),
+        pytest.param("local", '{"version": 1, "state": "complete"}', 100, "malformed", False, id="local-keyset-missing-digest"),
+        pytest.param("local", _VALID_HELPER.replace("DIGEST", "DIGESTUPPER"), 100, "complete", False, id="local-digest-uppercase"),
+        pytest.param("local", _VALID_HELPER.replace("DIGEST", "DIGESTPREFIX"), 100, "complete", False, id="local-digest-prefix"),
+        pytest.param("local", _VALID_HELPER.replace("DIGEST", "DIGESTOTHER"), 100, "complete", False, id="local-digest-mismatch"),
+        pytest.param("local", '{"version": 1, "state": "complete", "text_digest": NaN}', 100, "unknown", False, id="local-helper-nonfinite"),
+        pytest.param("local", None, 100, "legacy_absent", True, id="local-legacy-short"),
+        pytest.param("local", None, 4095, "legacy_absent", True, id="local-legacy-4095"),
+        pytest.param("local", None, 4096, "absent", False, id="local-legacy-4096"),
+        pytest.param("local", None, 4097, "absent", False, id="local-legacy-4097"),
+        pytest.param("sql", _VALID_HELPER, 100, "complete", True, id="sql-complete-valid"),
+        pytest.param("sql", '{"version":0,"version":1,"state":"complete","text_digest":"DIGEST"}', 100, "unknown", False, id="sql-duplicate-version"),
+        pytest.param("sql", "{not json", 100, "malformed", False, id="sql-bad-json"),
+        pytest.param("sql", '"complete"', 100, "malformed", False, id="sql-json-string-scalar"),
+        pytest.param("sql", '{"version":1,"state":"complete","text_digest":NaN}', 100, "unknown", False, id="sql-nonfinite"),
+        pytest.param("sql", None, 100, "legacy_absent", True, id="sql-helper-absent-legacy"),
+    ],
+)
+def test_strict_integrity_decoder_matrix(tmp_path, backend, helper, text_length, state_kind, complete):
+    from opencrab.stores._source_integrity import strict_utf8_digest
+
+    text = "x" * text_length
+    digest = strict_utf8_digest(text)
+    other_digest = strict_utf8_digest("other text")
+    assert digest is not None and other_digest is not None
+    if helper is not None:
+        helper = (
+            helper.replace("DIGESTUPPER", digest.upper())
+            .replace("DIGESTPREFIX", digest[:8])
+            .replace("DIGESTOTHER", other_digest)
+            .replace("DIGEST", digest)
+        )
+    normal_digest = strict_utf8_digest("normal")
+
+    if backend == "local":
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        data_dir = tmp_path / "local"
+        data_dir.mkdir()
+        target = (
+            '{"source_id": "target", "text": ' + json.dumps(text)
+            + ', "metadata": {"pack_id": "pack"}'
+            + ("" if helper is None else ', "source_integrity": ' + helper)
+            + "}"
+        )
+        normal = {
+            "source_id": "normal",
+            "text": "normal",
+            "metadata": {"pack_id": "pack"},
+            "source_integrity": {"version": 1, "state": "complete", "text_digest": normal_digest},
+        }
+        raw = '{"target": ' + target + ', "normal": ' + json.dumps(normal) + "}"
+        source_path = data_dir / "sources.json"
+        source_path.write_text(raw, encoding="utf-8")
+        before = source_path.read_bytes()
+        store = LocalDocStore(str(data_dir))
+    else:
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        store = LocalSQLDocStore(str(tmp_path / "docs.db"))
+        for source_id, source_text, source_helper in (
+            ("target", text, helper),
+            ("normal", "normal", json.dumps(
+                {"version": 1, "state": "complete", "text_digest": normal_digest}
+            )),
+        ):
+            store._exec_write(
+                "INSERT INTO doc_sources(source_id, text, metadata, ingested_at) "
+                "VALUES (:source_id, :text, :metadata, :ingested_at)",
+                {
+                    "source_id": source_id,
+                    "text": source_text,
+                    "metadata": json.dumps({"pack_id": "pack"}),
+                    "ingested_at": "2026-01-01T00:00:00+00:00",
+                },
+            )
+            if source_helper is not None:
+                store._exec_write(
+                    "INSERT INTO doc_source_integrity(source_id, source_integrity) "
+                    "VALUES (:source_id, :source_integrity)",
+                    {"source_id": source_id, "source_integrity": source_helper},
+                )
+
+    state = store.read_source_state_exact("target")
+    assert state is not None
+    assert state.complete is complete
+    assert state.text_digest == digest
+    scoped = store.get_source_scoped_exact("target", ["pack"])
+    assert scoped is not None
+    classification = scoped["_source_classification"]
+    assert classification["state_kind"] == state_kind
+    assert classification["complete"] is complete
+    assert classification["text_digest"] == digest
+    assert store.read_source_state_exact("normal").complete is True
+    if backend == "local":
+        assert source_path.read_bytes() == before
+
+
+def test_local_sources_get_list_non_dict_rows(local_store):
+    path = local_store._collection_path("sources")
+    dict_row = (
+        '{"source_id": "dict-row", "text": "t", "metadata": {}, '
+        '"source_integrity": {"version": 1, "state": "unknown"}}'
+    )
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(
+            '{"list-row": [], "number-row": 1, "string-row": "x", '
+            '"null-row": null, "dict-row": ' + dict_row + "}"
+        )
+    with open(path, "rb") as handle:
+        before = handle.read()
+
+    assert local_store.get_source("list-row") == []
+    assert local_store.get_source("number-row") == 1
+    assert local_store.get_source("string-row") == "x"
+    assert local_store.get_source("null-row") is None
+    public = local_store.get_source("dict-row")
+    assert public == {"source_id": "dict-row", "text": "t", "metadata": {}}
+    assert local_store.list_sources() == [[], 1, "x", None, public]
+    for source_id in ("list-row", "number-row", "string-row", "null-row"):
+        assert local_store.read_source_state_exact(source_id) is None
+        assert local_store.get_source_scoped_exact(source_id, ["pack"]) is None
+    with open(path, "rb") as handle:
+        assert handle.read() == before
