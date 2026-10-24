@@ -215,36 +215,64 @@ def test_sql_integrity_write_rolls_back_with_fts(sql_store):
     assert sql_store.get_source("source") is None
 
 @pytest.mark.parametrize(
-    ("case", "helper"),
+    ("case", "duplicate_key", "helper"),
     [
-        ("version", '{"version": 0, "version": 1, "state": "complete", "text_digest": "DIGEST"}'),
-        ("state", '{"version": 1, "state": "unknown", "state": "complete", "text_digest": "DIGEST"}'),
-        ("text_digest", '{"version": 1, "state": "complete", "text_digest": "0", "text_digest": "DIGEST"}'),
-        ("same-value", '{"version": 1, "version": 1, "state": "complete", "text_digest": "DIGEST"}'),
-        ("helper-key", '{"source_integrity": {"version": 1, "state": "unknown"}, "source_integrity": {"version": 1, "state": "complete", "text_digest": "DIGEST"}}'),
-        ("nested", '{"version": 1, "state": "complete", "text_digest": "DIGEST", "extra": {"key": 1, "key": 2}}'),
+        ("version", "version", '{"version": 0, "version": 1, "state": "complete", "text_digest": "DIGEST"}'),
+        ("state", "state", '{"version": 1, "state": "unknown", "state": "complete", "text_digest": "DIGEST"}'),
+        ("text_digest", "text_digest", '{"version": 1, "state": "complete", "text_digest": "0", "text_digest": "DIGEST"}'),
+        ("same-value", "version", '{"version": 1, "version": 1, "state": "complete", "text_digest": "DIGEST"}'),
+        ("helper-key", "source_integrity", '{"source_integrity": {"version": 1, "state": "unknown"}, "source_integrity": {"version": 1, "state": "complete", "text_digest": "DIGEST"}}'),
+        ("nested", "key", '{"version": 1, "state": "complete", "text_digest": "DIGEST", "extra": {"key": 1, "key": 2}}'),
     ],
 )
-def test_local_json_duplicate_integrity_file_never_promotes(tmp_path, case, helper):
+def test_local_json_duplicate_integrity_file_never_promotes(tmp_path, case, duplicate_key, helper):
     from opencrab.stores._source_integrity import strict_utf8_digest
     from opencrab.stores.local_doc_store import LocalDocStore
+
+    def duplicate_keys(value):
+        if not isinstance(value, list):
+            return set()
+        if all(isinstance(item, tuple) and len(item) == 2 for item in value):
+            keys = [key for key, _item in value]
+            return {key for key in keys if keys.count(key) > 1} | {
+                key
+                for _key, item in value
+                for key in duplicate_keys(item)
+            }
+        return {key for item in value for key in duplicate_keys(item)}
 
     data_dir = tmp_path / "local"
     data_dir.mkdir()
     text = "duplicate target"
     digest = strict_utf8_digest(text)
+    normal = {
+        "source_id": "normal",
+        "text": "normal",
+        "metadata": {"pack_id": "pack"},
+        "source_integrity": {
+            "version": 1,
+            "state": "complete",
+            "text_digest": strict_utf8_digest("normal"),
+        },
+    }
     assert digest is not None
-    (data_dir / "sources.json").write_text(
-        '{"duplicate": {"source_id": "duplicate", "text": "'
-        + text
-        + '", "metadata": {"pack_id": "pack"}, "source_integrity": '
-        + helper.replace("DIGEST", digest)
-        + '}, "normal": {"source_id": "normal", "text": "normal", "metadata": {"pack_id": "pack"}, "source_integrity": {"version": 1, "state": "complete", "text_digest": "'
-        + strict_utf8_digest("normal")
-        + '}}}',
-        encoding="utf-8",
+    assert normal["source_integrity"]["text_digest"] is not None
+    duplicate = ", ".join(
+        (
+            json.dumps("source_id") + ": " + json.dumps("duplicate"),
+            json.dumps("text") + ": " + json.dumps(text),
+            json.dumps("metadata") + ": " + json.dumps({"pack_id": "pack"}),
+            json.dumps("source_integrity") + ": " + helper.replace("DIGEST", digest),
+        )
     )
+    raw = "{" + json.dumps("duplicate") + ": {" + duplicate + "}, " + json.dumps("normal") + ": " + json.dumps(normal) + "}"
+    assert json.loads(raw)["normal"] == normal
+    parsed_pairs = json.loads(raw, object_pairs_hook=lambda pairs: pairs)
+    pairs_by_key = dict(parsed_pairs)
+    assert duplicate_key in duplicate_keys(pairs_by_key["duplicate"]), case
+    assert duplicate_keys(pairs_by_key["normal"]) == set()
 
+    (data_dir / "sources.json").write_text(raw, encoding="utf-8")
     store = LocalDocStore(str(data_dir))
     state = store.read_source_state_exact("duplicate")
     assert state is not None and state.complete is False, case
