@@ -69,9 +69,6 @@ ALLOWED: dict[tuple[str, str], str] = {
     # tests/test_pack_load_chunk_authz.py refuses a non-owner behaviourally.
     ("opencrab/pack/load.py", "flush"): "writer 3 -- gate runs at loader entry",
     ("opencrab/pack/load.py", "flush_single"): "writer 3 -- gate runs at loader entry",
-    ("opencrab/pack/load.py", "load_chunks_incremental"): (
-        "writer 3 -- gate runs at loader entry"
-    ),
     # --- explicitly out of scope (issue #148 acceptance narrowed to pack
     #     content writes; these are operator tools run locally, not client
     #     surfaces) ---

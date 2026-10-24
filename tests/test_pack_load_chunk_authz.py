@@ -226,6 +226,58 @@ class TestNonOwnerRejectionLoadChunksIncremental:
         assert vec.upsert_calls == 0
 
 
+class TestNonOwnerRejectionMetadataRewrite:
+    """#516 Z1: 메타 전용 재작성 분기도 인가 뒤에만 닿는다.
+
+    `load_chunks_incremental` 의 인가는 첫 저장소 호출보다 앞선다. 이 시험은 본문이 같고
+    메타만 바뀐 live 청크를 비소유자가 넘겨도 벡터 메타 갱신과 doc 재작성이 일어나지 않음을
+    행동으로 확인한다. 인가 호출을 빼면 이 분기에 닿아 시험이 실패한다."""
+
+    def test_public_read_pack_refuses_before_any_metadata_rewrite(
+        self, tmp_path, store, owner_a, user_b, monkeypatch
+    ):
+        docs, sql = store
+        with principal_scope(owner_a):
+            baseline = _chunks_file(tmp_path, "baseline.jsonl", [_chunk_row("c1", "원본", 쪽="3")])
+            ok, err = pack_load.load_chunks("authz-pack", baseline, _SpyVec(), docs, sql=sql)
+        assert (ok, err) == (1, 0)
+        set_visibility(sql, owner_a, "authz-pack", "public-read")
+        baseline_rows = _doc_sources_snapshot(docs)
+        assert len(baseline_rows) > 0
+        live_chunks = {
+            source_id: (text, json.loads(metadata)) for source_id, text, metadata in baseline_rows
+        }
+
+        class _MetaSpyVec(_SpyVec):
+            def __init__(self) -> None:
+                super().__init__()
+                self.meta_updates: list[str] = []
+
+            def update_metadata(self, chunk_id, meta):  # noqa: ARG002
+                self.meta_updates.append(chunk_id)
+                return True
+
+        rewrites: list[str] = []
+        real_rewrite = LocalSQLDocStore.rewrite_source_metadata
+
+        def spy(self, source_id, metadata, source_state):
+            rewrites.append(source_id)
+            return real_rewrite(self, source_id, metadata, source_state)
+
+        monkeypatch.setattr(LocalSQLDocStore, "rewrite_source_metadata", spy)
+        changed = _chunks_file(tmp_path, "changed.jsonl", [_chunk_row("c1", "원본", 쪽="99")])
+        vec = _MetaSpyVec()
+        with principal_scope(user_b):
+            with pytest.raises(PackForbiddenError):
+                pack_load.load_chunks_incremental(
+                    "authz-pack", changed, vec, docs, live_chunks, sql=sql)
+
+        assert _doc_sources_snapshot(docs) == baseline_rows
+        assert vec.meta_updates == [], "거부됐는데 벡터 메타를 갱신했다"
+        assert rewrites == [], "거부됐는데 doc 메타 재작성이 불렸다"
+        assert vec.upsert_calls == 0
+
+
 class _NoVec:
     """벡터 미가용 배포 형태. `load_chunks` 는 이 경우 적재를 통째로 skip 한다."""
 

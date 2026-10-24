@@ -180,29 +180,39 @@ def test_scoped_exact_reader_reads_source_and_helper_in_one_statement(tmp_path):
         finally:
             writer_done.set()
 
-    started = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    started: list[threading.Thread] = []
+    reader_thread: threading.Thread | None = None
+    writer_thread: threading.Thread | None = None
     try:
-        for thread in started:
-            thread.start()
-        started[1].join(15)
+        writer_thread = threading.Thread(target=writer)
+        writer_thread.start()
+        started.append(writer_thread)
+        reader_thread = threading.Thread(target=reader)
+        reader_thread.start()
+        started.append(reader_thread)
+        reader_thread.join(15)
         writer_go.set()
-        started[0].join(15)
+        writer_thread.join(15)
+        assert errors == [], errors
+        assert connections["reader"] != connections["writer"], "the two threads use two connections"
+        assert len(statements) == 1, statements
+        old = results["old"]
+        assert old is not None
+        assert (old["metadata"]["pack_id"], old["_source_classification"]["complete"]) == ("old-pack", False)
+        new = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+        assert new is not None
+        assert (new["metadata"]["pack_id"], new["_source_classification"]["complete"]) == ("new-pack", True)
     finally:
+        # Release the events, join only the threads that started, check that none is
+        # alive, and close the store only then. A live thread keeps its connection.
         writer_go.set()
         writer_done.set()
         for thread in started:
             thread.join(5)
-    assert not any(thread.is_alive() for thread in started)
-    assert errors == [], errors
-    assert connections["reader"] != connections["writer"], "the two threads use two connections"
-    assert len(statements) == 1, statements
-    old = results["old"]
-    assert old is not None
-    assert (old["metadata"]["pack_id"], old["_source_classification"]["complete"]) == ("old-pack", False)
-    new = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
-    assert new is not None
-    assert (new["metadata"]["pack_id"], new["_source_classification"]["complete"]) == ("new-pack", True)
-    store.close()
+        alive = [thread for thread in started if thread.is_alive()]
+        if not alive:
+            store.close()
+    assert not alive, "a test thread is still alive; the store was left open"
 
 
 def test_delete_failure_rolls_back_source_helper_and_fts(store):
