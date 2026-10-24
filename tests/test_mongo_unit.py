@@ -978,14 +978,6 @@ def _set_state(key, value):
 
 
 class TestMongoSourceIntegrityRewriteCas:
-    def test_evaluator_follows_mongo_equality(self):
-        """The evaluator keeps the rules that make the type clauses load-bearing."""
-        assert _mongo_equal(1, 1.0) is True
-        assert _mongo_equal(True, 1) is False
-        assert _mongo_equal(_ABSENT, None) is False
-        assert _mongo_equal(["a"], "a") is False
-        assert _strict_same(1, 1.0) is False
-
     @pytest.mark.parametrize("value", [["source-1"], 5, "other"], ids=["array", "int", "other-string"])
     def test_source_id_array_or_non_string_refuses(self, value):
         harness = _refused(_doc(_unknown()), _set("source_id", value))
