@@ -336,3 +336,49 @@ def test_doc_unavailable_with_a_healthy_vector_is_a_successful_ingest(sql):
     assert store_write_succeeded(receipt["stores"], "chromadb"), (
         "the vector leg must still land, and be readable as success"
     )
+
+
+# ---------------------------------------------------------------------------
+# #516 G3: a backend copy state reaches the existing public write exactly once
+# ---------------------------------------------------------------------------
+
+
+def test_copy_context_writes_once_and_preserves_unknown(sql, tmp_path):
+    from opencrab.stores._source_integrity import (
+        SourceCopyState,
+        current_source_copy_state,
+        strict_utf8_digest,
+    )
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    text = "copied body"
+    unknown = SourceCopyState("sqlite", "s-copy", text, strict_utf8_digest(text), False)
+    docs = LocalSQLDocStore(str(tmp_path / "copy.db"))
+    seen: list[SourceCopyState | None] = []
+    real_upsert = docs.upsert_source
+
+    def observing_upsert(source_id, body, metadata):
+        seen.append(current_source_copy_state())
+        return real_upsert(source_id, body, metadata)
+
+    docs.upsert_source = observing_upsert  # type: ignore[method-assign]
+    hybrid = _Hybrid()
+    try:
+        with principal_scope(ALICE):
+            receipt = write_source(
+                sql, hybrid, docs, _Vec(), graph=_Graph(),
+                text=text, source_id="s-copy", pack_id="pack-a",
+                write_vector=False, source_copy_state=unknown,
+            )
+        assert receipt["stores"]["documents"].startswith("ok")
+        # One doc write, bound to the copy state the caller verified.
+        assert seen == [unknown]
+        # The context ends with the write, and no vector call was made.
+        assert current_source_copy_state() is None
+        assert hybrid.calls == []
+        # The unknown state was copied as unknown and the text kept as given.
+        state = docs.read_source_state_exact("s-copy")
+        assert state is not None and state.text == text and state.complete is False
+        assert docs.get_source("s-copy")["text"] == text
+    finally:
+        docs.close()

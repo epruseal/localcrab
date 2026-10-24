@@ -1618,36 +1618,17 @@ def delete_pack(
             )
             src_ids = [docs._row_get(r, "source_id") for r in src_rows]
 
-            doc_sources_table = docs._table("doc_sources")
             chunk_sql_del = 0
             fts_del = 0
             for batch in _batched(src_ids):
-                placeholders, in_params = _in_names("sid", batch)
-                if not placeholders:                          # 도달 불가(위 주석) — 방어
-                    continue
-                chunk_sql_del += docs._exec_write(
-                    f"DELETE FROM {doc_sources_table} WHERE source_id IN ({placeholders})",
-                    in_params,
-                )
-                # doc_sources_fts 동기화(별도 fts5 가상 테이블 — 트리거 없이 수동 관리됨).
-                # [Δ r11 P1] sqlite 전용 방언 게이트만 신설 — 순서(doc_sources 삭제 뒤
-                # FTS 삭제)와 삭제 실패의 warning-삼킴은 **현행 그대로 유지**한다(FTS-first
-                # 로 뒤집지 않는다). 근거: 고아 FTS 행은 `keyword_search`(doc_sources
-                # 와 INNER JOIN, local_sql_doc_store.py:293)에서 안 보여 무해하고, 같은
-                # source_id 가 재적재되면 `upsert_source` 의 DELETE+INSERT 가 자가
-                # 치유한다(v6 검수 실측: orphan 상태 검색 결과 미포함·재업서트 후 fts
-                # 행 1). 전량 회수는 재실행으로 안 되고(별건, 대사 스윕 필요) —
-                # `_init_db` 의 n_fts==0 백필 가드(local_sql_doc_store.py:131)가 이
-                # 고아를 건드리는 유일한 비-JOIN 소비처다(그 가드는 "FTS 가 통째로
-                # 비어 있을 때"만 발동하므로 부분 고아는 못 건드린다).
-                if docs._dialect.name == "sqlite":
-                    try:
-                        fts_del += docs._exec_write(
-                            f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
-                            in_params,
-                        )
-                    except Exception as exc:
-                        log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
+                # #516 G4: source, helper state and FTS rows leave in one store
+                # transaction. A failure rolls the batch back and surfaces here.
+                delete_sources = getattr(docs, "delete_sources_with_state", None)
+                if not callable(delete_sources):
+                    raise RuntimeError("doc store lacks source-state delete boundary")
+                deleted = delete_sources(batch)
+                chunk_sql_del += deleted
+                fts_del += deleted if docs._dialect.name == "sqlite" else 0
             _commit_axis(
                 "doc_node_extra_and_sources",
                 {"done": True, "count": doc_node_extra_del + chunk_sql_del},
@@ -3153,7 +3134,13 @@ def load_chunks_incremental(
                 # 재시도 가능성을 보존한다(비교 기준을 섣불리 옮기지 않는다).
                 try:
                     if _vec_meta_update(vec, chunk_id, meta, pack_name):
-                        docs.upsert_source(chunk_id, row["text"], meta)
+                        # #516 G3: 메타 재작성은 읽은 상태를 그대로 두고 메타만 바꾼다.
+                        state_reader = getattr(docs, "read_source_state_exact", None)
+                        metadata_rewriter = getattr(docs, "rewrite_source_metadata", None)
+                        if callable(state_reader) and callable(metadata_rewriter):
+                            metadata_rewriter(chunk_id, meta, state_reader(chunk_id))
+                        else:
+                            docs.upsert_source(chunk_id, row["text"], meta)
                         c_meta += 1
                     else:
                         # 벡터 메타를 못 고쳤다 — 재임베딩으로라도 맞춘다.
@@ -3371,29 +3358,15 @@ def incremental_finalize(
 
     # ── 청크 삭제 (delete_pack과 동일 배치 패턴) ────────────────────────
     chunk_del_list = list(chunk_del_candidates)
-    doc_sources_table = docs._table("doc_sources")
     for batch in _batched(chunk_del_list):
-        placeholders, in_params = _in_names("cid", batch)
-        if not placeholders:                          # 도달 불가 — 방어(위 _in_names 주석)
-            continue
         try:
-            chunk_del += docs._exec_write(
-                f"DELETE FROM {doc_sources_table} WHERE source_id IN ({placeholders})",
-                in_params,
-            )
+            # #516 G4: source, helper state and FTS rows leave in one store transaction.
+            delete_sources = getattr(docs, "delete_sources_with_state", None)
+            if not callable(delete_sources):
+                raise RuntimeError("doc store lacks source-state delete boundary")
+            chunk_del += delete_sources(batch)
         except Exception as exc:
             log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
-        # [Δ r11 P1] delete_pack 과 동일 — sqlite 전용 방언 게이트만, 순서·삼킴은
-        # 현행 유지(고아 FTS 는 keyword_search INNER JOIN 기준 무해, 재적재가
-        # 자가 치유 — 위 delete_pack 의 상세 주석 참고).
-        if docs._dialect.name == "sqlite":
-            try:
-                docs._exec_write(
-                    f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
-                    in_params,
-                )
-            except Exception as exc:
-                log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
     if chunk_del_list:
         # evidence 노드 id == 청크 id 공유 팩: 청크만 사라지고 노드가 남는 id의
         # 벡터는 보존(노드 벡터 겸용 — 오삭제 방지, 2026-07-22)

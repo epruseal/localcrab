@@ -57,6 +57,7 @@ from opencrab.pack.write_gate import (
     source_identity_conflict,
     stamp,
 )
+from opencrab.stores._source_integrity import SourceCopyState, source_copy_context
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ def write_source(
     fork_copy: bool = False,
     write_vector: bool = True,
     write_graph: bool = True,
+    source_copy_state: SourceCopyState | None = None,
 ) -> dict[str, Any]:
     """Write one source's graph node, doc row and vector under one ownership stamp.
 
@@ -277,7 +279,12 @@ def write_source(
     doc_failed = False
     if _docs_available(docs):
         try:
-            created = docs.upsert_source(source_id, text, meta)
+            if source_copy_state is not None:
+                # #516 G3: the verified backend state rides the one public write.
+                with source_copy_context(source_copy_state):
+                    created = docs.upsert_source(source_id, text, meta)
+            else:
+                created = docs.upsert_source(source_id, text, meta)
             receipt["stores"]["documents"] = f"ok (id={created or source_id})"
         except Exception as exc:  # noqa: BLE001 -- reported, not raised (#158)
             # #168: this receipt's stores map flows straight into an MCP

@@ -122,6 +122,7 @@ from opencrab.pack.write_gate import (
     source_identity_conflict,
 )
 from opencrab.stores._graph_common import domain_labels
+from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
 from opencrab.stores._vector_base import validate_import_records
 
 logger = logging.getLogger(__name__)
@@ -596,6 +597,31 @@ def fork_pack(
         )
     except _RejectedError as rejected:
         return rejected.response
+
+
+def _verified_source_copy_state(docs: Any, source_id: str, text: str) -> SourceCopyState | None:
+    """The origin state to copy, or ``None`` when the origin cannot be verified.
+
+    Two exact reads must agree with each other and with the record text. A doc
+    store without the exact reader gets an unknown legacy state, so a copy never
+    gains a complete state the origin did not prove.
+    """
+    reader = getattr(docs, "read_source_state_exact", None)
+    if not callable(reader):
+        return SourceCopyState("legacy", source_id, text, None, False)
+    try:
+        first = reader(source_id)
+        final = reader(source_id)
+    except Exception as exc:  # noqa: BLE001 -- #168: only the type name leaves this function
+        logger.error("pack_fork: source state read failed for %r: %s", source_id, exc, exc_info=True)
+        return None
+    if not isinstance(first, SourceCopyState) or first != final:
+        return None
+    if final.source_id != source_id or final.text != text:
+        return None
+    if final.complete and final.text_digest != strict_utf8_digest(text):
+        return None
+    return final
 
 
 def _fork_pack_inner(
@@ -1680,6 +1706,14 @@ def _fork_pack_inner(
                     fetched = docs.get_source(old_id) if hasattr(docs, "get_source") else None
                     if isinstance(fetched, dict):
                         text = fetched.get("text") or ""
+                # #516 G3: read the origin state twice. The fork refuses an
+                # origin that differs between the reads or from the record. After
+                # the final read the fork copies this verified snapshot, even if
+                # the origin changes later.
+                source_state = _verified_source_copy_state(docs, old_id, text)
+                if source_state is None:
+                    tier2_failure = f"source {old_id!r} -> {new_id!r} state mismatch"
+                    break
                 receipt = write_source(
                     sql, hybrid, docs, vector, graph=graph,
                     text=text, source_id=new_id, metadata=meta, pack_id=dst,
@@ -1691,6 +1725,7 @@ def _fork_pack_inner(
                     # never had a node for stays node-less in the fork too --
                     # a fork copies, it does not backfill.
                     write_graph=False,
+                    source_copy_state=source_state,
                 )
                 if not _fork_leg_ok(receipt, "source"):
                     tier2_failure = f"source {old_id!r} -> {new_id!r} write failed"

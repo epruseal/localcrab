@@ -61,6 +61,36 @@ from opencrab.locking import file_lock
 
 console = Console()
 logger = logging.getLogger(__name__)
+_MONGO_MISSING = object()
+
+
+def _mongo_source_query(source_id: str) -> dict[str, Any]:
+    """Match one source only when its identifier is a scalar BSON string."""
+    return {
+        "$expr": {
+            "$and": [
+                {"$eq": [{"$type": "$source_id"}, "string"]},
+                {"$eq": ["$source_id", {"$literal": source_id}]},
+            ]
+        }
+    }
+
+
+def _mongo_structural_token(value: Any) -> tuple[Any, ...]:
+    """Keep BSON-like type distinctions for a migration source snapshot."""
+    if value is _MONGO_MISSING:
+        return ("missing",)
+    if value is None:
+        return ("null",)
+    if isinstance(value, dict):
+        return (
+            "object",
+            tuple(sorted((key, _mongo_structural_token(item)) for key, item in value.items())),
+        )
+    if isinstance(value, list):
+        return ("array", tuple(_mongo_structural_token(item) for item in value))
+    return (type(value).__name__, value)
+
 
 # ---------------------------------------------------------------------------
 # SQLStore 가 만드는 테이블 중 이 스크립트가 복사하지 않는 것이 소스에 있으면
@@ -453,16 +483,60 @@ def migrate_docs(
     with Progress(SpinnerColumn(), TextColumn("{task.description}"),
                   TextColumn("{task.completed} docs"), console=console) as progress:
         task = progress.add_task("  sources", total=None)
-        for doc in mongo_db["sources"].find({}, {"_id": 0}):
-            source_id = doc.get("source_id")
-            if not source_id:
+        sources = mongo_db["sources"]
+        for candidate in sources.find({}, {"_id": 0}):
+            source_id = candidate.get("source_id")
+            if not isinstance(source_id, str) or not source_id:
                 log.warning("source_id 없는 MongoDB 문서 스킵")
                 continue
-            sql_doc_store.upsert_source(
-                source_id,
-                doc.get("text", ""),
-                doc.get("metadata", {}),
+            origin = sources.find_one(_mongo_source_query(source_id), {"_id": 0})
+            if not isinstance(origin, dict) or origin.get("source_id") != source_id:
+                log.warning("변경되었거나 없는 MongoDB source 문서 스킵: %s", source_id)
+                continue
+            text = origin.get("text")
+            if not isinstance(text, str):
+                log.warning("text가 아닌 MongoDB source 문서 스킵")
+                continue
+            from opencrab.stores._source_integrity import (
+                SourceCopyState,
+                classify_integrity,
+                strict_utf8_digest,
             )
+
+            digest = strict_utf8_digest(text)
+            if digest is None:
+                log.warning("UTF-8이 아닌 MongoDB source 문서 스킵")
+                continue
+            changed = (
+                candidate.get("source_id") != origin.get("source_id")
+                or strict_utf8_digest(candidate.get("text")) != digest
+                or _mongo_structural_token(candidate.get("source_integrity", _MONGO_MISSING))
+                != _mongo_structural_token(origin.get("source_integrity", _MONGO_MISSING))
+            )
+            metadata = origin.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            complete, classified_digest = classify_integrity(
+                text,
+                origin.get("source_integrity"),
+                helper_present=("source_integrity" in origin),
+                legacy_complete=("source_integrity" not in origin),
+            )
+            source_state = SourceCopyState(
+                "mongo",
+                source_id,
+                text,
+                classified_digest if complete and not changed else digest,
+                complete and not changed,
+            )
+            copy_writer = getattr(sql_doc_store, "write_source_copy", None)
+            if callable(copy_writer):
+                copy_writer(source_id, text, metadata, source_state)
+            elif complete and not changed:
+                sql_doc_store.upsert_source(source_id, text, metadata)
+            else:
+                log.warning("무결성이 불명확한 MongoDB source 문서 스킵: %s", source_id)
+                continue
             total_sources += 1
             progress.update(task, completed=total_sources)
     console.print(f"  sources 완료: {total_sources:,}개")

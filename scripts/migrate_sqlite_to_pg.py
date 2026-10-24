@@ -80,6 +80,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -90,8 +91,30 @@ from typing import Any
 import _migration_tables as mt
 
 from opencrab.common.graph_identity import GraphMigrationFixtureOnlyError
+from opencrab.stores._source_integrity import (
+    classify_integrity,
+    complete_integrity,
+    decode_integrity_value,
+    unknown_integrity,
+)
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _migration_helper_state(text: str, raw: Any) -> str:
+    """Return the helper JSON to write for one source row.
+
+    The shared strict decoder and classifier decide. Only a well-formed complete
+    state whose digest matches ``text`` stays complete. Every other value,
+    including a malformed or ambiguous one, becomes unknown.
+    """
+    value = decode_integrity_value(raw, encoded_json=True)
+    complete, digest = classify_integrity(
+        text, value, helper_present=True, legacy_complete=False
+    )
+    state = complete_integrity(digest) if complete and digest is not None else unknown_integrity()
+    return json.dumps(state)
+
 
 
 def _check_ident(name: str, what: str) -> str:
@@ -284,12 +307,61 @@ def migrate_doc(
         "space, node_id",
         "SELECT space, node_id, node_type, properties, updated_at FROM doc_nodes",
     )
-    _copy(
-        "doc_sources",
-        ["source_id", "text", "metadata", "ingested_at"],
-        "source_id",
-        "SELECT source_id, text, metadata, ingested_at FROM doc_sources",
+    source_sql = text(
+        f"INSERT INTO {t}.doc_sources (source_id, text, metadata, ingested_at) "
+        "VALUES (:source_id, :text, CAST(:metadata AS jsonb), CAST(:ingested_at AS timestamptz)) "
+        "ON CONFLICT (source_id) DO UPDATE SET "
+        "text=EXCLUDED.text, metadata=EXCLUDED.metadata, ingested_at=EXCLUDED.ingested_at"
     )
+    helper_sql = text(
+        f"INSERT INTO {t}.doc_source_integrity (source_id, source_integrity) "
+        "VALUES (:source_id, CAST(:source_integrity AS jsonb)) "
+        "ON CONFLICT (source_id) DO UPDATE SET source_integrity=EXCLUDED.source_integrity"
+    )
+    helper_delete_sql = text(f"DELETE FROM {t}.doc_source_integrity WHERE source_id=:source_id")
+    # #516 G4: the table-presence check and every source/helper read share one
+    # SQLite snapshot. BEGIN is deferred, so the first read below fixes the snapshot.
+    # Target writes stay per batch; a count-based skip would keep a stale helper.
+    copied_sources = 0
+    src.execute("BEGIN")
+    try:
+        source_helper_available = src.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doc_source_integrity'"
+        ).fetchone() is not None
+        if source_helper_available:
+            source_query = (
+                "SELECT s.source_id, s.text, s.metadata, s.ingested_at, "
+                "i.source_id AS integrity_source_id, i.source_integrity "
+                "FROM doc_sources AS s LEFT JOIN doc_source_integrity AS i "
+                "ON i.source_id=s.source_id"
+            )
+        else:
+            source_query = (
+                "SELECT source_id, text, metadata, ingested_at, "
+                "NULL AS integrity_source_id, NULL AS source_integrity FROM doc_sources"
+            )
+        for rows in _fetch_batches(src, source_query, batch, limit):
+            source_rows = [
+                {key: row[key] for key in ("source_id", "text", "metadata", "ingested_at")}
+                for row in rows
+            ]
+            helper_rows = [
+                {
+                    "source_id": row["source_id"],
+                    "source_integrity": _migration_helper_state(row["text"], row["source_integrity"]),
+                }
+                for row in rows
+                if row["integrity_source_id"] is not None
+            ]
+            with engine.begin() as conn:
+                conn.execute(source_sql, source_rows)
+                conn.execute(helper_delete_sql, [{"source_id": row["source_id"]} for row in source_rows])
+                if helper_rows:
+                    conn.execute(helper_sql, helper_rows)
+            copied_sources += len(source_rows)
+    finally:
+        src.rollback()
+    print(f"#   doc_sources: {copied_sources} copied")
     _copy(
         "audit_log",
         ["event_id", "event_type", "subject_id", "details", "timestamp"],

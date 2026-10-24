@@ -11,7 +11,9 @@ schema/table (dropped in teardown) for parallel-safe isolation.
 
 from __future__ import annotations
 
+import json
 import os
+import threading
 import uuid
 
 import pytest
@@ -689,3 +691,178 @@ class TestPgNonFiniteJsonRejection:
         finally:
             with pg_engine.begin() as conn:
                 conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+
+
+# ---------------------------------------------------------------------------
+# #516 G2/G4/G8: source and helper state under concurrent writers (needs a real
+# PostgreSQL; implemented-unrun without OPENCRAB_PG_TEST_URL)
+# ---------------------------------------------------------------------------
+
+
+class TestPgDocSourceIntegrityLifecycle:
+    def test_locked_metadata_rewrite_rejects_concurrent_state_change(self, pg_engine):
+        """RW-PG-01. The writer and the rewrite run in two threads with two
+        connections. The rewrite lock attempt is taken from the statement hook of
+        the rewrite thread only, so a writer statement cannot stand in for it."""
+        from sqlalchemy import event
+
+        schema = f"t{uuid.uuid4().hex[:12]}_rw"
+        store = PgDocStore(pg_engine, schema=schema)
+        writer_locked = threading.Event()
+        rewrite_lock_attempted = threading.Event()
+        writer_committed = threading.Event()
+        rewrite_done = threading.Event()
+        release_writer = threading.Event()
+        errors: list[BaseException] = []
+        thread_ids: dict[str, int] = {}
+        hook_seen: list[tuple[str, bool]] = []
+
+        def observe_lock(_conn, _cursor, statement, _params, _context, _many):
+            if "FOR UPDATE" in statement and "doc_sources" in statement:
+                from_rewrite = threading.get_ident() == thread_ids.get("rewrite")
+                hook_seen.append((statement[:40], from_rewrite))
+                if from_rewrite:
+                    rewrite_lock_attempted.set()
+
+        try:
+            store.upsert_source("source", "body", {"pack_id": "pack"})
+            stale = store.read_source_state_exact("source")
+            assert stale is not None and stale.complete
+            event.listen(pg_engine, "before_cursor_execute", observe_lock)
+
+            def writer():
+                thread_ids["writer"] = threading.get_ident()
+                try:
+                    with pg_engine.begin() as conn:
+                        conn.execute(text(f'SELECT source_id FROM "{schema}".doc_sources WHERE source_id=\'source\' FOR UPDATE'))
+                        writer_locked.set()
+                        assert release_writer.wait(3)
+                        conn.execute(
+                            text(f'UPDATE "{schema}".doc_source_integrity SET source_integrity=CAST(:state AS jsonb) WHERE source_id=\'source\''),
+                            {"state": json.dumps({"version": 1, "state": "unknown"})},
+                        )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                finally:
+                    writer_committed.set()
+
+            def rewrite():
+                thread_ids["rewrite"] = threading.get_ident()
+                try:
+                    with pytest.raises(ValueError, match="source state changed"):
+                        store.rewrite_source_metadata("source", {"pack_id": "rewrite"}, stale)
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                finally:
+                    rewrite_done.set()
+
+            writer_thread = threading.Thread(target=writer)
+            rewrite_thread = threading.Thread(target=rewrite)
+            writer_thread.start()
+            assert writer_locked.wait(3)
+            rewrite_thread.start()
+            assert rewrite_lock_attempted.wait(3), hook_seen
+            assert not rewrite_done.wait(0.05), "the rewrite must wait on the writer's row lock"
+            release_writer.set()
+            assert writer_committed.wait(3)
+            assert rewrite_done.wait(3)
+            writer_thread.join(3)
+            rewrite_thread.join(3)
+            assert not writer_thread.is_alive() and not rewrite_thread.is_alive()
+            assert not errors
+            assert thread_ids["writer"] != thread_ids["rewrite"]
+            assert any(not from_rewrite for _statement, from_rewrite in hook_seen), "the writer lock was seen"
+            current = store.read_source_state_exact("source")
+            assert current is not None and current.complete is False
+            assert store.get_source("source")["metadata"]["pack_id"] == "pack"
+        finally:
+            release_writer.set()
+            event.remove(pg_engine, "before_cursor_execute", observe_lock)
+            _drop_schema(pg_engine, schema)
+
+
+class TestPgDocSourceIntegritySnapshot:
+    @staticmethod
+    def _unknown_copy_state():
+        from opencrab.stores._source_integrity import SourceCopyState
+
+        return SourceCopyState("postgresql", "source", "body", None, False)
+
+    def test_same_text_different_pack_unknown_to_complete_has_no_mixed_reader_version(self, pg_engine):
+        """PG-SNAP-01. While a writer holds uncommitted changes, the one-statement
+        reader returns the whole old version. After the commit it returns the whole
+        new version. The reader is never blocked by the writer."""
+        import hashlib
+
+        schema = f"t{uuid.uuid4().hex[:12]}_snap"
+        store = PgDocStore(pg_engine, schema=schema)
+        writer_locked = threading.Event()
+        release_writer = threading.Event()
+        writer_committed = threading.Event()
+        try:
+            store.write_source_copy("source", "body", {"pack_id": "old-pack"}, self._unknown_copy_state())
+
+            def writer():
+                with pg_engine.begin() as conn:
+                    conn.execute(text(f'SELECT source_id FROM "{schema}".doc_sources WHERE source_id=\'source\' FOR UPDATE'))
+                    writer_locked.set()
+                    assert release_writer.wait(3)
+                    conn.execute(
+                        text(f'UPDATE "{schema}".doc_sources SET metadata=CAST(:metadata AS jsonb) WHERE source_id=\'source\''),
+                        {"metadata": json.dumps({"pack_id": "new-pack"})},
+                    )
+                    conn.execute(
+                        text(f'UPDATE "{schema}".doc_source_integrity SET source_integrity=CAST(:state AS jsonb) WHERE source_id=\'source\''),
+                        {"state": json.dumps({"version": 1, "state": "complete", "text_digest": hashlib.sha256(b"body").hexdigest()})},
+                    )
+                writer_committed.set()
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+            assert writer_locked.wait(3)
+            old = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+            assert old is not None
+            assert (old["metadata"]["pack_id"], old["_source_classification"]["complete"]) == ("old-pack", False)
+            release_writer.set()
+            assert writer_committed.wait(3)
+            thread.join(3)
+            assert not thread.is_alive()
+            new = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+            assert new is not None
+            assert (new["metadata"]["pack_id"], new["_source_classification"]["complete"]) == ("new-pack", True)
+        finally:
+            release_writer.set()
+            _drop_schema(pg_engine, schema)
+
+    def test_split_read_counterexample_between_source_and_helper(self, pg_engine):
+        """A reader that reads the source row and the helper row in two statements
+        can see a tuple that no writer ever committed. This is the counterexample
+        that the one-statement JOIN of the store avoids."""
+        import hashlib
+
+        schema = f"t{uuid.uuid4().hex[:12]}_split"
+        store = PgDocStore(pg_engine, schema=schema)
+        try:
+            store.write_source_copy("source", "body", {"pack_id": "old-pack"}, self._unknown_copy_state())
+            with pg_engine.connect() as reader:
+                pack_before = reader.execute(
+                    text(f'SELECT metadata->>\'pack_id\' FROM "{schema}".doc_sources WHERE source_id=\'source\'')
+                ).scalar_one()
+                with pg_engine.begin() as writer:
+                    writer.execute(
+                        text(f'UPDATE "{schema}".doc_sources SET metadata=CAST(:metadata AS jsonb) WHERE source_id=\'source\''),
+                        {"metadata": json.dumps({"pack_id": "new-pack"})},
+                    )
+                    writer.execute(
+                        text(f'UPDATE "{schema}".doc_source_integrity SET source_integrity=CAST(:state AS jsonb) WHERE source_id=\'source\''),
+                        {"state": json.dumps({"version": 1, "state": "complete", "text_digest": hashlib.sha256(b"body").hexdigest()})},
+                    )
+                state_after = reader.execute(
+                    text(f'SELECT source_integrity->>\'state\' FROM "{schema}".doc_source_integrity WHERE source_id=\'source\'')
+                ).scalar_one()
+            # Mixed tuple: the old pack with the new complete state. No commit ever had it.
+            assert (pack_before, state_after) == ("old-pack", "complete")
+            whole = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+            assert (whole["metadata"]["pack_id"], whole["_source_classification"]["complete"]) == ("new-pack", True)
+        finally:
+            _drop_schema(pg_engine, schema)

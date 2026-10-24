@@ -4151,6 +4151,134 @@ def test_fts_lookup_by_rowid_matches_direct_query_and_delete_checks_text(world: 
         assert conn.execute("SELECT text FROM doc_sources_fts WHERE source_id=?", (candidate,)).fetchall() == [("edited",)]
 
 
+def _first_record(world: Path, tmp_path: Path) -> dict:
+    run = tmp_path / "run"
+    cleanup.dry_run(world, run, TABLE)
+    candidates, _manifest = cleanup._load_run(run)
+    return candidates[0]
+
+
+def test_delete_document_allows_absent_integrity_helper(world: Path, tmp_path: Path):
+    # #516 G4: no helper table at all (a store written before the helper existed).
+    record = _first_record(world, tmp_path)
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doc_source_integrity'"
+        ).fetchone() is None
+
+    cleanup._delete_document(world, record)
+
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute("SELECT source_id FROM doc_sources WHERE source_id=?", (record["id"],)).fetchone() is None
+
+
+def test_delete_document_allows_present_helper_table_without_row(world: Path, tmp_path: Path):
+    # #516 G4: the helper table exists but holds no row for this source (a legacy row).
+    record = _first_record(world, tmp_path)
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("CREATE TABLE doc_source_integrity (source_id TEXT PRIMARY KEY, source_integrity TEXT)")
+        conn.execute("INSERT INTO doc_source_integrity VALUES ('other-source', '{}')")
+
+    cleanup._delete_document(world, record)
+
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute("SELECT source_id FROM doc_sources WHERE source_id=?", (record["id"],)).fetchone() is None
+        # The table stays, the unrelated helper row stays, and the same ID can be reused.
+        assert conn.execute("SELECT source_id FROM doc_source_integrity").fetchall() == [("other-source",)]
+        conn.execute("INSERT INTO doc_sources VALUES (?, ?, ?)", (record["id"], "reuse", "{}"))
+        assert conn.execute(
+            "SELECT source_id FROM doc_source_integrity WHERE source_id=?", (record["id"],)
+        ).fetchone() is None
+
+
+def test_delete_document_same_id_reuse_has_no_stale_helper(world: Path, tmp_path: Path):
+    record = _first_record(world, tmp_path)
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("CREATE TABLE doc_source_integrity (source_id TEXT PRIMARY KEY, source_integrity TEXT)")
+        conn.execute(
+            "INSERT INTO doc_source_integrity VALUES (?, ?)",
+            (record["id"], json.dumps({"version": 1, "state": "unknown"})),
+        )
+
+    cleanup._delete_document(world, record)
+
+    with _db(world / "doc_store.db") as conn:
+        assert conn.execute("SELECT source_id FROM doc_source_integrity WHERE source_id=?", (record["id"],)).fetchone() is None
+        conn.execute("INSERT INTO doc_sources VALUES (?, ?, ?)", (record["id"], "reuse", "{}"))
+        assert conn.execute("SELECT source_id FROM doc_source_integrity WHERE source_id=?", (record["id"],)).fetchone() is None
+
+
+def _add_integrity_helper(root: Path, source_id: str) -> None:
+    with _db(root / "doc_store.db") as conn:
+        conn.execute("CREATE TABLE doc_source_integrity (source_id TEXT PRIMARY KEY, source_integrity TEXT)")
+        conn.execute(
+            "INSERT INTO doc_source_integrity VALUES (?, ?)",
+            (source_id, json.dumps({"version": 1, "state": "unknown"})),
+        )
+
+
+def _document_rows(root: Path, source_id: str) -> tuple[object, object, object, object]:
+    with _db(root / "doc_store.db") as conn:
+        source = conn.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchall()
+        helper = conn.execute("SELECT source_id,source_integrity FROM doc_source_integrity WHERE source_id=?", (source_id,)).fetchall()
+        fts = conn.execute("SELECT source_id,text FROM doc_sources_fts WHERE source_id=?", (source_id,)).fetchall()
+        doc = conn.execute("SELECT space,node_id,node_type,properties FROM doc_nodes WHERE node_id=?", (source_id,)).fetchall()
+    return source, helper, fts, doc
+
+
+class _FailDelete:
+    def __init__(self, conn: sqlite3.Connection, needle: str):
+        self._conn = conn
+        self._needle = needle
+
+    def execute(self, sql: str, params=()):
+        if self._needle in sql:
+            raise RuntimeError(f"forced {self._needle} failure")
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+
+def test_delete_document_helper_failure_rolls_back_source_fts_and_doc(world: Path, tmp_path: Path, monkeypatch):
+    record = _first_record(world, tmp_path)
+    _add_integrity_helper(world, record["id"])
+    before = _document_rows(world, record["id"])
+    original_writer = cleanup._writer
+    monkeypatch.setattr(cleanup, "_writer", lambda root, name: _FailDelete(original_writer(root, name), "DELETE FROM doc_source_integrity"))
+
+    with pytest.raises(RuntimeError, match="forced DELETE FROM doc_source_integrity failure"):
+        cleanup._delete_document(world, record)
+
+    assert _document_rows(world, record["id"]) == before
+
+
+def test_delete_document_cas_failure_restores_source_helper_fts_and_doc(world: Path, tmp_path: Path):
+    record = _first_record(world, tmp_path)
+    _add_integrity_helper(world, record["id"])
+    with _db(world / "doc_store.db") as conn:
+        conn.execute("UPDATE doc_sources SET text='changed' WHERE source_id=?", (record["id"],))
+    before = _document_rows(world, record["id"])
+
+    with pytest.raises(cleanup.CleanupRefusedError, match="source CAS conflict"):
+        cleanup._delete_document(world, record)
+
+    assert _document_rows(world, record["id"]) == before
+
+
+def test_delete_document_fts_failure_restores_source_helper_and_doc(world: Path, tmp_path: Path, monkeypatch):
+    record = _first_record(world, tmp_path)
+    _add_integrity_helper(world, record["id"])
+    before = _document_rows(world, record["id"])
+    original_writer = cleanup._writer
+    monkeypatch.setattr(cleanup, "_writer", lambda root, name: _FailDelete(original_writer(root, name), "DELETE FROM doc_sources_fts"))
+
+    with pytest.raises(RuntimeError, match="forced DELETE FROM doc_sources_fts failure"):
+        cleanup._delete_document(world, record)
+
+    assert _document_rows(world, record["id"]) == before
+
+
 def test_candidate_loop_issues_no_full_scan_statements(world: Path, tmp_path: Path, monkeypatch):
     statements: list[str] = []
     original_ro, original_rw = cleanup._ro, cleanup._rw

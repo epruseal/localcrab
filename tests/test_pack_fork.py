@@ -4161,3 +4161,98 @@ class TestLabelShapeAndRetiredAlias:
         assert metas, metas
         assert not any("pack" in m for m in metas), metas
         assert all(m.get("pack_id") == dst for m in metas), metas
+
+
+# ---------------------------------------------------------------------------
+# #516 G3: a fork copies one verified snapshot of each source
+# ---------------------------------------------------------------------------
+
+
+class TestSourceIntegritySnapshot:
+    """The fork reads the origin source state twice. The reads are real store
+    reads. A hook runs after a chosen read and changes the origin through the
+    real store, so the fork sees an origin that moves between the two reads or
+    right after the final one."""
+
+    @staticmethod
+    def _spy(stack, monkeypatch, hooks):
+        reads: list[Any] = []
+        real = type(stack["docs"]).read_source_state_exact
+
+        def spy(self, source_id):
+            state = real(self, source_id)
+            if source_id == "s0":
+                reads.append(state)
+                hook = hooks.get(len(reads))
+                if hook is not None:
+                    hook()
+            return state
+
+        monkeypatch.setattr(type(stack["docs"]), "read_source_state_exact", spy, raising=True)
+        return reads
+
+    @staticmethod
+    def _change_origin(stack, text):
+        docs = stack["docs"]
+        docs.upsert_source("s0", text, docs.get_source("s0")["metadata"])
+
+    @staticmethod
+    def _copied(stack, out):
+        return stack["docs"].list_sources_scoped([out["pack_id"]], 100)
+
+    def test_origin_change_before_final_reread_refuses(self, stack, monkeypatch):
+        src = _seed_pack(stack, ALICE, "src-snap-1", node_count=1, with_edge=False, with_source=True)
+        reads = self._spy(
+            stack, monkeypatch, {1: lambda: self._change_origin(stack, "origin moved between reads")}
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert len(reads) == 2 and reads[0] != reads[1], "the fork must read the origin state twice"
+        assert out["status"] == "partial", out
+        assert out["copied"]["sources"] == 0
+        assert self._copied(stack, out) == [], "no source is copied from a moving origin"
+
+    def test_final_unknown_writes_unknown_target(self, stack, monkeypatch):
+        from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
+
+        src = _seed_pack(stack, ALICE, "src-snap-2", node_count=1, with_edge=False, with_source=True)
+        docs = stack["docs"]
+        row = docs.get_source("s0")
+        text = row["text"]
+        docs.write_source_copy(
+            "s0", text, row["metadata"],
+            SourceCopyState("sqlite", "s0", text, strict_utf8_digest(text), False),
+        )
+        origin = docs.read_source_state_exact("s0")
+        assert origin is not None and origin.complete is False, "the origin must be unknown"
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert out["status"] == "ok", out
+        copied = self._copied(stack, out)
+        assert len(copied) == 1 and copied[0]["text"] == text
+        target = docs.read_source_state_exact(copied[0]["source_id"])
+        assert target is not None and target.text == text
+        assert target.complete is False, "an unknown origin must not become complete in the fork"
+        assert docs.read_source_state_exact("s0").complete is False
+
+    def test_origin_change_after_final_reread_keeps_verified_snapshot(self, stack, monkeypatch):
+        from opencrab.stores._source_integrity import strict_utf8_digest
+
+        src = _seed_pack(stack, ALICE, "src-snap-3", node_count=1, with_edge=False, with_source=True)
+        verified_text = stack["docs"].get_source("s0")["text"]
+        reads = self._spy(
+            stack, monkeypatch, {2: lambda: self._change_origin(stack, "origin moved after the final read")}
+        )
+
+        out = _fork(stack, principal=ALICE, src_pack_id=src)
+
+        assert len(reads) == 2 and reads[0] == reads[1]
+        assert out["status"] == "ok", out
+        assert stack["docs"].get_source("s0")["text"] == "origin moved after the final read"
+        copied = self._copied(stack, out)
+        assert len(copied) == 1 and copied[0]["text"] == verified_text, "the fork copies the verified snapshot"
+        target = stack["docs"].read_source_state_exact(copied[0]["source_id"])
+        assert target is not None and target.complete is True
+        assert target.text_digest == strict_utf8_digest(verified_text)
