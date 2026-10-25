@@ -87,10 +87,10 @@ _SYSTEM_TMP_ROOTS = (Path("/tmp"), Path("/dev/shm"))
 def check_write_paths(paths: list[Path], sources: list[Path] | None = None) -> None:
     """Refuse write paths inside the repository, the live data dir or a read source.
 
-    ``sources`` are the read-only inputs (corpus and load directories). A write
-    path inside a source, or one that contains a source, is refused. The
-    process ``TMPDIR`` must be set, must pass the same checks and must not be
-    under a system temporary root (design 9.1).
+    ``sources`` are the read-only inputs (corpus and load directories). The
+    function refuses a write path inside a source or a write path that
+    contains a source. The caller sets ``TMPDIR``. That path must pass the same
+    checks and must not lie under a system temporary root (design 9.1).
     """
     try:
         from opencrab.config import get_settings
@@ -489,6 +489,33 @@ def write_doc(docs: Any, vec: Any, rows: dict[str, Any]) -> None:
     if rows["vector"] is not None:
         vid, vtext, vmeta = rows["vector"]
         vec.upsert_texts(texts=[vtext], metadatas=[vmeta], ids=[vid])
+
+
+def locked_write(run_dir: Path, docs: Any, vec: Any, hq: Any, rows: dict[str, Any]) -> float:
+    """Write one document and invalidate BM25 inside one write.lock block.
+
+    The production ingest tools run the store writes and the invalidation
+    inside the same write.lock (design 8.3). Returns the lock wait in seconds.
+    """
+    from opencrab.locking import write_lock
+
+    started = time.perf_counter()
+    with write_lock(str(run_dir), timeout=30.0, purpose="search-baseline"):
+        acquired = time.perf_counter()
+        write_doc(docs, vec, rows)
+        hq.invalidate_bm25_cache()
+    return acquired - started
+
+
+def locked_delete(run_dir: Path, docs: Any, vec: Any, hq: Any, node_id: str) -> None:
+    """Delete one source-form document and invalidate BM25 inside one write.lock block."""
+    from opencrab.locking import write_lock
+
+    with write_lock(str(run_dir), timeout=30.0, purpose="search-baseline"):
+        docs.delete_node_doc("evidence", node_id)
+        docs.delete_sources_with_state([node_id])
+        vec.delete([node_id])
+        hq.invalidate_bm25_cache()
 
 
 def cmd_load(corpus: Path, work: Path) -> int:
@@ -1044,8 +1071,9 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
     def stable_bundle(q: dict[str, Any]) -> tuple[Any, Any, float, dict[str, Any], dict[str, float]] | None:
         """Build one bundle whose BM25 generation did not change (design 7.1).
 
-        A bundle whose generation changed is discarded with its latency
-        samples and rebuilt. Three changes in a row return None.
+        The function discards a bundle whose generation changed, together
+        with its latency samples, and builds it again. Three changes in a row
+        return None.
         """
         nonlocal discarded_bundles
         for _attempt in range(3):
@@ -1094,8 +1122,6 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
 
     # Freshness (step 6).
     cpu0 = time.process_time()
-    from opencrab.locking import write_lock
-
     fresh_marker1 = "qxfreshone"
     fresh_marker2 = "qxfreshtwo"
     body1 = f"{fresh_marker1} " + " ".join(f"qdfa{i}" for i in range(20))
@@ -1146,9 +1172,7 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
         return done
 
     def write_fresh(body: str) -> None:
-        with write_lock(str(run_dir), timeout=30.0, purpose="search-baseline"):
-            write_doc(docs, vec, doc_rows(fresh_doc(body), packs))
-        hq.invalidate_bm25_cache()
+        locked_write(run_dir, docs, vec, hq, doc_rows(fresh_doc(body), packs))
 
     freshness: dict[str, Any] = {}
     write_fresh(body1)
@@ -1171,11 +1195,7 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
         if leg not in visible:
             freshness["update"][leg] = "precondition_failed"
     still = {leg for leg, v in freshness["update"].items() if isinstance(v, float)}
-    with write_lock(str(run_dir), timeout=30.0, purpose="search-baseline"):
-        docs.delete_node_doc("evidence", fresh_id)
-        docs.delete_sources_with_state([fresh_id])
-        vec.delete([fresh_id])
-    hq.invalidate_bm25_cache()
+    locked_delete(run_dir, docs, vec, hq, fresh_id)
     freshness["delete"] = poll({
         leg: (lambda leg=leg: not leg_state(leg, body2 if leg == "vector" else fresh_marker2)[0])
         for leg in sorted(still)
@@ -1210,12 +1230,9 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
             try:
                 watchdog.op_start(f"write:{node_id}", slot="writer")
                 t0 = time.perf_counter()
-                with write_lock(str(run_dir), timeout=30.0, purpose="search-baseline"):
-                    t1 = time.perf_counter()
-                    write_doc(docs, vec, doc_rows(doc, packs))
-                hq.invalidate_bm25_cache()
+                waited = locked_write(run_dir, docs, vec, hq, doc_rows(doc, packs))
                 t2 = time.perf_counter()
-                lock_ms.append((t1 - t0) * 1000.0)
+                lock_ms.append(waited * 1000.0)
                 write_ms.append((t2 - t0) * 1000.0)
             except Exception as exc:  # noqa: BLE001 -- recorded in the report
                 write_errors.append(type(exc).__name__)

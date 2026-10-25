@@ -129,6 +129,34 @@ def test_row_contract_matches_the_production_writers(tmp_path):
         assert _read_rows(contract_dir, doc["id"]) == _read_rows(real_dir, doc["id"]), doc["id"]
 
 
+def test_harness_invalidates_bm25_while_holding_write_lock(tmp_path):
+    """The production ingest tools invalidate BM25 inside write.lock (design 8.3)."""
+    import opencrab.locking as locking
+
+    packs = {"measure": {"pack_id": "qpk-measure", "owner": "user_a", "status": "ready",
+                         "visibility": "private", "title": "m one", "description": "m two"}}
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    sql, docs, vec = harness._open_stores(run_dir)
+    harness._create_users(sql)
+    harness._register_packs(sql, packs)
+    lock_path = locking._lock_path("write.lock", str(run_dir))
+    seen: list[bool] = []
+
+    class RecordingHybrid:
+        def invalidate_bm25_cache(self) -> None:
+            seen.append(lock_path in (getattr(locking._held, "locks", None) or {}))
+
+    doc = {"id": "measure-000001", "pack": "measure", "form": "S", "space": "evidence",
+           "node_type": "TextUnit", "title": "t", "text": "body qxlockword"}
+    hybrid = RecordingHybrid()
+    harness.locked_write(run_dir, docs, vec, hybrid, harness.doc_rows(doc, packs))
+    harness.locked_delete(run_dir, docs, vec, hybrid, doc["id"])
+    harness._close(docs, vec, sql)
+    assert seen == [True, True]
+    assert lock_path not in (getattr(locking._held, "locks", None) or {})
+
+
 def _run(args: list[str], tmp_path: Path, script: str = "search_baseline.py") -> subprocess.CompletedProcess:
     # TMPDIR is a sibling of corpus, work and run, so the source-overlap check
     # accepts the normal layout (design 9.1).

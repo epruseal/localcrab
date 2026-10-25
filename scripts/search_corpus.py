@@ -4,9 +4,9 @@
 Design: docs/issue-542-search-baseline.md (sections 3, 5 and 6).
 
 The generator uses the standard library only. Every string comes from seeded
-generation rules, so no real pack name, content or count is copied. The same
-seed and preset produce byte-identical files. Documents are written as a
-stream, so a large preset does not hold every body in memory.
+generation rules. The generator copies no real pack name, content or count.
+The same seed and preset produce byte-identical files. The generator writes
+documents as a stream, so a large preset does not hold every body in memory.
 
 Usage:
     python scripts/search_corpus.py generate --preset S1 --seed 542 --out DIR
