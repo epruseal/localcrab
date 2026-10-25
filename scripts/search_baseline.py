@@ -191,9 +191,9 @@ def check_write_paths(paths: list[Path], sources: list[Path] | None = None, *, s
     ``sources`` are the read-only inputs (corpus and load directories). The
     function refuses a write path inside a source or a write path that
     contains a source. The caller sets ``TMPDIR``, and that path gets the same
-    checks. When the run is not smoke scale, the function also refuses a
-    ``TMPDIR`` or a write path on a RAM-backed filesystem, and it treats an
-    unknown filesystem type as RAM-backed (design 9.1).
+    checks. When the run is not smoke scale, the function resolves each path
+    to its real path and refuses it when that real path is on a RAM-backed
+    filesystem. It treats an unknown filesystem type as RAM-backed (design 9.1).
     """
     fs_type_of = fs_type_of or default_fs_type
     try:
@@ -216,14 +216,13 @@ def check_write_paths(paths: list[Path], sources: list[Path] | None = None, *, s
             if _inside(path, source) or _inside(source, path):
                 raise SystemExit(f"write path overlaps a read source: {path}")
         if not smoke:
-            # A ".." after a missing component cannot be opened, and a text
-            # resolution of it can differ from the kernel. Refuse it.
-            if ".." in Path(os.fspath(path)).parts:
-                raise SystemExit(f"write path contains '..': {path}")
-            fs_type = fs_type_of(path)
+            # Judge the real path, so direct callers and the CLI (which writes
+            # to Path.resolve() of its arguments) get the same answer.
+            real = Path(_resolve_for_mount(path))
+            fs_type = fs_type_of(real)
             if fs_type is None or fs_type in RAM_FS_TYPES:
                 raise SystemExit(f"write path is on a RAM-backed or unknown filesystem "
-                                 f"({fs_type}): {path}")
+                                 f"({fs_type}): {path} (real path {real})")
 
 
 def _read_kib(path: str, key: str) -> int | None:

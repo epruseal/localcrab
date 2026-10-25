@@ -362,17 +362,34 @@ def test_mountinfo_read_failure_is_unknown_and_refused(tmp_path, monkeypatch):
             fs_type_of=lambda path: harness.default_fs_type(path, read_mountinfo=denied))
 
 
-def test_dotdot_paths_are_refused_unless_smoke(tmp_path, monkeypatch):
-    disk = lambda path: "ext4"  # noqa: E731 -- leaves only the ".." rule
-    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
-    dotted = Path(f"{tmp_path}/a/../run")
+def test_guard_judges_the_real_path_through_symlinks_and_dotdot(tmp_path, monkeypatch):
+    """The guard resolves symlinks before ".." and judges the real path's medium."""
+    disk = tmp_path / "disk"
+    ram = tmp_path / "ram"
+    (ram / "sub").mkdir(parents=True)
+    disk.mkdir()
+    (disk / "up").symlink_to(ram / "sub")
+    text = f"20 1 8:2 / / rw - ext4 /dev/root rw\n60 20 0:50 / {os.path.realpath(ram)} rw - tmpfs tmpfs rw"
+
+    def lookup(path):
+        return harness.default_fs_type(path, read_mountinfo=lambda: text)
+
+    monkeypatch.setenv("TMPDIR", str(disk / "tmp"))
     with pytest.raises(SystemExit):
-        harness.check_write_paths([dotted], smoke=False, fs_type_of=disk)
-    harness.check_write_paths([dotted], smoke=True, fs_type_of=disk)
-    monkeypatch.setenv("TMPDIR", f"{tmp_path}/x/../tmp")
+        harness.check_write_paths([Path(f"{disk}/up/../run")], smoke=False, fs_type_of=lookup)
+    harness.check_write_paths([disk / "run"], smoke=False, fs_type_of=lookup)
+    harness.check_write_paths([Path(f"{disk}/up/../run")], smoke=True, fs_type_of=lookup)
+    monkeypatch.setenv("TMPDIR", f"{disk}/up/../tmp")
     with pytest.raises(SystemExit):
-        harness.check_write_paths([tmp_path / "run"], smoke=False, fs_type_of=disk)
-    harness.check_write_paths([tmp_path / "run"], smoke=True, fs_type_of=disk)
+        harness.check_write_paths([disk / "run"], smoke=False, fs_type_of=lookup)
+
+    # On a host where /var/run links to /run and /tmp is tmpfs (this device),
+    # the real lookup judges /var/run/../tmp as tmpfs.
+    if (os.path.islink("/var/run")
+            and Path("/var/run/../tmp").resolve() == Path("/tmp").resolve()
+            and harness.default_fs_type(Path("/tmp")) == "tmpfs"):
+        assert harness.default_fs_type(Path(harness._resolve_for_mount(Path("/var/run/../tmp")))) == "tmpfs"
+        assert harness.default_fs_type(Path("/var/run/../tmp")) == "tmpfs"
 
 
 def test_smoke_scale_comes_from_the_real_corpus_file(tmp_path):
