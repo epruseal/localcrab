@@ -325,7 +325,9 @@ source 형태의 `node_id`는 `source_id`와 같다. `doc_sources`의 메타데�
 
 - 하네스는 위 경로를 모두 인자로 받고 store를 그 경로로 직접 만든다. SQL URL은 `sqlite:///<디렉터리>/sql.db`로 하네스가 만들며 `Settings`의 URL을 쓰지 않는다. `resolve_packs`의 `local_data_dir`는 실행 디렉터리이며 manifest가 없으므로 enrichment는 비어 있다.
 - 하네스는 모든 쓰기 경로가 저장소 트리 밖이고 `Settings().local_data_dir`와 같지도 그 안도 아님을 확인한 뒤에만 시작한다. 쓰기 경로가 읽기 원본(코퍼스 디렉터리, 적재 디렉터리) 안이거나 그것을 포함해도 거부한다. `run`은 보고서 경로가 이미 있으면 거부한다.
-- 모든 하위 명령은 환경 변수 `TMPDIR`이 설정되어 있고 위 검사를 통과할 때만 시작한다. `TMPDIR`이 `/tmp`나 `/dev/shm` 아래이면 거부한다.
+- 모든 하위 명령은 환경 변수 `TMPDIR`이 설정되어 있고 위 검사를 통과할 때만 시작한다.
+- smoke 규모가 아닌 실행은 `TMPDIR`이나 쓰기 경로가 RAM 위 파일 시스템(`tmpfs`, `ramfs`)에 있으면 거부한다. 파일 시스템 종류는 `/proc/self/mountinfo`에서 경로 요소 경계로 가장 길게 일치하는 마운트로 판정하고, 판정할 수 없으면 RAM 위로 본다. 경로 이름(`/tmp`)이 아니라 매체로 판정하므로 디스크 위 `/tmp`(일반 CI 러너)는 허용하고 다른 위치에 마운트한 tmpfs는 거부한다.
+- smoke 규모는 코퍼스의 실제 `docs.jsonl`이 4MiB 이하이고 2000줄 이하인 경우다(`generate`는 생성기 프리셋 표의 전체 노드 수가 2000 이하인 경우). manifest의 프리셋 문자열은 판정에 쓰지 않는다. smoke 규모는 저장소 시험이 쓰는 S0이며 RAM 위 경로를 허용한다. 이 허용을 켜고 끄는 환경 변수나 플래그는 없다.
 - 하네스는 KURE 임베딩 함수, 원격 서버, MCP 엔드포인트, docker 자원을 쓰지 않는다.
 - 모든 실행(`generate`, `load`, `run`, `selftest`)은 4.1절의 transient systemd 서비스로 묶는다. 이 커널은 memory cgroup을 끈 상태라 `MemoryMax`가 동작하지 않는다. 메모리 보호는 `LimitAS`와 아래 감시 조건이 맡는다.
 
@@ -336,7 +338,7 @@ source 형태의 `node_id`는 `source_id`와 같다. `doc_sources`의 메타데�
 - 프로세스 RSS가 1.6GiB를 넘는다(`LimitAS=2G` 앞의 여유).
 - 장치의 `MemAvailable`이 1GiB 아래로 내려가거나 남은 swap이 1GiB 아래로 내려간다.
 - store를 부르는 호출 하나가 60초를 넘는다(`run`). 주 스레드의 요청, 레그 호출, freshness 확인과 쓰기 스레드의 쓰기 하나를 각자의 감시 슬롯으로 잰다.
-- 쓰기 경로 파일 시스템의 남은 공간이 10GiB 아래로 내려간다.
+- 쓰기 경로 파일 시스템의 남은 공간이 10GiB 아래로 내려간다. smoke 규모(9.1절)는 512MiB를 문턱으로 쓴다.
 - 시간 예산을 넘는다. `generate`와 `load`를 합친 예산은 S0 5분, S1 30분, S2 60분, S3 120분, S4 240분이다. `run`의 예산은 S0 5분, S1 30분, S2 60분, S3 90분, S4 180분이다. 생성기는 끝날 때 코퍼스 디렉터리에 경과 시간 파일(`generate-timing.json`, manifest의 digest 대상 밖)을 쓰고, `load`는 합계 예산에서 그 시간을 뺀 나머지를 예산으로 쓴다. 그 파일이 없는 코퍼스는 `load`가 거부한다.
 
 ## 10. 단계 확대 계획

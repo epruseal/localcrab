@@ -565,11 +565,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "generate":
         out = Path(args.out).resolve()
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from search_baseline import Watchdog, check_write_paths
+        from search_baseline import Watchdog, check_write_paths, preset_is_smoke
 
-        check_write_paths([out])
+        smoke = preset_is_smoke(args.preset)
+        check_write_paths([out], smoke=smoke)
         out.parent.mkdir(parents=True, exist_ok=True)
-        watchdog = Watchdog(args.preset, "generate", out.parent / f"{out.name}.aborted.json", [out.parent])
+        watchdog = Watchdog(args.preset, "generate", out.parent / f"{out.name}.aborted.json",
+                            [out.parent], smoke=smoke)
         watchdog.start()
         manifest = generate(args.preset, args.seed, out)
         # Outside manifest["files"], so the corpus digest stays deterministic.

@@ -81,17 +81,117 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-_SYSTEM_TMP_ROOTS = (Path("/tmp"), Path("/dev/shm"))
+# RAM-backed filesystems (design 9.1). This device's /tmp is tmpfs; a CI
+# runner's /tmp is usually a disk directory, so the guard judges the medium,
+# not the path name.
+RAM_FS_TYPES = frozenset({"tmpfs", "ramfs"})
+# Smoke scale (repository tests). Measured S0: docs.jsonl about 1.7MB and
+# 1170 lines, load dir about 9.5MB. S1 docs.jsonl is about 22MB.
+SMOKE_MAX_CORPUS_BYTES = 4 * (1 << 20)
+SMOKE_MAX_LINES = 2000
+DISK_FREE_MIN_SMOKE = 512 * (1 << 20)
 
 
-def check_write_paths(paths: list[Path], sources: list[Path] | None = None) -> None:
+def _unescape_mount(field: str) -> str:
+    """Undo the octal escapes (for example ``\\040`` for a space) of mountinfo."""
+    out: list[str] = []
+    i = 0
+    while i < len(field):
+        code = field[i + 1:i + 4]
+        if field[i] == "\\" and len(code) == 3 and all(c in "01234567" for c in code):
+            out.append(chr(int(code, 8)))
+            i += 4
+        else:
+            out.append(field[i])
+            i += 1
+    return "".join(out)
+
+
+def _resolve_for_mount(path: Path) -> str:
+    """Return the real path, resolving symlinks through the nearest existing parent."""
+    existing = Path(os.path.abspath(path))
+    tail: list[str] = []
+    while not existing.exists() and existing != existing.parent:
+        tail.append(existing.name)
+        existing = existing.parent
+    resolved = Path(os.path.realpath(existing))
+    for name in reversed(tail):
+        resolved = resolved / name
+    return str(resolved)
+
+
+def fs_type_for(path: Path, mountinfo_text: str) -> str | None:
+    """Return the filesystem type of the mount that holds ``path``.
+
+    The function picks the longest mount point that matches ``path`` at a path
+    component boundary. It returns None when no mount point matches.
+    """
+    target = _resolve_for_mount(path)
+    best: tuple[int, str] | None = None
+    for line in mountinfo_text.splitlines():
+        left, sep, right = line.partition(" - ")
+        fields = left.split()
+        rest = right.split()
+        if not sep or len(fields) < 5 or not rest:
+            continue
+        mount = _unescape_mount(fields[4])
+        if mount != "/" and target != mount and not target.startswith(mount.rstrip("/") + "/"):
+            continue
+        if best is None or len(mount) > best[0]:
+            best = (len(mount), rest[0])
+    return best[1] if best else None
+
+
+def default_fs_type(path: Path) -> str | None:
+    """Return the filesystem type of ``path`` from /proc/self/mountinfo, or None."""
+    try:
+        text = Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return fs_type_for(path, text)
+
+
+def corpus_is_smoke(corpus: Path) -> bool:
+    """Judge smoke scale from the real corpus file, never from the manifest preset."""
+    docs = corpus / "docs.jsonl"
+    try:
+        if docs.stat().st_size > SMOKE_MAX_CORPUS_BYTES:
+            return False
+        with docs.open("rb") as fh:
+            lines = sum(1 for _ in fh)
+    except OSError:
+        return False
+    return lines <= SMOKE_MAX_LINES
+
+
+def preset_is_smoke(preset: str) -> bool:
+    """Judge smoke scale from the generator's own preset table (code constants)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from search_corpus import PRESETS
+
+    spec = PRESETS[preset]
+    total = (sum(spec["large"]) + sum(spec["small"]) + spec["other_private"] + spec["other_public"]
+             + spec["creating"] + spec["measure"] + spec["unpackaged"])
+    return total <= SMOKE_MAX_LINES
+
+
+def disk_condition(free_bytes: int, smoke: bool) -> bool:
+    """Return True when the free space on a write path must stop the run (design 9.2)."""
+    return free_bytes < (DISK_FREE_MIN_SMOKE if smoke else DISK_FREE_MIN)
+
+
+def check_write_paths(paths: list[Path], sources: list[Path] | None = None, *, smoke: bool,
+                      fs_type_of: Any = None) -> None:
     """Refuse write paths inside the repository, the live data dir or a read source.
 
     ``sources`` are the read-only inputs (corpus and load directories). The
     function refuses a write path inside a source or a write path that
-    contains a source. The caller sets ``TMPDIR``. That path must pass the same
-    checks and must not lie under a system temporary root (design 9.1).
+    contains a source. The caller sets ``TMPDIR``, and that path gets the same
+    checks. When the run is not smoke scale, the function also refuses a
+    ``TMPDIR`` or a write path on a RAM-backed filesystem, and it treats an
+    unknown filesystem type as RAM-backed (design 9.1).
     """
+    fs_type_of = fs_type_of or default_fs_type
     try:
         from opencrab.config import get_settings
 
@@ -102,8 +202,6 @@ def check_write_paths(paths: list[Path], sources: list[Path] | None = None) -> N
     if not tmpdir:
         raise SystemExit("TMPDIR is not set; set it to a disk path outside the repository")
     tmp_path = Path(tmpdir)
-    if any(_inside(tmp_path, root) for root in _SYSTEM_TMP_ROOTS):
-        raise SystemExit(f"TMPDIR is under a system temporary root: {tmp_path}")
     sources = sources or []
     for path in [*paths, tmp_path]:
         if _inside(path, REPO_ROOT):
@@ -113,6 +211,11 @@ def check_write_paths(paths: list[Path], sources: list[Path] | None = None) -> N
         for source in sources:
             if _inside(path, source) or _inside(source, path):
                 raise SystemExit(f"write path overlaps a read source: {path}")
+        if not smoke:
+            fs_type = fs_type_of(path)
+            if fs_type is None or fs_type in RAM_FS_TYPES:
+                raise SystemExit(f"write path is on a RAM-backed or unknown filesystem "
+                                 f"({fs_type}): {path}")
 
 
 def _read_kib(path: str, key: str) -> int | None:
@@ -137,7 +240,8 @@ class Watchdog(threading.Thread):
     """Stop the process when a design section 9.2 condition holds."""
 
     def __init__(self, preset: str, phase: str, abort_path: Path, disk_paths: list[Path],
-                 *, spent_seconds: float = 0.0) -> None:
+                 *, spent_seconds: float = 0.0, smoke: bool = False,
+                 read_kib: Any = None, disk_free_of: Any = None) -> None:
         super().__init__(name="search-baseline-watchdog", daemon=True)
         budgets = BUDGET_RUN if phase == "run" else BUDGET_GENERATE_LOAD
         # generate and load share one budget: load receives what generate left.
@@ -145,6 +249,9 @@ class Watchdog(threading.Thread):
         self.phase = phase
         self.abort_path = abort_path
         self.disk_paths = disk_paths
+        self.smoke = smoke
+        self._read_kib = read_kib or _read_kib
+        self._disk_free_of = disk_free_of or (lambda probe: shutil.disk_usage(probe).free)
         self.started = time.monotonic()
         self.peak_rss = 0
         # One slot per thread that makes store calls (main and writer).
@@ -164,15 +271,15 @@ class Watchdog(threading.Thread):
         return time.monotonic() - self.started
 
     def _condition(self) -> str | None:
-        rss = _read_kib("/proc/self/status", "VmRSS") or 0
+        rss = self._read_kib("/proc/self/status", "VmRSS") or 0
         self.peak_rss = max(self.peak_rss, rss)
         if rss > RSS_ABORT_BYTES:
             return "process_rss"
-        available = _read_kib("/proc/meminfo", "MemAvailable")
+        available = self._read_kib("/proc/meminfo", "MemAvailable")
         if available is not None and available < MEM_AVAILABLE_MIN:
             return "mem_available"
-        swap_total = _read_kib("/proc/meminfo", "SwapTotal")
-        swap_free = _read_kib("/proc/meminfo", "SwapFree")
+        swap_total = self._read_kib("/proc/meminfo", "SwapTotal")
+        swap_free = self._read_kib("/proc/meminfo", "SwapFree")
         if swap_total and swap_free is not None and swap_free < SWAP_FREE_MIN:
             return "swap_free"
         with self._ops_lock:
@@ -183,7 +290,7 @@ class Watchdog(threading.Thread):
                 return f"operation_timeout:{slot}:{name}"
         for path in self.disk_paths:
             probe = path if path.exists() else path.parent
-            if probe.exists() and shutil.disk_usage(probe).free < DISK_FREE_MIN:
+            if probe.exists() and disk_condition(self._disk_free_of(probe), self.smoke):
                 return "disk_free"
         if self.elapsed() > self.budget:
             return "time_budget"
@@ -523,7 +630,8 @@ def cmd_load(corpus: Path, work: Path) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from search_corpus import TIMING_FILE, manifest_digest
 
-    check_write_paths([work], sources=[corpus])
+    smoke = corpus_is_smoke(corpus)
+    check_write_paths([work], sources=[corpus], smoke=smoke)
     if work.exists():
         raise SystemExit(f"load directory already exists: {work}")
     timing = corpus / TIMING_FILE
@@ -533,7 +641,7 @@ def cmd_load(corpus: Path, work: Path) -> int:
     manifest, packs, _queries = _read_corpus(corpus)
     work.mkdir(parents=True)
     watchdog = Watchdog(manifest["preset"], "load", work / "aborted.json", [work],
-                        spent_seconds=spent)
+                        spent_seconds=spent, smoke=smoke)
     watchdog.start()
     digest = manifest_digest(corpus)
     started = time.monotonic()
@@ -844,6 +952,7 @@ def _environment(config: str, env_values: dict[str, int], module_defaults: dict[
         "malloc_arena_max": os.environ.get("MALLOC_ARENA_MAX"), "config": config,
         "bm25_env": env_values, "bm25_module_defaults": module_defaults,
         "bm25_defaults_match": all(module_defaults.get(k) == v for k, v in BM25_DEFAULTS.items()),
+        "tmpdir_fs": default_fs_type(Path(os.environ.get("TMPDIR", ""))) if os.environ.get("TMPDIR") else None,
     }
 
 
@@ -914,13 +1023,14 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
 
     corpus, work = Path(args.corpus).resolve(), Path(args.work).resolve()
     run_dir, out = Path(args.run_dir).resolve(), Path(args.out).resolve()
-    check_write_paths([run_dir, out], sources=[corpus, work])
+    smoke = corpus_is_smoke(corpus)
+    check_write_paths([run_dir, out], sources=[corpus, work], smoke=smoke)
     if run_dir.exists():
         raise SystemExit(f"run directory already exists: {run_dir}")
     if out.exists():
         raise SystemExit(f"report already exists: {out}")
     manifest, packs, queries = _read_corpus(corpus)
-    watchdog = Watchdog(manifest["preset"], "run", out, [run_dir, out.parent])
+    watchdog = Watchdog(manifest["preset"], "run", out, [run_dir, out.parent], smoke=smoke)
     watchdog.start()
 
     report: dict[str, Any] = {"verdict": "INCOMPLETE", "reasons": []}

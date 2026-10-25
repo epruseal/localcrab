@@ -284,16 +284,94 @@ def test_write_paths_are_refused(bad, tmp_path, monkeypatch):
         "contains_source": tmp_path,
     }
     with pytest.raises(SystemExit):
-        harness.check_write_paths([paths[bad]], sources=[source])
+        harness.check_write_paths([paths[bad]], sources=[source], smoke=True)
 
 
-def test_tmpdir_must_be_set_and_off_the_system_tmp(tmp_path, monkeypatch):
+def test_ram_backed_paths_are_refused_unless_smoke(tmp_path, monkeypatch):
+    """The guard judges the medium through an injected lookup (design 9.1)."""
     target = tmp_path / "run"
+    tmp = tmp_path / "tmp"
+
+    def fs_of(table):
+        return lambda path: table.get(Path(path).name, "ext4")
+
     monkeypatch.delenv("TMPDIR", raising=False)
     with pytest.raises(SystemExit):
-        harness.check_write_paths([target])
-    monkeypatch.setenv("TMPDIR", "/tmp")
+        harness.check_write_paths([target], smoke=True, fs_type_of=fs_of({}))
+    monkeypatch.setenv("TMPDIR", str(tmp))
     with pytest.raises(SystemExit):
-        harness.check_write_paths([target])
-    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
-    harness.check_write_paths([target])
+        harness.check_write_paths([target], smoke=False, fs_type_of=fs_of({"tmp": "tmpfs"}))
+    with pytest.raises(SystemExit):
+        harness.check_write_paths([target], smoke=False, fs_type_of=fs_of({"run": "ramfs"}))
+    with pytest.raises(SystemExit):
+        harness.check_write_paths([target], smoke=False, fs_type_of=lambda path: None)
+    harness.check_write_paths([target], smoke=False, fs_type_of=fs_of({}))
+    harness.check_write_paths([target], smoke=True, fs_type_of=fs_of({"tmp": "tmpfs", "run": "tmpfs"}))
+
+
+_MOUNTINFO = "\n".join([
+    "20 1 8:2 / / rw,relatime shared:1 - ext4 /dev/root rw",
+    "41 20 0:35 / /tmp rw,nosuid shared:6 - tmpfs tmpfs rw",
+    "50 20 0:40 / /data/ram rw shared:7 - tmpfs tmpfs rw",
+    "51 50 8:3 / /data/ram/disk rw shared:8 - ext4 /dev/sdb1 rw",
+    "52 20 0:41 / /mnt/with\\040space rw shared:9 - ramfs ramfs rw",
+    "garbage line without separator",
+])
+
+
+def test_mount_lookup_matches_boundaries_nesting_and_escapes(tmp_path):
+    lookup = harness.fs_type_for
+    assert lookup(Path("/tmp/a/b"), _MOUNTINFO) == "tmpfs"
+    assert lookup(Path("/tmp"), _MOUNTINFO) == "tmpfs"
+    assert lookup(Path("/tmpfoo/x"), _MOUNTINFO) == "ext4"
+    assert lookup(Path("/data/ram/x"), _MOUNTINFO) == "tmpfs"
+    assert lookup(Path("/data/ram/disk/x"), _MOUNTINFO) == "ext4"
+    assert lookup(Path("/data/ramdisk/x"), _MOUNTINFO) == "ext4"
+    assert lookup(Path("/mnt/with space/x"), _MOUNTINFO) == "ramfs"
+    assert lookup(Path("/anything"), "") is None
+
+    # A missing path resolves through its nearest existing parent, and a
+    # symlink resolves to its target's mount.
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    text = f"20 1 8:2 / / rw - ext4 /dev/root rw\n60 20 0:50 / {real} rw - tmpfs tmpfs rw"
+    assert lookup(link / "not" / "yet", text) == "tmpfs"
+    assert lookup(tmp_path / "other", text) == "ext4"
+
+    root_type = harness.default_fs_type(Path("/"))
+    assert isinstance(root_type, str) and root_type
+
+
+def test_smoke_scale_comes_from_the_real_corpus_file(tmp_path):
+    big = tmp_path / "big"
+    big.mkdir()
+    (big / "manifest.json").write_text('{"preset": "S0"}', encoding="utf-8")
+    (big / "docs.jsonl").write_bytes(b"x" * (harness.SMOKE_MAX_CORPUS_BYTES + 1))
+    assert harness.corpus_is_smoke(big) is False
+    many = tmp_path / "many"
+    many.mkdir()
+    (many / "docs.jsonl").write_text("{}\n" * (harness.SMOKE_MAX_LINES + 1), encoding="utf-8")
+    assert harness.corpus_is_smoke(many) is False
+    small = tmp_path / "s0"
+    corpus_gen.generate("S0", 542, small)
+    assert harness.corpus_is_smoke(small) is True
+    assert harness.preset_is_smoke("S0") is True
+    assert harness.preset_is_smoke("S1") is False
+
+
+def test_disk_threshold_depends_on_scale(tmp_path):
+    gib = 1 << 30
+    assert harness.disk_condition(gib, smoke=True) is False
+    assert harness.disk_condition(256 * (1 << 20), smoke=True) is True
+    assert harness.disk_condition(gib, smoke=False) is True
+    assert harness.disk_condition(11 * gib, smoke=False) is False
+
+    def calm(path, key):
+        return {"VmRSS": 1, "MemAvailable": 8 * gib, "SwapTotal": 0, "SwapFree": 0}[key]
+
+    for smoke, expected in ((True, None), (False, "disk_free")):
+        dog = harness.Watchdog("S0", "run", tmp_path / "abort.json", [tmp_path], smoke=smoke,
+                               read_kib=calm, disk_free_of=lambda probe: gib)
+        assert dog._condition() == expected, smoke
