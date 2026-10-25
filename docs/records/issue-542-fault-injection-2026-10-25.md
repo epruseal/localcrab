@@ -8,7 +8,7 @@
 - 코퍼스: `scripts/search_corpus.py generate --preset S1 --seed 542`. 노드 20150, 질의 42. 적재는 `scripts/search_baseline.py load`로 했고 적재 완료 표시가 코퍼스의 기대 상태와 일치했다.
 - 실행: transient systemd 서비스(`CPUQuota=100%`, `Nice=19`, `IOSchedulingClass=best-effort`, `IOSchedulingPriority=7`, `LimitAS=2G`, `MALLOC_ARENA_MAX=2`, `PYTHONDONTWRITEBYTECODE=1`). 실행 중 주 PID의 `/proc/<pid>/limits`에서 주소 공간 상한 2147483648바이트, cgroup `cpu.max`에서 `100000 100000`을 확인했다. 보고서 `environment`에도 같은 값이 남았다. Python 3.13.5, SQLite 3.46.1.
 - 장치 등급: 8GB RAM, 4코어 aarch64. 한 번에 한 실행만 돌렸다.
-- 결과: 보고서 `verdict: COMPLETE`. 시나리오 21개 모두 주입을 확인했다(`not_injected` 0, `unavailable` 0). 하네스 프로세스의 표본 peak RSS는 약 368MiB였다.
+- 결과: 보고서 `verdict: COMPLETE`. 시나리오 21개 모두 주입을 확인했다(`not_injected` 0, `unavailable` 0). 하네스 프로세스의 표본 peak RSS는 약 373MiB였다.
 
 ## 기준 상태
 
@@ -31,7 +31,7 @@
 
 ### 타임아웃
 
-- T1: 정답 키 45개를 pending으로 둔 채 다른 연결이 SQLite 쓰기 잠금을 쥐었다. 질의 통과 동안 pending이 45개 그대로였고 질의 42개 가운데 39개의 BM25 결과에 pending 경고가 붙었다. 나머지 셋을 포함해 3.2절 위반은 0이다. BM25 호출 지연은 p50 50.9ms, p95 53.5ms, 최댓값 53.8ms였다(레그 요구치 500ms). 내부 잠금을 다른 스레드가 쥔 경우도 pending이 그대로였고 위반이 0이었다(p95 3.0ms). 잠금을 푼 뒤 다음 검색이 pending을 모두 소진했고 분류가 기준과 같았다.
+- T1: 정답 키 45개를 pending으로 둔 채 다른 연결이 SQLite 쓰기 잠금을 쥐었다. 질의 통과 동안 pending이 45개 그대로였고 질의 42개 가운데 39개의 BM25 결과에 pending 경고가 붙었다. 나머지 셋을 포함해 3.2절 위반은 0이다. BM25 호출 지연은 p50 50.9ms, p95 53.5ms, 최댓값 54.4ms였다(레그 요구치 500ms). 내부 잠금을 다른 스레드가 쥔 경우도 pending이 그대로였고 위반이 0이었다(p95 3.0ms). 잠금을 푼 뒤 다음 검색이 pending을 모두 소진했고 분류가 기준과 같았다.
 - T2: 잠금 중 새 노드 쓰기가 `OperationalError('database is locked')`로 실패했다. 그 키는 원본에도 pending에도 없었다.
 - T3: 저장소를 연 뒤 잠금을 쥐자 backfill 단계가 종료 코드 1과 `{"error": "database is locked", "processed": 0}`로 끝났다. 커서, 상태, 색인 문서 수가 그대로였다. 같은 시간의 질의 통과는 메모리 경로였고 위반이 0이다.
 - T4: 잠금을 `busy_timeout`보다 길게 쥔 동안 연 저장소 인스턴스는 사용 가능(`available`)이지만 색인이 `unsupported`였다. 잠금을 푼 뒤에도 그 인스턴스는 `unsupported`로 남았다. 그 인스턴스의 질의 42개는 모두 메모리 경로였고 경고 없는 결과가 오라클과 같았다. 그 인스턴스로 쓴 새 노드의 키는 pending에 남았고, 새로 연 프로세스가 소진했다.
@@ -64,7 +64,7 @@
 
 ### 재시작 수렴
 
-- R1: backfill 동안 서비스 역할의 `HybridQuery`는 메모리 경로였다. backfill 실행 중 쓰기 53건을 했고, 그 가운데 직접 SQL 수정 16건은 같은 트랜잭션에서 읽은 상태가 `backfill`이고 커서가 있었다. backfill이 끝나자 같은 인스턴스가 재시작 없이 DB 경로로 바뀌었고 질의 통과의 위반이 0이었다. 새 프로세스의 BM25 결과가 그 인스턴스의 결과와 같았다.
+- R1: backfill 동안 서비스 역할의 `HybridQuery`는 메모리 경로였다. backfill 실행 중 쓰기 60건을 했고, 그 가운데 직접 SQL 수정 30건은 같은 트랜잭션에서 읽은 상태가 `backfill`이고 커서가 있었다. backfill이 끝나자 같은 인스턴스가 재시작 없이 DB 경로로 바뀌었고 질의 통과의 위반이 0이었다. 새 프로세스의 BM25 결과가 그 인스턴스의 결과와 같았다.
 - R2: `OPENCRAB_BM25_MAX_NODE_CHARS=4096`으로 연 프로세스가 색인을 `backfill`로 초기화했다(`meta`의 값 4096). 그동안 서비스의 질의 통과는 메모리 경로에서 위반이 0이다. 원래 설정으로 다시 열고 backfill로 복구했다.
 - R3: `doc_nodes`를 같은 스키마로 다시 만들며 어느 질의도 참조하지 않는 문서 하나를 뺐다. 다시 열자 트리거 셋이 다시 생기고 행 수 점검이 색인을 `backfill`로 되돌렸다. 그동안 질의 통과는 메모리 경로에서 위반이 0이다.
 
