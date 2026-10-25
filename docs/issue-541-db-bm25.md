@@ -56,7 +56,9 @@
 3. 현재 행이 있으면 저장소의 `_row_to_node`로 노드 dict를 만든다. 토큰은 `tokenize(_node_text(node)[:max_text_chars])`다. docs 행과 FTS 행을 넣고 stats에 더한다. `pack_id`는 `scope_pack_id(node)`다.
 4. `pending`에서 그 키를 지운다.
 
-이 함수는 멱등이다. 같은 키를 여러 번 불러도 마지막 상태는 현재 행 하나를 반영한다. 기존 메모리 색인과 같은 함수(`_row_to_node`, `_node_text`, `tokenize`, `scope_pack_id`)를 쓰므로 문자열이 아닌 `pack_id`(문자열로 바꾼 값), 깨진 properties JSON(`properties={}`와 `property_decode_error`), 빈 `pack_id`의 처리가 기존과 같다. 깨진 행과 무소속 행도 색인에 들어가 N과 df에 기여하고, 범위 키가 빈 문자열이라 어떤 검색 결과에도 나오지 않는다. 기존 창도 이런 행을 담았으므로 같다.
+`max_text_chars`와 형식 버전은 프로세스 환경이 아니라 같은 트랜잭션에서 읽은 `meta`의 값을 쓴다. `meta`가 색인 설정의 정본이다. 프로세스의 코드 형식 버전이 `meta`의 `format`과 다르면 이 함수는 색인을 쓰지 않고 pending을 남긴다. 그래서 먼저 열린 프로세스가 다른 프로세스의 재설정 뒤에 옛 설정으로 색인을 쓰지 않는다.
+
+이 함수는 멱등이다. 같은 키를 여러 번 불러도 마지막 상태는 현재 행 하나를 반영한다. 기존 메모리 색인과 같은 함수(`_row_to_node`, `_node_text`, `tokenize`, `scope_pack_id`)를 쓰므로 `pack_id`(참으로 평가되는 값은 문자열로 바꾸고, `0`, `False`, 빈 문자열, 빈 리스트, 빈 사전 같은 거짓 값은 무소속으로 본다), 깨진 properties JSON(`properties={}`와 `property_decode_error`), 빈 `pack_id`의 처리가 기존과 같다. 깨진 행과 무소속 행도 색인에 들어가 N과 df에 기여하고, 범위 키가 빈 문자열이라 어떤 검색 결과에도 나오지 않는다. 기존 창도 이런 행을 담았으므로 같다.
 
 ### 4.3 토큰 보존
 
@@ -82,27 +84,34 @@ FTS5는 32768바이트보다 긴 용어를 바이트 단위로 자른다. 잘린
 
 입력은 기존 `BM25Index.search`와 같다(질의, `spaces`, `limit`, `pack_ids`). 단계는 다음과 같다.
 
-1. `q_tokens = tokenize(question)`. 비었거나 `pack_ids`가 비었거나 `limit <= 0`이면 빈 결과다.
+1. `q_tokens = tokenize(question)`. 비었거나 `pack_ids`가 비었으면 빈 결과다. `limit`은 기존처럼 정렬 목록에 `[:limit]` 자르기로 적용한다. 그래서 `limit <= 0`도 기존 `scores[:limit]`과 같은 결과다(음수는 뒤에서 그만큼 뺀다). 이 경우는 검증 대상 후보 전체를 검증한 뒤 자른다.
 2. pending 소진(4.6절).
-3. 하나의 읽기 트랜잭션에서 아래를 읽는다. 한 스냅숏이므로 stats, df, tf가 서로 맞는다.
+3. 하나의 읽기 트랜잭션에서 아래를 읽는다. 한 스냅숏이므로 stats, df, tf, pending, 상태가 서로 맞는다.
+   - `meta.state`. 이 스냅숏에서 `ready`가 아니면(다른 프로세스가 재설정했거나 지웠으면) DB 검색을 멈추고 기존 경로로 돌아간다.
+   - 이 스냅숏의 pending 키 수. 0보다 크면 4.6절의 pending 경고를 낸다. 2번 소진과 이 스냅숏 사이에 다른 프로세스가 직접 SQL로 쓴 변경도 여기서 잡힌다.
    - stats의 `doc_count`(N)와 `total_len`. N이 0이면 빈 결과다. `avgdl = total_len / N`이다.
    - 고유 질의 용어의 df(`vrow`). df가 없는 용어는 기존처럼 건너뛴다.
    - 용어마다 `vinst`와 docs를 이어 요청 팩(빈 문자열 제외)과 `spaces` 안의 `(doc_key, tf)`를 얻는다. 후보마다 `dl`, `updated_at`, `space`, `node_id`, `pack_id`를 얻는다.
 4. 후보마다 `q_tokens`를 원래 순서(중복 포함)로 돌며 기존과 같은 식으로 점수를 더한다. 식은 `bm25.py`의 공용 함수 하나에 두고 메모리 색인과 DB 색인이 함께 부른다. 그래서 부동소수 연산 순서까지 같다.
 5. 점수가 0보다 큰 후보를 `(-score, updated_at DESC, space, node_id)`로 정렬한다. 이 동점 순서는 기존 창의 위치 순서와 같다.
-6. 정렬 순서대로 `doc_nodes`의 현재 행을 일괄로 읽어 다시 검사한다. 행이 없거나, 현재 `scope_pack_id`가 요청 팩 밖이거나, 현재 space가 `spaces` 밖이면 버린다. 남은 행으로 `limit`개를 채운다. 결과 항목의 키와 값(`node_id`, `space`, `node_type`, `score`(넷째 자리 반올림), `properties`, `text=_node_text(현재 노드)`, `pack_id`)은 기존과 같다.
+6. 정렬 순서대로 같은 스냅숏에서 `doc_nodes`의 현재 행을 읽어 다시 검사한다. 키가 그 스냅숏의 pending에 있으면 버린다. 색인 항목이 현재 행을 반영하지 않으므로 점수와 일치 근거가 옛 본문의 것이기 때문이다. 행이 없거나, 현재 `scope_pack_id`가 요청 팩 밖이거나, 현재 space가 `spaces` 밖이어도 버린다. 남은 행으로 `limit`개를 채운다. 결과 항목의 키와 값(`node_id`, `space`, `node_type`, `score`(넷째 자리 반올림), `properties`, `text=_node_text(현재 노드)`, `pack_id`)은 기존과 같다.
 
-6번은 권한 경계의 최종 확인이다. pending이 남은 상태에서 팩이 바뀐 노드나 지워진 노드가 색인에 남아 있어도 결과에 나오지 않는다. 색인이 동기화된 상태에서는 아무것도 버리지 않으므로 결과가 기존 창 전량 색인의 결과와 같다.
+6번은 권한 경계와 신선도의 최종 확인이다. pending이 남은 상태에서 본문, 팩, space가 바뀐 노드와 지워진 노드는 옛 색인 항목으로 결과에 나오지 않는다. pending 키는 결과에서 빠지고 경고가 그 사실을 알린다. pending에 없는 키는 색인 항목이 현재 행과 같은 시점이다. 색인이 동기화된 상태에서는 아무것도 버리지 않으므로 결과가 `doc_nodes` 전량으로 만든 `BM25Index`의 결과와 같다.
 
-자동 팩 선택의 팩별 탐침(`_bm25_search_per_pack`)은 같은 계산을 한 번 하고 팩별로 상위 `limit`개씩 나눈다. 점수 통계가 전역이므로 팩마다 따로 부른 결과와 같다.
+pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변경이 빠져 있다. 그동안 다른 문서의 점수가 전량 오라클과 조금 다를 수 있다. 이 상태는 늘 pending 경고와 함께 나온다.
+
+자동 팩 선택의 팩별 탐침(`_bm25_search_per_pack`)은 같은 계산을 한 번 하고 팩별로 상위 `limit`개씩 나눈다. 점수 통계가 전역이므로 팩마다 따로 부른 결과와 같다. 팩별 모드의 검사는 현재 팩이 색인 팩과 같을 것을 요구한다.
+
+탐침의 coverage 경고는 선택 결과에 전달한다. `HybridQuery`에 `(팩별 결과, 경고)`를 돌려주는 `_bm25_search_per_pack_with_warnings`를 두고, `pack_registry`에 경고를 함께 돌려주는 `_choose_by_content_with_warnings`를 둔다. 기존 `_bm25_search_per_pack`과 `_choose_by_content`는 이 둘을 감싸 기존 반환 모양을 유지한다. `resolve_packs`는 탐침 경고가 있으면 새 선택 경고 코드 `auto_pack_probe_coverage`를 더한다. 이 코드는 MCP, REST, CLI의 문구 표에 모두 넣는다. 탐침 때 pending이나 색인 오류로 선택이 달라졌고 최종 검색 때 그 상태가 풀렸어도 응답에 탐침 당시의 사실이 남는다. 기존 메모리 경로의 팩별 탐침도 같은 메서드로 자기 coverage 경고를 전달한다.
 
 공통 용어(거의 모든 문서에 있는 토큰)를 담은 질의는 `vinst`가 그 용어의 모든 출현을 훑는다. 비용은 코퍼스 전체의 출현 수에 비례하고 요청 팩 크기와 무관하다. 기존 경로는 요청 팩의 모든 문서를 훑었다. 정확한 상위 k를 지키면서 이 비용을 줄이는 방법(MaxScore 계열 가지치기)은 S2 이상 측정에서 필요가 확인되면 후속으로 둔다.
 
 ### 4.6 pending 소진과 경고 계약
 
 - 검색은 `pending`이 있는지 `EXISTS`로 확인한다. 있으면 저장소 쓰기 트랜잭션(`BEGIN IMMEDIATE`)에서 키 묶음을 `reindex_key`로 처리한다. 묶음 크기와 검색 한 번의 시간 예산은 모듈 상수다. 예산이 끝나면 멈춘다.
-- 소진 뒤에도 pending이 남으면 검색 결과와 함께 `BM25 coverage pending changes: <n> node rows are not indexed yet` 경고를 낸다. 소진이 잠금이나 읽기 전용 파일 때문에 실패해도 같은 경고를 낸다.
+- 4.5절 3번의 스냅숏에서 pending이 남아 있으면 검색 결과와 함께 `BM25 coverage pending changes: <n> node rows are not indexed yet` 경고를 낸다. 소진이 잠금이나 읽기 전용 파일 때문에 실패해도 같은 경고를 낸다.
 - DB 색인 질의가 예외를 내면 빈 결과와 `BM25 coverage unavailable: node index query failed` 경고를 낸다. 기존 경로의 예외 삼킴(빈 결과, 경고 없음)은 DB 경로에 옮기지 않는다.
+- 소진은 저장소의 프로세스 내부 쓰기 잠금과 SQLite 쓰기 잠금을 기다린다. 시간 예산은 잠금을 얻은 뒤의 처리 시간만 묶는다. 잠금 대기는 SQLite 연결의 busy timeout이 묶는다. 하네스의 동시 쓰기 구간이 이 대기를 포함한 지연을 잰다.
 - 색인이 `ready`이고 pending이 비었으면 coverage 경고가 없다. 전량 색인이므로 기존의 `missing requested pack ids`, `partial rows`, `total unknown` 경고 조건이 생기지 않는다.
 
 경고는 모두 `BM25 coverage` 접두를 쓴다. 기존 결합 경로가 BM25 레그 경고를 `QueryOutcome.warnings`로 옮기므로 MCP 응답에도 나온다.
@@ -127,15 +136,21 @@ FTS5는 32768바이트보다 긴 용어를 바이트 단위로 자른다. 잘린
 | `backfill` | 색인 표가 있으나 기존 행 전량이 아직 색인되지 않음 | 기존 메모리 창 |
 | `ready` | 기존 행 전량을 한 번 색인했고, 그 뒤 변경은 쓰기 동기화와 pending이 맡음 | DB 색인 |
 
-환경 변수 `OPENCRAB_BM25_DB_INDEX=0`은 검색 경로만 기존 메모리 창으로 돌린다(킬 스위치). 색인 유지(트리거와 쓰기 동기화)는 계속된다. 다시 켜면 그동안 쌓인 변경은 이미 반영되어 있다.
+환경 변수 `OPENCRAB_BM25_DB_INDEX=0`은 검색 경로만 기존 메모리 창으로 돌린다(킬 스위치). 색인 유지(트리거와 쓰기 동기화)는 계속된다. 다시 켜면 저장소 메서드로 쓴 변경은 이미 반영되어 있다. 그동안의 직접 SQL 변경은 pending에 남아 있고 4.6절대로 소진과 경고를 거친다.
+
+`backfill` 상태에서 기존 경로를 쓴 서비스 프로세스는 `ready`로 바뀐 뒤에도 기존 메모리 상태와 재구축 스레드를 프로세스가 끝날 때까지 들고 있다. DB 경로는 그 상태를 읽지 않는다. 이 메모리는 전환 뒤 서비스 재시작(12절 6번)으로 돌려준다. 실행 중에 해제하지 않는 이유는 재구축 루프가 상태가 비면 cold 구축을 다시 시작하기 때문이다.
 
 ### 5.2 열기 때의 처리
 
 저장소 `_init_db`가 기존 FTS 블록 뒤에서, 같은 `write.lock`(`_bootstrap_lock`) 안에서 한다. 전체가 `BEGIN IMMEDIATE` 트랜잭션 하나다. 실패하면 되돌리고 상태를 `unsupported`로 둔다. 문서 저장소 자체는 `available`로 남는다.
 
 1. 객체를 `IF NOT EXISTS`로 만든다. 새로 만들었으면 `doc_nodes`가 비었을 때 `ready`, 아니면 `backfill`(커서 처음)로 둔다.
-2. `format` 또는 `max_text_chars`(`OPENCRAB_BM25_MAX_NODE_CHARS`)가 기록과 다르면 색인 행을 모두 지우고 `backfill`(커서 처음)로 되돌린다.
-3. `ready`이고 pending이 비었는데 `COUNT(doc_nodes)`가 stats의 `doc_count`와 다르면 `backfill`로 되돌리고 경고를 남긴다(4.4절의 표 재생성 감지).
+2. `format` 또는 `max_text_chars`(`OPENCRAB_BM25_MAX_NODE_CHARS`)가 기록과 다르면 색인을 초기화한다.
+3. `ready`이고 pending이 비었는데 `COUNT(doc_nodes)`가 stats의 `doc_count`와 다르면 색인을 초기화하고 경고를 남긴다(4.4절의 표 재생성 감지).
+
+초기화는 한 트랜잭션에서 docs 행 전부, FTS 내용 전부(`'delete-all'` 명령), pending 전부를 지우고 stats를 0으로, 커서를 처음으로, 상태를 `backfill`로, `format`과 `max_text_chars`를 이 프로세스 값으로 둔다. 커서만 되돌리면 현재 `doc_nodes`에 없는 고아 색인 항목이 남아 N과 df를 틀리게 한다. 초기화 뒤 backfill은 현재 행만으로 색인을 다시 만든다. pending을 지워도 되는 이유는 backfill이 현재 행 전부를 처리하고, 초기화 뒤의 변경은 트리거가 다시 pending에 넣기 때문이다.
+
+설정이 다른 두 프로세스가 같은 파일을 열면 나중에 연 프로세스의 설정으로 초기화된다. 먼저 연 프로세스는 4.2절대로 `meta`의 설정으로 쓰거나, 형식이 다르면 쓰지 않는다. 운영에서는 모든 프로세스가 같은 환경 파일을 쓴다.
 
 열기는 기존 행을 토큰화하지 않는다. 서비스 시작이 장시간 전체 구축을 기다리지 않는다.
 
@@ -152,12 +167,12 @@ FTS5는 32768바이트보다 긴 용어를 바이트 단위로 자른다. 잘린
 
 ### 5.4 전환 검증
 
-`opencrab packs bm25-index verify`가 읽기 전용으로 확인한다. 이 명령은 `doc_nodes`를 기본 키 순서로 스트리밍하며 노드마다 토큰을 다시 계산한다.
+`opencrab packs bm25-index verify`가 확인한다. 명령 자체는 색인과 원본에 쓰지 않는다. 저장소를 여는 일은 서비스와 같은 열기 절차(5.2절)를 거친다. 확인 전체는 읽기 트랜잭션 하나, 곧 한 스냅숏에서 한다. 그 스냅숏의 pending 키는 비교에서 빼고 수를 보고한다.
 
-- docs 행 집합이 `doc_nodes` 키 집합과 같다. 행마다 `pack_id`, `dl`, `updated_at`이 같다.
+- docs 행 집합이 pending을 뺀 `doc_nodes` 키 집합과 같다. 고아 항목과 빠진 항목의 수를 센다.
+- 행마다 `pack_id`, `dl`, `updated_at`이 다시 계산한 값과 같다.
+- 문서마다 용어와 tf의 다중집합이 같다. 비교는 순서에 무관한 128비트 지문으로 한다. 색인 쪽 지문은 `vinst`를 한 번 전량 훑으며 출현마다 그 문서의 지문에 용어 해시를 더해 만든다. 원본 쪽은 다시 계산한 대리 용어 열로 같은 방식으로 만든다. 두 문서의 tf를 서로 바꾼 경우처럼 길이와 df가 같아도 다중집합이 다르면 지문이 다르다.
 - stats가 docs의 합과 같다.
-- 표본 용어(노드 일부의 토큰)의 df가 `vrow`와 같다.
-- pending 수를 보고한다.
 
 결과는 JSON이다. 하나라도 다르면 0이 아닌 코드로 끝난다. 서비스는 검증 결과와 무관하게 `ready`면 DB 색인을 쓴다. 검증은 운영 절차(12절)의 전환 판정이다.
 
@@ -165,12 +180,12 @@ FTS5는 32768바이트보다 긴 용어를 바이트 단위로 자른다. 잘린
 
 - 검색만 되돌리기: `OPENCRAB_BM25_DB_INDEX=0`으로 서비스를 다시 시작한다. DB는 바뀌지 않는다.
 - 색인 제거: 서비스를 멈추고 `opencrab packs bm25-index drop`을 실행한다. 트리거와 색인 객체를 한 트랜잭션에서 지운다. `doc_nodes`와 다른 표는 건드리지 않는다. 이 코드가 다시 열면 객체를 새로 만들고 `backfill`로 시작하므로, 이전 코드로 되돌릴 때 이 명령을 쓴다.
-- 이전 코드로 되돌리고 drop을 하지 않으면 트리거가 남는다. 이전 코드는 색인 표를 읽지 않는다. pending은 키마다 한 행이므로 `doc_nodes` 행 수를 넘지 않는다. 다시 이 코드로 올리면 열기 점검과 pending 소진이 그 사이 변경을 반영한다.
+- 이전 코드로 되돌리고 drop을 하지 않으면 트리거가 남는다. 이전 코드는 색인 표를 읽지 않는다. pending은 이전 코드가 바꾼 서로 다른 키마다 한 행씩 늘어난다. 지운 키도 남으므로 현재 `doc_nodes` 행 수와 무관하게 커질 수 있다. 상한은 그 기간에 바뀐 서로 다른 키의 수다. 그래서 이전 코드로 오래 운영할 계획이면 되돌리기 전에 drop을 한다. drop 없이 다시 이 코드로 올리면 pending 소진이 그 사이 변경을 반영한다. pending이 많으면 그동안 검색은 pending 경고를 내므로, 올린 직후 `backfill` 명령(상태가 `ready`면 pending 소진만 한다)으로 비운다.
 - 원본 유실: 모든 단계가 색인 객체만 쓴다. `doc_nodes`, `doc_sources`, vector, 그래프는 읽기만 한다.
 
 ## 6. #550과의 관계
 
-#550은 이 이슈에 흡수하지 않는다. 새 색인은 같은 토큰 열과 같은 길이 정규화를 쓰므로 #550의 결함(한글 n-gram이 문서 길이에 들어가 긴 한국어 정답이 짧은 문서에 밀림)을 그대로 옮긴다. 기본 설정의 `top-k-pressure-1`은 base와 같은 `partial_silent`로 남는다. 축소 상한 설정에서는 base에서 창 밖 경고가 이 순위 실패를 가렸다. 새 색인은 창이 없으므로 경고가 사라지고 같은 질의가 `partial_silent`로 드러난다. 이 변화는 순위가 바뀐 결과가 아니라 경고가 사라진 결과다. 대조 보고(13절)에 질의별로 적는다. #550을 고치면 같은 공용 점수 함수와 토큰화 한 곳만 바꾸면 되고, 색인 형식 버전을 올려 backfill로 재색인한다.
+#550은 이 이슈에 흡수하지 않는다. 새 색인은 같은 토큰 열과 같은 길이 정규화를 쓰므로 #550의 결함(한글 n-gram이 문서 길이에 들어가 긴 한국어 정답이 짧은 문서에 밀림)을 그대로 옮긴다. 기본 설정의 `top-k-pressure-1`은 base와 같은 `partial_silent`로 남는다. 축소 상한 설정의 base에서는 이 질의의 정답이 창 밖에 있어 후보가 아니었고, coverage 경고가 붙어 `partial_flagged`였다. head는 창이 없으므로 정답이 후보에 들어오고, N, df, avgdl도 전량으로 계산한다. 그래서 head 축소 상한의 BM25 결과는 base 기본 설정의 결과와 같은 전량 색인의 결과다. 같은 전량 계산에서 정답이 대조군 아래로 밀리는 #550이 그대로 드러나 `partial_silent`가 된다. 이 근거는 두 가지로 보인다. 하나는 오라클 동등성 시험이다. 다른 하나는 대조 보고에서 head 축소 상한과 base 기본 설정의 이 질의 BM25 순위를 나란히 적는 것이다. `compare`는 head의 `partial_silent`를 base와 무관하게 회귀로 출력한다. 이 출력은 그대로 두고 대조 보고(13절)에 질의별 근거를 적는다. #550을 고치면 같은 공용 점수 함수와 토큰화 한 곳만 바꾸면 되고, 색인 형식 버전을 올려 backfill로 재색인한다.
 
 ## 7. 캐시
 
@@ -180,7 +195,7 @@ FTS5는 32768바이트보다 긴 용어를 바이트 단위로 자른다. 잘린
 
 - BM25 레그 진입점: `HybridQuery._bm25_search_state`, `_bm25_search_per_pack`, `_bm25_search_with_warnings`, `_bm25_search`. 앞의 둘이 DB 경로 분기를 갖고 뒤의 둘은 그 둘을 거친다. `pack_registry._choose_by_content`는 `_bm25_search_per_pack`을 부르고, 없으면 `_bm25_search`로 돌아간다.
 - 무효화 호출자: `mcp/tools/graph.py`(두 곳), `mcp/tools/pack.py`, `HybridQuery.ingest`. 모두 `invalidate_bm25_cache()`를 부른다. DB 모드에서는 아무 일도 하지 않는다.
-- `doc_nodes` 쓰기 지점: 저장소 메서드 셋(4.4절 첫 항목), `pack/load.py`의 팩 삭제 집합 DELETE, 운영 스크립트의 직접 SQL(`scripts/cleanup_openclaw_heartbeat_493.py`, `scripts/backfill_space.py` 등), #542 하네스의 `updated_at` 갱신. 앞의 것은 쓰기 동기화, 나머지는 트리거와 pending이 맡는다.
+- `pack/load.py`의 팩 삭제 집합 DELETE, 운영 스크립트의 직접 SQL(`scripts/cleanup_openclaw_heartbeat_493.py`), #542 하네스의 `updated_at` 갱신. 앞의 것은 쓰기 동기화, 나머지는 트리거와 pending이 맡는다.
 - 형제 저장소: `PgDocStore`와 `MongoStore`는 색인 능력을 노출하지 않는다. `HybridQuery`는 저장소의 `supports_node_bm25` 속성으로 분기하므로 두 저장소는 기존 경로를 그대로 쓴다.
 - 결과 결합과 동일 본문 접기(#482), 정책 필터(`_policy_filter`), source 결과 결합은 BM25 결과 항목의 모양을 읽는다. 항목 모양이 같으므로 바뀌지 않는다.
 - `opencrab packs reindex-bm25`는 CLI 프로세스 안에서 버려지는 메모리 색인을 만든다. 이 변경은 손대지 않고 후속 정리 후보로 둔다.
@@ -193,8 +208,13 @@ FTS5는 32768바이트보다 긴 용어를 바이트 단위로 자른다. 잘린
 - 토큰 왕복: `tokenize` 결과를 FTS5에 넣고 `vinst`로 되읽은 용어 열이 원래와 같다(`_`, 숫자, 한글, 여러 문자 체계, 1024바이트를 넘는 긴 토큰의 대리 용어). 긴 토큰 하나로 묻는 질의가 그 토큰을 가진 문서를 찾고, 앞부분만 같은 다른 긴 토큰의 문서는 찾지 않는다.
 - 트리거: upsert의 `DO UPDATE`, `INSERT OR REPLACE`, 키를 바꾸는 UPDATE, DELETE가 pending에 맞는 키를 남기고 실패하지 않는다.
 - 창 무관성: `OPENCRAB_BM25_NODE_LIMIT`과 `OPENCRAB_BM25_CHAR_BUDGET`을 아주 작게 둔 프로세스 환경에서도 오래된 문서와 다른 팩 문서가 찾히고 coverage 경고가 없다.
-- 쓰기 동기화: 삽입, 수정, 삭제, 팩 이동을 저장소 메서드로 한 직후 결과가 맞다. 직접 SQL 쓰기(다른 연결)는 pending에 남고 다음 검색이 소진한다. 소진 예산보다 많으면 pending 경고가 나오고, 그동안에도 지워진 노드와 팩 밖으로 옮긴 노드는 결과에 없다(적대 대조군).
+- 쓰기 동기화: 삽입, 수정, 삭제, 팩 이동을 저장소 메서드로 한 직후 결과가 맞다. 직접 SQL 쓰기(다른 연결)는 pending에 남고 다음 검색이 소진한다. 소진 예산보다 많으면 pending 경고가 나오고, 그동안에도 지워진 노드, 팩 밖으로 옮긴 노드, 본문을 바꾼 노드(옛 용어로 묻는 질의)는 결과에 없다(적대 대조군).
+- 스냅숏 경계: 소진 직후, 읽기 스냅숏 전에 다른 연결이 직접 SQL로 쓰도록 끼워 넣으면 그 검색이 pending 경고를 낸다. 같은 자리에서 다른 연결이 색인을 초기화하면 그 검색은 기존 경로로 돌아간다.
+- 자동 선택 경고: 탐침 때 pending이 남아 있으면 `resolve_packs` 결과에 `auto_pack_probe_coverage`가 있고, 세 문구 표가 그 코드를 정의한다.
+- `limit`: 0과 음수 `limit`의 결과가 기존 `BM25Index.search`와 같다.
 - 권한과 top-k 결합: 요청 팩 밖의 고득점 문서가 많아도 결과가 요청 팩 문서로 채워진다. `spaces` 필터도 같다.
+- 초기화: 색인에 고아 항목을 심고 행 수를 어긋나게 한 뒤 다시 열면 초기화된다. backfill 뒤 `verify`가 일치하고 오라클과 같다. 형식이 다른 `meta`를 본 쓰기는 색인을 쓰지 않고 pending을 남긴다.
+- 검증 검출력: 두 문서의 tf를 서로 바꾼 색인(길이와 df는 같음)을 `verify`가 불일치로 찾는다.
 - 실패와 복구: 색인 DDL 실패를 주입하면 색인 객체가 하나도 남지 않고 저장소는 쓰기와 읽기가 된다. `reindex_key` 실패를 주입하면 문서 쓰기는 성공하고 pending이 남는다. backfill 단계 도중 예외를 주입하면 커서와 색인 행이 단계 전 상태다. 다시 실행하면 `ready`가 되고 오라클과 같다.
 - 상태 전이: 기존 행이 있는 DB를 처음 열면 `backfill`이고 검색은 기존 경로다. `max_text_chars` 변경과 행 수 불일치가 `backfill`로 되돌린다. 킬 스위치와 `drop`이 기존 경로로 돌린다.
 - 다중 연결: 같은 파일을 연 두 저장소 인스턴스에서 한쪽 쓰기가 다른 쪽 검색에 바로 나온다.
@@ -219,7 +239,7 @@ PG 지원은 같은 상태 기계와 트리거 pending 구조를 PL/pgSQL 트리
 head의 하네스는 다음 세 가지만 바꾼다. 판정 함수, 질의 세트, 요구치 키 집합은 바꾸지 않는다.
 
 - `load`: `updated_at` 일괄 갱신 뒤 저장소가 색인을 가지면 pending을 끝까지 소진한다. 갱신이 트리거로 모든 행을 pending에 넣기 때문이다. 운영에서 대량 직접 SQL 뒤 운영자가 하는 일과 같다.
-- 자원: 색인 바이트에 `doc_nodes_bm25`로 시작하는 표를 더한다. 원문 본문 바이트에 `doc_nodes` 행의 검색 본문(`_node_text`의 UTF-8 바이트)을 더한다. 4.5절은 노드 색인을 색인에 넣으라고 정했고, 노드 색인의 원문은 노드 검색 본문이다. 보고서에는 구성 값을 따로 남긴다.
+- 자원: 요구치 `fts_index_ratio`의 계산은 바꾸지 않는다(source FTS 바이트 / source 본문 바이트). base와 head가 같은 정의로 비교되어야 하기 때문이다. 노드 색인은 요구치 키를 더하지 않고 `resources`에 따로 남긴다. 값은 이름에 `doc_nodes_bm25`가 든 모든 `dbstat` 객체(UNIQUE 제약의 자동 인덱스 `sqlite_autoindex_doc_nodes_bm25_docs_1` 포함)의 바이트, `doc_nodes` 검색 본문(`_node_text`의 UTF-8) 바이트, 그리고 4.5절 정의대로 (source FTS + 노드 색인) / (source 본문 + 노드 검색 본문)의 비율이다. base에는 노드 색인이 없으므로 이 비율의 base 값은 base 실행 디렉터리에서 같은 식으로 따로 계산해 대조 보고에 적는다. 4.5절의 2배 판정은 대조 보고가 이 비율로 한다.
 - 환경: 보고서 `environment`에 BM25 경로(`db` 또는 `memory`)를 남긴다.
 
 DB 모드에서는 하네스의 세대 확인(`hq._bm25.state.generation`)이 늘 `None`이다. 품질 판정 구간에는 쓰기가 없으므로 판정이 달라지지 않는다.
@@ -231,7 +251,7 @@ DB 모드에서는 하네스의 세대 확인(`hq._bm25.state.generation`)이 �
 3. 배포: 새 코드로 서비스를 다시 시작한다. 열기가 색인 객체와 트리거를 만든다. 상태는 `backfill`이고 검색은 기존 경로다. 이때부터 새 쓰기는 색인된다.
 4. backfill: 자원 상한(transient systemd 서비스, `CPUQuota`, `LimitAS`)을 걸고 `opencrab packs bm25-index backfill`을 실행한다. 중단되면 같은 명령으로 재개한다.
 5. 검증: `opencrab packs bm25-index verify`가 일치를 보고하는지 확인한다. 상태가 `ready`가 되면 다음 검색부터 DB 색인을 쓴다.
-6. 확인: 알려진 질의 몇 개로 결과와 경고를 확인한다.
+6. 확인: 알려진 질의 몇 개로 결과와 경고를 확인한다. backfill 동안 기존 경로가 들고 있던 메모리를 돌려주려고 서비스를 한 번 다시 시작한다.
 7. rollback: 5.5절.
 
 ## 13. 대조 계획 (구현 뒤)
@@ -239,7 +259,7 @@ DB 모드에서는 하네스의 세대 확인(`hq._bm25.state.generation`)이 �
 #542 하네스로 같은 seed(542), 같은 프리셋(S1), 두 설정(기본, 축소 상한)을 base(최신 `origin/main`)와 head에서 순차로 돌리고 `compare`로 대조한다. 기대는 다음과 같다.
 
 - 기본 설정: 분류가 base와 같다. 점수 식과 범위가 같기 때문이다. `top-k-pressure-1`의 `partial_silent`는 #550이며 base에도 있다.
-- 축소 상한 설정: 창 밖 누락으로 생긴 BM25와 결합의 `partial_flagged`가 사라지고 자동 선택 오류가 사라진다. `top-k-pressure-1`은 6절대로 `partial_silent`로 드러난다.
+- 축소 상한 설정: 창 밖 누락으로 생긴 BM25와 결합의 `partial_flagged`가 사라지고 자동 선택 오류가 사라진다. head 축소 상한의 분류는 head 기본 설정의 분류와 같다. `top-k-pressure-1`은 6절대로 `partial_silent`가 된다.
 - 두 설정 모두 누출, 중복, 범위 오류, 경고 누락이 0이다.
 - cold 지연과 peak RSS는 줄고, 쓰기 지연과 적재 시간은 늘 수 있다. 수치는 날짜 기록에 남긴다.
 
