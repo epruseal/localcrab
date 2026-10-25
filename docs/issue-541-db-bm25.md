@@ -56,7 +56,12 @@
 3. 현재 행이 있으면 저장소의 `_row_to_node`로 노드 dict를 만든다. 토큰은 `tokenize(_node_text(node)[:max_text_chars])`다. docs 행과 FTS 행을 넣고 stats에 더한다. `pack_id`는 `scope_pack_id(node)`다.
 4. `pending`에서 그 키를 지운다.
 
-`max_text_chars`와 형식 버전은 프로세스 환경이 아니라 같은 트랜잭션에서 읽은 `meta`의 값을 쓴다. `meta`가 색인 설정의 정본이다. 프로세스의 코드 형식 버전이 `meta`의 `format`과 다르면 이 함수는 색인을 쓰지 않고 pending을 남긴다. 그래서 먼저 열린 프로세스가 다른 프로세스의 재설정 뒤에 옛 설정으로 색인을 쓰지 않는다.
+`max_text_chars`와 형식 버전은 프로세스 환경이 아니라 같은 트랜잭션에서 읽은 `meta`의 값을 쓴다. `meta`가 색인 설정의 정본이다. 프로세스의 코드 형식 버전이 `meta`의 `format`과 다르면 이 함수는 아무것도 쓰지 않고 `IndexFormatMismatch` 예외를 낸다. 호출자마다 처리가 다르다.
+
+- 저장소 쓰기 경로: SAVEPOINT가 예외를 받아 되돌리고 경고를 남긴다. 문서 쓰기는 커밋되고 pending이 남는다.
+- pending 소진과 backfill 단계: 예외가 트랜잭션 전체를 되돌린다. 커서, pending, 상태가 그대로 남는다. 건너뛴 행을 처리한 것으로 세지 않는다. backfill 명령은 0이 아닌 코드로 끝나고, 검색의 소진은 멈춘 뒤 스냅숏 검사(4.5절 3번)로 간다.
+
+그래서 먼저 열린 프로세스가 다른 프로세스의 재설정 뒤에 옛 설정으로 색인을 쓰거나, 커서를 옮기거나, 상태를 `ready`로 바꾸지 않는다.
 
 이 함수는 멱등이다. 같은 키를 여러 번 불러도 마지막 상태는 현재 행 하나를 반영한다. 기존 메모리 색인과 같은 함수(`_row_to_node`, `_node_text`, `tokenize`, `scope_pack_id`)를 쓰므로 `pack_id`(참으로 평가되는 값은 문자열로 바꾸고, `0`, `False`, 빈 문자열, 빈 리스트, 빈 사전 같은 거짓 값은 무소속으로 본다), 깨진 properties JSON(`properties={}`와 `property_decode_error`), 빈 `pack_id`의 처리가 기존과 같다. 깨진 행과 무소속 행도 색인에 들어가 N과 df에 기여하고, 범위 키가 빈 문자열이라 어떤 검색 결과에도 나오지 않는다. 기존 창도 이런 행을 담았으므로 같다.
 
@@ -87,7 +92,7 @@ FTS5는 32768바이트보다 긴 용어를 바이트 단위로 자른다. 잘린
 1. `q_tokens = tokenize(question)`. 비었거나 `pack_ids`가 비었으면 빈 결과다. `limit`은 기존처럼 정렬 목록에 `[:limit]` 자르기로 적용한다. 그래서 `limit <= 0`도 기존 `scores[:limit]`과 같은 결과다(음수는 뒤에서 그만큼 뺀다). 이 경우는 검증 대상 후보 전체를 검증한 뒤 자른다.
 2. pending 소진(4.6절).
 3. 하나의 읽기 트랜잭션에서 아래를 읽는다. 한 스냅숏이므로 stats, df, tf, pending, 상태가 서로 맞는다.
-   - `meta.state`. 이 스냅숏에서 `ready`가 아니면(다른 프로세스가 재설정했거나 지웠으면) DB 검색을 멈추고 기존 경로로 돌아간다.
+   - `meta.state`와 `meta.format`. 이 스냅숏에서 상태가 `ready`가 아니거나 형식이 이 코드의 형식과 다르면(다른 프로세스가 재설정했거나 지웠거나 다른 형식으로 바꾸었으면) DB 검색을 멈추고 기존 경로로 돌아간다. 검색 진입 전의 상태 확인(`node_bm25_ready`)도 같은 두 조건을 본다.
    - 이 스냅숏의 pending 키 수. 0보다 크면 4.6절의 pending 경고를 낸다. 2번 소진과 이 스냅숏 사이에 다른 프로세스가 직접 SQL로 쓴 변경도 여기서 잡힌다.
    - stats의 `doc_count`(N)와 `total_len`. N이 0이면 빈 결과다. `avgdl = total_len / N`이다.
    - 고유 질의 용어의 df(`vrow`). df가 없는 용어는 기존처럼 건너뛴다.
@@ -102,7 +107,7 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 
 자동 팩 선택의 팩별 탐침(`_bm25_search_per_pack`)은 같은 계산을 한 번 하고 팩별로 상위 `limit`개씩 나눈다. 점수 통계가 전역이므로 팩마다 따로 부른 결과와 같다. 팩별 모드의 검사는 현재 팩이 색인 팩과 같을 것을 요구한다.
 
-탐침의 coverage 경고는 선택 결과에 전달한다. `HybridQuery`에 `(팩별 결과, 경고)`를 돌려주는 `_bm25_search_per_pack_with_warnings`를 두고, `pack_registry`에 경고를 함께 돌려주는 `_choose_by_content_with_warnings`를 둔다. 기존 `_bm25_search_per_pack`과 `_choose_by_content`는 이 둘을 감싸 기존 반환 모양을 유지한다. `resolve_packs`는 탐침 경고가 있으면 새 선택 경고 코드 `auto_pack_probe_coverage`를 더한다. 이 코드는 MCP, REST, CLI의 문구 표에 모두 넣는다. 탐침 때 pending이나 색인 오류로 선택이 달라졌고 최종 검색 때 그 상태가 풀렸어도 응답에 탐침 당시의 사실이 남는다. 기존 메모리 경로의 팩별 탐침도 같은 메서드로 자기 coverage 경고를 전달한다.
+탐침의 coverage 경고는 선택 결과에 전달한다. `HybridQuery`에 `(팩별 결과, 경고)`를 돌려주는 `_bm25_search_per_pack_with_warnings`를 두고, `pack_registry`에 경고를 함께 돌려주는 `_choose_by_content_with_warnings`를 둔다. 기존 `_bm25_search_per_pack`과 `_choose_by_content`는 이 둘을 감싸 기존 반환 모양을 유지한다. `resolve_packs`는 탐침 경고가 있으면 새 선택 경고 코드 `auto_pack_probe_coverage`를 더한다. 문구 표는 `_MCP_WARNINGS`와 `_CLI_WARNINGS` 둘이고 두 표 모두에 이 코드를 넣는다. MCP 응답과 REST 응답(`apps/api/main.py`)은 `mcp_warning_text`를, CLI는 `cli_warning_text`를 쓴다. 탐침 때 pending이나 색인 오류로 선택이 달라졌고 최종 검색 때 그 상태가 풀렸어도 응답에 탐침 당시의 사실이 남는다. 기존 메모리 경로의 팩별 탐침도 같은 메서드로 자기 coverage 경고를 전달한다.
 
 공통 용어(거의 모든 문서에 있는 토큰)를 담은 질의는 `vinst`가 그 용어의 모든 출현을 훑는다. 비용은 코퍼스 전체의 출현 수에 비례하고 요청 팩 크기와 무관하다. 기존 경로는 요청 팩의 모든 문서를 훑었다. 정확한 상위 k를 지키면서 이 비용을 줄이는 방법(MaxScore 계열 가지치기)은 S2 이상 측정에서 필요가 확인되면 후속으로 둔다.
 
@@ -111,7 +116,8 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 - 검색은 `pending`이 있는지 `EXISTS`로 확인한다. 있으면 저장소 쓰기 트랜잭션(`BEGIN IMMEDIATE`)에서 키 묶음을 `reindex_key`로 처리한다. 묶음 크기와 검색 한 번의 시간 예산은 모듈 상수다. 예산이 끝나면 멈춘다.
 - 4.5절 3번의 스냅숏에서 pending이 남아 있으면 검색 결과와 함께 `BM25 coverage pending changes: <n> node rows are not indexed yet` 경고를 낸다. 소진이 잠금이나 읽기 전용 파일 때문에 실패해도 같은 경고를 낸다.
 - DB 색인 질의가 예외를 내면 빈 결과와 `BM25 coverage unavailable: node index query failed` 경고를 낸다. 기존 경로의 예외 삼킴(빈 결과, 경고 없음)은 DB 경로에 옮기지 않는다.
-- 소진은 저장소의 프로세스 내부 쓰기 잠금과 SQLite 쓰기 잠금을 기다린다. 시간 예산은 잠금을 얻은 뒤의 처리 시간만 묶는다. 잠금 대기는 SQLite 연결의 busy timeout이 묶는다. 하네스의 동시 쓰기 구간이 이 대기를 포함한 지연을 잰다.
+- 검색의 소진은 잠금을 기다리지 않는다. 기존 `_tx`는 시간 제한 없는 프로세스 내부 `threading.Lock`을 먼저 얻으므로, 소진은 `_tx`를 쓰지 않고 그 잠금을 `acquire(blocking=False)`로 시도한다. 실패하면 소진을 건너뛴다. 잠금을 얻으면 같은 연결의 `busy_timeout`을 짧은 값(모듈 상수, 수십 ms)으로 낮춘 뒤 `BEGIN IMMEDIATE`를 실행하고, 끝나면 원래 값으로 되돌린다. 기존 `_checkpoint_if_wal_large`의 낮추기와 되돌리기 방식을 그대로 쓴다. `SQLITE_BUSY`면 소진을 건너뛴다. 건너뛴 검색은 스냅숏의 pending으로 경고를 내고 pending 키를 결과에서 뺀다. 그래서 검색 지연에 더해지는 잠금 대기는 위 짧은 값과 시간 예산으로 묶인다. 소진 묶음 크기는 한 묶음의 처리 시간이 예산을 크게 넘지 않게 정한다.
+- #542 하네스의 동시 쓰기 구간은 저장소 메서드로 쓰므로 커밋 뒤 pending이 남지 않는다. 그 구간은 쓰기 동기화의 비용을 재지만 소진 경합은 재지 않는다. 소진 경합은 시험이 잰다(9절): 다른 스레드가 내부 잠금을 쥔 동안, 그리고 다른 연결이 SQLite 쓰기 잠금을 쥔 동안 pending이 있는 검색이 짧은 상한 안에 경고와 함께 돌아오는지 확인한다.
 - 색인이 `ready`이고 pending이 비었으면 coverage 경고가 없다. 전량 색인이므로 기존의 `missing requested pack ids`, `partial rows`, `total unknown` 경고 조건이 생기지 않는다.
 
 경고는 모두 `BM25 coverage` 접두를 쓴다. 기존 결합 경로가 BM25 레그 경고를 `QueryOutcome.warnings`로 옮기므로 MCP 응답에도 나온다.
@@ -195,7 +201,7 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 
 - BM25 레그 진입점: `HybridQuery._bm25_search_state`, `_bm25_search_per_pack`, `_bm25_search_with_warnings`, `_bm25_search`. 앞의 둘이 DB 경로 분기를 갖고 뒤의 둘은 그 둘을 거친다. `pack_registry._choose_by_content`는 `_bm25_search_per_pack`을 부르고, 없으면 `_bm25_search`로 돌아간다.
 - 무효화 호출자: `mcp/tools/graph.py`(두 곳), `mcp/tools/pack.py`, `HybridQuery.ingest`. 모두 `invalidate_bm25_cache()`를 부른다. DB 모드에서는 아무 일도 하지 않는다.
-- `pack/load.py`의 팩 삭제 집합 DELETE, 운영 스크립트의 직접 SQL(`scripts/cleanup_openclaw_heartbeat_493.py`), #542 하네스의 `updated_at` 갱신. 앞의 것은 쓰기 동기화, 나머지는 트리거와 pending이 맡는다.
+- `doc_nodes` 쓰기 지점: 저장소 메서드 셋(4.4절 첫 항목)은 쓰기 동기화가 맡는다. `pack/load.py`의 팩 삭제 집합 DELETE(`_exec_write`로 직접 실행), 운영 스크립트의 직접 SQL(`scripts/cleanup_openclaw_heartbeat_493.py`), #542 하네스의 `updated_at` 갱신은 트리거와 pending이 맡는다. `scripts/backfill_space.py`는 source와 vector 메타데이터를 고치며 `doc_nodes`를 쓰지 않는다.
 - 형제 저장소: `PgDocStore`와 `MongoStore`는 색인 능력을 노출하지 않는다. `HybridQuery`는 저장소의 `supports_node_bm25` 속성으로 분기하므로 두 저장소는 기존 경로를 그대로 쓴다.
 - 결과 결합과 동일 본문 접기(#482), 정책 필터(`_policy_filter`), source 결과 결합은 BM25 결과 항목의 모양을 읽는다. 항목 모양이 같으므로 바뀌지 않는다.
 - `opencrab packs reindex-bm25`는 CLI 프로세스 안에서 버려지는 메모리 색인을 만든다. 이 변경은 손대지 않고 후속 정리 후보로 둔다.
@@ -210,7 +216,9 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 - 창 무관성: `OPENCRAB_BM25_NODE_LIMIT`과 `OPENCRAB_BM25_CHAR_BUDGET`을 아주 작게 둔 프로세스 환경에서도 오래된 문서와 다른 팩 문서가 찾히고 coverage 경고가 없다.
 - 쓰기 동기화: 삽입, 수정, 삭제, 팩 이동을 저장소 메서드로 한 직후 결과가 맞다. 직접 SQL 쓰기(다른 연결)는 pending에 남고 다음 검색이 소진한다. 소진 예산보다 많으면 pending 경고가 나오고, 그동안에도 지워진 노드, 팩 밖으로 옮긴 노드, 본문을 바꾼 노드(옛 용어로 묻는 질의)는 결과에 없다(적대 대조군).
 - 스냅숏 경계: 소진 직후, 읽기 스냅숏 전에 다른 연결이 직접 SQL로 쓰도록 끼워 넣으면 그 검색이 pending 경고를 낸다. 같은 자리에서 다른 연결이 색인을 초기화하면 그 검색은 기존 경로로 돌아간다.
-- 자동 선택 경고: 탐침 때 pending이 남아 있으면 `resolve_packs` 결과에 `auto_pack_probe_coverage`가 있고, 세 문구 표가 그 코드를 정의한다.
+- 자동 선택 경고: 탐침 때 pending이 남아 있으면 `resolve_packs` 결과에 `auto_pack_probe_coverage`가 있다. `_MCP_WARNINGS`와 `_CLI_WARNINGS`가 그 코드를 정의하고 `mcp_warning_text`와 `cli_warning_text`가 문구를 낸다.
+- 소진 경합: 다른 스레드가 저장소 내부 쓰기 잠금을 쥔 동안, 그리고 다른 연결이 `BEGIN IMMEDIATE`로 SQLite 쓰기 잠금을 쥔 동안 pending이 있는 검색이 잠금 해제를 기다리지 않고 pending 경고와 함께 돌아온다. 그 결과에 pending 키가 없다.
+- 형식 불일치: `meta.format`을 다른 값으로 바꾼 뒤 backfill 단계는 커서와 상태를 바꾸지 않고 실패하고, 소진은 pending을 지우지 않으며, 검색은 기존 경로로 간다.
 - `limit`: 0과 음수 `limit`의 결과가 기존 `BM25Index.search`와 같다.
 - 권한과 top-k 결합: 요청 팩 밖의 고득점 문서가 많아도 결과가 요청 팩 문서로 채워진다. `spaces` 필터도 같다.
 - 초기화: 색인에 고아 항목을 심고 행 수를 어긋나게 한 뒤 다시 열면 초기화된다. backfill 뒤 `verify`가 일치하고 오라클과 같다. 형식이 다른 `meta`를 본 쓰기는 색인을 쓰지 않고 pending을 남긴다.
