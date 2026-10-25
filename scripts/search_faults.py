@@ -109,8 +109,12 @@ def surface_violations(reference: dict[str, dict[str, Any]], observed: dict[str,
     return out
 
 
-def step_verdict(checks: list[dict[str, Any]], mode: str) -> str:
-    """Return the value of one step from its failed check categories (design 3.6)."""
+def step_verdict(checks: list[dict[str, Any]], mode: str | None) -> str | None:
+    """Return the value of one step from its failed check categories (design 3.6).
+
+    ``mode`` is ``None`` for a confirmation step; it has a value only when a
+    check fails.
+    """
     failed = {c["cat"] for c in checks if not c["ok"]}
     if "injection" in failed:
         return "not_injected"
@@ -121,8 +125,8 @@ def step_verdict(checks: list[dict[str, Any]], mode: str) -> str:
     return mode
 
 
-def worst(values: list[str]) -> str:
-    vals = [v for v in values if v != "unavailable"]
+def worst(values: list[str | None]) -> str:
+    vals = [v for v in values if v is not None and v != "unavailable"]
     if not vals:
         return "unavailable"
     return min(vals, key=lambda v: VERDICT_RANK[v])
@@ -200,6 +204,9 @@ def selftest_cases() -> list[tuple[str, Any, Any]]:
         ("worst not injected", "not_injected", worst(["inconsistent", "not_injected"])),
         ("worst unavailable only", "unavailable", worst(["unavailable"])),
         ("worst skips unavailable", "explicit_error", worst(["unavailable", "explicit_error"])),
+        ("confirmation step without failure", None, step_verdict([chk("recovery", True)], None)),
+        ("confirmation step with failure", "inconsistent", step_verdict([chk("recovery", False)], None)),
+        ("worst skips confirmation steps", "verified_fallback", worst([None, "verified_fallback", None])),
     ]
     return cases
 
@@ -757,7 +764,7 @@ class Scenario:
 
     # -- records ---------------------------------------------------------
 
-    def step(self, name: str, mode: str) -> dict[str, Any]:
+    def step(self, name: str, mode: str | None) -> dict[str, Any]:
         st = {"name": name, "mode": mode, "checks": [], "notes": {}}
         self.steps.append(st)
         return st
@@ -829,10 +836,20 @@ class Scenario:
         self.children.append({"n": self.n_actor, "role": role, "pid": popen.pid, "args": args})
         return child
 
+    def finish(self, child: Child) -> int | None:
+        """Reap ``child``; a timeout makes the scenario ``not_injected`` (design 5.3)."""
+        child.finish(self.ctx.child_timeout)
+        for entry in self.children:
+            if entry["pid"] == child.p.pid:
+                entry["rc"] = child.rc
+                entry["elapsed_s"] = round((child.ended or 0) - child.started, 3)
+        if child.rc is None or child.rc == -signal.SIGALRM:
+            raise NotInjectedError(f"{self.sid}: child {child.role} timed out (rc={child.rc}); log {child.log}")
+        return child.rc
+
     def run_child(self, role: str, *args: str, **kw: Any) -> Child:
         child = self.spawn(role, *args, **kw)
-        child.finish(self.ctx.child_timeout)
-        self.children[-1]["rc"] = child.rc
+        self.finish(child)
         return child
 
     def cli(self, role: str, *args: str, record: bool = True) -> Child:
@@ -869,9 +886,20 @@ class Scenario:
         st["notes"]["flagged_queries"] = sorted(q for q, o in observed.items() if o["bm25_cov"])
         return violations
 
+    def converged(self, st: dict[str, Any], observed: dict[str, dict[str, Any]]) -> None:
+        """Design 3.7: after the fault is removed, classes equal the reference."""
+        diff = [qid for qid, r in self.ctx.reference.items()
+                if observed[qid]["classes"] != r["classes"] or observed[qid]["wrong_pack"] != r["wrong_pack"]]
+        self.check(st, "recovery", "classes equal the reference after the fault is removed", not diff, diff)
+
+    def ready_invariant(self, st: dict[str, Any]) -> None:
+        """Design 3.4 and 3.7: read-only verify, pending excluded, before any state change."""
+        verify = ro_verify(self.dir)
+        self.check(st, "invariant", "verify excluding pending", verify["ok"], verify)
+
     def recover(self, commands: list[tuple[str, tuple[str, ...]]]) -> None:
         """Run documented recovery commands, restart and check design 3.5."""
-        st = self.step("recovery", "verified_fallback")
+        st = self.step("recovery", None)
         self.close_svc()
         for role, args in commands:
             child = self.cli(role, *args)
@@ -913,7 +941,8 @@ class Scenario:
         values = [step_verdict(s["checks"], s["mode"]) for s in self.steps]
         for s, v in zip(self.steps, values):
             s["value"] = v
-        return {"id": self.sid, "value": worst(values) if values else "not_injected",
+        valued = [v for v in values if v is not None]
+        return {"id": self.sid, "value": worst(valued) if valued else "not_injected",
                 "steps": self.steps, "recovery_commands": self.recovery_commands,
                 "children": self.children}
 
@@ -1016,12 +1045,14 @@ def sc_t1(sc: Scenario) -> None:
     sc.inject(st, "pending kept under the in-process lock", before > 0 and after == before, [before, after])
     sc.judge_pass(st, observed)
     st["notes"]["bm25_latency_ms"] = _summary(lat)
+    sc.ready_invariant(st)
 
-    st = sc.step("after release", "explicit_error")
+    st = sc.step("after release", None)
     observed, _ = quality_pass(ctx, svc)
-    sc.check(st, "surface", "pending drained by the next searches",
+    sc.check(st, "recovery", "pending drained by the next searches",
              not (ro_pending(sc.dir) & set(keys)), len(ro_pending(sc.dir)))
     sc.judge_pass(st, observed)
+    sc.converged(st, observed)
     sc.recover([])
 
 
@@ -1044,6 +1075,7 @@ def sc_t2(sc: Scenario) -> None:
     sc.check(st, "stage", "failed write left no row and no pending",
              ro_node(sc.dir, "evidence", node_id) is None and ("evidence", node_id) not in pending,
              {"pending": len(pending)})
+    sc.ready_invariant(st)
     sc.recover([])
 
 
@@ -1056,14 +1088,14 @@ def sc_t3(sc: Scenario) -> None:
     child = sc.spawn("backfill", "--batch", str(ctx.batch), "--wait-go", stdin=True)
     opened = child.wait_tag("opened", ctx.child_timeout)
     if not opened:
-        child.finish(ctx.child_timeout)
+        sc.finish(child)
         sc.inject(st, "child opened the store", False, child.stderr_text()[-2000:])
     before = ro_status(sc.dir)
     holder = _hold_write_lock(sc.dir)
     try:
         child.send("go\n")
         observed, _ = quality_pass(ctx, svc)
-        child.finish(ctx.child_timeout)
+        sc.finish(child)
     finally:
         _release(holder)
     out = child.json_out() or {}
@@ -1100,7 +1132,7 @@ def sc_t4(sc: Scenario) -> None:
         released = True
         if opened:
             child.send("go\n")
-        child.finish(ctx.child_timeout)
+        sc.finish(child)
     finally:
         if not released:
             _release(holder)
@@ -1111,15 +1143,18 @@ def sc_t4(sc: Scenario) -> None:
     sc.check(st, "surface", "every query answered", len(results) == len(ctx.queries), len(results))
     sc.check(st, "surface", "memory path in that instance",
              all(r["path"] == "memory" for r in results), sorted({r["path"] for r in results}))
+    # Read-only checks before the harness reopens the store (design 3.7).
+    sc.ready_invariant(st)
+    writes = child.tags("ack") + child.tags("err")
+    pending = ro_pending(sc.dir)
+    stored = ro_node(sc.dir, "evidence", node_id)
+    sc.check(st, "stage", "write stored its body and kept its key in pending",
+             child.tags("ack") and stored is not None and stored.get("text") == f"{MARK}open body"
+             and ("evidence", node_id) in pending, {"writes": writes, "pending": len(pending)})
     svc = sc.open_svc()
     # The child searched before its write, so the oracle is the reference rows.
     viol = _bm25_results_violations_at_reference(sc, results)
     sc.check(st, "surface", "unflagged results equal the oracle", not viol, viol[:20])
-    writes = child.tags("ack") + child.tags("err")
-    pending = ro_pending(sc.dir)
-    sc.check(st, "stage", "write kept its key in pending",
-             child.tags("ack") and ro_node(sc.dir, "evidence", node_id) is not None
-             and ("evidence", node_id) in pending, {"writes": writes, "pending": len(pending)})
     st["notes"]["after_release"] = child.tags("status")
     svc.close()
     sc.svc = None
@@ -1228,9 +1263,10 @@ def sc_c1(sc: Scenario) -> None:
     sc.check(st, "surface", "each point is equal, flagged or an equal fallback", not bad, bad[:20])
     verify = ro_verify(sc.dir)
     sc.check(st, "invariant", "verify excluding pending", verify["ok"], verify)
-    st = sc.step("after cancellation", "explicit_error")
+    st = sc.step("after cancellation", None)
     observed, _ = quality_pass(ctx, svc)
     sc.judge_pass(st, observed)
+    sc.converged(st, observed)
     sc.recover([])
 
 
@@ -1290,14 +1326,21 @@ def sc_c2(sc: Scenario) -> None:
             bad.append({"k": k, "returned": len(ids), "path": path})
         outcomes[kind] = outcomes.get(kind, 0) + 1
         problems = backfill_invariant(sc.dir)
-        if conn.in_transaction or problems:
+        free = svc.docs._lock.acquire(blocking=False)
+        if free:
+            svc.docs._lock.release()
+        if conn.in_transaction or not free or problems:
             sc.check(st, "invariant", f"state after cancel point {k}", False,
-                     {"in_tx": conn.in_transaction, "problems": problems})
+                     {"in_tx": conn.in_transaction, "lock_free": free, "problems": problems})
     st["notes"]["outcomes"] = outcomes
     sc.inject(st, "at least one cancellation fired", fired > 0, fired)
     sc.check(st, "surface", "each point is equal or flagged", not bad, bad[:20])
     problems = backfill_invariant(sc.dir)
     sc.check(st, "invariant", "backfill invariant", not problems, problems)
+    st = sc.step("after cancellation", None)
+    observed, _ = quality_pass(ctx, svc)
+    sc.judge_pass(st, observed)
+    sc.converged(st, observed)
     sc.recover([("backfill", ("--batch", str(ctx.batch)))])
 
 
@@ -1313,8 +1356,7 @@ def sc_c3(sc: Scenario) -> None:
         reached = sc.wait_progress(child, int(total * frac))
         state_at = ro_status(sc.dir)["state"]
         alive = child.signal(sig)
-        child.finish(ctx.child_timeout)
-        sc.children[-1]["rc"] = child.rc
+        sc.finish(child)
         after = ro_status(sc.dir)
         if sig == signal.SIGTERM:
             by_signal = child.rc == -signal.SIGTERM
@@ -1327,6 +1369,7 @@ def sc_c3(sc: Scenario) -> None:
                  {"rc": child.rc, "stderr_tail": child.stderr_text()[-300:]})
         problems = backfill_invariant(sc.dir)
         sc.check(st, "invariant", "no partial step", not problems, problems)
+        _stopped_pass(sc, f"search after {name}")
     st = sc.step("--max-seconds stop", "explicit_error")
     child = sc.run_child("backfill", "--batch", str(ctx.batch), "--max-seconds", "0.2")
     out = child.json_out() or {}
@@ -1336,12 +1379,18 @@ def sc_c3(sc: Scenario) -> None:
              child.rc == 0 and out.get("state") == "backfill", {"rc": child.rc, "out": out})
     problems = backfill_invariant(sc.dir)
     sc.check(st, "invariant", "no partial step", not problems, problems)
+    _stopped_pass(sc, "search after --max-seconds")
+    sc.recover([("backfill", ("--batch", str(ctx.batch)))])
+
+
+def _stopped_pass(sc: Scenario, name: str) -> None:
+    """Query pass on a stopped backfill copy from a restarted service (design 4.2)."""
     svc = sc.open_svc()
-    st = sc.step("search while stopped", "verified_fallback")
-    observed, _ = quality_pass(ctx, svc)
+    st = sc.step(name, "verified_fallback")
+    observed, _ = quality_pass(sc.ctx, svc)
     sc.check(st, "surface", "memory path used", svc.memory_entries > 0, svc.memory_entries)
     sc.judge_pass(st, observed)
-    sc.recover([("backfill", ("--batch", str(ctx.batch)))])
+    sc.close_svc()
 
 
 def _disk_limit(ctx: Ctx) -> int:
@@ -1439,14 +1488,15 @@ def sc_d2(sc: Scenario) -> None:
     sc.inject(st, "a write failed with a write error",
               any("disk I/O error" in e["error"] for e in errs), errs[:4])
     pending = ro_pending(sc.dir)
-    lost = [i for i in acks if ro_node(sc.dir, "evidence", i) is None]
-    sc.check(st, "stage", "every acknowledged write is in the source", not lost, lost)
+    plan_rows = {r[1]: r[2] for r in json.loads(plan.read_text(encoding="utf-8"))}
+    lost = [i for i in acks if (ro_node(sc.dir, "evidence", i) or {}).get("text") != plan_rows[i]]
+    sc.check(st, "stage", "every acknowledged write stored its body", not lost, lost)
     stray = [e["id"] for e in errs
              if ro_node(sc.dir, "evidence", e["id"]) is not None and ("evidence", e["id"]) not in pending]
     sc.check(st, "stage", "a failed write is absent or pending", not stray, stray)
     st["notes"].update(acked=len(acks), failed=len(errs))
+    sc.ready_invariant(st)
     svc = sc.open_svc()
-    plan_rows = {r[1]: r[2] for r in json.loads(plan.read_text(encoding="utf-8"))}
     missing = []
     for node_id in acks:
         marker = plan_rows[node_id].split()[0]
@@ -1475,15 +1525,18 @@ def sc_d2(sc: Scenario) -> None:
         error = repr(exc)
     finally:
         store_conn.execute("PRAGMA max_page_count=1073741823")
-    present = ro_node(sc.dir, "evidence", node_id) is not None
+    stored = ro_node(sc.dir, "evidence", node_id)
+    present = stored is not None
     in_pending = ("evidence", node_id) in ro_pending(sc.dir)
+    sc.ready_invariant(st)
     st["notes"].update(error=error, present=present, pending=in_pending)
     sc.inject(st, "page limit hit the write",
               (error is not None and "full" in error) or (present and in_pending),
               {"error": error, "present": present, "pending": in_pending})
     sc.check(st, "stage", "a raised write is absent or pending",
              error is None or not present or in_pending, {"error": error, "present": present})
-    sc.check(st, "stage", "a returned write is in the source", error is not None or present, present)
+    sc.check(st, "stage", "a returned write stored its body",
+             error is not None or (stored or {}).get("text") == props.get("text"), present)
     hits, warns = svc.hq._bm25_search_with_warnings(f"{MARK}pagefull", None, 10, pack_ids=[ctx.measure_pack])
     found = node_id in [h["node_id"] for h in hits]
     sc.check(st, "surface", "a stored write is found or flagged after the limit",
@@ -1511,9 +1564,10 @@ def sc_d3(sc: Scenario) -> None:
     sc.check(st, "surface", "unflagged results equal the oracle", not viol, viol[:20])
     verify = ro_verify(sc.dir)
     sc.check(st, "invariant", "verify excluding pending", verify["ok"], verify)
-    st = sc.step("search without the limit", "explicit_error")
+    st = sc.step("search without the limit", None)
     observed, _ = quality_pass(ctx, svc)
     sc.judge_pass(st, observed)
+    sc.converged(st, observed)
     sc.recover([])
 
 
@@ -1712,8 +1766,7 @@ def sc_k1(sc: Scenario) -> None:
         child = sc.spawn("backfill", "--batch", str(ctx.batch))
         reached = sc.wait_progress(child, int(total * frac))
         alive = child.signal(signal.SIGKILL)
-        child.finish(ctx.child_timeout)
-        sc.children[-1]["rc"] = child.rc
+        sc.finish(child)
         after = ro_status(sc.dir)
         sc.inject(st, "kill landed during backfill",
                   reached and alive and child.rc == -signal.SIGKILL and after["state"] == "backfill",
@@ -1750,8 +1803,7 @@ def sc_k2(sc: Scenario) -> None:
     child = sc.spawn("writer", "--plan", str(path), "--pause-at", str(pause_at))
     inside = child.wait_tag("inside", ctx.child_timeout)
     alive = child.signal(signal.SIGKILL)
-    child.finish(ctx.child_timeout)
-    sc.children[-1]["rc"] = child.rc
+    sc.finish(child)
     begins = child.tags("begin")
     acks = child.tags("ack")
     sc.inject(st, "kill landed inside a write transaction",
@@ -1804,8 +1856,7 @@ def sc_k3(sc: Scenario) -> None:
             break
         time.sleep(POLL)
     alive = child.signal(signal.SIGKILL)
-    child.finish(ctx.child_timeout)
-    sc.children[-1]["rc"] = child.rc
+    sc.finish(child)
     p1 = len(ro_pending(sc.dir))
     sc.inject(st, "kill landed mid-drain", alive and child.rc == -signal.SIGKILL and 0 < p1 < p0,
               {"alive": alive, "rc": child.rc, "p0": p0, "seen": seen, "p1": p1})
@@ -1831,11 +1882,12 @@ def sc_r1(sc: Scenario) -> None:
     observed, _ = quality_pass(ctx, svc)
     sc.inject(st, "first pass on the memory path", svc.memory_entries > 0, svc.memory_entries)
     sc.judge_pass(st, observed)
-    st = sc.step("writes during backfill", "explicit_error")
+    st = sc.step("writes during backfill", None)
     # The child rests between backfill steps so writes land while it runs (design 4.6).
     child = sc.spawn("backfill", "--batch", str(max(1, ctx.node_count // 200)), "--step-delay", "0.02")
     sc.wait_progress(child, 1)
     writes: list[dict[str, Any]] = []
+    expected_text: dict[str, str] = {}
     n = 0
     while child.p.poll() is None and n < len(ids):
         status = ro_status(sc.dir)
@@ -1843,6 +1895,7 @@ def sc_r1(sc: Scenario) -> None:
         if n % 2 == 0:
             space, node_type, nid, props = ctx.new_doc(ids[n], f"{MARK}r{n} body")
             svc.docs.upsert_node_doc(space, node_type, nid, props)
+            expected_text[nid] = f"{MARK}r{n} body"
             kind = "store"
         else:
             # Read the index state inside the transaction that commits the edit (design 4.6).
@@ -1859,20 +1912,24 @@ def sc_r1(sc: Scenario) -> None:
                 conn.execute("COMMIT")
             finally:
                 conn.close()
+            expected_text[target] = f"{MARK}redit{n} body"
             status = {"state": meta.get("state"), "cursor": [meta.get("cursor_space"), meta.get("cursor_node_id")]}
             kind = "sql_in_tx"
         writes.append({"n": n, "kind": kind, "state": status.get("state"), "cursor": status.get("cursor"),
                        "t": round(started - child.started, 3)})
         n += 1
-    child.finish(ctx.child_timeout)
-    sc.children[-1]["rc"] = child.rc
+    sc.finish(child)
     st["notes"]["writes"] = writes
+    st["notes"]["child_end_s"] = round((child.ended or 0) - child.started, 3)
+    lost = [i for i, text in expected_text.items()
+            if (ro_node(sc.dir, ctx.truth[i][1], i) or {}).get("text") != text]
+    sc.check(st, "stage", "every write during backfill stored its body", not lost, lost[:10])
     overlap = [w for w in writes if w["kind"] == "sql_in_tx" and w["state"] == "backfill"
                and w["cursor"] and w["cursor"][0] is not None]
     sc.inject(st, "a write overlapped the running backfill",
               child.rc == 0 and overlap and ro_status(sc.dir)["state"] == "ready",
               {"rc": child.rc, "overlap": len(overlap)})
-    st = sc.step("same service after backfill", "explicit_error")
+    st = sc.step("same service after backfill", None)
     sc.check(st, "surface", "same instance switched to the DB path", svc.path() == "db", svc.path())
     observed, _ = quality_pass(ctx, svc)
     sc.judge_pass(st, observed)
@@ -1964,6 +2021,7 @@ def _environment() -> dict[str, Any]:
     env.pop("bm25_defaults_match", None)
     env["sqlite"] = sqlite3.sqlite_version
     env["platform"] = platform.platform()
+    env["mem_total_bytes"] = sb._read_kib("/proc/meminfo", "MemTotal")
     return env
 
 
@@ -2028,6 +2086,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     unknown = [s for s in selected if s not in SCENARIOS]
     if unknown:
         raise SystemExit(f"unknown scenarios: {unknown}")
+    from search_corpus import manifest_digest
+
     for key, value in sb.BM25_DEFAULTS.items():
         os.environ[key] = str(value)
     root.mkdir(parents=True)
@@ -2039,7 +2099,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     ctx = Ctx(corpus, work, root, smoke, watchdog)
     ctx.empty_env.write_text("", encoding="utf-8")
     report: dict[str, Any] = {"verdict": "INCOMPLETE", "reasons": [], "environment": _environment(),
-                              "corpus": {"preset": manifest["preset"], "seed": manifest["seed"],
+                              "corpus": {"manifest_digest": manifest_digest(corpus),
+                                         "preset": manifest["preset"], "seed": manifest["seed"],
                                          "node_count": manifest["node_count"],
                                          "query_count": len(ctx.queries)}}
     marker = work / "load-complete.json"
@@ -2082,6 +2143,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         sb._atomic_json(sc.dir / "result.json", res)
         results.append(res)
         watchdog.extra["completed"] = [r["id"] for r in results]
+        sb._atomic_json(out, {**report, "reasons": [*report["reasons"], "running"], "scenarios": results})
         print(json.dumps({"scenario": sid, "value": res["value"], "elapsed_s": res["elapsed_s"]}), flush=True)
     report["scenarios"] = results
     report["faults"] = {fault: worst([r["value"] for r in results if r["id"] in ids])
