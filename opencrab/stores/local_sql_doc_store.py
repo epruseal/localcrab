@@ -283,7 +283,11 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
     def _node_bm25_try_drain(self) -> None:
         """Drain pending keys without waiting for locks (design 4.6)."""
         conn = self._conn
-        if not _nbm.has_pending(conn):
+        try:
+            if not _nbm.has_pending(conn):
+                return
+        except Exception as exc:  # noqa: BLE001 -- e.g. the index was dropped; the snapshot decides
+            logger.debug("node BM25 pending check failed: %s", exc)
             return
         if not self._lock.acquire(blocking=False):
             return

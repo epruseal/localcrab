@@ -563,3 +563,79 @@ def test_cli_status_backfill_verify_drop(tmp_path, monkeypatch):
     result = runner.invoke(cli_mod.main, ["packs", "bm25-index", "drop", "--yes"])
     assert result.exit_code == 0, result.output
     assert not store.supports_node_bm25
+
+
+def test_final_backfill_step_drains_pending_before_ready(tmp_path, monkeypatch):
+    """Design 5.3: a failing pending key keeps the index in backfill."""
+    store = _store(tmp_path)
+    for i in range(4):
+        store.upsert_node_doc("evidence", "Note", f"n{i}", {"text": "alpha", "pack_id": "a"})
+    store = _drop_and_reopen(tmp_path, store)
+    assert store.node_bm25_backfill_step(10)["processed"] == 4
+    _raw(str(tmp_path / "doc.db"), "UPDATE doc_nodes SET properties=? WHERE node_id='n0'",
+         ('{"text": "beta", "pack_id": "a"}',))
+    real = nbm.reindex_key
+
+    def fail_n0(conn, row_to_node, space, node_id, meta=None):
+        if node_id == "n0":
+            raise RuntimeError("injected pending failure")
+        return real(conn, row_to_node, space, node_id, meta)
+
+    monkeypatch.setattr(nbm, "reindex_key", fail_n0)
+    with pytest.raises(nbm.ReindexError):
+        store.node_bm25_backfill_step(10)
+    status = store.node_bm25_status()
+    assert status["state"] == "backfill" and status["pending"] == 1
+    assert store.node_bm25_search("beta", pack_ids=["a"]) is None
+    monkeypatch.undo()
+    step = store.node_bm25_backfill_step(10)
+    assert step["state"] == "ready" and step["pending_drained"] == 1
+    assert store.node_bm25_status()["pending"] == 0
+    assert store.node_bm25_verify()["ok"] is True
+
+
+def _drop_through_another_connection(path: str) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        nbm.drop(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_drop_after_entry_check_before_drain_uses_the_memory_path(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    store.upsert_node_doc("evidence", "Note", "k", {"text": "alpha", "pack_id": "a"})
+    path = str(tmp_path / "doc.db")
+    real_ready = store.node_bm25_ready
+
+    def ready_then_drop():
+        ready = real_ready()
+        _drop_through_another_connection(path)
+        return ready
+
+    monkeypatch.setattr(store, "node_bm25_ready", ready_then_drop)
+    hq = _hybrid(store)
+    hits, warnings = hq._bm25_search_with_warnings("alpha", None, 10, pack_ids=["a"])
+    assert [h["node_id"] for h in hits] == ["k"]
+    assert not any("unavailable" in w for w in warnings)
+    hq.shutdown_bm25()
+
+
+def test_drop_after_drain_before_snapshot_uses_the_memory_path(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    store.upsert_node_doc("evidence", "Note", "k", {"text": "alpha", "pack_id": "a"})
+    path = str(tmp_path / "doc.db")
+    real = store._node_bm25_try_drain
+
+    def drain_then_drop():
+        real()
+        _drop_through_another_connection(path)
+
+    monkeypatch.setattr(store, "_node_bm25_try_drain", drain_then_drop)
+    assert store.node_bm25_search("alpha", pack_ids=["a"]) is None
+    hq = _hybrid(store)
+    hits, warnings = hq._bm25_search_with_warnings("alpha", None, 10, pack_ids=["a"])
+    assert [h["node_id"] for h in hits] == ["k"]
+    assert not any("unavailable" in w for w in warnings)
+    hq.shutdown_bm25()

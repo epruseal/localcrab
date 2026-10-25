@@ -314,8 +314,18 @@ def backfill_step(conn: sqlite3.Connection, row_to_node: RowToNode, batch: int) 
     if rows:
         _set_meta(conn, cursor_space=rows[-1][0], cursor_node_id=rows[-1][1])
         return {"state": STATE_BACKFILL, "processed": len(rows)}
+    # Design 5.3: the final step drains every pending key and switches to
+    # ready in this one transaction. A failure rolls both back.
+    drained = 0
+    while True:
+        keys = conn.execute(f"SELECT space, node_id FROM {PENDING} LIMIT ?", (batch,)).fetchall()
+        if not keys:
+            break
+        for space, node_id in keys:
+            _reindex_or_raise(conn, row_to_node, space, node_id, meta)
+        drained += len(keys)
     _set_meta(conn, state=STATE_READY)
-    return {"state": STATE_READY, "processed": 0}
+    return {"state": STATE_READY, "processed": 0, "pending_drained": drained}
 
 
 def drop(conn: sqlite3.Connection) -> None:
@@ -360,6 +370,12 @@ def search(
     from opencrab.ontology.text_cues import tokenize
 
     empty: Any = {} if per_pack else []
+    # Design 4.5: another process may have dropped the index after the entry
+    # check. An absent meta table means "not ready", not "unavailable".
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (META,)
+    ).fetchone() is None:
+        raise NotReadyError
     if not is_ready(conn):
         raise NotReadyError
     warnings: list[str] = []
