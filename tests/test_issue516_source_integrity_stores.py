@@ -648,9 +648,8 @@ def test_local_json_file_query_and_range_controls(tmp_path, monkeypatch):
     """Rows with a duplicate key inside the helper never get a locator.
 
     sources.json is raw text with the duplicate keys kept, so the actual file read,
-    ``HybridQuery.query`` and the range handler all see it. The controls are a normal complete
-    row and a helper-free legacy row below the Local JSON limit (a locator that reads back the
-    text) and legacy rows at and above the limit (no locator)."""
+    ``HybridQuery.query`` and the range handler all see it. Two controls give a locator that reads back the text: a normal complete row and a helper-free
+    legacy row below the Local JSON limit. Legacy rows at and above the limit give no locator."""
     from opencrab.stores._source_integrity import strict_utf8_digest
     from tests import _issue516_flow as flow
 

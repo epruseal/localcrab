@@ -149,7 +149,7 @@ def _legacy_text(length: int) -> str:
     return ("legacy " * 700)[:length]
 
 
-def _seed_row(stack, source_id: str, text: str, state_kind: str | None = None, raw: Any = "absent") -> None:
+def _seed_row(stack, source_id: str, text: str, raw: Any = "absent") -> None:
     """Store one row through the raw layer of its backend. ``raw`` is the helper state."""
     meta = {"pack_id": _LP, "space": "evidence", "node_id": source_id}
     backend = stack["backend"]
@@ -235,8 +235,8 @@ BACKEND_CELLS = [
 
 @pytest.mark.parametrize(("backend", "raw", "kind"), BACKEND_CELLS)
 def test_backend_reader_raw_state_query_range(tmp_path, monkeypatch, backend, raw, kind):
-    """Raw helper states that must never read as complete, through a real SQL reader and a
-    mocked Mongo reader, then through the real query and the range handler."""
+    """Raw helper states must never read as complete. Each state goes through a real SQL reader or a mocked
+    Mongo reader, then through the real query and the range handler."""
     source_id, text = "state-row", "state text " * 500
     if raw == "UNSUPPORTED":
         raw = {**_complete_state(text), "version": 2}

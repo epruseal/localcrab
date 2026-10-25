@@ -382,8 +382,8 @@ def test_rerank_strip_at_limit_marks_unavailable():
 
 
 def test_rerank_source_mix_below_limit_marks_unavailable():
-    """The name follows the manifest. Under the lead ruling the mix cells are the control: the
-    same body from two legs is no transformation, so nothing is cut and nothing is hidden."""
+    """The name follows the manifest. Under the lead ruling the mix cells are the control.
+    The same body from two legs is no transformation. Nothing is cut and nothing is hidden."""
     from tests import _issue516_flow as flow
 
     flow.assert_merge_cap_cell("mix-below")

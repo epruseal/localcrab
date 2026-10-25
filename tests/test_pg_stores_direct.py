@@ -722,6 +722,40 @@ def _lock_waiter_seen(pg_engine, schema: str) -> bool:
     return count > 0
 
 
+def _stored_rows(pg_engine, schema: str, ids: list[str], with_time: bool = False) -> dict:
+    """Read the stored source and helper rows of ``ids`` directly, without any store reader.
+
+    A missing helper row stays missing here. The store readers would read it as legacy complete.
+    The driver already decodes jsonb values. A second json.loads would make a JSON string scalar
+    equal to the object that it spells. So the test compares the values as the driver returns them."""
+    time_column = ", ingested_at" if with_time else ""
+    with pg_engine.connect() as conn:
+        sources = conn.execute(
+            text(
+                f'SELECT source_id, text, metadata{time_column} FROM "{schema}".doc_sources '
+                "WHERE source_id = ANY(:ids) ORDER BY source_id"
+            ),
+            {"ids": ids},
+        ).fetchall()
+        helpers = conn.execute(
+            text(
+                f'SELECT source_id, source_integrity FROM "{schema}".doc_source_integrity '
+                "WHERE source_id = ANY(:ids) ORDER BY source_id"
+            ),
+            {"ids": ids},
+        ).fetchall()
+    return {
+        "sources": [tuple(row) for row in sources],
+        "helpers": [tuple(row) for row in helpers],
+    }
+
+
+def _complete_helper(text_value: str) -> dict:
+    import hashlib
+
+    return {"version": 1, "state": "complete", "text_digest": hashlib.sha256(text_value.encode("utf-8")).hexdigest()}
+
+
 def _lock_waiter_on(pg_engine, schema: str, table: str) -> bool:
     """True while some backend waits on a lock in a statement that names this schema and table."""
     with pg_engine.connect() as conn:
@@ -841,9 +875,7 @@ class TestPgDocSourceIntegrityLifecycle:
 
     def test_source_delete_writer_same_id_has_no_orphan_helper(self, pg_engine):
         """PG-DEL-01. The deleter removes the source row first and pauses before it
-        removes the helper row. A writer for the same ID starts then. The writer
-        INSERT waits on the deleted row, so the helper of the old row cannot be
-        removed after the writer has stored a new helper. The final source and helper
+        removes the helper row. A writer for the same ID starts then. The writer INSERT waits on the deleted row. So the old helper cannot be removed after the writer stored a new helper. The final source and helper
         are the writer's whole new state and no helper row lacks a source row."""
         import hashlib
 
@@ -914,6 +946,10 @@ class TestPgDocSourceIntegrityLifecycle:
             assert not errors, errors
             assert thread_ids["deleter"] != thread_ids["writer"]
             assert deleted == [1]
+            assert _stored_rows(pg_engine, schema, ["source"]) == {
+                "sources": [("source", new_text, {"pack_id": "pack"})],
+                "helpers": [("source", _complete_helper(new_text))],
+            }
             with pg_engine.connect() as conn:
                 source_text = conn.execute(
                     text(f'SELECT text FROM "{schema}".doc_sources WHERE source_id=\'source\'')
@@ -996,6 +1032,10 @@ class TestPgDocSourceIntegrityLifecycle:
                     text(f'SELECT count(*) FROM "{schema}".doc_sources WHERE source_id=\'fresh\'')
                 ).scalar_one()
             assert (source_rows, helper_rows) == (1, 1)
+            assert _stored_rows(pg_engine, schema, ["fresh"]) == {
+                "sources": [("fresh", "fresh body", {"pack_id": "pack"})],
+                "helpers": [("fresh", _complete_helper("fresh body"))],
+            }
             state = store.read_source_state_exact("fresh")
             assert state is not None and state.complete is True
         finally:
@@ -1048,6 +1088,8 @@ class TestPgDocSourceIntegrityLifecycle:
             store.upsert_source("a", "text a", {"pack_id": "pack"})
             store.upsert_source("b", "text b", {"pack_id": "pack"})
             assert counts() == (2, 2)
+            before = _stored_rows(pg_engine, schema, ["a", "b"], with_time=True)
+            assert [row[0] for row in before["helpers"]] == ["a", "b"]
             event.listen(pg_engine, "before_cursor_execute", fail_second_helper_delete)
             listening = True
             with pytest.raises(OperationalError) as raised:
@@ -1056,6 +1098,9 @@ class TestPgDocSourceIntegrityLifecycle:
             assert injected == [failure]
             # The first ID's source and helper deletes were in the same transaction.
             assert counts() == (2, 2)
+            assert _stored_rows(pg_engine, schema, ["a", "b"], with_time=True) == before, (
+                "rollback must restore every stored value, the ingestion time included"
+            )
             for source_id in ("a", "b"):
                 state = store.read_source_state_exact(source_id)
                 assert state is not None and state.complete is True

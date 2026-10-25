@@ -313,8 +313,8 @@ class TestRemoteCanStillCallReadTools:
         assert "spaces" in result
 
     def test_ontology_get_source_range_dispatches_for_remote_principal(self):
-        """The source range tool is READ tier: a remote principal lists it and gets the tool's own
-        fixed error, while an ADMIN tool stays unknown to the same principal."""
+        """The source range tool is READ tier. A remote principal lists it and gets the tool's own fixed error.
+        An ADMIN tool stays unknown to the same principal."""
         with principal_scope(_REMOTE):
             names = {t["name"] for t in tools_for_principal(current_principal())}
             assert "ontology_get_source_range" in names

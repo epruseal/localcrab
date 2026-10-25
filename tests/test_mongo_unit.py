@@ -813,6 +813,8 @@ def _eval(expr, doc, variables):
             return None
         return [_eval(arg["in"], doc, {**variables, arg["as"]: item}) for item in source]
     if op == "$objectToArray":
+        # Assumption: null or missing input gives null. The operator page does not say so.
+        # The server gate has to confirm it.
         value = _eval(arg, doc, variables)
         if value is None or value is _ABSENT:
             return None

@@ -333,7 +333,7 @@ class TestItemHandling:
             _item(text=text, _query_provenance=dict(proof), _query_provenance_invalidated=True)
         )
         assert len(invalid["text"]) == LIMIT
-        assert invalid["truncation"]["full_text_unavailable"] is True
+        assert invalid["truncation"].get("full_text_unavailable") is True
         assert "source_locator" not in invalid["truncation"]
         assert "full_text_tool" not in invalid["truncation"]
         assert flow.find_reserved(invalid) == []
