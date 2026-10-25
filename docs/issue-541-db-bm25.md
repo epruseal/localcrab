@@ -195,7 +195,7 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 ### 5.5 rollback
 
 - 검색만 되돌리기: `OPENCRAB_BM25_DB_INDEX=0`으로 서비스를 다시 시작한다. DB는 바뀌지 않는다.
-- 색인 제거: 서비스를 멈추고 `opencrab packs bm25-index drop`을 실행한다. 트리거와 색인 객체를 한 트랜잭션에서 지운다. `doc_nodes`와 다른 표는 건드리지 않는다. 이 코드가 다시 열면 객체를 새로 만들고 `backfill`로 시작하므로, 이전 코드로 되돌릴 때 이 명령을 쓴다.
+- 색인 제거: 서비스를 멈추고 `opencrab packs bm25-index drop --yes`를 실행한다. `--yes`가 없으면 거부한다. 트리거와 색인 객체를 한 트랜잭션에서 지운다. `doc_nodes`와 다른 표는 건드리지 않는다. 이 코드가 다시 열면 객체를 새로 만들고 `backfill`로 시작하므로, 이전 코드로 되돌릴 때 이 명령을 쓴다.
 - 이전 코드로 되돌리고 drop을 하지 않으면 트리거가 남는다. 이전 코드는 색인 표를 읽지 않는다. pending은 이전 코드가 바꾼 서로 다른 키마다 한 행씩 늘어난다. 지운 키도 남으므로 현재 `doc_nodes` 행 수와 무관하게 커질 수 있다. 상한은 그 기간에 바뀐 서로 다른 키의 수다. 그래서 이전 코드로 오래 운영할 계획이면 되돌리기 전에 drop을 한다. drop 없이 다시 이 코드로 올리면 pending 소진이 그 사이 변경을 반영한다. pending이 많으면 그동안 검색은 pending 경고를 내므로, 올린 직후 `backfill` 명령(상태가 `ready`면 pending 소진만 한다)으로 비운다.
 - 원본 유실: 모든 단계가 색인 객체만 쓴다. `doc_nodes`, `doc_sources`, vector, 그래프는 읽기만 한다.
 
@@ -325,7 +325,7 @@ DB 모드에서는 하네스의 세대 확인(`hq._bm25.state.generation`)이 �
 opencrab packs bm25-index status     # 상태, pending 수, 문서 수, 커서
 opencrab packs bm25-index backfill   # 재개 가능한 backfill, 끝나면 ready
 opencrab packs bm25-index verify     # 읽기 전용 정합 확인, 불일치면 0이 아닌 코드
-opencrab packs bm25-index drop       # 트리거와 색인 객체 제거(서비스 정지 뒤)
+opencrab packs bm25-index drop --yes # 트리거와 색인 객체 제거(서비스 정지 뒤)
 ```
 
 `OPENCRAB_BM25_DB_INDEX=0`은 검색 경로만 기존 메모리 창으로 돌린다.
