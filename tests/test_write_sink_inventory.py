@@ -110,6 +110,12 @@ ALLOWED: dict[tuple[str, str], str] = {
     # tests/test_search_baseline.py pins those rows to the real writers' rows.
     ("scripts/search_baseline.py", "cmd_load"): "search baseline harness, isolated work dir",
     ("scripts/search_baseline.py", "write_doc"): "search baseline harness, isolated run dir",
+    # #542 fault injection: the harness and its child processes write
+    # synthetic rows into copies of the isolated load dir only.
+    ("scripts/search_faults.py", "_actor_open"): "fault injection harness, isolated scenario copy",
+    ("scripts/search_faults.py", "_actor_writer"): "fault injection harness, isolated scenario copy",
+    ("scripts/search_faults.py", "sc_d2"): "fault injection harness, isolated scenario copy",
+    ("scripts/search_faults.py", "sc_r1"): "fault injection harness, isolated scenario copy",
     ("scripts/seed_ontology.py", "seed"): "operator seeding tool, binds a principal",
     ("scripts/import_obsidian_vault.py", "_import_vault_unlocked"): (
         "operator import tool, binds a principal"
