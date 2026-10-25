@@ -1017,6 +1017,7 @@ def sc_t1(sc: Scenario) -> None:
     try:
         observed, lat = quality_pass(ctx, svc)
         after = len(ro_pending(sc.dir) & set(keys))
+        sc.ready_invariant(st)  # design 3.7: before the lock is released
     finally:
         _release(holder)
     sc.inject(st, "pending kept under the lock", before > 0 and after == before, [before, after])
@@ -1039,13 +1040,13 @@ def sc_t1(sc: Scenario) -> None:
     try:
         observed, lat = quality_pass(ctx, svc)
         after = len(ro_pending(sc.dir) & set(keys))
+        sc.ready_invariant(st)  # design 3.7: before the lock is released
     finally:
         release.set()
         holder_thread.join(10)
     sc.inject(st, "pending kept under the in-process lock", before > 0 and after == before, [before, after])
     sc.judge_pass(st, observed)
     st["notes"]["bm25_latency_ms"] = _summary(lat)
-    sc.ready_invariant(st)
 
     st = sc.step("after release", None)
     observed, _ = quality_pass(ctx, svc)
@@ -1370,7 +1371,8 @@ def sc_c3(sc: Scenario) -> None:
         problems = backfill_invariant(sc.dir)
         sc.check(st, "invariant", "no partial step", not problems, problems)
         _stopped_pass(sc, f"search after {name}")
-    st = sc.step("--max-seconds stop", "explicit_error")
+    # Design 3.6: an honest exit 0 is neither an error nor a fallback.
+    st = sc.step("--max-seconds stop", None)
     child = sc.run_child("backfill", "--batch", str(ctx.batch), "--max-seconds", "0.2")
     out = child.json_out() or {}
     after = ro_status(sc.dir)
@@ -1745,7 +1747,8 @@ def sc_e3(sc: Scenario) -> None:
     st1 = sc.step("E3i index entry of a gold document removed", "explicit_error")
     sc.inject(st1, "gold left the candidate set",
               g_key not in _candidate_keys(sc.dir, t1, ctx.ref_effective[q1["qid"]]), g_key)
-    st2 = sc.step("E3ii pack of a forbidden document changed in the index", "explicit_error")
+    # Design 3.6: the guard filtered the document without an error or a warning.
+    st2 = sc.step("E3ii pack of a forbidden document changed in the index", None)
     sc.inject(st2, "forbidden document reached the candidate set",
               f_key in _candidate_keys(sc.dir, t2, [q2["pack_ids"][0]]), f_key)
     svc = sc.open_svc()
