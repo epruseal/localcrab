@@ -22,7 +22,7 @@
 | 후보 | 판정 | 사유 |
 |---|---|---|
 | 기존 `doc_sources_fts`처럼 `unicode61` FTS5로 노드 본문 색인, `bm25()` 순위 | 채택 안 함 | 토큰화가 다르다. `unicode61`은 한글 n-gram을 만들지 않고 `_`에서 끊는다. FTS5 `bm25()`는 k1과 idf 식이 기존과 다르다. 순위와 한국어 재현율이 함께 바뀌므로 노드 검색 계약을 보존했다고 볼 수 없다. |
-| 맞춤 역색인 표 `(term, pack, doc, tf)` | 채택 안 함 | 점수는 정확히 같게 만들 수 있다. 그러나 행마다 B-tree 오버헤드가 붙어 디스크가 노드 검색 본문의 여러 배가 된다. 4.5절 디스크 요구치(색인이 원문 본문의 2배 이하)를 넘는다. |
+| 맞춤 역색인 표 `(term, pack, doc, tf)` | 채택 안 함 | 점수는 정확히 같게 만들 수 있다. 그러나 행마다 B-tree 오버헤드가 붙어 디스크가 노드 검색 본문의 여러 배가 된다. `docs/issue-542-search-baseline.md` 4.5절의 디스크 요구치(색인이 원문 본문의 2배 이하)를 넘는다. |
 | FTS5 contentless 표에 기존 토큰 열을 저장, 점수는 Python | 채택 | 토큰 열을 `ascii` 토크나이저(`tokenchars '_'`)로 넣으면 FTS5가 공백에서만 끊으므로 저장 토큰이 Python 토큰과 같다(4.3절). df는 `fts5vocab` `row` 표, tf는 `instance` 표에서 읽는다. 점수는 기존 식으로 계산하므로 같다. FTS5 doclist는 varint 압축이라 디스크가 작다. |
 | PostgreSQL `tsvector`나 `pg_trgm` | 이 이슈에서 구현 안 함 | local 모드에 없다. 토큰화와 순위가 다르다. 10절의 후속 후보다. |
 | Neo4j 전문 색인(Lucene) | 채택 안 함 | 그래프 저장소이고 docker 모드에만 있다. BM25 레그는 문서 저장소만 읽는다. 분석기가 다르다. |
@@ -77,7 +77,7 @@ FTS5는 32768바이트보다 긴 용어를 바이트 단위로 자른다. 잘린
 - 그 밖의 모든 `doc_nodes` 변경(팩 삭제의 집합 DELETE, 운영 스크립트의 직접 SQL, 다른 프로세스, 이전 코드 버전, sqlite3 CLI)은 트리거가 pending에 남긴다.
 - 검색은 pending이 있으면 먼저 소진한다(4.6절). 소진하지 못한 행이 남으면 coverage 경고를 낸다.
 
-이 구조가 기존 무효화 계약(`invalidate_bm25_cache()` 호출)을 대신한다. 색인의 신선도는 호출자가 무효화를 불렀는지에 기대지 않는다. #44처럼 쓰기 뒤 무효화 호출이 빠진 경로도 BM25 레그에서는 다음 검색 전에 반영된다. `invalidate_bm25_cache()`는 색인이 `ready`이면 아무 일도 하지 않는다. 그래서 DB 색인 모드에서는 기존 재구축 스레드가 시작되지 않는다.
+이 구조가 기존 무효화 계약(`invalidate_bm25_cache()` 호출)을 대신한다. 색인의 신선도는 호출자가 무효화를 불렀는지에 기대지 않는다. #44처럼 쓰기 뒤 무효화 호출이 빠진 경로도 BM25 레그에서는 다음 검색 전에 반영된다. `invalidate_bm25_cache()`는 DB 검색 경로가 활성일 때만 기존 무효화를 생략한다. 활성 조건은 검색 진입 조건과 같다: 저장소가 색인을 지원하고, 킬 스위치가 꺼져 있고, `meta`가 `ready`이고 형식이 맞다. 킬 스위치, `backfill`, `unsupported`, 형식 불일치로 기존 경로를 쓰는 동안에는 기존 무효화를 그대로 한다. 기존 경로는 전역 `(COUNT, MAX(updated_at))` 지문이 같으면 재구축하지 않으므로, 무효화 없이 본문만 바뀐 수정을 놓치기 때문이다. 생략한 적이 있는 `HybridQuery`가 나중에 기존 경로로 돌아가면(다른 프로세스의 초기화 등) 첫 기존 경로 검색 전에 기존 무효화를 한 번 실행한다. 생략 여부는 인스턴스의 표지 하나로 기억한다. DB 경로가 활성인 동안에는 기존 재구축 스레드가 시작되지 않는다.
 
 외부 쓰기 감지의 지원 경계는 다음과 같다.
 
@@ -201,7 +201,7 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 
 - BM25 레그 진입점: `HybridQuery._bm25_search_state`, `_bm25_search_per_pack`, `_bm25_search_with_warnings`, `_bm25_search`. 앞의 둘이 DB 경로 분기를 갖고 뒤의 둘은 그 둘을 거친다. `pack_registry._choose_by_content`는 `_bm25_search_per_pack`을 부르고, 없으면 `_bm25_search`로 돌아간다.
 - 무효화 호출자: `mcp/tools/graph.py`(두 곳), `mcp/tools/pack.py`, `HybridQuery.ingest`. 모두 `invalidate_bm25_cache()`를 부른다. DB 모드에서는 아무 일도 하지 않는다.
-- `doc_nodes` 쓰기 지점: 저장소 메서드 셋(4.4절 첫 항목)은 쓰기 동기화가 맡는다. `pack/load.py`의 팩 삭제 집합 DELETE(`_exec_write`로 직접 실행), 운영 스크립트의 직접 SQL(`scripts/cleanup_openclaw_heartbeat_493.py`), #542 하네스의 `updated_at` 갱신은 트리거와 pending이 맡는다. `scripts/backfill_space.py`는 source와 vector 메타데이터를 고치며 `doc_nodes`를 쓰지 않는다.
+- `doc_nodes` 쓰기 지점: 저장소 메서드 셋(4.4절 첫 항목)은 쓰기 동기화가 맡는다. `pack/load.py`의 팩 삭제 집합 DELETE(`_exec_write`로 직접 실행), 운영 스크립트의 직접 SQL(`scripts/cleanup_openclaw_heartbeat_493.py`, `scripts/migrate_pack_ownership.py`의 `_backfill_doc_table`), #542 하네스의 `updated_at` 갱신은 트리거와 pending이 맡는다. `scripts/backfill_space.py`는 source와 vector 메타데이터를 고치며 `doc_nodes`를 쓰지 않는다.
 - 형제 저장소: `PgDocStore`와 `MongoStore`는 색인 능력을 노출하지 않는다. `HybridQuery`는 저장소의 `supports_node_bm25` 속성으로 분기하므로 두 저장소는 기존 경로를 그대로 쓴다.
 - 결과 결합과 동일 본문 접기(#482), 정책 필터(`_policy_filter`), source 결과 결합은 BM25 결과 항목의 모양을 읽는다. 항목 모양이 같으므로 바뀌지 않는다.
 - `opencrab packs reindex-bm25`는 CLI 프로세스 안에서 버려지는 메모리 색인을 만든다. 이 변경은 손대지 않고 후속 정리 후보로 둔다.
@@ -218,7 +218,8 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 - 스냅숏 경계: 소진 직후, 읽기 스냅숏 전에 다른 연결이 직접 SQL로 쓰도록 끼워 넣으면 그 검색이 pending 경고를 낸다. 같은 자리에서 다른 연결이 색인을 초기화하면 그 검색은 기존 경로로 돌아간다.
 - 자동 선택 경고: 탐침 때 pending이 남아 있으면 `resolve_packs` 결과에 `auto_pack_probe_coverage`가 있다. `_MCP_WARNINGS`와 `_CLI_WARNINGS`가 그 코드를 정의하고 `mcp_warning_text`와 `cli_warning_text`가 문구를 낸다.
 - 소진 경합: 다른 스레드가 저장소 내부 쓰기 잠금을 쥔 동안, 그리고 다른 연결이 `BEGIN IMMEDIATE`로 SQLite 쓰기 잠금을 쥔 동안 pending이 있는 검색이 잠금 해제를 기다리지 않고 pending 경고와 함께 돌아온다. 그 결과에 pending 키가 없다.
-- 형식 불일치: `meta.format`을 다른 값으로 바꾼 뒤 backfill 단계는 커서와 상태를 바꾸지 않고 실패하고, 소진은 pending을 지우지 않으며, 검색은 기존 경로로 간다.
+- 무효화와 킬 스위치: `ready`와 킬 스위치가 함께 걸린 상태에서, 다른 행의 미래 시각 때문에 전역 지문이 바뀌지 않는 본문 수정을 저장소 메서드와 `invalidate_bm25_cache()`로 한 뒤 기존 경로 검색이 새 본문을 찾고 옛 본문으로는 찾지 않는다. DB 경로에서 무효화를 생략한 뒤 기존 경로로 돌아간 경우도 같다.
+- 형식 불일치: `meta.format`을 다른 값으로 바꾼 뒤 backfill 단계(처리할 키가 없는 마지막 단계 포함)는 커서와 상태를 바꾸지 않고 실패하고, 소진은 pending을 지우지 않으며, 검색은 기존 경로로 간다.
 - `limit`: 0과 음수 `limit`의 결과가 기존 `BM25Index.search`와 같다.
 - 권한과 top-k 결합: 요청 팩 밖의 고득점 문서가 많아도 결과가 요청 팩 문서로 채워진다. `spaces` 필터도 같다.
 - 초기화: 색인에 고아 항목을 심고 행 수를 어긋나게 한 뒤 다시 열면 초기화된다. backfill 뒤 `verify`가 일치하고 오라클과 같다. 형식이 다른 `meta`를 본 쓰기는 색인을 쓰지 않고 pending을 남긴다.
@@ -247,7 +248,7 @@ PG 지원은 같은 상태 기계와 트리거 pending 구조를 PL/pgSQL 트리
 head의 하네스는 다음 세 가지만 바꾼다. 판정 함수, 질의 세트, 요구치 키 집합은 바꾸지 않는다.
 
 - `load`: `updated_at` 일괄 갱신 뒤 저장소가 색인을 가지면 pending을 끝까지 소진한다. 갱신이 트리거로 모든 행을 pending에 넣기 때문이다. 운영에서 대량 직접 SQL 뒤 운영자가 하는 일과 같다.
-- 자원: 요구치 `fts_index_ratio`의 계산은 바꾸지 않는다(source FTS 바이트 / source 본문 바이트). base와 head가 같은 정의로 비교되어야 하기 때문이다. 노드 색인은 요구치 키를 더하지 않고 `resources`에 따로 남긴다. 값은 이름에 `doc_nodes_bm25`가 든 모든 `dbstat` 객체(UNIQUE 제약의 자동 인덱스 `sqlite_autoindex_doc_nodes_bm25_docs_1` 포함)의 바이트, `doc_nodes` 검색 본문(`_node_text`의 UTF-8) 바이트, 그리고 4.5절 정의대로 (source FTS + 노드 색인) / (source 본문 + 노드 검색 본문)의 비율이다. base에는 노드 색인이 없으므로 이 비율의 base 값은 base 실행 디렉터리에서 같은 식으로 따로 계산해 대조 보고에 적는다. 4.5절의 2배 판정은 대조 보고가 이 비율로 한다.
+- 자원: 요구치 `fts_index_ratio`의 계산은 바꾸지 않는다(source FTS 바이트 / source 본문 바이트). base와 head가 같은 정의로 비교되어야 하기 때문이다. 노드 색인은 요구치 키를 더하지 않고 `resources`에 따로 남긴다. 값은 이름에 `doc_nodes_bm25`가 든 모든 `dbstat` 객체(UNIQUE 제약의 자동 인덱스 `sqlite_autoindex_doc_nodes_bm25_docs_1` 포함)의 바이트, `doc_nodes` 검색 본문(`_node_text`의 UTF-8) 바이트, 그리고 `docs/issue-542-search-baseline.md` 4.5절 정의대로 (source FTS + 노드 색인) / (source 본문 + 노드 검색 본문)의 비율이다. base에는 노드 색인이 없으므로 이 비율의 base 값은 base 실행 디렉터리에서 같은 식으로 따로 계산해 대조 보고에 적는다. 그 4.5절의 2배 판정은 대조 보고가 이 비율로 한다.
 - 환경: 보고서 `environment`에 BM25 경로(`db` 또는 `memory`)를 남긴다.
 
 DB 모드에서는 하네스의 세대 확인(`hq._bm25.state.generation`)이 늘 `None`이다. 품질 판정 구간에는 쓰기가 없으므로 판정이 달라지지 않는다.
