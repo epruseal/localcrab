@@ -106,6 +106,10 @@ ALLOWED: dict[tuple[str, str], str] = {
         "write.lock rechecks, and source-vector readback verification"
     ),
     ("scripts/bench_graph_backends.py", "ingest_to_store"): "developer benchmark",
+    # #542: the harness writes synthetic rows into its own isolated work dir.
+    # tests/test_search_baseline.py pins those rows to the real writers' rows.
+    ("scripts/search_baseline.py", "cmd_load"): "search baseline harness, isolated work dir",
+    ("scripts/search_baseline.py", "write_doc"): "search baseline harness, isolated run dir",
     ("scripts/seed_ontology.py", "seed"): "operator seeding tool, binds a principal",
     ("scripts/import_obsidian_vault.py", "_import_vault_unlocked"): (
         "operator import tool, binds a principal"
