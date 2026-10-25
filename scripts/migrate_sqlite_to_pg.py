@@ -6,7 +6,7 @@ store is limited to read-only source inspection until its global-identity
 mapping and target writer qualification are complete; a graph apply attempt
 raises ``GraphMigrationFixtureOnlyError`` before opening the target.
 
-WHAT THIS DOES: row-for-row copy for the document, SQL, and vector stores,
+WHAT THIS DOES: copy of the document, SQL, and vector stores,
 widening TEXT-JSON columns to JSONB and TEXT timestamps to TIMESTAMPTZ. Graph
 selection is inspection-only until its apply qualification is complete. NO
 re-embedding - the vector table's raw
@@ -19,16 +19,14 @@ has no binary 2-stage path (its HNSW index already serves global search at
 p95 6.44ms, see docs/vector-backends.md, pgvector section).
 
 SOURCE SAFETY: unlike migrate_add_binary_quantization.py (which rebuilds the
-source table in place and therefore REQUIRES --backup-to), this script only
-ever opens the source SQLite files with plain SELECT statements — it never
-issues a single write against them. The originals are guaranteed unmodified
-by construction; there is deliberately no --backup-to flag here. Instead,
-pass --verify to have the script assert (exit non-zero on mismatch) that the
-target holds what the source did after loading. SQL-store tables with a natural
-key are checked by key rather than by count, because upserting into a target
-that already held rows of its own makes it a superset — a count comparison
-would call that a failure, while a genuine drop offset by a pre-existing row
-would pass. Everything else is still compared by count.
+source table in place and therefore REQUIRES --backup-to), this script reads
+the source SQLite files with SELECT statements. The doc_sources copy also sends
+BEGIN and ROLLBACK to fix one read snapshot. The script issues no data write
+against the source files. There is deliberately no --backup-to flag here.
+Pass --verify to check the target after loading; a mismatch exits non-zero.
+``--verify`` compares keys for SQL-store tables with a natural key and row counts
+for the other tables in ``source_counts``. It skips a table that is absent from
+the source. It does not compare helper rows.
 
 IDEMPOTENCY: re-running is safe, but how differs by table.
 
@@ -44,8 +42,13 @@ and reported rather than blindly re-inserted, which would duplicate history.
 Operators should inspect and clear them manually before re-running in that edge
 case.
 
-The doc/vector migrations still skip on equal counts. Their rows are not
-credentials, and reworking them is outside this script's SQL-store scope.
+The doc_nodes and audit_log copies skip a table when the target row count
+equals the source row count and the count is above zero. The vector copy keeps
+its own equal-count skip. The doc_sources copy has no count skip. A copied
+source whose helper row is absent in the source database ends with no target
+helper row. A helper row is not copied as it is: its state is written as
+complete only when the shared strict decoder and the stored text digest both
+confirm it, and every other helper value is written as unknown.
 
 SCHEMA CREATION: graph apply does not construct a target store. For the
 document store this script imports and instantiates PgDocStore (its constructor
@@ -80,6 +83,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -90,8 +94,29 @@ from typing import Any
 import _migration_tables as mt
 
 from opencrab.common.graph_identity import GraphMigrationFixtureOnlyError
+from opencrab.stores._source_integrity import (
+    classify_integrity,
+    complete_integrity,
+    decode_integrity_value,
+    unknown_integrity,
+)
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _migration_helper_state(text: str, raw: Any) -> str:
+    """Return the helper JSON to write for one source row.
+
+    Only a well-formed complete state whose digest matches ``text`` stays complete.
+    Every other value, including a malformed or ambiguous one, becomes unknown.
+    """
+    value = decode_integrity_value(raw, encoded_json=True)
+    complete, digest = classify_integrity(
+        text, value, helper_present=True, legacy_complete=False
+    )
+    state = complete_integrity(digest) if complete and digest is not None else unknown_integrity()
+    return json.dumps(state)
+
 
 
 def _check_ident(name: str, what: str) -> str:
@@ -284,12 +309,59 @@ def migrate_doc(
         "space, node_id",
         "SELECT space, node_id, node_type, properties, updated_at FROM doc_nodes",
     )
-    _copy(
-        "doc_sources",
-        ["source_id", "text", "metadata", "ingested_at"],
-        "source_id",
-        "SELECT source_id, text, metadata, ingested_at FROM doc_sources",
+    source_sql = text(
+        f"INSERT INTO {t}.doc_sources (source_id, text, metadata, ingested_at) "
+        "VALUES (:source_id, :text, CAST(:metadata AS jsonb), CAST(:ingested_at AS timestamptz)) "
+        "ON CONFLICT (source_id) DO UPDATE SET "
+        "text=EXCLUDED.text, metadata=EXCLUDED.metadata, ingested_at=EXCLUDED.ingested_at"
     )
+    helper_sql = text(
+        f"INSERT INTO {t}.doc_source_integrity (source_id, source_integrity) "
+        "VALUES (:source_id, CAST(:source_integrity AS jsonb)) "
+        "ON CONFLICT (source_id) DO UPDATE SET source_integrity=EXCLUDED.source_integrity"
+    )
+    helper_delete_sql = text(f"DELETE FROM {t}.doc_source_integrity WHERE source_id=:source_id")
+    # BEGIN is deferred: the first read after it fixes the snapshot.
+    copied_sources = 0
+    src.execute("BEGIN")
+    try:
+        source_helper_available = src.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doc_source_integrity'"
+        ).fetchone() is not None
+        if source_helper_available:
+            source_query = (
+                "SELECT s.source_id, s.text, s.metadata, s.ingested_at, "
+                "i.source_id AS integrity_source_id, i.source_integrity "
+                "FROM doc_sources AS s LEFT JOIN doc_source_integrity AS i "
+                "ON i.source_id=s.source_id"
+            )
+        else:
+            source_query = (
+                "SELECT source_id, text, metadata, ingested_at, "
+                "NULL AS integrity_source_id, NULL AS source_integrity FROM doc_sources"
+            )
+        for rows in _fetch_batches(src, source_query, batch, limit):
+            source_rows = [
+                {key: row[key] for key in ("source_id", "text", "metadata", "ingested_at")}
+                for row in rows
+            ]
+            helper_rows = [
+                {
+                    "source_id": row["source_id"],
+                    "source_integrity": _migration_helper_state(row["text"], row["source_integrity"]),
+                }
+                for row in rows
+                if row["integrity_source_id"] is not None
+            ]
+            with engine.begin() as conn:
+                conn.execute(source_sql, source_rows)
+                conn.execute(helper_delete_sql, [{"source_id": row["source_id"]} for row in source_rows])
+                if helper_rows:
+                    conn.execute(helper_sql, helper_rows)
+            copied_sources += len(source_rows)
+    finally:
+        src.rollback()
+    print(f"#   doc_sources: {copied_sources} copied")
     _copy(
         "audit_log",
         ["event_id", "event_type", "subject_id", "details", "timestamp"],

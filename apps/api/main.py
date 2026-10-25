@@ -698,6 +698,7 @@ def query_ontology(
         limit=payload.limit,
         graph_depth=payload.graph_depth,
         pack_ids=selection.effective_pack_ids,
+        full_scope=scope,
     )
     primary_results = outcome.results
     results = primary_results[payload.offset:payload.limit]
@@ -732,7 +733,7 @@ def query_ontology(
         "spaces_filter": payload.spaces,
         "total": len(results),
         "results": [
-            result_caps.cap_query_item(result.to_dict(), folded=bool(result.folded_count))
+            result_caps.cap_query_item(result.to_cap_item(), folded=bool(result.folded_count))
             for result in results
         ],
         "keyword_fallback": [

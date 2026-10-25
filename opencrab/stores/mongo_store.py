@@ -12,6 +12,18 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from opencrab.stores._source_integrity import (
+    SourceCopyState,
+    classify_integrity,
+    complete_integrity,
+    require_original_source,
+    source_classification,
+    strict_utf8_digest,
+    unknown_integrity,
+)
+
+_MISSING_STATE = object()
+
 logger = logging.getLogger(__name__)
 
 
@@ -430,23 +442,18 @@ class MongoStore:
     # Source / ingestion records
     # ------------------------------------------------------------------
 
-    def upsert_source(
+    def _write_source_state(
         self,
         source_id: str,
         text: str,
         metadata: dict[str, Any],
+        source_integrity: dict[str, str | int],
     ) -> str:
-        """Store or update a raw ingestion source document.
-
-        `metadata.user_id` is mirrored to a top-level `user_id` column so
-        ownership counters can use an indexed field instead of a nested path.
-        """
-        self._require_available()
-
         doc: dict[str, Any] = {
             "source_id": source_id,
             "text": text,
             "metadata": metadata,
+            "source_integrity": source_integrity,
             "updated_at": datetime.now(tz=UTC),
         }
         user_id = metadata.get("user_id") if isinstance(metadata, dict) else None
@@ -462,12 +469,242 @@ class MongoStore:
         existing = self._db["sources"].find_one({"source_id": source_id}, {"_id": 1})
         return str(existing["_id"]) if existing else ""
 
+    def write_source_original(
+        self, source_id: str, text: str, metadata: dict[str, Any]
+    ) -> str:
+        self._require_available()
+        source_id, text, text_digest = require_original_source(source_id, text)
+        return self._write_source_state(source_id, text, metadata, complete_integrity(text_digest))
+
+    def upsert_source(
+        self,
+        source_id: str,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        """Store validated original source content and its integrity state."""
+        from opencrab.stores._source_integrity import current_source_copy_state
+
+        state = current_source_copy_state()
+        if state is None:
+            return self.write_source_original(source_id, text, metadata)
+        return self.write_source_copy(source_id, text, metadata, state)
+
+    @staticmethod
+    def _exact_source_query(source_id: str) -> dict[str, Any]:
+        return {
+            "$expr": {
+                "$and": [
+                    {"$eq": [{"$type": "$source_id"}, "string"]},
+                    {"$eq": ["$source_id", {"$literal": source_id}]},
+                ]
+            }
+        }
+
+    @staticmethod
+    def _raw_state_token(raw_state: Any) -> tuple[Any, ...]:
+        if raw_state is _MISSING_STATE:
+            return ("missing",)
+        if raw_state is None:
+            return ("null",)
+        if not isinstance(raw_state, dict):
+            return (type(raw_state).__name__, raw_state)
+        return (
+            "object",
+            tuple(sorted((key, type(value).__name__, value) for key, value in raw_state.items())),
+        )
+
+    @staticmethod
+    def _is_rewriteable_state(raw_state: dict[str, Any]) -> bool:
+        if set(raw_state) == {"version", "state", "text_digest"}:
+            return (
+                type(raw_state["version"]) is int
+                and raw_state["version"] == 1
+                and raw_state["state"] == "complete"
+                and isinstance(raw_state["text_digest"], str)
+            )
+        return (
+            set(raw_state) == {"version", "state"}
+            and type(raw_state["version"]) is int
+            and raw_state["version"] == 1
+            and raw_state["state"] == "unknown"
+        )
+
+    def read_source_state_exact(self, source_id: str) -> SourceCopyState | None:
+        self._require_available()
+        if not isinstance(source_id, str):
+            return None
+        doc = self._db["sources"].find_one(
+            self._exact_source_query(source_id),
+            {"_id": 0, "source_id": 1, "text": 1, "source_integrity": 1},
+        )
+        if not isinstance(doc, dict) or doc.get("source_id") != source_id or not isinstance(doc.get("text"), str):
+            return None
+        raw_state = doc.get("source_integrity", _MISSING_STATE)
+        complete, digest = classify_integrity(
+            doc["text"], None if raw_state is _MISSING_STATE else raw_state,
+            helper_present=raw_state is not _MISSING_STATE,
+            legacy_complete=(raw_state is _MISSING_STATE),
+        )
+        return SourceCopyState(
+            "mongo", source_id, doc["text"], digest, complete,
+            self._raw_state_token(raw_state),
+        )
+
+    def write_source_copy(
+        self,
+        source_id: str,
+        text: str,
+        metadata: dict[str, Any],
+        source_copy_state: SourceCopyState,
+    ) -> str:
+        self._require_available()
+        source_id, text, text_digest = require_original_source(source_id, text)
+        integrity = (
+            complete_integrity(text_digest)
+            if source_copy_state.complete
+            and source_copy_state.text == text
+            and source_copy_state.text_digest == text_digest
+            else unknown_integrity()
+        )
+        return self._write_source_state(source_id, text, metadata, integrity)
+
+    def _rewrite_cas_query(
+        self, source_id: str, text: str, raw_state: Any
+    ) -> dict[str, Any]:
+        clauses: list[dict[str, Any]] = [
+            {"$eq": [{"$type": "$source_id"}, "string"]},
+            {"$eq": ["$source_id", {"$literal": source_id}]},
+            {"$eq": [{"$type": "$text"}, "string"]},
+            {"$eq": ["$text", {"$literal": text}]},
+        ]
+        if raw_state is _MISSING_STATE:
+            clauses.append({"$eq": [{"$type": "$source_integrity"}, "missing"]})
+        elif raw_state is None:
+            clauses.append({"$eq": [{"$type": "$source_integrity"}, "null"]})
+        else:
+            keys = sorted(raw_state)
+            nested = [
+                {"$setEquals": [
+                    {"$map": {
+                        "input": {"$objectToArray": "$source_integrity"},
+                        "as": "field",
+                        "in": "$$field.k",
+                    }},
+                    {"$literal": keys},
+                ]},
+            ]
+            for key, value in raw_state.items():
+                nested.extend([
+                    {"$eq": [{"$type": f"$source_integrity.{key}"}, self._bson_type(value)]},
+                    {"$eq": [f"$source_integrity.{key}", {"$literal": value}]},
+                ])
+            clauses.append({
+                "$cond": [
+                    {"$eq": [{"$type": "$source_integrity"}, "object"]},
+                    {"$and": nested},
+                    False,
+                ]
+            })
+        return {"$expr": {"$and": clauses}}
+
+    @staticmethod
+    def _bson_type(value: Any) -> str:
+        if value is None:
+            return "null"
+        if type(value) is bool:
+            return "bool"
+        if type(value) is int:
+            return "int"
+        if type(value) is float:
+            return "double"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        return "missing"
+
+    def rewrite_source_metadata(
+        self, source_id: str, metadata: dict[str, Any], source_state: SourceCopyState
+    ) -> str:
+        self._require_available()
+        if (
+            source_state.backend_kind != "mongo"
+            or source_state.source_id != source_id
+            or strict_utf8_digest(source_id) is None
+            or strict_utf8_digest(source_state.text) is None
+        ):
+            raise ValueError("source state changed before metadata rewrite")
+        current = self.read_source_state_exact(source_id)
+        if current is None or current != source_state:
+            raise ValueError("source state changed before metadata rewrite")
+        raw_state = self._db["sources"].find_one(
+            self._exact_source_query(source_id),
+            {"_id": 0, "source_integrity": 1},
+        )
+        if not isinstance(raw_state, dict):
+            raise ValueError("source state changed before metadata rewrite")
+        captured_state = raw_state.get("source_integrity", _MISSING_STATE)
+        if (
+            self._raw_state_token(captured_state) != source_state.raw_state_token
+            or (
+                captured_state is not _MISSING_STATE
+                and captured_state is not None
+                and (
+                    not isinstance(captured_state, dict)
+                    or not self._is_rewriteable_state(captured_state)
+                )
+            )
+        ):
+            raise ValueError("source state changed before metadata rewrite")
+        result = self._db["sources"].update_one(
+            self._rewrite_cas_query(source_id, source_state.text, captured_state),
+            {"$set": {"metadata": metadata, "updated_at": datetime.now(tz=UTC)}},
+            upsert=False,
+        )
+        if result.matched_count == 0:
+            raise ValueError("source state changed before metadata rewrite")
+        return source_id
+
     def get_source(self, source_id: str) -> dict[str, Any] | None:
-        """Retrieve a source document."""
+        """Retrieve a source document without its private integrity state."""
         self._require_available()
 
-        doc = self._db["sources"].find_one({"source_id": source_id}, {"_id": 0})
+        doc = self._db["sources"].find_one(
+            {"source_id": source_id}, {"_id": 0, "source_integrity": 0}
+        )
         return dict(doc) if doc else None
+
+    def get_source_scoped_exact(
+        self, source_id: str, pack_ids: list[str]
+    ) -> dict[str, Any] | None:
+        self._require_available()
+        if not isinstance(source_id, str) or not pack_ids:
+            return None
+        query: dict[str, Any] = {
+            "$and": [
+                self._exact_source_query(source_id),
+                _non_array("metadata"),
+                {"metadata.pack_id": _scalar_string_in(list(pack_ids))},
+            ]
+        }
+        doc = self._db["sources"].find_one(query, {"_id": 0})
+        if not isinstance(doc, dict) or doc.get("source_id") != source_id:
+            return None
+        raw_state = doc.get("source_integrity", _MISSING_STATE)
+        row = dict(doc)
+        metadata = row.get("metadata")
+        row["_source_classification"] = source_classification(
+            source_id,
+            row.get("text"),
+            metadata.get("pack_id") if isinstance(metadata, dict) else None,
+            None if raw_state is _MISSING_STATE else raw_state,
+            helper_present=raw_state is not _MISSING_STATE,
+            legacy_complete=(raw_state is _MISSING_STATE),
+        )
+        return row
 
     def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
         """List all ingested sources.
@@ -479,7 +716,12 @@ class MongoStore:
             return []
 
         cursor = self._db["sources"].find({}, {"_id": 0, "text": 0}).limit(limit)
-        return [dict(doc) for doc in cursor]
+        rows = []
+        for doc in cursor:
+            row = dict(doc)
+            row.pop("source_integrity", None)
+            rows.append(row)
+        return rows
 
     def list_sources_scoped(self, pack_ids: list[str], limit: int = 100) -> list[dict[str, Any]]:
         """Authorization-scoped counterpart to ``list_sources`` (issue #201
@@ -545,7 +787,12 @@ class MongoStore:
             ],
         }
         cursor = self._db["sources"].find(query, {"_id": 0}).limit(limit)
-        return [dict(doc) for doc in cursor]
+        rows = []
+        for doc in cursor:
+            row = dict(doc)
+            row.pop("source_integrity", None)
+            rows.append(row)
+        return rows
 
     def count_sources_scoped(self, pack_ids: list[str]) -> int:
         """Exact ``count_documents`` counterpart to ``list_sources_scoped``,

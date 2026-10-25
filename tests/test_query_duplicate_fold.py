@@ -367,3 +367,29 @@ def test_rerank_path_keeps_its_result_cap():
     bm25 = [_bm(f"b{i:03d}", f"distinct {i}", float(200 - i)) for i in range(cap + 40)]
     out = _hq_with_legs(bm25=bm25).query("question", pack_ids=[PACK], use_rerank=True, limit=limit)
     assert len(out) == cap
+
+
+def test_rerank_strip_below_limit_marks_unavailable():
+    from tests import _issue516_flow as flow
+
+    flow.assert_merge_cap_cell("strip-below")
+
+
+def test_rerank_strip_at_limit_marks_unavailable():
+    from tests import _issue516_flow as flow
+
+    flow.assert_merge_cap_cell("strip-at")
+
+
+def test_rerank_source_mix_below_limit_marks_unavailable():
+    """The name follows the manifest. Under the lead ruling the mix cells are the control.
+    The same body from two legs is no transformation. Nothing is cut and nothing is hidden."""
+    from tests import _issue516_flow as flow
+
+    flow.assert_merge_cap_cell("mix-below")
+
+
+def test_rerank_source_mix_at_limit_marks_unavailable():
+    from tests import _issue516_flow as flow
+
+    flow.assert_merge_cap_cell("mix-at")

@@ -26,6 +26,236 @@ def store(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _state_rows(store, source_id):
+    conn = store._conn
+    source = conn.execute(
+        "SELECT source_id, text, metadata FROM doc_sources WHERE source_id=?", (source_id,)
+    ).fetchall()
+    helper = conn.execute(
+        "SELECT source_id, source_integrity FROM doc_source_integrity WHERE source_id=?", (source_id,)
+    ).fetchall()
+    fts = (
+        conn.execute("SELECT source_id, text FROM doc_sources_fts WHERE source_id=?", (source_id,)).fetchall()
+        if store._fts_ok
+        else []
+    )
+    return [tuple(r) for r in source], [tuple(r) for r in helper], [tuple(r) for r in fts]
+
+
+def test_rewrite_state_change_rolls_back_without_overwrite(tmp_path):
+    """#516 G4/G8: a metadata rewrite with a stale state is refused and leaves the
+    other writer's state. Two stores use two real connections. The trace of each
+    connection shows the real order: writer DML, writer COMMIT, rewrite BEGIN
+    IMMEDIATE."""
+    from opencrab.stores._source_integrity import strict_utf8_digest
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    path = str(tmp_path / "shared.db")
+    store_a = LocalSQLDocStore(path)  # the rewriting store, this thread's connection
+    store_b = LocalSQLDocStore(path)  # the writer store, its connection is made in the writer thread
+    store_a.upsert_source("source", "old", {"pack_id": "pack"})
+    stale = store_a.read_source_state_exact("source")
+    assert stale is not None and stale.text == "old"
+
+    events: list[tuple[str, int, str]] = []
+    lock = threading.Lock()
+
+    def observe(who: str, conn_id: int, sql: str) -> None:
+        kind = None
+        if sql.startswith("INSERT INTO doc_sources ") or sql.startswith("INSERT INTO doc_sources("):
+            kind = "DML"
+        elif sql in ("COMMIT", "ROLLBACK", "BEGIN IMMEDIATE"):
+            kind = sql
+        if kind is not None:
+            with lock:
+                events.append((who, conn_id, kind))
+
+    writer_conn_ids: list[int] = []
+    writer_done = threading.Event()
+    errors: list[BaseException] = []
+
+    def writer() -> None:
+        try:
+            conn = store_b._conn  # this thread's own connection
+            writer_conn_ids.append(id(conn))
+            conn.set_trace_callback(lambda sql: observe("B", id(conn), sql))
+            try:
+                store_b.upsert_source("source", "latest", {"pack_id": "pack"})
+            finally:
+                conn.set_trace_callback(None)
+        except BaseException as exc:  # pragma: no cover - reported by the assertion below
+            errors.append(exc)
+        finally:
+            writer_done.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        assert writer_done.wait(5)
+    finally:
+        thread.join(5)
+    assert not thread.is_alive() and errors == []
+
+    a_conn = store_a._conn
+    a_conn.set_trace_callback(lambda sql: observe("A", id(a_conn), sql))
+    try:
+        with pytest.raises(ValueError, match="source state changed"):
+            store_a.rewrite_source_metadata("source", {"pack_id": "changed"}, stale)
+    finally:
+        a_conn.set_trace_callback(None)
+
+    assert writer_conn_ids and writer_conn_ids[0] != id(a_conn), "the two stores must use two connections"
+    order = [(who, kind) for who, _conn, kind in events]
+    assert ("B", "DML") in order and ("B", "COMMIT") in order and ("A", "BEGIN IMMEDIATE") in order
+    assert order.index(("B", "DML")) < order.index(("B", "COMMIT")) < order.index(("A", "BEGIN IMMEDIATE")), order
+    assert not a_conn.in_transaction
+
+    observer = LocalSQLDocStore(path)
+    try:
+        row = observer.get_source("source")
+        assert row["text"] == "latest" and row["metadata"] == {"pack_id": "pack"}
+        state = observer.read_source_state_exact("source")
+        assert state is not None and state.complete is True
+        assert state.text_digest == strict_utf8_digest("latest")
+        _source, helper, fts = _state_rows(observer, "source")
+        assert len(helper) == 1
+        if observer._fts_ok:
+            assert fts == [("source", "latest")]
+    finally:
+        observer.close()
+        store_a.close()
+        store_b.close()
+
+
+def test_scoped_exact_reader_reads_source_and_helper_in_one_statement(tmp_path):
+    """#516 F2 twin of the PG snapshot test. The reader thread traces its own
+    connection. If the product reader issues a second source or helper SELECT, the
+    trace waits there until the writer thread has committed the new pack and the
+    complete state. A one-statement reader never reaches that point, so the writer
+    runs after the read. The reader must return the whole old version from one
+    statement, and the second call must return the whole new version."""
+    from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    store = LocalSQLDocStore(str(tmp_path / "snapshot.db"))
+    store.write_source_copy(
+        "source", "body", {"pack_id": "old-pack"},
+        SourceCopyState("sqlite", "source", "body", strict_utf8_digest("body"), False),
+    )
+    statements: list[str] = []
+    writer_go = threading.Event()
+    writer_done = threading.Event()
+    results: dict[str, object] = {}
+    errors: list[BaseException] = []
+    connections: dict[str, int] = {}
+
+    def trace(sql: str) -> None:
+        text = " ".join(sql.split())
+        if text.startswith("SELECT") and ("doc_sources" in text or "doc_source_integrity" in text):
+            statements.append(text)
+            if len(statements) >= 2:
+                writer_go.set()
+                assert writer_done.wait(5), "the writer did not commit"
+
+    def reader() -> None:
+        try:
+            conn = store._conn
+            connections["reader"] = id(conn)
+            conn.set_trace_callback(trace)
+            try:
+                results["old"] = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+            finally:
+                conn.set_trace_callback(None)
+        except BaseException as exc:  # pragma: no cover - reported by the assertions below
+            errors.append(exc)
+            writer_go.set()
+
+    def writer() -> None:
+        try:
+            assert writer_go.wait(10)
+            connections["writer"] = id(store._conn)
+            store.upsert_source("source", "body", {"pack_id": "new-pack"})
+        except BaseException as exc:  # pragma: no cover - reported by the assertions below
+            errors.append(exc)
+        finally:
+            writer_done.set()
+
+    started: list[threading.Thread] = []
+    reader_thread: threading.Thread | None = None
+    writer_thread: threading.Thread | None = None
+    try:
+        writer_thread = threading.Thread(target=writer)
+        writer_thread.start()
+        started.append(writer_thread)
+        reader_thread = threading.Thread(target=reader)
+        reader_thread.start()
+        started.append(reader_thread)
+        reader_thread.join(15)
+        writer_go.set()
+        writer_thread.join(15)
+        assert errors == [], errors
+        assert connections["reader"] != connections["writer"], "the two threads use two connections"
+        assert len(statements) == 1, statements
+        old = results["old"]
+        assert old is not None
+        assert (old["metadata"]["pack_id"], old["_source_classification"]["complete"]) == ("old-pack", False)
+        new = store.get_source_scoped_exact("source", ["old-pack", "new-pack"])
+        assert new is not None
+        assert (new["metadata"]["pack_id"], new["_source_classification"]["complete"]) == ("new-pack", True)
+    finally:
+        # Release the events, join only the threads that started, check that none is
+        # alive, and close the store only then. A live thread keeps its connection.
+        writer_go.set()
+        writer_done.set()
+        for thread in started:
+            thread.join(5)
+        alive = [thread for thread in started if thread.is_alive()]
+        if not alive:
+            store.close()
+    assert not alive, "a test thread is still alive; the store was left open"
+
+
+def test_delete_failure_rolls_back_source_helper_and_fts(store):
+    """#516 G4: one failing statement leaves source, helper and FTS rows as they were."""
+    if not store._fts_ok:
+        pytest.skip("SQLite FTS5 is not available in this build")
+    store.upsert_source("s1", "body one", {"pack_id": "pack"})
+    store.upsert_source("s2", "body two", {"pack_id": "pack"})
+    before = (_state_rows(store, "s1"), _state_rows(store, "s2"))
+    assert all(all(part for part in rows) for rows in before)
+
+    real_conn = store._conn
+
+    class _FailFts:
+        def execute(self, sql, params=()):
+            if "DELETE FROM doc_sources_fts" in sql:
+                raise RuntimeError("forced FTS delete failure")
+            return real_conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+    store._local.conn = _FailFts()
+    try:
+        with pytest.raises(RuntimeError, match="forced FTS delete failure"):
+            store.delete_sources_with_state(["s1", "s2"])
+    finally:
+        store._local.conn = real_conn
+
+    assert (_state_rows(store, "s1"), _state_rows(store, "s2")) == before
+
+
+def test_delete_removes_source_helper_and_fts_together(store):
+    store.upsert_source("s1", "body one", {"pack_id": "pack"})
+    store.upsert_source("s2", "body two", {"pack_id": "pack"})
+
+    assert store.delete_sources_with_state(["s1"]) == 1
+
+    assert _state_rows(store, "s1") == ([], [], [])
+    source, helper, fts = _state_rows(store, "s2")
+    assert source and helper and (fts or not store._fts_ok)
+
+
 class TestInit:
     def test_init_creates_db_file(self, tmp_path):
         from opencrab.stores.local_sql_doc_store import LocalSQLDocStore

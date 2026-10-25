@@ -63,6 +63,16 @@ from typing import Any, Literal
 
 from opencrab.stores._graph_common import decode_properties
 from opencrab.stores._json import dump_props
+from opencrab.stores._source_integrity import (
+    SourceCopyState,
+    classify_integrity,
+    complete_integrity,
+    decode_integrity_value,
+    require_original_source,
+    source_classification,
+    strict_utf8_digest,
+    unknown_integrity,
+)
 from opencrab.stores._sql_dialect import (
     Column,
     IndexSpec,
@@ -98,6 +108,14 @@ DOC_STORE_SCHEMA = SchemaSpec(
                 Column("text", "text", default=""),
                 Column("metadata", "json", default="{}"),
                 Column("ingested_at", "timestamp"),
+            ),
+            primary_key=("source_id",),
+        ),
+        TableSpec(
+            name="doc_source_integrity",
+            columns=(
+                Column("source_id", "text"),
+                Column("source_integrity", "json", not_null=False),
             ),
             primary_key=("source_id",),
         ),
@@ -260,6 +278,9 @@ class _SqlDocStoreBase(abc.ABC):
 
     @abc.abstractmethod
     def _exec_write(self, sql: str, params: dict[str, Any]) -> int: ...
+
+    @abc.abstractmethod
+    def _exec_write_many(self, statements: list[tuple[str, dict[str, Any]]]) -> list[int]: ...
 
     @abc.abstractmethod
     def _row_get(self, row: Any, name: str) -> Any: ...
@@ -671,28 +692,185 @@ class _SqlDocStoreBase(abc.ABC):
     # Source ingestion
     # ------------------------------------------------------------------
 
-    def upsert_source(self, source_id: str, text: str, metadata: dict[str, Any]) -> str:
-        """Writes doc_sources only. SQLite subclasses must additionally sync
-        the FTS5 shadow table after calling this (see class docstring)."""
-        self._require_available()
-        now = datetime.now(UTC)
-        sql = self._dialect.upsert(
+    def _source_upsert_sql(self) -> str:
+        return self._dialect.upsert(
             self._table("doc_sources"),
             ["source_id", "text", "metadata", "ingested_at"],
             conflict_cols=["source_id"],
             update_cols=["text", "metadata", "ingested_at"],
             json_columns=["metadata"],
         )
-        self._exec_write(
-            sql,
+
+    def _source_integrity_upsert_sql(self) -> str:
+        return self._dialect.upsert(
+            self._table("doc_source_integrity"),
+            ["source_id", "source_integrity"],
+            conflict_cols=["source_id"],
+            update_cols=["source_integrity"],
+            json_columns=["source_integrity"],
+        )
+
+    def _source_write_params(
+        self,
+        source_id: str,
+        text: str,
+        metadata: dict[str, Any],
+        source_integrity: dict[str, str | int],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return (
             {
                 "source_id": source_id,
                 "text": text,
                 "metadata": dump_props(metadata),
-                "ingested_at": self._dialect.bind_value_for_timestamp(now),
+                "ingested_at": self._dialect.bind_value_for_timestamp(datetime.now(UTC)),
+            },
+            {
+                "source_id": source_id,
+                "source_integrity": dump_props(source_integrity),
             },
         )
+
+    def _write_source_state(
+        self,
+        source_id: str,
+        text: str,
+        metadata: dict[str, Any],
+        source_integrity: dict[str, str | int],
+    ) -> str:
+        source_params, integrity_params = self._source_write_params(
+            source_id, text, metadata, source_integrity
+        )
+        self._exec_write_many([
+            (self._source_upsert_sql(), source_params),
+            (self._source_integrity_upsert_sql(), integrity_params),
+        ])
         return source_id
+
+    def _decode_integrity_raw(self, value: Any) -> Any:
+        """Decode only helper state with the G1 strict integrity boundary."""
+        return decode_integrity_value(value, encoded_json=self._dialect.name == "sqlite")
+
+    def _source_state_join(self, where: str) -> str:
+        return (
+            f"SELECT s.source_id, s.text, s.metadata, s.ingested_at, "
+            "i.source_id AS integrity_source_id, i.source_integrity "
+            f"FROM {self._table('doc_sources')} AS s "
+            f"LEFT JOIN {self._table('doc_source_integrity')} AS i "
+            "ON i.source_id=s.source_id "
+            f"WHERE {where}"
+        )
+
+    def _source_state_from_row(self, row: Any) -> SourceCopyState | None:
+        source_id = self._row_get(row, "source_id")
+        text = self._row_get(row, "text")
+        if not isinstance(source_id, str) or not isinstance(text, str):
+            return None
+        helper_present = self._row_get(row, "integrity_source_id") is not None
+        raw_state = self._row_get(row, "source_integrity")
+        complete, digest = classify_integrity(
+            text,
+            self._decode_integrity_raw(raw_state) if helper_present else None,
+            helper_present=helper_present,
+            legacy_complete=not helper_present,
+        )
+        return SourceCopyState(self._dialect.name, source_id, text, digest, complete)
+
+    def write_source_original(self, source_id: str, text: str, metadata: dict[str, Any]) -> str:
+        """Write validated original content and backend-owned complete state."""
+        self._require_available()
+        source_id, text, text_digest = require_original_source(source_id, text)
+        return self._write_source_state(source_id, text, metadata, complete_integrity(text_digest))
+
+    def upsert_source(self, source_id: str, text: str, metadata: dict[str, Any]) -> str:
+        from opencrab.stores._source_integrity import current_source_copy_state
+
+        state = current_source_copy_state()
+        if state is None:
+            return self.write_source_original(source_id, text, metadata)
+        return self.write_source_copy(source_id, text, metadata, state)
+
+    def read_source_state_exact(self, source_id: str) -> SourceCopyState | None:
+        self._require_available()
+        row = self._fetch_one(
+            self._source_state_join("s.source_id=:source_id"),
+            {"source_id": source_id},
+        )
+        if row is None or self._row_get(row, "source_id") != source_id:
+            return None
+        return self._source_state_from_row(row)
+
+    def write_source_copy(
+        self,
+        source_id: str,
+        text: str,
+        metadata: dict[str, Any],
+        source_copy_state: SourceCopyState,
+    ) -> str:
+        self._require_available()
+        source_id, text, text_digest = require_original_source(source_id, text)
+        integrity = (
+            complete_integrity(text_digest)
+            if source_copy_state.complete
+            and source_copy_state.text == text
+            and source_copy_state.text_digest == text_digest
+            else unknown_integrity()
+        )
+        return self._write_source_state(source_id, text, metadata, integrity)
+
+    def rewrite_source_metadata(
+        self, source_id: str, metadata: dict[str, Any], source_state: SourceCopyState
+    ) -> str:
+        """Rewrite source state in one LocalSQL transaction.
+
+        PgDocStore overrides this method for its source-row lock contract.
+        """
+        self._require_available()
+        if not hasattr(self, "_tx"):
+            raise RuntimeError("metadata rewrite requires a transactional store")
+        with self._tx(immediate=True) as conn:
+            row = conn.execute(
+                self._source_state_join("s.source_id=:source_id"),
+                {"source_id": source_id},
+            ).fetchone()
+            current = self._source_state_from_row(row) if row is not None else None
+            if current is None or current != source_state:
+                raise ValueError("source state changed before metadata rewrite")
+            integrity = (
+                complete_integrity(current.text_digest)
+                if current.complete and current.text_digest
+                else unknown_integrity()
+            )
+            source_params, integrity_params = self._source_write_params(
+                source_id, current.text, metadata, integrity
+            )
+            conn.execute(self._source_upsert_sql(), source_params)
+            conn.execute(self._source_integrity_upsert_sql(), integrity_params)
+            if getattr(self, "_fts_ok", False):
+                conn.execute("DELETE FROM doc_sources_fts WHERE source_id=:source_id", {"source_id": source_id})
+                conn.execute(
+                    "INSERT INTO doc_sources_fts(source_id, text) VALUES (:source_id, :text)",
+                    {"source_id": source_id, "text": current.text},
+                )
+        return source_id
+
+    def delete_sources_with_state(self, source_ids: list[str]) -> int:
+        """Delete source rows and private state as one store transaction."""
+        if not source_ids:
+            return 0
+        placeholders = ", ".join(f":sid_{index}" for index in range(len(source_ids)))
+        params = {f"sid_{index}": source_id for index, source_id in enumerate(source_ids)}
+        counts = self._exec_write_many([
+            (
+                f"DELETE FROM {self._table('doc_source_integrity')} "
+                f"WHERE source_id IN ({placeholders})",
+                params,
+            ),
+            (
+                f"DELETE FROM {self._table('doc_sources')} WHERE source_id IN ({placeholders})",
+                params,
+            ),
+        ])
+        return counts[-1]
 
     # keyword_search: NOT implemented here — see class docstring (#3).
 
@@ -706,6 +884,49 @@ class _SqlDocStoreBase(abc.ABC):
         if row is None:
             return None
         return self._row_to_source(row)
+
+    def get_source_scoped_exact(
+        self, source_id: str, pack_ids: list[str]
+    ) -> dict[str, Any] | None:
+        self._require_available()
+        if not pack_ids or any(
+            not isinstance(pack_id, str) or strict_utf8_digest(pack_id) is None
+            for pack_id in pack_ids
+        ):
+            return None
+        predicate, transform = _json_str_in(self._dialect, "s.metadata", "pack_id", ":sc_packs")
+        row = self._fetch_one(
+            self._source_state_join(f"s.source_id=:source_id AND ({predicate})"),
+            {"source_id": source_id, "sc_packs": transform(sorted(set(pack_ids)))},
+        )
+        if row is None:
+            return None
+        entry = self._row_to_source(row)
+        if entry.get("property_decode_error"):
+            return None
+        metadata = entry.get("metadata")
+        normalized_scope = set(pack_ids)
+        pack_id = metadata.get("pack_id") if isinstance(metadata, dict) else None
+        if (
+            not isinstance(pack_id, str)
+            or strict_utf8_digest(pack_id) is None
+            or pack_id not in normalized_scope
+        ):
+            return None
+        helper_present = self._row_get(row, "integrity_source_id") is not None
+        raw_state = self._decode_integrity_raw(self._row_get(row, "source_integrity")) if helper_present else None
+        # Keep this private compatibility field for existing scoped readers.
+        # Classification below remains the only locator and range authority.
+        entry["source_integrity"] = raw_state
+        entry["_source_classification"] = source_classification(
+            entry.get("source_id"),
+            entry.get("text"),
+            pack_id,
+            raw_state,
+            helper_present=helper_present,
+            legacy_complete=not helper_present,
+        )
+        return entry
 
     def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
         """``limit <= 0``: returns ``[]`` without querying -- same contract

@@ -37,7 +37,7 @@ class TestToolDispatch:
         # #407's pack_diagnose_residue.
         # 비노출(주석처리): query_bm25, rebac, workflow×2, approval, billing×2,
         #   identity×5, canonicalize×2, promotion×4, ontology_extract, ontology_ingest
-        assert len(TOOLS) == 20
+        assert len(TOOLS) == 21
         names = [t["name"] for t in TOOLS]
         # Core exposed
         assert "ontology_manifest" in names
@@ -1032,7 +1032,11 @@ class TestMCPServer:
         assert response["id"] == 2
         assert "tools" in response["result"]
         tools = response["result"]["tools"]
-        assert len(tools) == 20  # 위 18개 + #135 tool_search + #407 pack_diagnose_residue
+        assert len(tools) == 21  # 위 18개 + #135 tool_search + #407 pack_diagnose_residue + #516 ontology_get_source_range
+        range_tool = next(t for t in tools if t["name"] == "ontology_get_source_range")
+        assert range_tool["inputSchema"]["required"] == [
+            "source_locator", "offset_bytes", "length_bytes",
+        ]
 
     def test_handle_tools_call_manifest(self, server):
         request = json.dumps({

@@ -957,29 +957,29 @@ docstring은 이 절을 가리킨다.
 
 ### 항목 상한
 
-결과 항목의 `text`, `metadata`, `graph_context`에 든 문자열이
-`QUERY_FIELD_CHAR_LIMIT`(글자 수)을 넘으면 앞부분만 싣는다. 접힌 결과의
+결과 항목의 `text`, `metadata`, `graph_context`에 든 문자열은 `QUERY_FIELD_CHAR_LIMIT`(글자 수)을 넘을 때만 `cap_query_item`이 앞부분만 싣는다. 접힌 결과의
 `metadata.folded_duplicates.members`는 각각 결과 항목으로 처리한다.
-`selected_packs[i]`의 문자열도 같은 상한을 받는다. 상한을 넘은 항목에는 새 키
-`truncation`이 붙는다.
+`selected_packs[i]`의 문자열도 같은 상한을 받는다. 항목의 `truncation` 키는 문자열이 잘렸거나 `text`가 변형됐을 때만 붙는다.
 
 ```json
 {"limit_chars": 4000,
  "fields": [{"path": ["text"], "original_chars": 380000}],
- "full_text_tool": "ontology_get_node"}
+ "source_locator": {"version": "1", "source_id": "...", "pack_id": "...", "source_digest": "..."},
+ "full_text_tool": "ontology_get_source_range"}
 ```
 
-- 잘린 문자열이 없는 항목에는 `truncation`이 없고 변경 전 응답과 같은 값을 싣는다.
 - 식별자 자리(`node_id`, `canonical`, `graph_context`의 `anchor_id`와
   `edge_endpoints`와 `edge`, `selected_packs[i].pack_id`)와 객체 키는 자르지 않는다.
-- 전체 본문은 `ontology_get_node(node_id)`로 읽는다. 이 도구가 원문을 돌려주지
-  못하는 경우가 있다: 노드 id 한도를 넘는 소스 id로 적재해 그래프 노드가 없는
-  소스(`found=false`), `metadata.node_id`가 없는 id를 가리키는 소스(`found=false`),
-  `metadata.node_id`가 다른 기존 노드를 가리키는 소스(그 노드를 돌려준다),
-  속성 해독 오류(`property_decode_error`)가 있는 노드(`found=true`이지만 속성이
-  원문을 담지 않는다).
-  BM25 leg와 일반 노드 벡터의 `text`는 합성 문자열이므로 원래 값은 노드의
-  `properties`에서 읽는다.
+- 항목의 `truncation`은 다음 네 모양 중 하나이거나 없다: 키 없음, `limit_chars`와 `fields`만 가진 모양, 그 모양에 `source_locator`와 `full_text_tool`을 더한 모양, 그 모양에 `full_text_unavailable`을 더한 모양.
+- `source_locator`와 `full_text_tool`은 다음 조건을 모두 만족할 때만 붙는다. `text`가 잘렸다. `text`에 변형 표지가 없다. 증명 무효화 표지가 없다. 현재 정확한 source row가 존재하고, 실제 row의 string `metadata.pack_id`가 읽기 범위와 질의 팩 범위에 있으며, backend-owned complete state의 digest와 본문이 일치한다. 표시되는 `text`가 source 본문과 바이트 단위로 같거나 증명된 본문의 앞 4000자와 글자 단위로 같다.
+- `full_text_unavailable`은 `text`가 잘렸거나 변형된 항목에서 locator가 붙지 않았을 때만 붙는다.
+- 변형 표지는 병합이 대표 `text`를 바꾼 경우에만 선다.
+- 병합 전 본문과 source 본문의 일치는 `validate_source_row_payload`가 판정하고, 앞 4000자와의 일치는 병합이 증명된 본문에서 값으로 계산한다. source row의 판정은 `opencrab/stores/_source_integrity.py`의 `validate_source_row_payload` 한 곳이 맡는다.
+- `ontology_get_source_range(source_locator, offset_bytes, length_bytes)`는 다음 중 하나를 돌려준다: `source_id`, `offset_bytes`, `length_bytes`, `total_bytes`, `source_digest`, `text`를 가진 strict UTF-8 구간(남은 바이트가 있으면 `next_offset_bytes`도 가진다), 또는 `error`가 `invalid_source_locator`, `invalid_source_range`, `source_not_found`, `full_text_unavailable`, `stale_source_locator`, `response_too_large` 중 하나인 오류.
+- 구간은 다음 조건을 모두 만족할 때만 돌려준다. locator의 모양이 유효하다. offset은 0 이상 정수이고 length는 양의 정수이다. 현재 source row가 `validate_source_row_payload`를 통과한다. locator의 digest가 현재 source digest와 같다. 시작점과 끝점이 UTF-8 코드포인트 경계이다. 구간 응답이 응답 예산 이하이다.
+- 응답에는 private 증거(`_query_provenance` 계열 키, `source_integrity`, `_source_classification`)가 어느 깊이에도 실리지 않는다. 모든 공개 cap(결과 항목, 접힌 member, `selected_packs`, REST keyword fallback)은 같은 재귀 sanitizer를 거친다.
+- 앞 4000자만 남은 경우의 `original_chars`(source 전체 길이)는 병합이 만든 값이며 cap은 그 값과 저장 원문의 관계를 따로 인증하지 않는다.
+- `ontology_get_node(node_id)`의 graph-scoped 동작은 바뀌지 않는다. 이 도구는 locator의 원문 읽기 경로가 아니다.
 
 ### 응답 예산
 

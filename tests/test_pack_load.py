@@ -1225,6 +1225,113 @@ class TestChunksIncremental:
         assert stored.get("쪽") == "99", (
             f"meta 로 세었지만 문서 스토어가 갱신되지 않았다 — 라이브가 영구 스테일이다: {stored}")
 
+    def test_metadata_only_change_keeps_an_unknown_source_unknown(self, live, tmp_path, pack_sql):
+        """#516 G3: 메타만 바뀌는 재작성은 unknown 원문을 complete 로 승격하지 않는다.
+
+        재작성은 한 쓰기로 메타와 상태를 함께 바꾸고, 본문은 읽은 상태 그대로 둔다.
+        """
+        from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
+
+        _b, _g, docs = live
+        f1 = _write_jsonl(tmp_path / "c1.jsonl",
+                          [{"id": "c1", "document_id": "n1", "text": "본문",
+                            "metadata": {"쪽": "3"}}])
+        pack_load.load_chunks("pack-1", f1, _RecordingVec(), docs, sql=pack_sql)
+        row = docs.get_source("c1")
+        docs.write_source_copy(
+            "c1", row["text"], row["metadata"],
+            SourceCopyState("sqlite", "c1", row["text"], strict_utf8_digest(row["text"]), False),
+        )
+        assert docs.read_source_state_exact("c1").complete is False
+        live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
+            "SELECT source_id, text, metadata FROM doc_sources")}
+
+        f2 = _write_jsonl(tmp_path / "c2.jsonl",
+                          [{"id": "c1", "document_id": "n1", "text": "본문",
+                            "metadata": {"쪽": "99"}}])
+        vec = _RecordingVec()
+        _n, _t, c_meta, _same, _e, _i, _vu = pack_load.load_chunks_incremental(
+            "pack-1", f2, vec, docs, live_chunks, sql=pack_sql)
+
+        assert c_meta == 1 and vec.calls == []
+        after = docs.get_source("c1")
+        assert after["metadata"].get("쪽") == "99" and after["text"] == row["text"]
+        state = docs.read_source_state_exact("c1")
+        assert state is not None and state.complete is False, "unknown 이 complete 로 승격됐다"
+
+    @staticmethod
+    def _proxy(docs, hidden):
+        """실제 doc store 를 감싸되 지정한 메서드만 숨긴다. `upsert_source` 호출은 기록한다."""
+
+        class _Proxy:
+            def __init__(self):
+                self.upserts = []
+
+            def __getattr__(self, name):
+                if name in hidden:
+                    raise AttributeError(name)
+                return getattr(docs, name)
+
+            def upsert_source(self, *args, **kwargs):
+                self.upserts.append(args)
+                return docs.upsert_source(*args, **kwargs)
+
+        return _Proxy()
+
+    def _unknown_chunk_setup(self, live, tmp_path, pack_sql):
+        from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
+
+        _b, _g, docs = live
+        f1 = _write_jsonl(tmp_path / "c1.jsonl",
+                          [{"id": "c1", "document_id": "n1", "text": "본문",
+                            "metadata": {"쪽": "3"}}])
+        pack_load.load_chunks("pack-1", f1, _RecordingVec(), docs, sql=pack_sql)
+        row = docs.get_source("c1")
+        docs.write_source_copy(
+            "c1", row["text"], row["metadata"],
+            SourceCopyState("sqlite", "c1", row["text"], strict_utf8_digest(row["text"]), False),
+        )
+        live_chunks = {sid: (txt, json.loads(md)) for sid, txt, md in docs._conn.execute(
+            "SELECT source_id, text, metadata FROM doc_sources")}
+        f2 = _write_jsonl(tmp_path / "c2.jsonl",
+                          [{"id": "c1", "document_id": "n1", "text": "본문",
+                            "metadata": {"쪽": "99"}}])
+        return docs, row, live_chunks, f2
+
+    def test_metadata_rewrite_without_boundary_methods_is_rejected(self, live, tmp_path, pack_sql):
+        """#516 F1: 상태 읽기와 메타 재작성 메서드가 없는 doc store 는 일반 upsert 로
+        unknown 을 complete 로 올리지 못한다. 행은 오류로 세고 doc 은 옛 메타로 남는다."""
+        docs, row, live_chunks, f2 = self._unknown_chunk_setup(live, tmp_path, pack_sql)
+        proxy = self._proxy(docs, {"read_source_state_exact", "rewrite_source_metadata"})
+        vec = _RecordingVec()
+
+        _n, _t, c_meta, _same, err, _i, _vu = pack_load.load_chunks_incremental(
+            "pack-1", f2, vec, proxy, live_chunks, sql=pack_sql)
+
+        assert vec.meta_updates and vec.meta_updates[0][0] == "c1", "벡터 메타 갱신이 먼저 성공해야 한다"
+        assert (c_meta, err) == (0, 1)
+        assert proxy.upserts == [], "일반 upsert 가 불리면 unknown 이 complete 가 된다"
+        after = docs.get_source("c1")
+        assert after["metadata"].get("쪽") == "3" and after["text"] == row["text"]
+        state = docs.read_source_state_exact("c1")
+        assert state is not None and state.complete is False
+
+    def test_metadata_rewrite_through_an_unhidden_proxy_succeeds(self, live, tmp_path, pack_sql):
+        """대조군: 같은 프록시가 두 메서드를 숨기지 않으면 같은 입력이 재작성되고 unknown 이 남는다."""
+        docs, row, live_chunks, f2 = self._unknown_chunk_setup(live, tmp_path, pack_sql)
+        proxy = self._proxy(docs, set())
+        vec = _RecordingVec()
+
+        _n, _t, c_meta, _same, err, _i, _vu = pack_load.load_chunks_incremental(
+            "pack-1", f2, vec, proxy, live_chunks, sql=pack_sql)
+
+        assert (c_meta, err) == (1, 0)
+        assert proxy.upserts == []
+        after = docs.get_source("c1")
+        assert after["metadata"].get("쪽") == "99" and after["text"] == row["text"]
+        state = docs.read_source_state_exact("c1")
+        assert state is not None and state.complete is False
+
 
 class TestIncrementalFinalizeSafetyPins:
     """`incremental_finalize` 의 안전핀 — **삭제 권한을 가진 함수**인데 커버리지 0이었다.

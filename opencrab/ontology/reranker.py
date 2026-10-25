@@ -84,6 +84,13 @@ def _intent_boost(query: str, item: dict[str, Any]) -> float:
 def _merge_duplicate(existing: dict[str, Any], item: dict[str, Any]) -> None:
     """Merge duplicate node hits so consensus survives reranking."""
     existing_sources = set(existing.get("sources") or [existing.get("source", "hybrid")])
+    # Private provenance (see opencrab/ontology/query.py) describes the stored
+    # source text that the representative text was proven against. It survives
+    # a merge only while the representative text is that text or its exact first
+    # 4000 characters. A second proof for the same node is ambiguous and ends it.
+    existing_proof = existing.get("_query_provenance")
+    item_proof = item.get("_query_provenance")
+    proof_conflict = item_proof is not None and item_proof != existing_proof
     existing_sources.add(item.get("source", "hybrid"))
     existing["sources"] = sorted(str(s) for s in existing_sources if s)
     if len(existing["sources"]) > 1:
@@ -101,8 +108,28 @@ def _merge_duplicate(existing: dict[str, Any], item: dict[str, Any]) -> None:
 
     old_text = existing.get("text") or ""
     new_text = item.get("text") or ""
+    text_changed = False
     if new_text and new_text not in old_text:
-        existing["text"] = f"{old_text}\n{new_text}".strip()[:4000]
+        merged_text = f"{old_text}\n{new_text}".strip()
+        candidate = merged_text[:4000]
+        existing["text"] = candidate
+        if candidate != old_text:
+            if (
+                isinstance(existing_proof, dict)
+                and not proof_conflict
+                and candidate == old_text[:4000]
+            ):
+                # The slice kept exactly the first 4000 characters of the proven
+                # text (len(old_text) > 4000 follows). Record the full length so
+                # the cap can report the cut and offer the locator.
+                existing["_query_text_source_chars"] = len(old_text)
+            else:
+                existing["_query_text_transformed"] = True
+                text_changed = True
+    if text_changed or proof_conflict:
+        existing.pop("_query_provenance", None)
+        existing.pop("_query_text_source_chars", None)
+        existing["_query_provenance_invalidated"] = True
 
     # #57: leg 병합 순서(vector < bm25 < fts < graph)는 값의 신뢰도와 무관하다.
     # 무조건 update() 하면 후순위 leg 의 falsy 값(빈 문자열, None 등)이 앞선

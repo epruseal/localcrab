@@ -46,6 +46,7 @@ from typing import Any
 
 from opencrab.stores._graph_common import IDENT_RE as _SCHEMA_IDENT_RE
 from opencrab.stores._graph_common import decode_properties
+from opencrab.stores._source_integrity import complete_integrity, unknown_integrity
 from opencrab.stores._sql_dialect import POSTGRES
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 
@@ -112,12 +113,102 @@ class PgDocStore(_SqlDocStoreBase):
         with self._conn(write=True) as conn:
             return conn.execute(self._text(sql), params).rowcount
 
+    def _exec_write_many(self, statements: list[tuple[str, dict[str, Any]]]) -> list[int]:
+        with self._conn(write=True) as conn:
+            return [conn.execute(self._text(sql), params).rowcount for sql, params in statements]
+
     def _row_get(self, row: Any, name: str) -> Any:
         return row._mapping[name]
 
     def _require_available(self) -> None:
         if not self._available:
             raise RuntimeError(f"{type(self).__name__} is not available.")
+
+    def _write_source_state(
+        self,
+        source_id: str,
+        text: str,
+        metadata: dict[str, Any],
+        source_integrity: dict[str, str | int],
+    ) -> str:
+        """Write the source serialization row before its helper state."""
+        source_params, integrity_params = self._source_write_params(
+            source_id, text, metadata, source_integrity
+        )
+        with self._conn(write=True) as conn:
+            conn.execute(self._text(self._source_upsert_sql()), source_params)
+            conn.execute(
+                self._text(
+                    f"SELECT source_id FROM {self._table('doc_sources')} "
+                    "WHERE source_id=:source_id FOR UPDATE"
+                ),
+                {"source_id": source_id},
+            ).one()
+            conn.execute(self._text(self._source_integrity_upsert_sql()), integrity_params)
+        return source_id
+
+    def rewrite_source_metadata(
+        self, source_id: str, metadata: dict[str, Any], source_state: Any
+    ) -> str:
+        """Rewrite metadata only after a source-first locked state read."""
+        self._require_available()
+        with self._conn(write=True) as conn:
+            locked = conn.execute(
+                self._text(
+                    f"SELECT source_id FROM {self._table('doc_sources')} "
+                    "WHERE source_id=:source_id FOR UPDATE"
+                ),
+                {"source_id": source_id},
+            ).fetchone()
+            if locked is None:
+                raise ValueError("source state changed before metadata rewrite")
+            row = conn.execute(
+                self._text(self._source_state_join("s.source_id=:source_id")),
+                {"source_id": source_id},
+            ).fetchone()
+            current = self._source_state_from_row(row) if row is not None else None
+            if current is None or current != source_state:
+                raise ValueError("source state changed before metadata rewrite")
+            source_params, integrity_params = self._source_write_params(
+                source_id,
+                current.text,
+                metadata,
+                complete_integrity(current.text_digest)
+                if current.complete and current.text_digest
+                else unknown_integrity(),
+            )
+            conn.execute(self._text(self._source_upsert_sql()), source_params)
+            conn.execute(self._text(self._source_integrity_upsert_sql()), integrity_params)
+        return source_id
+
+    def delete_sources_with_state(self, source_ids: list[str]) -> int:
+        """Delete each source before its helper state in one transaction."""
+        self._require_available()
+        if not source_ids:
+            return 0
+        deleted = 0
+        with self._conn(write=True) as conn:
+            for source_id in sorted(set(source_ids)):
+                row = conn.execute(
+                    self._text(
+                        f"DELETE FROM {self._table('doc_sources')} "
+                        "WHERE source_id=:source_id RETURNING source_id"
+                    ),
+                    {"source_id": source_id},
+                ).fetchone()
+                if row is None:
+                    continue
+                if self._row_get(row, "source_id") != source_id:
+                    raise RuntimeError("source delete returned an unexpected ID")
+                conn.execute(
+                    self._text(
+                        f"DELETE FROM {self._table('doc_source_integrity')} "
+                        "WHERE source_id=:source_id"
+                    ),
+                    {"source_id": source_id},
+                )
+                deleted += 1
+        return deleted
 
     # ------------------------------------------------------------------
     # Lifecycle

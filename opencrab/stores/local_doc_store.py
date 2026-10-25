@@ -29,6 +29,17 @@ import threading
 from datetime import UTC, datetime
 from typing import Any
 
+from opencrab.stores._source_integrity import (
+    SourceCopyState,
+    classify_integrity,
+    complete_integrity,
+    load_source_json,
+    normalize_source_rows,
+    require_original_source,
+    source_classification,
+    unknown_integrity,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -85,7 +96,13 @@ class LocalDocStore:
         # json parses (a bytes buffer plus a str would double the peak).
         try:
             with open(path, encoding="utf-8") as f:
-                data = json.load(f)
+                data = load_source_json(f) if collection == "sources" else json.load(f)
+            if not isinstance(data, dict):
+                reason = f"top-level value is {type(data).__name__}, not an object"
+                logger.error("Corrupt %s.json: %s", collection, reason)
+                raise CorruptCollectionError(collection, path, reason)
+            if collection == "sources":
+                data = normalize_source_rows(data)
         except UnicodeDecodeError as exc:
             reason = f"invalid UTF-8: {exc}"
             logger.error("Corrupt %s.json: %s", collection, reason)
@@ -177,31 +194,162 @@ class LocalDocStore:
             return str(s)
         return s.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
 
-    def upsert_source(
-        self, source_id: str, text: str, metadata: dict[str, Any]
+    def _read_source_state_row(
+        self, source_id: str, row: Any
+    ) -> SourceCopyState | None:
+        if not isinstance(row, dict) or row.get("source_id") != source_id:
+            return None
+        helper_present = "source_integrity" in row
+        complete, digest = classify_integrity(
+            row.get("text"),
+            row.get("source_integrity"),
+            helper_present=helper_present,
+            legacy_complete=(
+                not helper_present
+                and isinstance(row.get("text"), str)
+                and len(row["text"]) < 4096
+            ),
+        )
+        text = row.get("text")
+        if not isinstance(text, str):
+            return None
+        return SourceCopyState("local", source_id, text, digest, complete)
+
+    def read_source_state_exact(self, source_id: str) -> SourceCopyState | None:
+        """Read one source and classify its backend-owned integrity state."""
+        with self._lock:
+            return self._read_source_state_row(source_id, self._load("sources").get(source_id))
+
+    def _write_source(
+        self,
+        source_id: str,
+        text: str,
+        metadata: dict[str, Any],
+        source_integrity: dict[str, str | int],
     ) -> str:
-        source_id = self._safe_str(source_id)
-        text = self._safe_str(text)
         with self._lock:
             data = self._load("sources")
             data[source_id] = {
                 "source_id": source_id,
-                "text": text[:4096],  # truncate for storage
+                "text": text,
                 "metadata": metadata,
                 "ingested_at": datetime.now(UTC).isoformat(),
+                "source_integrity": source_integrity,
             }
             self._save("sources", data)
-            return source_id
+        return source_id
+
+    def write_source_original(
+        self, source_id: str, text: str, metadata: dict[str, Any]
+    ) -> str:
+        source_id, text, text_digest = require_original_source(source_id, text)
+        return self._write_source(source_id, text, metadata, complete_integrity(text_digest))
+
+    def write_source_copy(
+        self,
+        source_id: str,
+        text: str,
+        metadata: dict[str, Any],
+        source_copy_state: SourceCopyState,
+    ) -> str:
+        source_id, text, text_digest = require_original_source(source_id, text)
+        integrity = (
+            complete_integrity(text_digest)
+            if source_copy_state.complete
+            and source_copy_state.text_digest == text_digest
+            and source_copy_state.text == text
+            else unknown_integrity()
+        )
+        return self._write_source(source_id, text, metadata, integrity)
+
+    def rewrite_source_metadata(
+        self, source_id: str, metadata: dict[str, Any], source_state: SourceCopyState
+    ) -> str:
+        """Rewrite metadata while one lock owns read, comparison, and write."""
+        with self._lock:
+            data = self._load("sources")
+            current = self._read_source_state_row(source_id, data.get(source_id))
+            if current is None or current != source_state:
+                raise ValueError("source state changed before metadata rewrite")
+            integrity = (
+                complete_integrity(current.text_digest)
+                if current.complete and current.text_digest
+                else unknown_integrity()
+            )
+            data[source_id] = {
+                "source_id": source_id,
+                "text": current.text,
+                "metadata": metadata,
+                "ingested_at": datetime.now(UTC).isoformat(),
+                "source_integrity": integrity,
+            }
+            self._save("sources", data)
+        return source_id
+
+    def upsert_source(
+        self, source_id: str, text: str, metadata: dict[str, Any]
+    ) -> str:
+        from opencrab.stores._source_integrity import current_source_copy_state
+
+        state = current_source_copy_state()
+        if state is None:
+            return self.write_source_original(source_id, text, metadata)
+        return self.write_source_copy(source_id, text, metadata, state)
+
+    def get_source_scoped_exact(
+        self, source_id: str, pack_ids: list[str]
+    ) -> dict[str, Any] | None:
+        if not pack_ids:
+            return None
+        with self._lock:
+            row = self._load("sources").get(source_id)
+            metadata = row.get("metadata") if isinstance(row, dict) else None
+            if (
+                not isinstance(metadata, dict)
+                or not isinstance(metadata.get("pack_id"), str)
+                or metadata["pack_id"] not in set(pack_ids)
+            ):
+                return None
+            state = self._read_source_state_row(source_id, row)
+            if state is None:
+                return None
+            helper_present = "source_integrity" in row
+            raw_state = row.get("source_integrity") if helper_present else None
+            result = dict(row)
+            result["_source_classification"] = source_classification(
+                source_id,
+                row.get("text"),
+                metadata.get("pack_id"),
+                raw_state,
+                helper_present=helper_present,
+                legacy_complete=(not helper_present and len(row["text"]) < 4096),
+                known_state=state,
+            )
+            return result
+
+    @staticmethod
+    def _public_source(row: Any) -> Any:
+        """Hide the private helper from a dict row; return any other value
+        unchanged, as the stores did before the helper existed."""
+        if not isinstance(row, dict):
+            return row
+        return {key: value for key, value in row.items() if key != "source_integrity"}
 
     def get_source(self, source_id: str) -> dict[str, Any] | None:
-        return self._load("sources").get(source_id)
+        row = self._load("sources").get(source_id)
+        if row is None:
+            return None
+        return self._public_source(row)
 
     def list_sources(self, limit: int = 100) -> list[dict[str, Any]]:
         """``limit <= 0``: returns ``[]`` -- same contract as ``list_nodes``
         above."""
         if limit <= 0:
             return []
-        return list(self._load("sources").values())[:limit]
+        return [
+            self._public_source(row)
+            for row in list(self._load("sources").values())[:limit]
+        ]
 
     # ------------------------------------------------------------------
     # Audit log (mirrors MongoStore)

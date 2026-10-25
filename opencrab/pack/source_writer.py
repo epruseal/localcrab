@@ -57,6 +57,7 @@ from opencrab.pack.write_gate import (
     source_identity_conflict,
     stamp,
 )
+from opencrab.stores._source_integrity import SourceCopyState, source_copy_context
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ def write_source(
     fork_copy: bool = False,
     write_vector: bool = True,
     write_graph: bool = True,
+    source_copy_state: SourceCopyState | None = None,
 ) -> dict[str, Any]:
     """Write one source's graph node, doc row and vector under one ownership stamp.
 
@@ -194,6 +196,12 @@ def write_source(
     used ``chromadb`` for the vector leg before this parameter existed. Fork
     sets this False because ``hybrid.ingest`` re-embeds, which issue #200
     forbids for a fork; the original vector is imported raw elsewhere instead.
+
+    ``source_copy_state``, default None, is a backend state that the caller
+    verified. When it is not None, a doc store stores a complete state for this
+    write only when the state says complete and its text and digest equal the
+    written text and digest. When ``source_copy_state`` is None, ``write_source``
+    sets no context.
 
     A doc-store *error* stops the vector write: a vector row pointing at a
     source that failed to record is an orphan no read path can hydrate. A doc
@@ -277,7 +285,11 @@ def write_source(
     doc_failed = False
     if _docs_available(docs):
         try:
-            created = docs.upsert_source(source_id, text, meta)
+            if source_copy_state is not None:
+                with source_copy_context(source_copy_state):
+                    created = docs.upsert_source(source_id, text, meta)
+            else:
+                created = docs.upsert_source(source_id, text, meta)
             receipt["stores"]["documents"] = f"ok (id={created or source_id})"
         except Exception as exc:  # noqa: BLE001 -- reported, not raised (#158)
             # #168: this receipt's stores map flows straight into an MCP

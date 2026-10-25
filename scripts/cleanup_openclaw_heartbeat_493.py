@@ -2139,6 +2139,15 @@ def _delete_document(data_dir: Path, record: dict[str, Any]) -> None:
     try:
         _begin_write(conn)
         source = conn.execute("SELECT source_id,text,metadata FROM doc_sources WHERE source_id=?", (record["id"],)).fetchone()
+        # #516 G4: a store may lack the helper table, or hold it without this row.
+        helper_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='doc_source_integrity'"
+        ).fetchone() is not None
+        helper = (
+            conn.execute("SELECT source_id FROM doc_source_integrity WHERE source_id=?", (record["id"],)).fetchone()
+            if helper_table
+            else None
+        )
         fts = []
         for rowid in _fts_rowids(conn, record["id"]):
             row = conn.execute("SELECT source_id,text FROM doc_sources_fts WHERE rowid=?", (rowid,)).fetchone()
@@ -2153,6 +2162,10 @@ def _delete_document(data_dir: Path, record: dict[str, Any]) -> None:
             raise CleanupRefusedError(f"{record['id']}: doc CAS conflict")
         if source is not None and conn.execute("DELETE FROM doc_sources WHERE source_id=?", (record["id"],)).rowcount != 1:
             raise CleanupRefusedError(f"{record['id']}: source delete rowcount")
+        if helper_table:
+            deleted_helper = conn.execute("DELETE FROM doc_source_integrity WHERE source_id=?", (record["id"],)).rowcount
+            if deleted_helper != (1 if helper is not None else 0):
+                raise CleanupRefusedError(f"{record['id']}: helper delete rowcount")
         deleted_fts = sum(
             conn.execute("DELETE FROM doc_sources_fts WHERE rowid=? AND source_id=? AND text=?", (rowid, row[0], row[1])).rowcount
             for rowid, row in fts

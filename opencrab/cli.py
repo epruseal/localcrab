@@ -974,6 +974,7 @@ def query(
         spaces=space_filter,
         limit=limit,
         pack_ids=effective_pack_ids,
+        full_scope=scope,
     )
     results = outcome.results[offset:limit]
     # #51: spaces 필터의 과도기 경고(백필 전 기존 벡터 제외)를 pack 경고와 동일하게 echo.
@@ -982,7 +983,7 @@ def query(
         click.echo(f"warning: {warning}", err=True)
 
     result_dicts = [
-        result_caps.cap_query_item(result.to_dict(), folded=bool(result.folded_count))
+        result_caps.cap_query_item(result.to_cap_item(), folded=bool(result.folded_count))
         for result in results
     ]
     selected_packs = [result_caps.cap_selected_pack(pack) for pack in selected_packs]

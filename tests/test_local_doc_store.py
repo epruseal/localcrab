@@ -321,12 +321,12 @@ class TestEdgeCases:
         assert doc is not None
         assert doc["node_id"] == "a::b::c"
 
-    def test_source_text_truncated_at_4096(self, store):
-        """LocalDocStore truncates source text to 4096 chars on upsert."""
+    def test_source_text_is_not_truncated_at_4096(self, store):
+        """LocalDocStore preserves full validated source text on upsert."""
         long_text = "x" * 10_000
         store.upsert_source("long_src", long_text, {})
         src = store.get_source("long_src")
-        assert len(src["text"]) == 4096
+        assert src["text"] == long_text
 
     def test_safe_str_handles_non_string(self, store):
         """_safe_str converts non-str values to str."""
@@ -663,3 +663,64 @@ class TestCorruptCollection:
         with pytest.raises(CorruptCollectionError):
             s.upsert_node_doc("s1", "T", "n9", {})
         assert not os.path.exists(tmp_sibling)
+
+
+# ---------------------------------------------------------------------------
+# Issue #516: duplicate-key decode stays last-key-wins outside source helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["source-metadata", "nodes", "audit-log"])
+def test_source_integrity_decoder_preserves_other_decode_contracts(tmp_path, kind):
+    from opencrab.stores.local_doc_store import LocalDocStore
+
+    data_dir = tmp_path / "doc_store"
+    data_dir.mkdir()
+    text = "source text"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    raw_by_kind = {
+        "source-metadata": (
+            "sources",
+            '{"src": {"source_id": "src", "text": "' + text + '", '
+            '"metadata": {"pack_id": "other", "pack_id": "pack", "tag": 1, "tag": 2}, '
+            '"source_integrity": {"version": 1, "state": "complete", '
+            '"text_digest": "' + digest + '"}}}',
+        ),
+        "nodes": (
+            "nodes",
+            '{"s1::n1": {"space": "s1", "node_type": "T", "node_id": "n1", '
+            '"properties": {"a": 1, "a": 2}, "updated_at": "x"}}',
+        ),
+        "audit-log": (
+            "audit_log",
+            '{"e1": {"event_type": "x", "subject_id": null, '
+            '"details": {"k": 1, "k": 2}, "timestamp": "2026-01-01T00:00:00+00:00"}}',
+        ),
+    }
+    collection, raw = raw_by_kind[kind]
+    path = data_dir / f"{collection}.json"
+    path.write_text(raw, encoding="utf-8")
+    before = path.read_bytes()
+    store = LocalDocStore(str(data_dir))
+
+    if kind == "source-metadata":
+        row = store.get_source("src")
+        assert row is not None
+        assert row["metadata"] == {"pack_id": "pack", "tag": 2}
+        assert type(row) is dict and type(row["metadata"]) is dict
+        state = store.read_source_state_exact("src")
+        assert state is not None and state.complete is True
+        scoped = store.get_source_scoped_exact("src", ["pack"])
+        assert scoped is not None
+        assert scoped["_source_classification"]["state_kind"] == "complete"
+    elif kind == "nodes":
+        node = store.get_node_doc("s1", "n1")
+        assert node is not None
+        assert type(node) is dict and type(node["properties"]) is dict
+        assert node["properties"] == {"a": 2}
+    else:
+        entries = store.get_audit_log()
+        assert len(entries) == 1
+        assert type(entries[0]) is dict and type(entries[0]["details"]) is dict
+        assert entries[0]["details"] == {"k": 2}
+    assert path.read_bytes() == before

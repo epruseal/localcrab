@@ -7,6 +7,7 @@ LocalSQLDocStore 미구현 시 해당 테스트는 skip 처리.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import sys
 from pathlib import Path
@@ -142,6 +143,27 @@ class TestMigrateGraph:
 # Test: migrate_docs — MongoDB → LocalDocStore
 # ---------------------------------------------------------------------------
 
+class _CopyTargetSpy:
+    def __init__(self) -> None:
+        self.copy_states: list[tuple[str, str, bool]] = []
+        self.upsert_calls: list[tuple[str, str]] = []
+
+    def write_source_copy(self, source_id, text, _metadata, state) -> None:
+        self.copy_states.append((source_id, text, state.complete))
+
+    def upsert_source(self, source_id, text, _metadata) -> None:
+        self.upsert_calls.append((source_id, text))
+        raise AssertionError("ordinary upsert must not run")
+
+
+class _LegacyTargetSpy:
+    def __init__(self) -> None:
+        self.upsert_calls: list[tuple[str, str]] = []
+
+    def upsert_source(self, source_id, text, _metadata) -> None:
+        self.upsert_calls.append((source_id, text))
+
+
 class TestMigrateDocs:
     def test_migrate_docs_mongo_to_local_doc_store(self, tmp_path: Path) -> None:
         """MongoDB → LocalDocStore 변환 로직 검증."""
@@ -213,6 +235,147 @@ class TestMigrateDocs:
         import logging
         result = mig.migrate_docs(db, doc_store, batch_size=100, log=logging.getLogger())
         assert result["nodes"] == 1
+
+    def test_origin_change_after_enumeration_writes_unknown_copy_state(self, tmp_path: Path) -> None:
+        from opencrab.stores._source_integrity import complete_integrity, strict_utf8_digest
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        candidate = {
+            "source_id": "src-1",
+            "text": "old",
+            "metadata": {"pack_id": "pack"},
+            "source_integrity": complete_integrity(strict_utf8_digest("old")),
+        }
+        reread = {
+            "source_id": "src-1",
+            "text": "new",
+            "metadata": {"pack_id": "pack"},
+            "source_integrity": complete_integrity(strict_utf8_digest("new")),
+        }
+        db = _make_mongo_db_mock([], [candidate], [], reread_overrides={"src-1": reread})
+        doc_store = LocalDocStore(data_dir=str(tmp_path / "changed-source"))
+
+        result = mig.migrate_docs(db, doc_store, batch_size=100, log=logging.getLogger())
+
+        assert result["sources"] == 1
+        state = doc_store.read_source_state_exact("src-1")
+        assert state is not None
+        assert state.text == "new"
+        assert state.complete is False
+        assert db["sources"].requested_source_ids == ["src-1"]
+
+    def test_origin_reread_explicit_unknown_never_complete(self, tmp_path: Path) -> None:
+        from opencrab.stores._source_integrity import unknown_integrity
+
+        candidate = {"source_id": "src-1", "text": "body", "metadata": {}, "source_integrity": unknown_integrity()}
+        reread = {"source_id": "src-1", "text": "body", "metadata": {}, "source_integrity": unknown_integrity()}
+        db = _make_mongo_db_mock([], [candidate], [], reread_overrides={"src-1": reread})
+        target = _CopyTargetSpy()
+
+        result = mig.migrate_docs(db, target, batch_size=100, log=logging.getLogger())
+
+        assert result["sources"] == 1
+        assert target.copy_states == [("src-1", "body", False)], "assert_explicit_unknown_never_complete"
+        assert target.upsert_calls == [], "assert_ordinary_upsert_calls_zero"
+
+    def test_origin_reread_equal_complete_copies_complete_state(self, tmp_path: Path) -> None:
+        from opencrab.stores._source_integrity import complete_integrity, strict_utf8_digest
+
+        text = "body"
+        source = {"source_id": "src-1", "text": text, "metadata": {}, "source_integrity": complete_integrity(strict_utf8_digest(text))}
+        db = _make_mongo_db_mock([], [source], [])
+        target = _CopyTargetSpy()
+
+        result = mig.migrate_docs(db, target, batch_size=100, log=logging.getLogger())
+
+        assert result["sources"] == 1
+        assert target.copy_states == [("src-1", text, True)], "assert_equal_complete_copies_complete"
+        assert target.upsert_calls == [], "assert_ordinary_upsert_calls_zero"
+
+    def test_origin_reread_changed_complete_never_calls_ordinary_upsert(self, tmp_path: Path) -> None:
+        from opencrab.stores._source_integrity import complete_integrity, strict_utf8_digest
+
+        candidate = {"source_id": "src-1", "text": "old", "metadata": {}, "source_integrity": complete_integrity(strict_utf8_digest("old"))}
+        reread = {"source_id": "src-1", "text": "new", "metadata": {}, "source_integrity": complete_integrity(strict_utf8_digest("new"))}
+        db = _make_mongo_db_mock([], [candidate], [], reread_overrides={"src-1": reread})
+        target = _LegacyTargetSpy()
+
+        result = mig.migrate_docs(db, target, batch_size=100, log=logging.getLogger())
+
+        assert target.upsert_calls == [], "assert_ordinary_upsert_calls_zero"
+        assert result["sources"] == 0
+
+    def test_origin_reread_delete_never_writes_source(self, tmp_path: Path) -> None:
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        candidate = {"source_id": "src-1", "text": "body", "metadata": {}}
+        db = _make_mongo_db_mock([], [candidate], [], reread_overrides={"src-1": None})
+        doc_store = LocalDocStore(data_dir=str(tmp_path / "deleted-source"))
+
+        result = mig.migrate_docs(db, doc_store, batch_size=100, log=logging.getLogger())
+
+        assert result["sources"] == 0
+        assert doc_store.get_source("src-1") is None
+        assert db["sources"].requested_source_ids == ["src-1"]
+
+    def test_origin_reread_never_uses_unrelated_source(self, tmp_path: Path) -> None:
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        source_a = {"source_id": "src-a", "text": "A", "metadata": {}}
+        source_b = {"source_id": "src-b", "text": "B", "metadata": {}}
+        db = _make_mongo_db_mock([], [source_a, source_b], [])
+        doc_store = LocalDocStore(data_dir=str(tmp_path / "unrelated-source"))
+
+        result = mig.migrate_docs(db, doc_store, batch_size=100, log=logging.getLogger())
+
+        assert result["sources"] == 2
+        assert db["sources"].requested_source_ids == ["src-a", "src-b"]
+        assert doc_store.get_source("src-a")["text"] == "A"
+        assert doc_store.get_source("src-b")["text"] == "B"
+
+    def test_origin_reread_non_string_text_skips_source(self, tmp_path: Path) -> None:
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        candidate = {"source_id": "src-1", "text": "body", "metadata": {}}
+        badtext = {"source_id": "src-1", "text": ["not-string"], "metadata": {}}
+        db = _make_mongo_db_mock([], [candidate], [], reread_overrides={"src-1": badtext})
+        doc_store = LocalDocStore(data_dir=str(tmp_path / "badtext-source"))
+
+        result = mig.migrate_docs(db, doc_store, batch_size=100, log=logging.getLogger())
+
+        assert result["sources"] == 0
+        assert doc_store.get_source("src-1") is None
+        assert db["sources"].requested_source_ids == ["src-1"]
+
+    def test_missing_and_non_string_source_id_warn_differently(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from opencrab.stores.local_doc_store import LocalDocStore
+
+        docs = [
+            {"text": "no key", "metadata": {}},
+            {"source_id": None, "text": "null id", "metadata": {}},
+            {"source_id": "", "text": "empty id", "metadata": {}},
+            {"source_id": 123, "text": "int id", "metadata": {}},
+            {"source_id": False, "text": "bool id", "metadata": {}},
+        ]
+        db = _make_mongo_db_mock([], docs, [])
+        doc_store = LocalDocStore(data_dir=str(tmp_path / "ids-source"))
+        logger = logging.getLogger("mig-id-warn")
+
+        with caplog.at_level(logging.WARNING, logger="mig-id-warn"):
+            result = mig.migrate_docs(db, doc_store, batch_size=100, log=logger)
+
+        messages = [r.getMessage() for r in caplog.records if r.name == "mig-id-warn"]
+        missing = [m for m in messages if "source_id 없는" in m]
+        non_string = [m for m in messages if "문자열이 아닌 source_id" in m]
+        assert len(missing) == 3, messages
+        assert len(non_string) == 2, messages
+        assert any(m.endswith(": int") for m in non_string), non_string
+        assert any(m.endswith(": bool") for m in non_string), non_string
+        assert "123" not in " ".join(messages), "the id value stays out of the warning"
+        assert result["sources"] == 0
+        assert db["sources"].requested_source_ids == []
 
 
 # ---------------------------------------------------------------------------
@@ -528,8 +691,14 @@ def _make_mongo_db_mock(
     nodes: list[dict],
     sources: list[dict],
     audit: list[dict],
+    *,
+    reread_overrides: dict[str, dict | None] | None = None,
 ) -> MagicMock:
-    """pymongo db mock — __getitem__ 로 컬렉션 접근 지원."""
+    """pymongo db mock — source rereads validate the requested scalar ID."""
+    overrides = reread_overrides or {}
+    if any(not isinstance(source_id, str) for source_id in overrides):
+        raise ValueError("reread override IDs must be strings")
+
     def _make_col(docs: list[dict]) -> MagicMock:
         col = MagicMock()
         cursor = MagicMock()
@@ -538,9 +707,39 @@ def _make_mongo_db_mock(
         col.find = MagicMock(return_value=cursor)
         return col
 
+    source_col = _make_col(sources)
+    source_col.requested_source_ids = []
+
+    def _find_source(query: object, projection: object) -> dict | None:
+        try:
+            clauses = query["$expr"]["$and"]  # type: ignore[index]
+            source_type, source_match = clauses
+            requested_id = source_match["$eq"][1]["$literal"]
+        except (KeyError, IndexError, TypeError):
+            raise AssertionError("source reread must use the exact scalar-ID query") from None
+        if (
+            source_type != {"$eq": [{"$type": "$source_id"}, "string"]}
+            or not isinstance(requested_id, str)
+            or source_match != {"$eq": ["$source_id", {"$literal": requested_id}]}
+            or projection != {"_id": 0}
+        ):
+            raise AssertionError("source reread must use the exact scalar-ID query")
+        source_col.requested_source_ids.append(requested_id)
+        if requested_id in overrides:
+            override = overrides[requested_id]
+            return dict(override) if isinstance(override, dict) else None
+        matches = [
+            row for row in sources
+            if isinstance(row.get("source_id"), str) and row["source_id"] == requested_id
+        ]
+        if len(matches) > 1:
+            raise AssertionError("source fixture has duplicate scalar source IDs")
+        return dict(matches[0]) if matches else None
+
+    source_col.find_one.side_effect = _find_source
     col_map = {
         "nodes":     _make_col(nodes),
-        "sources":   _make_col(sources),
+        "sources":   source_col,
         "audit_log": _make_col(audit),
     }
     db = MagicMock()

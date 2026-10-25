@@ -1590,10 +1590,7 @@ def delete_pack(
                 {"done": not any_doc_failed, "clean": not any_doc_failed},
             )
 
-        # ── 2. doc_node_extra_and_sources: 고아 doc_nodes 벌크 삭제 + doc_sources
-        # (청크) + FTS. node_twin_loop 의 done 여부와 무관하게(게이팅 없음, 리드
-        # 재정의 실행 순서) 항상 시도한다 — 이 축 자신은 `done` 하나로만 재실행을
-        # 막는다.
+        # ── 2. doc_node_extra_and_sources: 고아 doc_nodes 와 doc_sources 행(청크, helper, FTS)을 삭제한다.
         if not _axis_done("doc_node_extra_and_sources") or live_docs or doc_nodes_live:
             # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
             # 위 조회와 동일하게 `pack_id` 단일 소유 키만 본다(위 주석의
@@ -1618,36 +1615,14 @@ def delete_pack(
             )
             src_ids = [docs._row_get(r, "source_id") for r in src_rows]
 
-            doc_sources_table = docs._table("doc_sources")
             chunk_sql_del = 0
-            fts_del = 0
             for batch in _batched(src_ids):
-                placeholders, in_params = _in_names("sid", batch)
-                if not placeholders:                          # 도달 불가(위 주석) — 방어
-                    continue
-                chunk_sql_del += docs._exec_write(
-                    f"DELETE FROM {doc_sources_table} WHERE source_id IN ({placeholders})",
-                    in_params,
-                )
-                # doc_sources_fts 동기화(별도 fts5 가상 테이블 — 트리거 없이 수동 관리됨).
-                # [Δ r11 P1] sqlite 전용 방언 게이트만 신설 — 순서(doc_sources 삭제 뒤
-                # FTS 삭제)와 삭제 실패의 warning-삼킴은 **현행 그대로 유지**한다(FTS-first
-                # 로 뒤집지 않는다). 근거: 고아 FTS 행은 `keyword_search`(doc_sources
-                # 와 INNER JOIN, local_sql_doc_store.py:293)에서 안 보여 무해하고, 같은
-                # source_id 가 재적재되면 `upsert_source` 의 DELETE+INSERT 가 자가
-                # 치유한다(v6 검수 실측: orphan 상태 검색 결과 미포함·재업서트 후 fts
-                # 행 1). 전량 회수는 재실행으로 안 되고(별건, 대사 스윕 필요) —
-                # `_init_db` 의 n_fts==0 백필 가드(local_sql_doc_store.py:131)가 이
-                # 고아를 건드리는 유일한 비-JOIN 소비처다(그 가드는 "FTS 가 통째로
-                # 비어 있을 때"만 발동하므로 부분 고아는 못 건드린다).
-                if docs._dialect.name == "sqlite":
-                    try:
-                        fts_del += docs._exec_write(
-                            f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
-                            in_params,
-                        )
-                    except Exception as exc:
-                        log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
+                # 삭제 경계의 예외는 이 함수 밖으로 전파된다.
+                delete_sources = getattr(docs, "delete_sources_with_state", None)
+                if not callable(delete_sources):
+                    raise RuntimeError("doc store lacks source-state delete boundary")
+                deleted = delete_sources(batch)
+                chunk_sql_del += deleted
             _commit_axis(
                 "doc_node_extra_and_sources",
                 {"done": True, "count": doc_node_extra_del + chunk_sql_del},
@@ -1655,7 +1630,6 @@ def delete_pack(
         else:
             doc_node_extra_del = 0
             chunk_sql_del = 0
-            fts_del = 0
 
         # ── 3. 게이팅: node_twin_loop 이 done 이어야만 graph_nodes 축에 진입한다 ──
         # `or rows`: 위 node_twin_loop 축과 동일한 이유(#327 재리뷰 P1, id
@@ -1733,7 +1707,7 @@ def delete_pack(
         prior_unknown = " 이전 부분 실행이 있었으며 그 건수는 알 수 없음." if resumed else ""
         print(
             f"  [{pack_name}] {resume_tag}삭제: 노드+엣지 {node_del}개(doc_nodes 보강 {doc_node_extra_del}), "
-            f"doc_sources {chunk_sql_del}개(fts {fts_del}), 벡터({vec_backend}) {vec_shown}개."
+            f"doc_sources {chunk_sql_del}개, 벡터({vec_backend}) {vec_shown}개."
             f"{prior_unknown}",
             flush=True,
         )
@@ -2999,9 +2973,11 @@ def load_chunks_incremental(
     sql,
     recover_vectors: bool = False,
 ) -> tuple[int, int, int, int, int, set, int]:
-    """청크 증분 적재. 텍스트 불변·메타만 변경된 행은 임베딩 없이 upsert_source만 호출.
+    """청크 증분 적재.
 
     반환: (c_new, c_txt, c_meta, c_same, err, bypack_ids, vec_unrecovered)
+    - c_meta: 텍스트 불변·메타 변경 행 중 `rewrite_source_metadata` 가 정상 반환한 행만 센다.
+    - err: 처리하지 못한 청크 수.
 
     열거 실패(#425): 시작 열거가 백엔드 오류로 실패하면 `_live_vec_ids_or_unconfirmed`
     가 "벡터 상태 미확인"으로 접는다. 적재는 끝까지 가고, 열거 결과로 존재를
@@ -3141,22 +3117,15 @@ def load_chunks_incremental(
                 b_metas.append(meta)
                 b_kinds.append("txt")
             elif strip_retired_keys(live[1]) != meta:
-                # 텍스트 불변, 메타만 변경 — 임베딩은 재계산하지 않는다(텍스트가 같으므로).
-                #
-                # **벡터를 먼저 고치고, 성공했을 때만 doc 기준을 옮긴다.** 형제(flush·
-                # flush_single)는 이미 벡터 먼저·doc 나중 순서다. 종전엔 이 메타 전용
-                # 분기만 `doc_sources`를 **먼저** 커밋하고 그 뒤에 벡터를 고쳤는데,
-                # `doc_sources`는 **다음 증분의 비교 기준**이라 벡터 수리가 실패해도
-                # 기준이 갱신돼 다음 실행이 "동일"로 넘어간다 — **영구 불일치**가 된다
-                # (2026-08-11 리뷰 지적). 벡터를 못 고치는 백엔드면 조용히 넘기지 않고
-                # 텍스트 경로로 보내 재임베딩시킨다 — 이때 doc은 옛 메타 그대로 두어
-                # 재시도 가능성을 보존한다(비교 기준을 섣불리 옮기지 않는다).
                 try:
                     if _vec_meta_update(vec, chunk_id, meta, pack_name):
-                        docs.upsert_source(chunk_id, row["text"], meta)
+                        state_reader = getattr(docs, "read_source_state_exact", None)
+                        metadata_rewriter = getattr(docs, "rewrite_source_metadata", None)
+                        if not (callable(state_reader) and callable(metadata_rewriter)):
+                            raise RuntimeError("doc store lacks source-state rewrite boundary")
+                        metadata_rewriter(chunk_id, meta, state_reader(chunk_id))
                         c_meta += 1
                     else:
-                        # 벡터 메타를 못 고쳤다 — 재임베딩으로라도 맞춘다.
                         b_ids.append(chunk_id)
                         b_texts.append(row["text"])
                         b_metas.append(meta)
@@ -3371,29 +3340,15 @@ def incremental_finalize(
 
     # ── 청크 삭제 (delete_pack과 동일 배치 패턴) ────────────────────────
     chunk_del_list = list(chunk_del_candidates)
-    doc_sources_table = docs._table("doc_sources")
     for batch in _batched(chunk_del_list):
-        placeholders, in_params = _in_names("cid", batch)
-        if not placeholders:                          # 도달 불가 — 방어(위 _in_names 주석)
-            continue
         try:
-            chunk_del += docs._exec_write(
-                f"DELETE FROM {doc_sources_table} WHERE source_id IN ({placeholders})",
-                in_params,
-            )
+            # 삭제 경계의 예외는 경고로 남기고 계속한다.
+            delete_sources = getattr(docs, "delete_sources_with_state", None)
+            if not callable(delete_sources):
+                raise RuntimeError("doc store lacks source-state delete boundary")
+            chunk_del += delete_sources(batch)
         except Exception as exc:
             log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
-        # [Δ r11 P1] delete_pack 과 동일 — sqlite 전용 방언 게이트만, 순서·삼킴은
-        # 현행 유지(고아 FTS 는 keyword_search INNER JOIN 기준 무해, 재적재가
-        # 자가 치유 — 위 delete_pack 의 상세 주석 참고).
-        if docs._dialect.name == "sqlite":
-            try:
-                docs._exec_write(
-                    f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
-                    in_params,
-                )
-            except Exception as exc:
-                log.warning("doc_sources_fts 삭제 오류(%s): %s", pack_name, exc)
     if chunk_del_list:
         # evidence 노드 id == 청크 id 공유 팩: 청크만 사라지고 노드가 남는 id의
         # 벡터는 보존(노드 벡터 겸용 — 오삭제 방지, 2026-07-22)

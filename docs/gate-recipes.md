@@ -157,28 +157,33 @@ diff <("<워크트리>/.venv/bin/ruff" check --show-files . 2>&1 | sort) \
 
 - **base 규칙**: 별도 base 워크트리에서 동일 env, 동일 명령으로 순차 실행
   (동시 실행 금지: 공유 `opencrab_test` DB 오염). `scripts/select_targets.sh`
-  는 이 저장소에 없으므로 전체 스위트 대사로 갈음한다.
+  는 이 저장소에 없으므로 전체 스위트 대사로 갈음한다. 회귀 대사는
+  `tests/` 전량을 base와 작업 양쪽에서 돌리며 변경 모듈에 맞춘 부분 집합으로
+  갈음하지 않는다.
+
+  `<임시 루트>`는 저장소 밖 디스크 경로다. 이 머신의 시스템 임시 디렉터리(메모리
+  tmpfs)는 쓰지 않는다. `TMPDIR`을 `<임시 루트>`로 두고 `--basetemp`를 그 아래에 둔다. 일부 시험은 basetemp가 `tempfile.gettempdir()`나 시스템 임시 디렉터리 아래에 있기를 요구한다.
 
   재현 명령은 아래 한 줄이며, base 실행과 작업 실행은 이 줄에서 `<워크트리>`
   자리(cd 대상 경로, 파이썬 인터프리터 경로, 임시 경로, 로그 파일명의
-  식별자: 전부 같은 워크트리를 가리키는 동일 값)만 각자의 워크트리
-  경로로 바꿔 쓴다. `<Makefile test-pg 타깃의 값>`도 실행 전에 `Makefile`의
+  식별자: 전부 같은 워크트리를 가리키는 동일 값)와 `<임시 루트>`(두 실행이 같은
+  값)만 각자의 값으로 바꿔 쓴다. `<Makefile test-pg 타깃의 값>`도 실행 전에 `Makefile`의
   `test-pg` 타깃에서 실제 URL 값을 확인해 치환한다(두 실행 모두 같은
   값을 쓴다: 아래 참고). 그 외 자리는 글자 그대로 동일하게 둔다:
 
   ```bash
   (
-    rm -f /tmp/<워크트리 식별자>-run.log /tmp/<워크트리 식별자>-run.xml
+    rm -f <임시 루트>/<워크트리 식별자>-run.log <임시 루트>/<워크트리 식별자>-run.xml
     cd "<워크트리>" || exit 17
     set -o pipefail
     PYTEST_ADDOPTS= PY_COLORS=0 OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
-    OPENCRAB_SMOKE_BIN_DIR="<워크트리>/.venv/bin" \
+    OPENCRAB_SMOKE_BIN_DIR="<워크트리>/.venv/bin" TMPDIR="<임시 루트>" \
     "<워크트리>/.venv/bin/python" -m pytest tests/ \
-      --basetemp=/tmp/<워크트리 식별자>-basetemp \
-      --junit-xml=/tmp/<워크트리 식별자>-run.xml \
-      2>&1 | tee /tmp/<워크트리 식별자>-run.log
+      --basetemp=<임시 루트>/<워크트리 식별자>-basetemp \
+      --junit-xml=<임시 루트>/<워크트리 식별자>-run.xml \
+      2>&1 | tee <임시 루트>/<워크트리 식별자>-run.log
     code=$?
-    echo "EXIT:$code" | tee -a /tmp/<워크트리 식별자>-run.log
+    echo "EXIT:$code" | tee -a <임시 루트>/<워크트리 식별자>-run.log
     exit "$code"
   )
   echo "BLOCK_EXIT:$?"
@@ -225,8 +230,8 @@ diff <("<워크트리>/.venv/bin/ruff" check --show-files . 2>&1 | sort) \
   끝나기 전(`pytest_sessionstart` 등)에 `pytest.exit(msg,
   returncode=17)`을 부르면 pytest는 `collected` 줄을 한 번도 찍지
   않고 종료 코드 17로 끝난다(적대검증에서 이 경로를 실측으로
-  재현했다). 그래서 서브셸 맨 앞에 `rm -f /tmp/<워크트리 식별자>-run.log
-  /tmp/<워크트리 식별자>-run.xml`을 둔다: 이전 실행의 로그나 xml이 남아
+  재현했다). 그래서 서브셸 맨 앞에 `rm -f <임시 루트>/<워크트리 식별자>-run.log
+  <임시 루트>/<워크트리 식별자>-run.xml`을 둔다: 이전 실행의 로그나 xml이 남아
   있으면 `cd`가 실패해 이번 파이프라인이 전혀 안 돌았는데도 지난 실행의
   산출물이 그대로 남아 오판정을 낳기 때문이다(xml이 남으면 아래 판정
   절차 3번의 파일 존재 판정이 이번 실행이 아니라 지난 실행의 결과를
@@ -305,7 +310,7 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
 
 1. 각 실행의 `BLOCK_EXIT` 값(재현 명령 맨 끝의 `echo "BLOCK_EXIT:$?"`가
    낸 값)을 기록한다.
-2. `BLOCK_EXIT`가 17이고 로그 파일(`/tmp/<워크트리 식별자>-run.log`)
+2. `BLOCK_EXIT`가 17이고 로그 파일(`<임시 루트>/<워크트리 식별자>-run.log`)
    자체가 없으면 `cd`가 실패해 pytest가 아예 실행되지 않은 것이다(서브셸
    맨 앞의 `rm -f`가 매번 로그를 비우므로 이 파일 부재는 이번 실행이
    `tee`까지 한 번도 못 갔다는 뜻이다). 17은 이 문서가 고른 sentinel이지
@@ -320,7 +325,7 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
    전량, 이 워크트리가 설치한 pytest 9.1.1 소스로 확인했다). 어느
    코드든 diff를 내지 않고 원인부터 조사한다.
 3. `BLOCK_EXIT`가 17이 아니고 로그 파일도 있는데 xml 파일
-   (`/tmp/<워크트리 식별자>-run.xml`)이 없으면, pytest가
+   (`<임시 루트>/<워크트리 식별자>-run.xml`)이 없으면, pytest가
    `pytest_sessionfinish` 훅(JUnit XML을 실제로 쓰는 지점)까지 못 가고
    죽은 것이다(세그폴트, OOM-kill, 강제종료 등). 서브셸 맨 앞의
    `rm -f`가 매번 xml도 비우므로 이 부재는 이번 실행이 남긴 것이다.
@@ -336,12 +341,12 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
    경우 오탐하므로(테스트 코드가 `print("[PG tripwire] ...")`를
    실행하는 경우) 사람이 원인을 좁히는 참고용일 뿐 판정 근거가 아니다:
    ```bash
-   grep -n '\[PG tripwire\]' /tmp/<워크트리 식별자>-run.log
+   grep -n '\[PG tripwire\]' <임시 루트>/<워크트리 식별자>-run.log
    ```
 4. xml 파일이 있으면 아래 스크립트로 완주 여부와 실패/에러 id 집합을
    함께 얻는다. `<워크트리>`는 재현 명령과 같은 워크트리 경로다:
    ```bash
-   python3 - "/tmp/<워크트리 식별자>-run.log" "/tmp/<워크트리 식별자>-run.xml" "<워크트리>" <<'PYEOF'
+   python3 - "<임시 루트>/<워크트리 식별자>-run.log" "<임시 루트>/<워크트리 식별자>-run.xml" "<워크트리>" <<'PYEOF'
    import re
    import sys
    import xml.etree.ElementTree as ET
@@ -598,7 +603,7 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
    `UNTRUSTED`가 하나라도 있으면 diff를 내지 않고 원인부터 조사한다.
 
    ```bash
-   python3 - /tmp/<base 식별자>-summary.txt /tmp/<작업 식별자>-summary.txt <<'PYEOF'
+   python3 - <임시 루트>/<base 식별자>-summary.txt <임시 루트>/<작업 식별자>-summary.txt <<'PYEOF'
    import sys
    from pathlib import Path
 
@@ -648,7 +653,7 @@ diff가 base 대비 `tests=` 감소로 다시 걸러낼 여지가 있다.
 세션 시작이 아니라 세션 중 `TempPathFactory.getbasetemp()` 최초 호출(첫
 임시 경로 요청) 때다. 두 실행(base 워크트리 vs 작업 워크트리)이 같은
 경로를 공유하면 나중에 그 시점에 도달한 쪽이 먼저 도달한 쪽의 임시
-파일을 지운다. 이를 피하려면 `/tmp` 하위에 워크트리 식별자를 포함한 고유
+파일을 지운다. 이를 피하려면 `<임시 루트>` 하위에 워크트리 식별자를 포함한 고유
 이름을 쓰고, 실행 직후(다른 프로세스가 그 경로를 쓰고 있지 않은지 확인한
 뒤) 회수한다.
 

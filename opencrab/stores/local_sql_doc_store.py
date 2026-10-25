@@ -46,10 +46,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
 from typing import Any
 
-from opencrab.stores._json import dump_props
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 from opencrab.stores._sqlite_base import _SqliteConnMixin
@@ -222,49 +220,67 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
     # Source ingestion — override to keep the FTS5 shadow table in sync
     # ------------------------------------------------------------------
 
-    def upsert_source(
-        self, source_id: str, text: str, metadata: dict[str, Any]
+    def _write_source_state(
+        self,
+        source_id: str,
+        text: str,
+        metadata: dict[str, Any],
+        source_integrity: dict[str, str | int],
     ) -> str:
-        """
-        Replaces: LocalDocStore.upsert_source / MongoStore.upsert_source
-        Writes doc_sources and syncs the FTS5 shadow table (delete+insert) in a
-        SINGLE transaction (_exec_write_many), not via super().upsert_source()
-        + a separate commit — otherwise doc_sources and doc_sources_fts commit
-        independently and a failure between them (or a later exception) leaves
-        the two tables permanently out of sync with no rollback able to fix it.
-        """
-        self._require_available()
-        now = datetime.now(UTC)
-        sql = self._dialect.upsert(
-            self._table("doc_sources"),
-            ["source_id", "text", "metadata", "ingested_at"],
-            conflict_cols=["source_id"],
-            update_cols=["text", "metadata", "ingested_at"],
-            json_columns=["metadata"],
+        """Write source state and the FTS shadow entry in one transaction."""
+        source_params, integrity_params = self._source_write_params(
+            source_id, text, metadata, source_integrity
         )
         statements: list[tuple[str, dict[str, Any]]] = [
-            (
-                sql,
-                {
-                    "source_id": source_id,
-                    "text": text,
-                    "metadata": dump_props(metadata),
-                    "ingested_at": self._dialect.bind_value_for_timestamp(now),
-                },
-            )
+            (self._source_upsert_sql(), source_params),
+            (self._source_integrity_upsert_sql(), integrity_params),
         ]
         if self._fts_ok:
-            statements.append(
-                ("DELETE FROM doc_sources_fts WHERE source_id=:source_id", {"source_id": source_id})
-            )
-            statements.append(
-                (
-                    "INSERT INTO doc_sources_fts(source_id, text) VALUES (:source_id, :text)",
-                    {"source_id": source_id, "text": text},
-                )
+            statements.extend(
+                [
+                    ("DELETE FROM doc_sources_fts WHERE source_id=:source_id", {"source_id": source_id}),
+                    (
+                        "INSERT INTO doc_sources_fts(source_id, text) VALUES (:source_id, :text)",
+                        {"source_id": source_id, "text": text},
+                    ),
+                ]
             )
         self._exec_write_many(statements)
         return source_id
+
+    def upsert_source(
+        self, source_id: str, text: str, metadata: dict[str, Any]
+    ) -> str:
+        """Write original source content with its FTS entry atomically."""
+        from opencrab.stores._source_integrity import current_source_copy_state
+
+        state = current_source_copy_state()
+        if state is None:
+            return self.write_source_original(source_id, text, metadata)
+        return self.write_source_copy(source_id, text, metadata, state)
+
+    def delete_sources_with_state(self, source_ids: list[str]) -> int:
+        if not source_ids:
+            return 0
+        placeholders = ", ".join(f":sid_{index}" for index in range(len(source_ids)))
+        params = {f"sid_{index}": source_id for index, source_id in enumerate(source_ids)}
+        statements = [
+            (
+                f"DELETE FROM {self._table('doc_sources')} WHERE source_id IN ({placeholders})",
+                params,
+            ),
+            (
+                f"DELETE FROM {self._table('doc_source_integrity')} "
+                f"WHERE source_id IN ({placeholders})",
+                params,
+            ),
+        ]
+        if self._fts_ok:
+            statements.append((
+                f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
+                params,
+            ))
+        return self._exec_write_many(statements)[0]
 
     def keyword_search(
         self,

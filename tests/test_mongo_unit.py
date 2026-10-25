@@ -10,6 +10,9 @@ serverSelectionTimeoutMS waits.
 
 from __future__ import annotations
 
+import copy
+import hashlib
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -684,3 +687,514 @@ class TestOntologyBuilderMongoAuditContract:
         assert result["stores"]["docs"] == "error: RuntimeError"
         assert result["stores"]["audit"] == "skipped (doc write failed)"
         mongo.log_event.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# #516 manifest D1: raw-state CAS of MongoStore.rewrite_source_metadata
+# ---------------------------------------------------------------------------
+#
+# These cases run against a mocked pymongo collection. They do not prove what a
+# MongoDB server does (the manifest keeps that as a separate server gate). The
+# fake ``sources`` collection applies the update filter with an evaluator that
+# is written here from the MongoDB aggregation rules. It never calls the
+# product's query builder. The evaluator reads only the ``$expr`` document that
+# the product hands to ``update_one``.
+
+_ABSENT = object()
+
+
+class _EvalError(Exception):
+    """The expression could not be evaluated (the server would reject it)."""
+
+
+def _kind(value):
+    if value is _ABSENT:
+        return "missing"
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "double"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    raise _EvalError(f"unsupported value {value!r}")
+
+
+def _mongo_equal(left, right):
+    """Aggregation ``$eq``: ints and doubles compare by value, nothing else crosses kinds."""
+    lk, rk = _kind(left), _kind(right)
+    if {lk, rk} <= {"int", "double"}:
+        return left == right
+    if lk != rk:
+        return False
+    if lk == "array":
+        return len(left) == len(right) and all(_mongo_equal(a, b) for a, b in zip(left, right))
+    if lk == "object":
+        return set(left) == set(right) and all(_mongo_equal(left[k], right[k]) for k in left)
+    if lk in ("missing", "null"):
+        return True
+    return left == right
+
+
+def _strict_same(left, right):
+    """Same BSON kind at every depth and equal values (an int is not a double)."""
+    if _kind(left) != _kind(right):
+        return False
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_strict_same(a, b) for a, b in zip(left, right))
+    if isinstance(left, dict):
+        return set(left) == set(right) and all(_strict_same(left[k], right[k]) for k in left)
+    return left == right
+
+
+def _truthy(value):
+    if value is _ABSENT or value is None or value is False:
+        return False
+    return not (isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0)
+
+
+def _path(value, parts):
+    for part in parts:
+        if isinstance(value, dict):
+            value = value.get(part, _ABSENT)
+        elif isinstance(value, list):
+            value = [item[part] for item in value if isinstance(item, dict) and part in item]
+        else:
+            return _ABSENT
+    return value
+
+
+def _eval(expr, doc, variables):
+    if isinstance(expr, str):
+        if expr.startswith("$$"):
+            name, *rest = expr[2:].split(".")
+            return _path(variables[name], rest)
+        if expr.startswith("$"):
+            return _path(doc, expr[1:].split("."))
+        return expr
+    if isinstance(expr, list):
+        return [_eval(item, doc, variables) for item in expr]
+    if not isinstance(expr, dict):
+        return expr
+    if len(expr) != 1:
+        raise _EvalError(f"expression object needs one operator: {expr!r}")
+    ((op, arg),) = expr.items()
+    if op == "$literal":
+        return arg
+    if op == "$type":
+        return _kind(_eval(arg, doc, variables))
+    if op == "$eq":
+        left, right = (_eval(item, doc, variables) for item in arg)
+        return _mongo_equal(left, right)
+    if op == "$and":
+        # The server does not promise short-circuit evaluation or order, so every
+        # argument is evaluated and any error makes the whole expression an error.
+        values = [_eval(item, doc, variables) for item in arg]
+        return all(_truthy(value) for value in values)
+    if op == "$cond":
+        condition, then, other = arg
+        return _eval(then if _truthy(_eval(condition, doc, variables)) else other, doc, variables)
+    if op == "$setEquals":
+        left, right = (_eval(item, doc, variables) for item in arg)
+        if not isinstance(left, list) or not isinstance(right, list):
+            raise _EvalError("$setEquals needs arrays")
+        return (all(any(_mongo_equal(a, b) for b in right) for a in left)
+                and all(any(_mongo_equal(a, b) for b in left) for a in right))
+    if op == "$map":
+        source = _eval(arg["input"], doc, variables)
+        if source is None or source is _ABSENT:
+            return None
+        return [_eval(arg["in"], doc, {**variables, arg["as"]: item}) for item in source]
+    if op == "$objectToArray":
+        # Assumption: null or missing input gives null. The operator page does not say so.
+        # The server gate has to confirm it.
+        value = _eval(arg, doc, variables)
+        if value is None or value is _ABSENT:
+            return None
+        if not isinstance(value, dict):
+            raise _EvalError("$objectToArray needs an object")
+        return [{"k": key, "v": item} for key, item in value.items()]
+    raise _EvalError(f"unsupported operator {op}")
+
+
+def _match(query, doc):
+    """Return ``match``, ``no-match`` or ``error`` for an ``$expr`` filter."""
+    if doc is None:
+        return "no-match"
+    try:
+        return "match" if _truthy(_eval(query["$expr"], doc, {})) else "no-match"
+    except _EvalError:
+        return "error"
+
+
+def _project(doc, projection):
+    included = [k for k, v in (projection or {}).items() if v and k != "_id"]
+    if included:
+        return {k: copy.deepcopy(doc[k]) for k in included if k in doc}
+    excluded = {k for k, v in (projection or {}).items() if not v}
+    return {k: copy.deepcopy(v) for k, v in doc.items() if k not in excluded}
+
+
+class _CasHarness:
+    """One document behind a mocked ``sources`` collection and its update log."""
+
+    def __init__(self, document):
+        self.doc = copy.deepcopy(document)
+        self.race = None
+        self.finds = []
+        self.recreated = False
+        self.updates = []
+        self.result = None  # (matched, modified) to force; None applies the filter
+        self.store, _client, db = _make_connected_store()
+        db["sources"].find_one.side_effect = self._find_one
+        db["sources"].update_one.side_effect = self._update_one
+
+    def _find_one(self, query, projection=None):
+        self.finds.append(query)
+        if self.doc is None or not _query_match(query, self.doc):
+            return None
+        return _project(self.doc, projection)
+
+    def _update_one(self, query, update, upsert=False):
+        before = _match(query, self.doc)
+        if self.race is not None:
+            self.race(self)
+        after = _match(query, self.doc)
+        self.updates.append(SimpleNamespace(query=query, update=update, upsert=upsert, before=before, after=after))
+        if self.result is not None:
+            matched, modified = self.result
+        else:
+            matched = modified = 1 if after == "match" else 0
+        if matched and self.doc is not None:
+            self.doc["metadata"] = update["$set"]["metadata"]
+        if upsert and not matched and self.doc is None:
+            self.recreated = True
+        return SimpleNamespace(matched_count=matched, modified_count=modified)
+
+
+def _digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_BODY = "body"
+
+
+def _doc(state=_ABSENT):
+    doc = {"source_id": "source-1", "text": _BODY}
+    if state is not _ABSENT:
+        doc["source_integrity"] = state
+    return doc
+
+
+def _complete():
+    return {"version": 1, "state": "complete", "text_digest": _digest(_BODY)}
+
+
+def _unknown():
+    return {"version": 1, "state": "unknown"}
+
+
+def _clauses(harness):
+    return harness.updates[-1].query["$expr"]["$and"]
+
+
+def _require_type(clauses, path, kind, name):
+    found = [c for c in clauses if isinstance(c.get("$eq"), list) and c["$eq"][0] == {"$type": path}]
+    assert len(found) == 1, name
+    assert found[0]["$eq"][1] == kind, name
+
+
+def _require_literal(clauses, path, expected, name):
+    found = [
+        c for c in clauses
+        if isinstance(c.get("$eq"), list) and c["$eq"][0] == path
+        and isinstance(c["$eq"][1], dict) and set(c["$eq"][1]) == {"$literal"}
+    ]
+    assert len(found) == 1, name
+    assert _strict_same(expected, found[0]["$eq"][1]["$literal"]), name
+
+
+def _require_object_guard(clauses, name):
+    guarded = [c["$cond"] for c in clauses if "$cond" in c]
+    assert len(guarded) == 1, name
+    assert guarded[0][0] == {"$eq": [{"$type": "$source_integrity"}, "object"]}, name
+    assert guarded[0][2] is False, name
+    return guarded[0][1]["$and"]
+
+
+def _require_keyset(nested, keys, name):
+    found = [c["$setEquals"] for c in nested if "$setEquals" in c]
+    assert len(found) == 1, name
+    expected_map = {"$map": {"input": {"$objectToArray": "$source_integrity"}, "as": "field", "in": "$$field.k"}}
+    assert found[0][0] == expected_map and found[0][1] == {"$literal": sorted(keys)}, name
+
+
+def _require_state_fields(harness, state, label):
+    """Assert the nested type and literal clauses for every field of ``state``."""
+    nested = _require_object_guard(_clauses(harness), f"require_{label}_object_cond_type")
+    _require_keyset(nested, state, f"require_{label}_keyset")
+    for key, value in state.items():
+        name = "digest" if key == "text_digest" else key
+        _require_type(nested, f"$source_integrity.{key}", _kind(value), f"require_{label}_{name}_type")
+        _require_literal(nested, f"$source_integrity.{key}", value, f"require_{label}_{name}_literal")
+
+
+def _top_level_guards(harness):
+    clauses = _clauses(harness)
+    _require_type(clauses, "$source_id", "string", "require_source_id_type")
+    _require_literal(clauses, "$source_id", "source-1", "require_source_id_literal")
+    _require_type(clauses, "$text", "string", "require_text_type")
+    _require_literal(clauses, "$text", _BODY, "require_text_literal")
+
+
+def _refused(document, race):
+    """Run one rewrite whose document changes after the re-read; return the harness."""
+    harness = _CasHarness(document)
+    snapshot = harness.store.read_source_state_exact("source-1")
+    assert snapshot is not None
+    harness.race = race
+    with pytest.raises(ValueError, match="source state changed"):
+        harness.store.rewrite_source_metadata("source-1", {"pack_id": "new"}, snapshot)
+    update = harness.updates[-1]
+    assert update.upsert is False
+    assert update.before == "match", "the filter must match the document it was built from"
+    assert update.after == "no-match", update.after
+    if harness.doc is not None:
+        assert "metadata" not in harness.doc, "a refused rewrite must not write"
+    return harness
+
+
+def _set(key, value):
+    return lambda h: h.doc.__setitem__(key, value)
+
+
+def _set_state(key, value):
+    return lambda h: h.doc["source_integrity"].__setitem__(key, value)
+
+
+class TestMongoSourceIntegrityRewriteCas:
+    @pytest.mark.parametrize("value", [["source-1"], 5, "other"], ids=["array", "int", "other-string"])
+    def test_source_id_array_or_non_string_refuses(self, value):
+        harness = _refused(_doc(_unknown()), _set("source_id", value))
+        _top_level_guards(harness)
+
+    @pytest.mark.parametrize("value", [["body"], 5, "other"], ids=["array", "int", "other-string"])
+    def test_text_array_or_non_string_refuses(self, value):
+        harness = _refused(_doc(_unknown()), _set("text", value))
+        _top_level_guards(harness)
+
+    def test_missing_to_null_race_refuses(self):
+        harness = _refused(_doc(), _set("source_integrity", None))
+        _require_type(_clauses(harness), "$source_integrity", "missing", "require_missing_top_type")
+
+    def test_null_to_array_race_refuses(self):
+        harness = _refused(_doc(None), _set("source_integrity", [None]))
+        _require_type(_clauses(harness), "$source_integrity", "null", "require_null_top_type")
+
+    def test_object_to_array_race_refuses(self):
+        harness = _refused(_doc(_unknown()), lambda h: h.doc.__setitem__("source_integrity", [h.doc["source_integrity"]]))
+        _require_object_guard(_clauses(harness), "require_object_cond_type")
+
+    @pytest.mark.parametrize("value", [1.0, 2], ids=["double", "changed-int"])
+    def test_version_int_to_double_race_refuses(self, value):
+        harness = _refused(_doc(_complete()), _set_state("version", value))
+        _require_state_fields(harness, _complete(), "complete")
+        assert _mongo_equal(1, 1.0), "only the $type clause separates int from double"
+
+    @pytest.mark.parametrize("value", [[1], 2], ids=["array", "changed-int"])
+    def test_version_int_to_array_race_refuses(self, value):
+        harness = _refused(_doc(_unknown()), _set_state("version", value))
+        _require_state_fields(harness, _unknown(), "unknown")
+
+    @pytest.mark.parametrize("value", [["complete"], "other"], ids=["array", "other-string"])
+    def test_state_string_to_array_race_refuses(self, value):
+        harness = _refused(_doc(_complete()), _set_state("state", value))
+        _require_state_fields(harness, _complete(), "complete")
+
+    def test_digest_string_to_array_race_refuses(self):
+        harness = _refused(_doc(_complete()), _set_state("text_digest", [_digest(_BODY)]))
+        _require_state_fields(harness, _complete(), "complete")
+
+    @pytest.mark.parametrize("change", ["extra-key", "missing-digest"])
+    def test_complete_extra_or_missing_field_refuses(self, change):
+        def race(h):
+            if change == "extra-key":
+                h.doc["source_integrity"]["extra"] = True
+            else:
+                del h.doc["source_integrity"]["text_digest"]
+
+        harness = _refused(_doc(_complete()), race)
+        _require_state_fields(harness, _complete(), "complete")
+
+    @pytest.mark.parametrize("change", ["extra-key", "digest-added", "state-array", "state-complete"])
+    def test_unknown_extra_or_digest_field_refuses(self, change):
+        def race(h):
+            state = h.doc["source_integrity"]
+            if change == "extra-key":
+                state["extra"] = True
+            elif change == "digest-added":
+                state["text_digest"] = _digest(_BODY)
+            elif change == "state-array":
+                state["state"] = ["unknown"]
+            else:
+                state["state"] = "complete"
+
+        harness = _refused(_doc(_unknown()), race)
+        _require_state_fields(harness, _unknown(), "unknown")
+
+    def test_complete_digest_change_race_refuses(self):
+        harness = _refused(_doc(_complete()), _set_state("text_digest", "0" * 64))
+        _require_state_fields(harness, _complete(), "complete")
+
+    def test_source_delete_race_does_not_recreate(self):
+        harness = _refused(_doc(_complete()), lambda h: setattr(h, "doc", None))
+        assert harness.updates[-1].upsert is False
+        assert harness.doc is None and harness.recreated is False
+
+    def test_match_zero_raises_and_modified_zero_succeeds(self):
+        # matched 1, modified 0 (the stored metadata already equals the new one): success
+        harness = _CasHarness(_doc(_complete()))
+        snapshot = harness.store.read_source_state_exact("source-1")
+        harness.result = (1, 0)
+        assert harness.store.rewrite_source_metadata("source-1", {"pack_id": "same"}, snapshot) == "source-1"
+        assert harness.updates[-1].upsert is False
+        # matched 0 (a change that the filter rejects): conflict
+        harness = _CasHarness(_doc(_complete()))
+        snapshot = harness.store.read_source_state_exact("source-1")
+        harness.result = (0, 0)
+        with pytest.raises(ValueError, match="source state changed"):
+            harness.store.rewrite_source_metadata("source-1", {"pack_id": "same"}, snapshot)
+        # matched 1, modified 1 (an ordinary rewrite) writes the metadata
+        harness = _CasHarness(_doc(_complete()))
+        snapshot = harness.store.read_source_state_exact("source-1")
+        assert harness.store.rewrite_source_metadata("source-1", {"pack_id": "new"}, snapshot) == "source-1"
+        assert harness.doc["metadata"] == {"pack_id": "new"}
+        assert harness.updates[-1].before == "match" and harness.updates[-1].after == "match"
+
+
+def _exact_expr_clauses(query):
+    """Return the ``$expr`` ``$and`` clauses of an exact-source filter."""
+    if "$expr" in query:
+        return query["$expr"]["$and"]
+    return next(part for part in query["$and"] if "$expr" in part)["$expr"]["$and"]
+
+
+def test_exact_source_reader_rejects_array_source_id():
+    """MID-01. Both exact readers accept a scalar string source_id only.
+
+    A find on ``{"source_id": "source-1"}`` would match a row whose source_id is
+    ``["source-1"]``. The readers use an ``$expr`` filter instead. This case
+    evaluates that filter on an array-valued row and on a scalar control row.
+    """
+    row = {"text": _BODY, "source_integrity": _unknown(), "metadata": {"pack_id": "pack"}}
+    for bad in (["source-1"], ["source-1", "other"], 5):
+        harness = _CasHarness({**row, "source_id": bad})
+        assert harness.store.read_source_state_exact("source-1") is None, bad
+        assert harness.store.get_source_scoped_exact("source-1", ["pack"]) is None, bad
+        assert len(harness.finds) == 2
+        for query in harness.finds:
+            assert not _query_match(query, harness.doc), bad
+            clauses = _exact_expr_clauses(query)
+            _require_type(clauses, "$source_id", "string", "require_source_id_type")
+            _require_literal(clauses, "$source_id", "source-1", "require_source_id_literal")
+    control = _CasHarness({**row, "source_id": "source-1"})
+    assert control.store.read_source_state_exact("source-1") is not None
+    scoped = control.store.get_source_scoped_exact("source-1", ["pack"])
+    assert scoped is not None and scoped["source_id"] == "source-1"
+
+
+# ---- query matcher for the filters of the Mongo scoped readers (test_mongo_unit.py) ----
+
+def _field_values(doc, path):
+    """Candidate values of a dotted path; arrays on the way are walked element by element."""
+    current = [doc]
+    for part in path.split("."):
+        nxt = []
+        for value in current:
+            if isinstance(value, dict):
+                nxt.append(value.get(part, _ABSENT))
+            elif isinstance(value, list):
+                nxt.extend(item.get(part, _ABSENT) for item in value if isinstance(item, dict))
+        current = nxt
+    return current
+
+
+def _type_matches(value, name):
+    if name == "array":
+        return isinstance(value, list)
+    if isinstance(value, list):
+        return any(_kind(item) == name for item in value)
+    return _kind(value) == name
+
+
+def _operator_matches(values, operators):
+    for op, arg in operators.items():
+        if op == "$in":
+            hit = False
+            for value in values:
+                candidates = [value, *(value if isinstance(value, list) else [])]
+                for candidate in candidates:
+                    if any(_mongo_equal(candidate, item) for item in arg if item is not None):
+                        hit = True
+                    if None in arg and (candidate is None or candidate is _ABSENT):
+                        hit = True
+            if not hit:
+                return False
+        elif op == "$type":
+            if not any(_type_matches(value, arg) for value in values):
+                return False
+        elif op == "$not":
+            if _operator_matches(values, arg):
+                return False
+        else:
+            raise AssertionError(f"unsupported query operator {op}")
+    return True
+
+
+def _query_match(query, doc):
+    """Evaluate the query documents that MongoStore sends: $and, $expr and field operators."""
+    for key, value in query.items():
+        if key == "$and":
+            if not all(_query_match(part, doc) for part in value):
+                return False
+        elif key == "$expr":
+            if _match({"$expr": value}, doc) != "match":
+                return False
+        elif key.startswith("$"):
+            raise AssertionError(f"unsupported query operator {key}")
+        elif isinstance(value, dict) and all(op.startswith("$") for op in value):
+            if not _operator_matches(_field_values(doc, key), value):
+                return False
+        else:
+            raise AssertionError(f"unsupported field condition {key}")
+    return True
+
+
+def test_scoped_filter_matcher_follows_the_product_filter():
+    """The query matcher evaluates the whole filter that get_source_scoped_exact sends.
+
+    The matcher is the fixture of the Mongo cases above. This case checks it against the filter of
+    the product on rows that must match and rows that must not."""
+    base = {"source_id": "source-1", "text": _BODY, "metadata": {"pack_id": "pack"}}
+    cases = {
+        "normal": (base, True),
+        "pack-out-of-scope": ({**base, "metadata": {"pack_id": "other"}}, False),
+        "metadata-array": ({**base, "metadata": [{"pack_id": "pack"}]}, False),
+        "pack-id-array": ({**base, "metadata": {"pack_id": ["pack"]}}, False),
+        "source-id-array": ({**base, "source_id": ["source-1"]}, False),
+    }
+    for name, (document, expected) in cases.items():
+        harness = _CasHarness(document)
+        row = harness.store.get_source_scoped_exact("source-1", ["pack"])
+        assert (row is not None) is expected, name
+        query = harness.finds[-1]
+        assert _query_match(query, document) is expected, name
+    with pytest.raises(AssertionError, match="unsupported query operator"):
+        _query_match({"metadata.pack_id": {"$regex": "p"}}, base)

@@ -7,8 +7,15 @@ function scope inside each handler rather than at module level (required for
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Mapping
 from typing import Any
+
+from opencrab.common.json_transport import serialize_tool_result
+from opencrab.services import result_caps
+from opencrab.services.result_caps import _SOURCE_LOCATOR_VERSION
+from opencrab.stores._source_integrity import validate_source_row_payload
 
 from ._registry import AccessTier, safe_tool_error, tool
 
@@ -20,17 +27,17 @@ logger = logging.getLogger(__name__)
     {
         "description": (
             "Hybrid vector + BM25 + graph search with RRF reranking. "
-            "A string inside a result's text, metadata or graph_context that is longer "
-            "than 4000 characters is cut; the result then carries a `truncation` key "
-            "with the cut paths and original lengths. Identifier places (a result's "
+            "A string inside a result's text, metadata or graph_context is cut only "
+            "when it is longer than 4000 characters; a `truncation` key with the cut "
+            "paths and original lengths appears only on a result with a cut or a "
+            "transformed text. Identifier places (a result's "
             "node_id and canonical, graph_context anchor_id, edge_endpoints and edge) "
-            "and object keys are not cut. "
-            "ontology_get_node(node_id) returns the full body when it finds the graph "
-            "node in the readable scope and the node's properties hold the body. A "
-            "source without a graph node (found=false), a source whose "
-            "metadata.node_id names another node, a node with property_decode_error, "
-            "and the synthesized text of BM25 and plain node vectors can differ from "
-            "the original. When the response would pass its size budget, "
+            "and object keys are not cut. A cut source result has a source locator only "
+            "when its current scoped source row proves that it retains the full text. "
+            "Use ontology_get_source_range to read that source by UTF-8 byte range. "
+            "full_text_unavailable appears only on a result whose text is cut or "
+            "transformed and that has no locator. "
+            "When the response would pass its size budget, "
             "results are dropped from the tail: `total` is the number of results "
             "returned, `results_truncated` is true, `omitted_results` is the number "
             "dropped, and `next_offset` resumes the same query window. If no result can be "
@@ -142,18 +149,22 @@ def ontology_query(
     ``offset`` starts a page inside the fixed ``limit`` result window. Reuse the
     same query input and limit with ``next_offset`` to resume an over-budget page.
 
-    Response size (#511): a string inside a result's ``text``, ``metadata`` or
-    ``graph_context`` (and inside ``selected_packs``) that is longer than
-    ``QUERY_FIELD_CHAR_LIMIT`` is cut, and the item gets a ``truncation`` key.
-    Identifier places (a result's ``node_id`` and ``canonical``, the
-    ``graph_context`` keys ``anchor_id``, ``edge_endpoints`` and ``edge``,
-    ``selected_packs[i].pack_id``) and object keys are not cut. The full body is
-    read with ``ontology_get_node(node_id)`` when that tool finds the graph node
-    in the readable scope and the node's properties hold the body; a source
-    without a graph node, a source whose ``metadata.node_id`` names another
-    node, a node with ``property_decode_error`` and the synthesized text of
-    BM25 and plain node vectors can differ from the original. When the response
-    is over
+    Response size (#511): the cap cuts a string inside a result's ``text``,
+    ``metadata`` or ``graph_context`` (and inside ``selected_packs``) only when
+    it is longer than ``QUERY_FIELD_CHAR_LIMIT``. An item's ``truncation`` key
+    appears only when a string was cut (by the cap, or by the merge that kept the
+    first 4000 characters of a longer proven text) or its ``text`` was
+    transformed. Identifier places (a result's ``node_id`` and ``canonical``,
+    the ``graph_context`` keys ``anchor_id``, ``edge_endpoints`` and ``edge``,
+    ``selected_packs[i].pack_id``) and object keys are not cut.
+    ``truncation.source_locator`` appears only when the ``text`` is cut, the
+    shown text is the proven source text or its exact first 4000 characters,
+    and the proof is neither missing nor invalidated. Read the whole source with
+    ``ontology_get_source_range(source_locator, offset_bytes, length_bytes)``.
+    ``truncation.full_text_unavailable`` appears only on an item whose ``text``
+    is cut or transformed and that carries no locator.
+    ``ontology_get_node(node_id)`` keeps its graph-node meaning and is not the
+    way to read the source text. When the response is over
     ``QUERY_RESPONSE_CHAR_BUDGET``, results are dropped from the tail and the
     response carries ``results_truncated`` and ``omitted_results``; ``total``
     is the number of results returned. Contract: docs/ARCHITECTURE.md, "질의
@@ -195,7 +206,6 @@ def ontology_query(
     from opencrab.auth import current_principal
     from opencrab.config import get_settings
     from opencrab.mcp.tools import _current_read_scope, _get_context
-    from opencrab.services import result_caps
     from opencrab.services.canonical_ids import enrich as enrich_canonical
     from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
 
@@ -234,6 +244,7 @@ def ontology_query(
             use_rerank=use_rerank,
             use_fts=use_fts,
             pack_ids=effective_pack_ids,
+            full_scope=scope,
         )
         results = outcome.results[offset:limit]
         # This is a store write (billing_events INSERT), but ontology_query stays
@@ -263,7 +274,7 @@ def ontology_query(
                 "on_query billing event failed to persist (tenant=%s, subject=%s): %s",
                 tenant_id, principal.user_id, billing_result.get("error"),
             )
-        result_dicts = [r.to_dict() for r in results]
+        result_dicts = [r.to_cap_item() for r in results]
         if include_canonical_ids:
             # .get: a context without a graph store (test doubles, degraded
             # deployments) must not turn a good query into an error.
@@ -448,3 +459,172 @@ def ontology_lever_simulate(
     except Exception as exc:
         logger.error("ontology_lever_simulate failed: %s", exc)
         return {"error": safe_tool_error("ontology_lever_simulate", exc)}
+
+
+_RANGE_INVALID_LOCATOR = {"error": "invalid_source_locator"}
+_RANGE_NOT_FOUND = {"error": "source_not_found"}
+_RANGE_UNAVAILABLE = {"error": "full_text_unavailable"}
+_RANGE_STALE = {"error": "stale_source_locator"}
+_RANGE_INVALID = {"error": "invalid_source_range"}
+
+
+def _strict_utf8(value: Any) -> bytes | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return None
+
+
+def _valid_locator(locator: Any) -> dict[str, str] | None:
+    """Validate locator fields without MCP's surrogate-replacement helper."""
+    if not isinstance(locator, Mapping) or set(locator) != {
+        "version", "source_id", "pack_id", "source_digest"
+    }:
+        return None
+    values = {key: locator[key] for key in locator}
+    if values["version"] != _SOURCE_LOCATOR_VERSION:
+        return None
+    if any(_strict_utf8(value) is None for value in values.values()):
+        return None
+    try:
+        wire = serialize_tool_result({"source_locator": values})
+        if json.loads(wire) != {"source_locator": values}:
+            return None
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    return values
+
+
+_RANGE_TOO_LARGE_MESSAGE = (
+    "The range response is larger than the response budget. "
+    "Lower length_bytes and call again with the same offset_bytes."
+)
+
+
+def _range_response(value: dict[str, Any]) -> dict[str, Any]:
+    if result_caps._wire_length(value) > result_caps.QUERY_RESPONSE_CHAR_BUDGET:
+        return {"error": "response_too_large", "message": _RANGE_TOO_LARGE_MESSAGE}
+    return value
+
+
+@tool(
+    "ontology_get_source_range",
+    {
+        "description": "Read a UTF-8 byte range from an exact scoped source locator.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_locator": {
+                    "type": "object",
+                    "properties": {
+                        "version": {
+                            "type": "string",
+                            "const": _SOURCE_LOCATOR_VERSION,
+                        },
+                        "source_id": {"type": "string"},
+                        "pack_id": {"type": "string"},
+                        "source_digest": {"type": "string"},
+                    },
+                    "required": [
+                        "version",
+                        "source_id",
+                        "pack_id",
+                        "source_digest",
+                    ],
+                    "additionalProperties": False,
+                },
+                "offset_bytes": {"type": "integer", "minimum": 0},
+                "length_bytes": {"type": "integer", "minimum": 1},
+            },
+            "required": ["source_locator", "offset_bytes", "length_bytes"],
+        },
+    },
+    order=20,
+    access=AccessTier.READ,
+)
+def ontology_get_source_range(
+    source_locator: Any,
+    offset_bytes: Any,
+    length_bytes: Any,
+) -> dict[str, Any]:
+    """Read one valid UTF-8 byte range from the current exact source row.
+
+    The row judgment is the shared G1 ``validate_source_row_payload``. This
+    handler only reads the scoped row and assembles the fixed error shapes.
+
+    It returns one of: a range (``source_id``, ``offset_bytes``,
+    ``length_bytes``, ``total_bytes``, ``source_digest``, ``text`` and
+    ``next_offset_bytes`` when more bytes follow), or an error object whose
+    ``error`` is ``invalid_source_locator``, ``invalid_source_range``,
+    ``source_not_found``, ``full_text_unavailable``, ``stale_source_locator``
+    or ``response_too_large``.
+    """
+    from opencrab.mcp.tools import _current_read_scope, _get_context
+
+    locator = _valid_locator(source_locator)
+    if locator is None:
+        return dict(_RANGE_INVALID_LOCATOR)
+    if (
+        isinstance(offset_bytes, bool)
+        or not isinstance(offset_bytes, int)
+        or offset_bytes < 0
+        or isinstance(length_bytes, bool)
+        or not isinstance(length_bytes, int)
+        or length_bytes <= 0
+    ):
+        return dict(_RANGE_INVALID)
+
+    ctx = _get_context()
+    reader = getattr(ctx.get("mongo"), "get_source_scoped_exact", None)
+    if not callable(reader):
+        return dict(_RANGE_UNAVAILABLE)
+    scope = _current_read_scope(ctx)
+    try:
+        record = reader(locator["source_id"], sorted(scope))
+    except Exception:  # Store errors must not disclose source identifiers.
+        logger.exception("exact source range lookup failed")
+        return dict(_RANGE_NOT_FOUND)
+    if not isinstance(record, Mapping):
+        return dict(_RANGE_NOT_FOUND)
+    metadata = record.get("metadata")
+    if not isinstance(metadata, Mapping) or metadata.get("pack_id") != locator["pack_id"]:
+        return dict(_RANGE_NOT_FOUND)
+
+    validated = validate_source_row_payload(
+        record,
+        permitted_packs=set(scope) & {locator["pack_id"]},
+        expected_source_id=locator["source_id"],
+    )
+    if validated is None:
+        return dict(_RANGE_UNAVAILABLE)
+    source_id, _pack_id, text, digest = validated
+    if digest != locator["source_digest"]:
+        return dict(_RANGE_STALE)
+
+    raw = text.encode("utf-8")
+    if offset_bytes >= len(raw):
+        return dict(_RANGE_INVALID)
+    end = min(len(raw), offset_bytes + length_bytes)
+    if raw[offset_bytes] & 0xC0 == 0x80 or (
+        end < len(raw) and raw[end] & 0xC0 == 0x80
+    ):
+        return dict(_RANGE_INVALID)
+    try:
+        chunk = raw[offset_bytes:end].decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return dict(_RANGE_INVALID)
+    if not chunk:
+        return dict(_RANGE_INVALID)
+    response: dict[str, Any] = {
+        "source_id": source_id,
+        "offset_bytes": offset_bytes,
+        "length_bytes": len(raw[offset_bytes:end]),
+        "total_bytes": len(raw),
+        "source_digest": digest,
+        "text": chunk,
+    }
+    if end < len(raw):
+        response["next_offset_bytes"] = end
+    return _range_response(response)

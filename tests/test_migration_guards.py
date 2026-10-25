@@ -42,6 +42,8 @@ the run gets past the counts stage without live PostgreSQL.
 
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -474,3 +476,326 @@ class TestForwardMainGuard:
         assert rc == 0
         assert "mystery_table" in out
         assert "excluded" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# #516 G4: the SQLite source is read in one snapshot, and the helper state is
+# decided by the shared strict integrity boundary.
+# ---------------------------------------------------------------------------
+
+
+def _doc_source_db(
+    path: Path, *, helper_state: object | None, with_helper_table: bool, null_row: bool = False
+) -> str:
+    """A WAL source database with one source row and, if asked, its helper row."""
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        conn.executescript(
+            "CREATE TABLE doc_nodes (space TEXT, node_id TEXT, node_type TEXT, properties TEXT, updated_at TEXT);"
+            "CREATE TABLE doc_sources (source_id TEXT PRIMARY KEY, text TEXT, metadata TEXT, ingested_at TEXT);"
+            "CREATE TABLE audit_log (event_id TEXT, event_type TEXT, subject_id TEXT, details TEXT, timestamp TEXT);"
+        )
+        conn.execute(
+            "INSERT INTO doc_sources VALUES ('source', 'old body', '{\"pack_id\": \"pack\"}', '2026-01-01T00:00:00+00:00')"
+        )
+        if with_helper_table:
+            conn.execute("CREATE TABLE doc_source_integrity (source_id TEXT PRIMARY KEY, source_integrity TEXT)")
+            if helper_state is not None:
+                conn.execute("INSERT INTO doc_source_integrity VALUES ('source', ?)", (helper_state,))
+            elif null_row:
+                conn.execute("INSERT INTO doc_source_integrity VALUES ('source', NULL)")
+        conn.commit()
+    finally:
+        conn.close()
+    return str(path)
+
+
+class _RecordingResult:
+    def fetchone(self):
+        return (0,)
+
+
+class _RecordingConn:
+    def __init__(self, log: list[tuple[str, object]]) -> None:
+        self._log = log
+
+    def execute(self, statement, params=None):
+        self._log.append((str(statement), params))
+        return _RecordingResult()
+
+
+class _RecordingEngine:
+    """The PostgreSQL target is replaced by a recorder; the source is a real SQLite file."""
+
+    def __init__(self) -> None:
+        self.log: list[tuple[str, object]] = []
+
+    def begin(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            yield _RecordingConn(self.log)
+
+        return _ctx()
+
+
+class _FakePgDocStore:
+    available = True
+
+    def __init__(self, engine, schema="public") -> None:  # noqa: ARG002
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize("case", ["table-presence", "helper-row"])
+def test_wal_source_helper_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str) -> None:
+    """The real migrate_doc opens one read snapshot with BEGIN and its first read.
+    A second connection in another thread changes the source and the helper table
+    and commits after the presence check and before the source read. The copy must
+    show the state of the first read.
+
+    The order is taken from the statement trace of the migration connection and
+    from the writer thread, not from sleeps."""
+    import threading
+
+    from opencrab.stores._source_integrity import complete_integrity, strict_utf8_digest
+
+    old_state = json.dumps(complete_integrity(strict_utf8_digest("old body")))
+    with_table = case == "helper-row"
+    db = _doc_source_db(
+        tmp_path / "wal.db", helper_state=old_state if with_table else None, with_helper_table=with_table
+    )
+
+    monkeypatch.setattr("opencrab.stores.pg_doc_store.PgDocStore", _FakePgDocStore)
+    order: list[str] = []
+    lock = threading.Lock()
+    start_writer = threading.Event()
+    writer_done = threading.Event()
+    errors: list[BaseException] = []
+    connections: list[int] = []
+
+    def mark(label: str) -> None:
+        with lock:
+            order.append(label)
+
+    def writer() -> None:
+        try:
+            assert start_writer.wait(5)
+            conn = sqlite3.connect(db, timeout=5)
+            connections.append(id(conn))
+            try:
+                if not with_table:
+                    conn.execute("CREATE TABLE doc_source_integrity (source_id TEXT PRIMARY KEY, source_integrity TEXT)")
+                conn.execute("DELETE FROM doc_source_integrity")
+                conn.execute(
+                    "INSERT INTO doc_source_integrity VALUES ('source', ?)",
+                    (json.dumps({"version": 1, "state": "unknown"}),),
+                )
+                conn.execute("UPDATE doc_sources SET text='new body' WHERE source_id='source'")
+                conn.commit()
+                mark("B:commit")
+            finally:
+                conn.close()
+        except BaseException as exc:  # pragma: no cover - reported by the assertion below
+            errors.append(exc)
+        finally:
+            writer_done.set()
+
+    real_conn_factory = fwd._sqlite_conn
+    source_connection_ids: list[int] = []
+
+    def traced_conn(path: str):
+        conn = real_conn_factory(path)
+        if path != db:
+            return conn
+        source_connection_ids.append(id(conn))
+        state = {"read_seen": False}
+
+        def trace(sql: str) -> None:
+            text = " ".join(sql.split())
+            if text == "BEGIN":
+                mark("A:begin")
+            elif "FROM sqlite_master" in text and "doc_source_integrity" in text:
+                mark("A:presence")
+            elif "FROM doc_sources" in text and "doc_nodes" not in text and "count(*)" not in text:
+                if not state["read_seen"]:
+                    state["read_seen"] = True
+                    # The statement has not read a row yet. Let the other
+                    # connection commit, then let this read run.
+                    start_writer.set()
+                    assert writer_done.wait(5)
+                    mark("A:source-read")
+
+        conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(fwd, "_sqlite_conn", traced_conn)
+    thread = threading.Thread(target=writer)
+    thread.start()
+    engine = _RecordingEngine()
+    try:
+        fwd.migrate_doc(db, engine, "public", batch=10, limit=None, dry_run=False)
+    finally:
+        start_writer.set()
+        thread.join(5)
+    assert not thread.is_alive() and errors == []
+
+    assert order == ["A:begin", "A:presence", "B:commit", "A:source-read"], order
+    assert connections and connections[0] not in source_connection_ids, "the writer must use its own connection"
+
+    source_inserts = [
+        params for statement, params in engine.log
+        if "INTO \"public\".doc_sources (" in statement and params
+    ]
+    assert len(source_inserts) == 1 and len(source_inserts[0]) == 1
+    assert source_inserts[0][0]["text"] == "old body", "the copy must come from the first read"
+    helper_inserts = [
+        params for statement, params in engine.log
+        if "INTO \"public\".doc_source_integrity" in statement and "INSERT" in statement and params
+    ]
+    if with_table:
+        assert len(helper_inserts) == 1
+        assert json.loads(helper_inserts[0][0]["source_integrity"]) == json.loads(old_state)
+    else:
+        assert helper_inserts == [], "a helper table that appeared later must not be read"
+
+
+def _canonical_helper_cases():
+    from opencrab.stores._source_integrity import complete_integrity, strict_utf8_digest
+
+    digest = strict_utf8_digest("body")
+    complete = complete_integrity(digest)
+    unknown = {"version": 1, "state": "unknown"}
+    return {
+        "duplicate-key": (
+            '{"version": 1, "state": "unknown", "state": "complete", "text_digest": "' + digest + '"}',
+            unknown,
+        ),
+        "float-version": (
+            '{"version": 1.0, "state": "complete", "text_digest": "' + digest + '"}',
+            unknown,
+        ),
+        "wrong-keyset": ('{"version": 1, "state": "complete"}', unknown),
+        "wrong-digest": (
+            json.dumps({"version": 1, "state": "complete", "text_digest": "0" * 64}),
+            unknown,
+        ),
+        "json-null": ("null", unknown),
+        "not-json": ("not json at all", unknown),
+        "unknown": (json.dumps(unknown), unknown),
+        "valid-complete": (json.dumps(complete), complete),
+    }
+
+
+@pytest.mark.parametrize("case", list(_canonical_helper_cases()))
+def test_migration_helper_state_is_decided_by_the_strict_decoder(case: str) -> None:
+    """The helper JSON that migrate_doc writes is the canonical state of the shared
+    decoder. A malformed or ambiguous state becomes unknown, never complete."""
+    raw, expected = _canonical_helper_cases()[case]
+
+    written = fwd._migration_helper_state("body", raw)
+
+    assert json.loads(written) == expected
+
+
+@pytest.mark.parametrize(
+    "case", ["sql-null", "table-present-row-absent", "table-absent", "valid-complete"]
+)
+def test_migrate_doc_helper_row_matrix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str) -> None:
+    """The real migrate_doc separates a SQL NULL helper value, a present helper table
+    without this source's row, an absent helper table and a valid complete row.
+    The recording engine keeps each target statement and its parameters."""
+    from opencrab.stores._source_integrity import complete_integrity, strict_utf8_digest
+
+    complete_state = json.dumps(complete_integrity(strict_utf8_digest("old body")))
+    options = {
+        "sql-null": dict(helper_state=None, with_helper_table=True, null_row=True),
+        "table-present-row-absent": dict(helper_state=None, with_helper_table=True),
+        "table-absent": dict(helper_state=None, with_helper_table=False),
+        "valid-complete": dict(helper_state=complete_state, with_helper_table=True),
+    }[case]
+    db = _doc_source_db(tmp_path / "matrix.db", **options)
+    monkeypatch.setattr("opencrab.stores.pg_doc_store.PgDocStore", _FakePgDocStore)
+    engine = _RecordingEngine()
+
+    fwd.migrate_doc(db, engine, "public", batch=10, limit=None, dry_run=False)
+
+    deletes = [
+        params for statement, params in engine.log
+        if 'DELETE FROM "public".doc_source_integrity' in statement
+    ]
+    inserts = [
+        params for statement, params in engine.log
+        if 'INTO "public".doc_source_integrity' in statement and "INSERT" in statement and params
+    ]
+    assert deletes == [[{"source_id": "source"}]], "the target helper row is removed for every copied source"
+    if case == "valid-complete":
+        assert len(inserts) == 1 and len(inserts[0]) == 1
+        assert json.loads(inserts[0][0]["source_integrity"]) == json.loads(complete_state)
+    elif case == "sql-null":
+        assert len(inserts) == 1 and len(inserts[0]) == 1
+        assert json.loads(inserts[0][0]["source_integrity"]) == {"version": 1, "state": "unknown"}
+    else:
+        assert inserts == [], "a source without a helper row writes no helper row"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("OPENCRAB_PG_TEST_URL"),
+    reason="OPENCRAB_PG_TEST_URL not set - needs a real PostgreSQL target (implemented-unrun)",
+)
+@pytest.mark.parametrize("case", [*_canonical_helper_cases(), "absence", "null-helper", "row-absent"])
+def test_malformed_helper_jsonb_retry(tmp_path: Path, case: str) -> None:
+    """A real PostgreSQL target that already holds a complete state is corrected by
+    migrate_doc, and a second run gives the same canonical state."""
+    import uuid
+
+    from sqlalchemy import create_engine, text
+
+    from opencrab.stores.pg_doc_store import PgDocStore
+
+    if case == "absence":
+        raw, expected, table, null_row = None, None, False, False
+    elif case == "null-helper":
+        raw, expected, table, null_row = None, {"version": 1, "state": "unknown"}, True, True
+    elif case == "row-absent":
+        raw, expected, table, null_row = None, None, True, False
+    else:
+        raw, expected = _canonical_helper_cases()[case]
+        table, null_row = True, False
+    schema = f"t{uuid.uuid4().hex[:12]}_mig"
+    db = _doc_source_db(tmp_path / "source.db", helper_state=raw, with_helper_table=table, null_row=null_row)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE doc_sources SET text='body' WHERE source_id='source'")
+    engine = create_engine(os.environ["OPENCRAB_PG_TEST_URL"])
+    try:
+        target = PgDocStore(engine, schema=schema)
+        target.upsert_source("source", "body", {"pack_id": "pack"})
+        assert target.read_source_state_exact("source").complete is True
+
+        def helper_row():
+            """Return (row exists, decoded value): a missing row, a SQL NULL and a JSON null differ."""
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(f'SELECT source_integrity FROM "{schema}".doc_source_integrity WHERE source_id=\'source\'')
+                ).fetchone()
+            if row is None:
+                return False, None
+            value = row[0]
+            return True, (json.loads(value) if isinstance(value, str) else value)
+
+        for _attempt in range(2):
+            fwd.migrate_doc(db, engine, schema, batch=10, limit=None, dry_run=False)
+            if case in ("absence", "row-absent"):
+                assert helper_row() == (False, None), "the target helper row must be gone"
+            elif case == "null-helper":
+                assert helper_row() == (True, {"version": 1, "state": "unknown"})
+            else:
+                assert helper_row() == (True, expected)
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        engine.dispose()

@@ -122,6 +122,7 @@ from opencrab.pack.write_gate import (
     source_identity_conflict,
 )
 from opencrab.stores._graph_common import domain_labels
+from opencrab.stores._source_integrity import SourceCopyState, strict_utf8_digest
 from opencrab.stores._vector_base import validate_import_records
 
 logger = logging.getLogger(__name__)
@@ -596,6 +597,37 @@ def fork_pack(
         )
     except _RejectedError as rejected:
         return rejected.response
+
+
+def _verified_source_copy_state(
+    docs: Any, source_id: str, text: str
+) -> tuple[SourceCopyState | None, str | None]:
+    """Return ``(state, None)`` for a verified origin, else ``(None, failure)``.
+
+    A doc store without ``read_source_state_exact`` gets an unknown legacy state
+    and ``None``. ``failure`` is ``"state read failed (<exception type>)"`` when a
+    read raised. ``failure`` is ``"state mismatch"`` when the first read is not a
+    ``SourceCopyState``, the two reads differ, the state id or text differs from
+    the record, or a complete state has a digest that differs from the record
+    text. The response carries the exception type only; the exception text goes
+    to the operator log (#168).
+    """
+    reader = getattr(docs, "read_source_state_exact", None)
+    if not callable(reader):
+        return SourceCopyState("legacy", source_id, text, None, False), None
+    try:
+        first = reader(source_id)
+        final = reader(source_id)
+    except Exception as exc:  # noqa: BLE001 -- #168: only the type name leaves this function
+        logger.error("pack_fork: source state read failed for %r: %s", source_id, exc, exc_info=True)
+        return None, f"state read failed ({type(exc).__name__})"
+    if not isinstance(first, SourceCopyState) or first != final:
+        return None, "state mismatch"
+    if final.source_id != source_id or final.text != text:
+        return None, "state mismatch"
+    if final.complete and final.text_digest != strict_utf8_digest(text):
+        return None, "state mismatch"
+    return final, None
 
 
 def _fork_pack_inner(
@@ -1675,11 +1707,13 @@ def _fork_pack_inner(
                 text = record.get("text") or ""
                 if not text:
                     # Defense against a backend returning an incomplete row.
-                    # Fall back to a direct fetch before treating this
-                    # source as empty.
                     fetched = docs.get_source(old_id) if hasattr(docs, "get_source") else None
                     if isinstance(fetched, dict):
                         text = fetched.get("text") or ""
+                source_state, state_failure = _verified_source_copy_state(docs, old_id, text)
+                if source_state is None:
+                    tier2_failure = f"source {old_id!r} -> {new_id!r} {state_failure}"
+                    break
                 receipt = write_source(
                     sql, hybrid, docs, vector, graph=graph,
                     text=text, source_id=new_id, metadata=meta, pack_id=dst,
@@ -1691,6 +1725,7 @@ def _fork_pack_inner(
                     # never had a node for stays node-less in the fork too --
                     # a fork copies, it does not backfill.
                     write_graph=False,
+                    source_copy_state=source_state,
                 )
                 if not _fork_leg_ok(receipt, "source"):
                     tier2_failure = f"source {old_id!r} -> {new_id!r} write failed"
