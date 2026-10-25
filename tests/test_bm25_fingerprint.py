@@ -11,6 +11,14 @@ from opencrab.ontology.bm25 import BM25Index, compute_fingerprint
 from opencrab.ontology.query import Bm25CacheState, HybridQuery
 
 
+@pytest.fixture(autouse=True)
+def _memory_bm25_path(monkeypatch):
+    """#541: these tests pin the memory BM25 path (cold build, fingerprint,
+    window, rebuild worker). The path still serves PostgreSQL, MongoDB and a
+    SQLite index in backfill, so the tests keep it by the kill switch."""
+    monkeypatch.setenv("OPENCRAB_BM25_DB_INDEX", "0")
+
+
 def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.01) -> bool:
     """Poll ``predicate`` until true or timeout (for background rebuild tests)."""
     deadline = time.monotonic() + timeout
@@ -567,10 +575,17 @@ def test_398_same_fingerprint_keeps_the_complete_state_reference() -> None:
         hybrid._bm25_search("alpha", spaces=None, limit=5, pack_ids=["A"])
         first_state = hybrid._bm25.state
         reads_after_cold_build = doc_store.list_nodes.call_count
-        hybrid.invalidate_bm25_cache()
+        # #541 design 4.8: a redundant stale mark (#422, no epoch move) keeps
+        # the state; an invalidate() after a write rebuilds even when the
+        # fingerprint is equal, because equal count and max timestamp do not
+        # prove equal content.
+        hybrid._bm25.mark_stale()
         assert _wait_until(lambda: hybrid._bm25_dirty is False)
         assert hybrid._bm25.state is first_state
         assert doc_store.list_nodes.call_count == reads_after_cold_build
+        hybrid.invalidate_bm25_cache()
+        assert _wait_until(lambda: hybrid._bm25.state is not first_state)
+        assert _wait_until(lambda: hybrid._bm25_dirty is False)
     finally:
         hybrid.shutdown_bm25()
 

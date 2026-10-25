@@ -27,6 +27,14 @@ from opencrab.stores._json import dump_props
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
 
+@pytest.fixture(autouse=True)
+def _memory_bm25_path(monkeypatch):
+    """#541: these tests pin the memory BM25 path (cold build, fingerprint,
+    window, rebuild worker). The path still serves PostgreSQL, MongoDB and a
+    SQLite index in backfill, so the tests keep it by the kill switch."""
+    monkeypatch.setenv("OPENCRAB_BM25_DB_INDEX", "0")
+
+
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

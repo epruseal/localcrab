@@ -46,8 +46,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
+from opencrab.stores import _node_bm25_sqlite as _nbm
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 from opencrab.stores._sqlite_base import _SqliteConnMixin
@@ -82,6 +84,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         """
         self._available = False
         self._fts_ok = False  # SQLite FTS5 키워드 색인 가용 여부(capability)
+        self._node_bm25_ok = False  # #541 node BM25 index objects exist
         self._init_conn_state(db_path)
         self._init_db()
 
@@ -156,10 +159,29 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                 except Exception as exc:
                     logger.warning("FTS5 keyword index unavailable (graceful): %s", exc)
                     self._fts_ok = False
+                self._init_node_bm25()
         except Exception as exc:
             logger.warning("LocalSQLDocStore bootstrap lock failed: %s", exc)
             self._available = False
             return
+
+    def _init_node_bm25(self) -> None:
+        """#541: create or check the node BM25 index in one transaction.
+
+        Runs under the bootstrap write.lock. On any failure the transaction
+        rolls back, no index object stays, and the index is unsupported for
+        this process (design 5.2).
+        """
+        from opencrab.ontology.bm25 import max_text_chars_setting
+
+        try:
+            with self._tx(immediate=True) as conn:
+                state = _nbm.ensure_schema(conn, max_text_chars_setting())
+            self._node_bm25_ok = True
+            logger.info("node BM25 index state: %s", state)
+        except Exception as exc:
+            logger.warning("node BM25 index unavailable (graceful): %s", exc)
+            self._node_bm25_ok = False
 
     # ------------------------------------------------------------------
     # Availability / lifecycle
@@ -215,6 +237,143 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         return row[name]
 
     # _require_available is provided by _SqliteConnMixin.
+
+    # ------------------------------------------------------------------
+    # #541 node BM25 index (docs/issue-541-db-bm25.md)
+    # ------------------------------------------------------------------
+
+    # Search-time drain budget and lock wait. Operational values only.
+    _NODE_BM25_DRAIN_BATCH = 128
+    _NODE_BM25_DRAIN_SECONDS = 0.25
+    _NODE_BM25_DRAIN_BUSY_MS = 50
+    _NODE_BM25_BACKFILL_BATCH = 500
+
+    @property
+    def supports_node_bm25(self) -> bool:
+        return bool(self._available and self._node_bm25_ok)
+
+    def _exec_node_write(self, sql: str, params: dict[str, Any], space: str, node_id: str) -> int:
+        """Write one doc_nodes row and reindex its key in the same transaction.
+
+        The reindex runs in a SAVEPOINT. A failure rolls back only the index
+        change; the trigger's pending row and the document write stay (design 4.4).
+        """
+        with self._tx() as conn:
+            rowcount = conn.execute(sql, params).rowcount
+            if self._node_bm25_ok:
+                conn.execute("SAVEPOINT node_bm25")
+                try:
+                    _nbm.reindex_key(conn, self._row_to_node, space, node_id)
+                except Exception as exc:  # noqa: BLE001 -- the doc write must not fail
+                    conn.execute("ROLLBACK TO SAVEPOINT node_bm25")
+                    logger.warning("node BM25 index sync failed for one key: %s", exc)
+                conn.execute("RELEASE SAVEPOINT node_bm25")
+            return rowcount
+
+    def node_bm25_ready(self) -> bool:
+        """True when the index is ready in this code's format."""
+        if not self.supports_node_bm25:
+            return False
+        try:
+            return _nbm.is_ready(self._conn)
+        except Exception as exc:  # noqa: BLE001 -- dropped tables, locked file
+            logger.debug("node BM25 status read failed: %s", exc)
+            return False
+
+    def _node_bm25_try_drain(self) -> None:
+        """Drain pending keys without waiting for locks (design 4.6)."""
+        conn = self._conn
+        if not _nbm.has_pending(conn):
+            return
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            old_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            conn.execute(f"PRAGMA busy_timeout={int(self._NODE_BM25_DRAIN_BUSY_MS)}")
+            try:
+                deadline = time.monotonic() + self._NODE_BM25_DRAIN_SECONDS
+                while time.monotonic() < deadline:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        done = _nbm.drain(conn, self._row_to_node, self._NODE_BM25_DRAIN_BATCH)
+                        conn.commit()
+                    except BaseException:
+                        conn.rollback()
+                        raise
+                    if done < self._NODE_BM25_DRAIN_BATCH:
+                        break
+            finally:
+                self._restore_busy_timeout(conn, old_timeout)
+        except Exception as exc:  # noqa: BLE001 -- busy, read-only file, format change
+            logger.debug("node BM25 search-time drain skipped: %s", exc)
+        finally:
+            self._lock.release()
+
+    def node_bm25_search(
+        self,
+        query: str,
+        *,
+        pack_ids: list[str],
+        spaces: list[str] | None = None,
+        limit: int = 10,
+        per_pack: bool = False,
+    ) -> tuple[Any, list[str]] | None:
+        """Search the node index. Returns ``None`` when it is not ready.
+
+        Returns ``(hits, warnings)``; ``hits`` is a dict keyed by pack when
+        ``per_pack``. The shape of each hit is the ``BM25Index.search`` shape.
+        """
+        if not self.supports_node_bm25:
+            return None
+        self._node_bm25_try_drain()
+        conn = self._conn
+        own = not conn.in_transaction
+        if own:
+            conn.execute("BEGIN")
+        try:
+            return _nbm.search(
+                conn, self._row_to_node, query,
+                pack_ids=pack_ids, spaces=spaces, limit=limit, per_pack=per_pack,
+            )
+        except _nbm.NotReadyError:
+            return None
+        finally:
+            if own:
+                conn.commit()
+
+    def node_bm25_sync_pending(self, *, max_seconds: float | None = None) -> int:
+        """Drain pending keys (waiting for locks). Returns the remaining count."""
+        deadline = None if max_seconds is None else time.monotonic() + max_seconds
+        while True:
+            with self._tx(immediate=True) as conn:
+                done = _nbm.drain(conn, self._row_to_node, self._NODE_BM25_BACKFILL_BATCH)
+            if done == 0 or (deadline is not None and time.monotonic() >= deadline):
+                break
+        return _nbm.pending_count(self._conn)
+
+    def node_bm25_backfill_step(self, batch: int | None = None) -> dict[str, Any]:
+        with self._tx(immediate=True) as conn:
+            return _nbm.backfill_step(
+                conn, self._row_to_node, batch or self._NODE_BM25_BACKFILL_BATCH
+            )
+
+    def node_bm25_status(self) -> dict[str, Any]:
+        if not self.supports_node_bm25:
+            return {"state": "unsupported"}
+        return _nbm.status(self._conn)
+
+    def node_bm25_verify(self) -> dict[str, Any]:
+        conn = self._conn
+        conn.execute("BEGIN")
+        try:
+            return _nbm.verify(conn, self._row_to_node)
+        finally:
+            conn.commit()
+
+    def node_bm25_drop(self) -> None:
+        with self._bootstrap_lock(), self._tx(immediate=True) as conn:
+            _nbm.drop(conn)
+        self._node_bm25_ok = False
 
     # ------------------------------------------------------------------
     # Source ingestion — override to keep the FTS5 shadow table in sync

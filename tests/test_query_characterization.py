@@ -97,9 +97,10 @@ class TestBm25WorkerNormal:
         finally:
             hybrid.shutdown_bm25()
 
-    def test_worker_skips_ref_swap_when_fingerprint_unchanged(self) -> None:
-        """Line contract: cache is not None and fp == cache.fingerprint -> dirty
-        cleared but no new object is built (ref identity preserved)."""
+    def test_worker_rebuilds_after_invalidate_even_when_fingerprint_unchanged(self) -> None:
+        """#541 design 4.8: invalidate() means a write landed. An equal
+        fingerprint (count and max timestamp) does not prove equal content, so
+        the worker publishes a new index instead of keeping the old one."""
         doc_store = MagicMock()
         doc_store.available = True
         doc_store.list_nodes = MagicMock(return_value=[_node("a")])
@@ -107,10 +108,26 @@ class TestBm25WorkerNormal:
         try:
             hybrid._bm25_search("x", spaces=None, limit=5, pack_ids=["pack-a"])  # cold synchronous build
             first_cache = hybrid._bm25_cache
-            hybrid.invalidate_bm25_cache()  # corpus unchanged -> "nothing changed" leg
+            hybrid.invalidate_bm25_cache()  # same fingerprint after a write
+            assert _wait_until(lambda: hybrid._bm25_cache is not first_cache)
+            assert _wait_until(lambda: hybrid._bm25_dirty is False)
+        finally:
+            hybrid.shutdown_bm25()
+
+    def test_worker_skips_ref_swap_on_redundant_stale_mark(self) -> None:
+        """#422 kept: mark_stale() moves no epoch, so an unchanged fingerprint
+        keeps the published index object."""
+        doc_store = MagicMock()
+        doc_store.available = True
+        doc_store.list_nodes = MagicMock(return_value=[_node("a")])
+        hybrid = _hybrid_with_doc_store(doc_store)
+        try:
+            hybrid._bm25_search("x", spaces=None, limit=5, pack_ids=["pack-a"])  # cold synchronous build
+            first_cache = hybrid._bm25_cache
+            hybrid._bm25.mark_stale()
             assert _wait_until(lambda: doc_store.list_nodes.call_count >= 2)
+            assert _wait_until(lambda: hybrid._bm25_dirty is False)
             assert hybrid._bm25_cache is first_cache
-            assert hybrid._bm25_dirty is False
         finally:
             hybrid.shutdown_bm25()
 

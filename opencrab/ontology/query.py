@@ -15,6 +15,7 @@ Query pipeline:
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import logging
 import os
 import threading
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from opencrab.common.pack_tags import canonicalize_pack_alias
+from opencrab.ontology import bm25 as _bm25_mod
 from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.ontology.text_cues import QUERY_MULTIHOP_CUES as _MULTIHOP_QUERY_CUES
 from opencrab.ontology.text_cues import RELATION_CUES as _RELATION_QUERY_CUES
@@ -48,7 +50,7 @@ _BM25_NODE_LIMIT = int(os.getenv("OPENCRAB_BM25_NODE_LIMIT", "50000"))
 # of the kept nodes reaches it. OPENCRAB_BM25_MAX_NODE_CHARS cuts the text that
 # is tokenised for each node. A value of 0 or less turns the rule off. Both are
 # read per build (docs/issue-506-bm25-memory.md).
-_BM25_MAX_NODE_CHARS_DEFAULT = 65536
+_BM25_MAX_NODE_CHARS_DEFAULT = _bm25_mod._MAX_NODE_CHARS_DEFAULT
 _BM25_CHAR_BUDGET_DEFAULT = 200_000_000
 
 # #506: after a build the worker waits this many times the build's duration
@@ -61,10 +63,7 @@ def _bm25_window_limits() -> tuple[int | None, int | None]:
     budget = int(
         os.getenv("OPENCRAB_BM25_CHAR_BUDGET", str(_BM25_CHAR_BUDGET_DEFAULT))
     )
-    max_node = int(
-        os.getenv("OPENCRAB_BM25_MAX_NODE_CHARS", str(_BM25_MAX_NODE_CHARS_DEFAULT))
-    )
-    return (budget if budget > 0 else None, max_node if max_node > 0 else None)
+    return (budget if budget > 0 else None, _bm25_mod.max_text_chars_setting())
 
 
 _libc: Any = None
@@ -250,6 +249,9 @@ class Bm25CacheState:
     total_rows: int | None
     covered_pack_ids: frozenset[str]
     generation: int
+    # #541 design 4.8: the epoch read before the observation behind this
+    # state. None keeps the pre-#541 skip rule (states built by tests).
+    observed_epoch: int | None = None
 
 
 
@@ -552,6 +554,7 @@ class _Bm25CacheWorker:
             total_rows=None,
             covered_pack_ids=frozenset(),
             generation=self._generation,
+            observed_epoch=self._epoch,
         )
 
     @property
@@ -684,7 +687,9 @@ class _Bm25CacheWorker:
                 build_epoch = self._epoch
             started = time.monotonic()
             observation = self._observe(doc_store)
-            candidate = self._make_state(observation)
+            candidate = dataclasses.replace(
+                self._make_state(observation), observed_epoch=build_epoch
+            )
             with self._lock:
                 self.state = candidate
                 self.dirty = False
@@ -795,9 +800,16 @@ class _Bm25CacheWorker:
                     self.ensure_built(ds)
                     self._wake.set()
                     continue
+                # #541 design 4.8: an equal fingerprint may skip the rebuild
+                # only when no invalidate() landed since this state's
+                # observation. mark_stale() does not move the epoch (#422).
+                unchanged_since_state = (
+                    state.observed_epoch is None or state.observed_epoch == build_epoch
+                )
                 probe = self._native_probe(ds)
                 if probe is not None and (
-                    probe.failed or probe.fingerprint == state.probe_fingerprint
+                    probe.failed
+                    or (unchanged_since_state and probe.fingerprint == state.probe_fingerprint)
                 ):
                     with self._lock:
                         if self._epoch == build_epoch:
@@ -808,7 +820,10 @@ class _Bm25CacheWorker:
                 started = time.monotonic()
                 built = True
                 observation = self._observe(ds, probe)
-                if observation.probe.fingerprint == state.probe_fingerprint:
+                if (
+                    unchanged_since_state
+                    and observation.probe.fingerprint == state.probe_fingerprint
+                ):
                     with self._lock:
                         self._set_rest_locked(started)
                         if self._epoch == build_epoch:
@@ -816,7 +831,9 @@ class _Bm25CacheWorker:
                         else:
                             self._wake.set()
                     continue
-                candidate = self._make_state(observation)
+                candidate = dataclasses.replace(
+                    self._make_state(observation), observed_epoch=build_epoch
+                )
                 with self._lock:
                     self._set_rest_locked(started)
                     if self._epoch == build_epoch:
@@ -880,6 +897,61 @@ class HybridQuery:
         # fingerprint mismatch schedules a rebuild that atomically swaps it in.
         debounce = float(os.getenv("OPENCRAB_BM25_DEBOUNCE", "1.5"))
         self._bm25 = _Bm25CacheWorker(lambda: self._doc_store, debounce)
+        # #541 design 4.4: set when invalidate_bm25_cache() skipped the memory
+        # invalidation because the DB node index served searches. The next
+        # memory-path search runs that invalidation first.
+        self._bm25_invalidation_skipped = False
+
+    def _node_index_store(self) -> Any:
+        """Return the doc store when the DB node index serves BM25 (#541).
+
+        The conditions are the search entry conditions of design 4.5: the
+        store supports the index, ``OPENCRAB_BM25_DB_INDEX`` is not ``0``, and
+        the index is ready in this code's format.
+        """
+        ds = self._doc_store
+        if ds is None or os.getenv("OPENCRAB_BM25_DB_INDEX", "1") == "0":
+            return None
+        if getattr(ds, "supports_node_bm25", False) is not True:
+            return None
+        try:
+            ready = ds.node_bm25_ready()
+        except Exception as exc:  # noqa: BLE001 -- treat as not ready
+            logger.debug("node BM25 readiness check failed: %s", exc)
+            return None
+        return ds if ready is True else None
+
+    def _node_index_search(
+        self,
+        ds: Any,
+        question: str,
+        spaces: list[str] | None,
+        limit: int,
+        pack_ids: list[str],
+        per_pack: bool,
+    ) -> tuple[Any, list[str]] | None:
+        """Run one DB node index search; ``None`` means use the memory path."""
+        try:
+            result = ds.node_bm25_search(
+                question, pack_ids=pack_ids, spaces=spaces, limit=limit, per_pack=per_pack
+            )
+        except Exception as exc:  # noqa: BLE001 -- reported as a coverage warning
+            logger.warning("node BM25 index search error: %s", exc)
+            from opencrab.stores._node_bm25_sqlite import UNAVAILABLE_WARNING
+
+            return ({} if per_pack else []), [UNAVAILABLE_WARNING]
+        if result is None:
+            return None
+        hits, warnings = result
+        for hit in (h for group in hits.values() for h in group) if per_pack else hits:
+            hit["source"] = "bm25"
+        return hits, list(warnings)
+
+    def _memory_path_entered(self) -> None:
+        """Run the invalidation the DB path skipped (design 4.4)."""
+        if self._bm25_invalidation_skipped:
+            self._bm25_invalidation_skipped = False
+            self._bm25.invalidate()
 
     # -- BM25 cache/worker state, forwarded to the extracted worker so the
     #    public/private surface (and tests pinning it) stays unchanged. --
@@ -923,7 +995,14 @@ class HybridQuery:
         return self._bm25.thread
 
     def invalidate_bm25_cache(self) -> None:
-        """Mark the BM25 index stale and schedule a debounced background rebuild."""
+        """Mark the BM25 index stale and schedule a debounced background rebuild.
+
+        #541: while the DB node index serves searches, its triggers and write
+        sync keep it fresh, so the memory invalidation is skipped and remembered.
+        """
+        if self._node_index_store() is not None:
+            self._bm25_invalidation_skipped = True
+            return
         self._bm25.invalidate()
 
     def _bm25_join(self, timeout: float | None = None) -> None:
@@ -1328,6 +1407,12 @@ class HybridQuery:
         """Search and diagnose one captured immutable BM25 state."""
         if not pack_ids:
             return [], []
+        ds = self._node_index_store()
+        if ds is not None:
+            found = self._node_index_search(ds, question, spaces, limit, pack_ids, False)
+            if found is not None:
+                return found
+        self._memory_path_entered()
         try:
             state = self._bm25_acquire_state()
             if state is None:
@@ -1368,14 +1453,38 @@ class HybridQuery:
         instance-level ``_bm25_search`` override exists, the cold build raised,
         no state exists, or a per-pack search raised.
         """
+        return self._bm25_search_per_pack_with_warnings(
+            question, spaces, limit, pack_ids=pack_ids
+        )[0]
+
+    def _bm25_search_per_pack_with_warnings(
+        self,
+        question: str,
+        spaces: list[str] | None,
+        limit: int,
+        *,
+        pack_ids: list[str],
+    ) -> tuple[dict[str, list[dict[str, Any]]] | None, list[str]]:
+        """``_bm25_search_per_pack`` plus the coverage warnings of that probe.
+
+        #541 design 4.5: the auto-pack probe forwards these warnings to the
+        pack selection, so a probe on a partial index stays visible.
+        """
         if self.__dict__.get("_bm25_search") is not None:
-            return None
+            return None, []
         if not pack_ids:
-            return {}
+            return {}, []
+        ds = self._node_index_store()
+        if ds is not None:
+            found = self._node_index_search(ds, question, spaces, limit, pack_ids, True)
+            if found is not None:
+                hits, warnings = found
+                return {pid: hits.get(pid, []) for pid in pack_ids}, warnings
+        self._memory_path_entered()
         try:
             state = self._bm25_acquire_state()
             if state is None:
-                return None
+                return None, []
             out: dict[str, list[dict[str, Any]]] = {}
             for pid in pack_ids:
                 hits = state.index.search(
@@ -1384,10 +1493,10 @@ class HybridQuery:
                 for hit in hits:
                     hit["source"] = "bm25"
                 out[pid] = hits
-            return out
+            return out, self._coverage_warnings(state, pack_ids)
         except Exception as exc:
             logger.warning("BM25 per-pack search error: %s", exc)
-            return None
+            return None, []
 
     def _bm25_search_with_warnings(
         self,

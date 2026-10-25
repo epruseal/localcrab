@@ -56,7 +56,7 @@
 3. 현재 행이 있으면 저장소의 `_row_to_node`로 노드 dict를 만든다. 토큰은 `tokenize(_node_text(node)[:max_text_chars])`다. docs 행과 FTS 행을 넣고 stats에 더한다. `pack_id`는 `scope_pack_id(node)`다.
 4. `pending`에서 그 키를 지운다.
 
-`max_text_chars`와 형식 버전은 프로세스 환경이 아니라 같은 트랜잭션에서 읽은 `meta`의 값을 쓴다. `meta`가 색인 설정의 정본이다. 프로세스의 코드 형식 버전이 `meta`의 `format`과 다르면 이 함수는 아무것도 쓰지 않고 `IndexFormatMismatch` 예외를 낸다. 호출자마다 처리가 다르다.
+`max_text_chars`와 형식 버전은 프로세스 환경이 아니라 같은 트랜잭션에서 읽은 `meta`의 값을 쓴다. `meta`가 색인 설정의 정본이다. 프로세스의 코드 형식 버전이 `meta`의 `format`과 다르면 이 함수는 아무것도 쓰지 않고 `IndexFormatMismatchError` 예외를 낸다. 호출자마다 처리가 다르다.
 
 - 저장소 쓰기 경로: SAVEPOINT가 예외를 받아 되돌리고 경고를 남긴다. 문서 쓰기는 커밋되고 pending이 남는다.
 - pending 소진과 backfill 단계: 예외가 트랜잭션 전체를 되돌린다. 커서, pending, 상태가 그대로 남는다. 건너뛴 행을 처리한 것으로 세지 않는다. backfill 명령은 0이 아닌 코드로 끝나고, 검색의 소진은 멈춘 뒤 스냅숏 검사(4.5절 3번)로 간다.
@@ -174,7 +174,7 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 
 `opencrab packs bm25-index backfill`이 수행한다. 서비스가 자동으로 시작하지 않는다. 운영자가 백업과 승인 뒤 실행한다(12절).
 
-- 한 단계는 `BEGIN IMMEDIATE` 트랜잭션 하나다. 커서 `(cursor_space, cursor_node_id)` 다음 키부터 기본 키 순서로 묶음 하나를 읽는다. 키마다 `reindex_key`를 부르고 커서를 마지막 키로 옮긴다. 묶음이 비면 남은 pending을 소진하고 상태를 `ready`로 바꾼다. 단계는 시작할 때 같은 트랜잭션에서 `meta.format`이 이 코드의 형식과 같은지 확인하고, 다르면 아무것도 바꾸지 않고 `IndexFormatMismatch`로 끝난다. 처리할 키가 없는 마지막 단계도 같다.
+- 한 단계는 `BEGIN IMMEDIATE` 트랜잭션 하나다. 커서 `(cursor_space, cursor_node_id)` 다음 키부터 기본 키 순서로 묶음 하나를 읽는다. 키마다 `reindex_key`를 부르고 커서를 마지막 키로 옮긴다. 묶음이 비면 남은 pending을 소진하고 상태를 `ready`로 바꾼다. 단계는 시작할 때 같은 트랜잭션에서 `meta.format`이 이 코드의 형식과 같은지 확인하고, 다르면 아무것도 바꾸지 않고 `IndexFormatMismatchError`로 끝난다. 처리할 키가 없는 마지막 단계도 같다.
 - 자원 위치: 진행 상태는 `doc_nodes_bm25_meta`의 커서와 상태 행 두 곳에만 있다. 색인 행은 `doc_nodes_bm25_docs`, `doc_nodes_bm25_fts`, stats에 있다. 진행 중 변경은 `doc_nodes_bm25_pending`에 있다. 프로세스 메모리에는 묶음 하나의 행만 있다.
 - 중단: 단계 도중 프로세스가 죽거나 예외가 나면 SQLite가 그 트랜잭션을 되돌린다. 커서와 색인 행은 단계 시작 전 상태로 남는다. 부분 단계가 남지 않는다.
 - 재개: 다시 실행하면 커서를 읽어 다음 키부터 간다. 커서 앞 키라도 그 뒤 바뀌었으면 쓰기 동기화나 pending이 처리한다. 커서 뒤 키를 쓰기 동기화가 미리 색인했어도 `reindex_key`가 멱등이므로 다시 처리해도 같다.

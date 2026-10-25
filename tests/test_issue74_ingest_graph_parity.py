@@ -2893,6 +2893,8 @@ def _settled_bm25(stack, timeout: float = 30.0) -> None:
     import time
 
     hybrid = stack["hybrid"]
+    if hybrid._node_index_store() is not None:
+        return  # #541: the DB node index is updated in the write transaction
     deadline = time.monotonic() + timeout
     while hybrid._bm25_dirty and time.monotonic() < deadline:
         time.sleep(0.1)

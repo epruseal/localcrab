@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from collections import Counter
 from typing import Any
 
@@ -50,6 +51,49 @@ _TEXT_FIELDS = (
     "heading_path",
 )
 _MAX_PROPERTY_TEXT = 1200
+
+# #506: per-node tokenising cut. ``OPENCRAB_BM25_MAX_NODE_CHARS`` <= 0 turns it off.
+_MAX_NODE_CHARS_DEFAULT = 65536
+
+
+def max_text_chars_setting() -> int | None:
+    """Return the per-node tokenising cut, or ``None`` when the rule is off.
+
+    The memory index reads it per build. The SQLite node index (#541) records
+    the value in its ``meta`` table when it is initialised.
+    """
+    value = int(os.getenv("OPENCRAB_BM25_MAX_NODE_CHARS", str(_MAX_NODE_CHARS_DEFAULT)))
+    return value if value > 0 else None
+
+
+def bm25_idf(n: int, df: int) -> float:
+    """Return the IDF of a term with document frequency ``df`` among ``n`` docs."""
+    return math.log((n - df + 0.5) / (df + 0.5) + 1)
+
+
+def bm25_score(
+    q_tokens: list[str],
+    tf_map: Any,
+    idf: dict[str, float],
+    dl: int,
+    avgdl: float,
+) -> float:
+    """Return the BM25 score of one document (#541: shared by both indexes).
+
+    ``q_tokens`` keeps the query order and duplicates. ``tf_map`` maps a term to
+    its count in the document. The memory index and the SQLite node index call
+    this one function, so both add the same floats in the same order.
+    """
+    score = 0.0
+    for term in q_tokens:
+        if term not in idf:
+            continue
+        tf = tf_map.get(term, 0)
+        term_idf = idf[term]
+        numerator = tf * (_K1 + 1)
+        denominator = tf + _K1 * (1 - _B + _B * dl / max(avgdl, 1))
+        score += term_idf * (numerator / denominator)
+    return score
 
 
 def _flatten_property_text(value: Any, depth: int = 0) -> list[str]:
@@ -188,7 +232,7 @@ class BM25Index:
         # Pre-compute IDF for all known terms
         n = len(nodes)
         for term, df in idx._df.items():
-            idx._idf[term] = math.log((n - df + 0.5) / (df + 0.5) + 1)
+            idx._idf[term] = bm25_idf(n, df)
 
         idx._fingerprint = fingerprint if fingerprint is not None else compute_fingerprint(nodes)
         logger.debug("BM25Index built: %d nodes, %d unique terms", n, len(idx._idf))
@@ -269,18 +313,7 @@ class BM25Index:
                     continue
 
                 toks = self._tokens[i]
-                dl = len(toks)
-                tf_map = Counter(toks)
-                score = 0.0
-
-                for term in q_tokens:
-                    if term not in self._idf:
-                        continue
-                    tf = tf_map.get(term, 0)
-                    idf = self._idf[term]
-                    numerator = tf * (_K1 + 1)
-                    denominator = tf + _K1 * (1 - _B + _B * dl / max(self._avgdl, 1))
-                    score += idf * (numerator / denominator)
+                score = bm25_score(q_tokens, Counter(toks), self._idf, len(toks), self._avgdl)
 
                 if score > 0:
                     scores.append((i, score))
