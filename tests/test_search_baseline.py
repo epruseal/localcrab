@@ -330,18 +330,49 @@ def test_mount_lookup_matches_boundaries_nesting_and_escapes(tmp_path):
     assert lookup(Path("/mnt/with space/x"), _MOUNTINFO) == "ramfs"
     assert lookup(Path("/anything"), "") is None
 
-    # A missing path resolves through its nearest existing parent, and a
-    # symlink resolves to its target's mount.
-    real = tmp_path / "real"
-    real.mkdir()
-    link = tmp_path / "link"
-    link.symlink_to(real)
-    text = f"20 1 8:2 / / rw - ext4 /dev/root rw\n60 20 0:50 / {real} rw - tmpfs tmpfs rw"
-    assert lookup(link / "not" / "yet", text) == "tmpfs"
-    assert lookup(tmp_path / "other", text) == "ext4"
+    # Symlinks resolve before "..", the way the kernel and Path.resolve() do.
+    # The link lives on "disk" and its target on "ram", so a text-only fold of
+    # ".." (os.path.abspath) or a nearest-existing-parent walk judges "ext4".
+    disk = tmp_path / "disk"
+    ram = tmp_path / "ram"
+    (ram / "sub").mkdir(parents=True)
+    disk.mkdir()
+    (disk / "dangling").symlink_to(ram / "missing")
+    (disk / "up").symlink_to(ram / "sub")
+    text = f"20 1 8:2 / / rw - ext4 /dev/root rw\n60 20 0:50 / {os.path.realpath(ram)} rw - tmpfs tmpfs rw"
+    assert lookup(disk / "dangling", text) == "tmpfs"
+    assert lookup(disk / "dangling" / "f", text) == "tmpfs"
+    assert lookup(Path(f"{disk}/up/../x"), text) == "tmpfs"
+    assert lookup(Path(f"{disk}/up/.."), text) == "tmpfs"
+    assert lookup(disk / "other", text) == "ext4"
 
     root_type = harness.default_fs_type(Path("/"))
     assert isinstance(root_type, str) and root_type
+
+
+def test_mountinfo_read_failure_is_unknown_and_refused(tmp_path, monkeypatch):
+    def denied():
+        raise PermissionError("mountinfo")
+
+    assert harness.default_fs_type(tmp_path, read_mountinfo=denied) is None
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    with pytest.raises(SystemExit):
+        harness.check_write_paths(
+            [tmp_path / "run"], smoke=False,
+            fs_type_of=lambda path: harness.default_fs_type(path, read_mountinfo=denied))
+
+
+def test_dotdot_paths_are_refused_unless_smoke(tmp_path, monkeypatch):
+    disk = lambda path: "ext4"  # noqa: E731 -- leaves only the ".." rule
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    dotted = Path(f"{tmp_path}/a/../run")
+    with pytest.raises(SystemExit):
+        harness.check_write_paths([dotted], smoke=False, fs_type_of=disk)
+    harness.check_write_paths([dotted], smoke=True, fs_type_of=disk)
+    monkeypatch.setenv("TMPDIR", f"{tmp_path}/x/../tmp")
+    with pytest.raises(SystemExit):
+        harness.check_write_paths([tmp_path / "run"], smoke=False, fs_type_of=disk)
+    harness.check_write_paths([tmp_path / "run"], smoke=True, fs_type_of=disk)
 
 
 def test_smoke_scale_comes_from_the_real_corpus_file(tmp_path):

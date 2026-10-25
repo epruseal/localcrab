@@ -108,16 +108,16 @@ def _unescape_mount(field: str) -> str:
 
 
 def _resolve_for_mount(path: Path) -> str:
-    """Return the real path, resolving symlinks through the nearest existing parent."""
-    existing = Path(os.path.abspath(path))
-    tail: list[str] = []
-    while not existing.exists() and existing != existing.parent:
-        tail.append(existing.name)
-        existing = existing.parent
-    resolved = Path(os.path.realpath(existing))
-    for name in reversed(tail):
-        resolved = resolved / name
-    return str(resolved)
+    """Return the real path the way Path.resolve() computes it.
+
+    The function never folds ".." as text before it resolves symlinks.
+    os.path.realpath walks the components in order, follows each symlink
+    (also a dangling one), and folds ".." against the resolved prefix.
+    """
+    raw = os.fspath(path)
+    if not os.path.isabs(raw):
+        raw = os.path.join(os.getcwd(), raw)
+    return os.path.realpath(raw)
 
 
 def fs_type_for(path: Path, mountinfo_text: str) -> str | None:
@@ -142,10 +142,14 @@ def fs_type_for(path: Path, mountinfo_text: str) -> str | None:
     return best[1] if best else None
 
 
-def default_fs_type(path: Path) -> str | None:
+def _read_proc_mountinfo() -> str:
+    return Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="replace")
+
+
+def default_fs_type(path: Path, read_mountinfo: Any = None) -> str | None:
     """Return the filesystem type of ``path`` from /proc/self/mountinfo, or None."""
     try:
-        text = Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="replace")
+        text = (read_mountinfo or _read_proc_mountinfo)()
     except OSError:
         return None
     return fs_type_for(path, text)
@@ -212,6 +216,10 @@ def check_write_paths(paths: list[Path], sources: list[Path] | None = None, *, s
             if _inside(path, source) or _inside(source, path):
                 raise SystemExit(f"write path overlaps a read source: {path}")
         if not smoke:
+            # A ".." after a missing component cannot be opened, and a text
+            # resolution of it can differ from the kernel. Refuse it.
+            if ".." in Path(os.fspath(path)).parts:
+                raise SystemExit(f"write path contains '..': {path}")
             fs_type = fs_type_of(path)
             if fs_type is None or fs_type in RAM_FS_TYPES:
                 raise SystemExit(f"write path is on a RAM-backed or unknown filesystem "
