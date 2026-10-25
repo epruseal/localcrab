@@ -20,7 +20,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from opencrab.ontology.bm25 import _B, _K1, BM25Index, _node_text, node_size, trim_to_budget
+from opencrab.ontology.bm25 import (
+    _B,
+    _DELTA,
+    _K1,
+    BM25Index,
+    _node_text,
+    node_size,
+    trim_to_budget,
+)
 from opencrab.ontology.query import HybridQuery
 from opencrab.ontology.text_cues import tokenize
 from opencrab.stores._json import dump_props
@@ -198,7 +206,11 @@ def _reference_scores(
                 continue
             idf = math.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1)
             tf = tf_map.get(term, 0)
-            score += idf * (tf * (_K1 + 1)) / (tf + _K1 * (1 - _B + _B * len(toks) / max(avgdl, 1)))
+            if tf == 0:
+                continue
+            # #550: BM25+ lower bound for a term the document holds.
+            score += idf * ((tf * (_K1 + 1)) / (tf + _K1 * (1 - _B + _B * len(toks) / max(avgdl, 1)))
+                            + _DELTA)
         if score > 0:
             out[node["node_id"]] = round(score, 4)
     return out
