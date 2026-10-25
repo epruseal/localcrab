@@ -431,6 +431,56 @@ def _fold_identical_bodies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
+def _reserve_leg_tops(
+    items: list[dict[str, Any]],
+    place_ids: list[str],
+    warn_ids: list[str],
+    window: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Keep the lexical leg top hits inside the returned window (#556).
+
+    ``items`` is the folded result list in final score order. ``place_ids``
+    are the BM25 and FTS top hits to keep inside the first ``window`` items.
+    At most ``window // 2`` groups are kept. ``warn_ids`` are the vector and
+    graph top hits. They are not moved. The second return value counts the
+    ids of both lists that are in ``items`` but outside the new window. An id
+    that is not in ``items`` (for example, removed by the policy filter) is
+    not counted. Only the order changes. The result objects are the same.
+    Contract: docs/ARCHITECTURE.md, "결합 결과의 레그 1위".
+    """
+    position: dict[str, int] = {}
+    for index, item in enumerate(items):
+        for member in [item, *(item.get(_FOLDED_MEMBERS) or [])]:
+            node_id = member.get("node_id")
+            if node_id and node_id not in position:
+                position[node_id] = index
+
+    protected: list[int] = []
+    for node_id in place_ids:
+        if len(protected) >= window // 2:
+            break
+        index = position.get(node_id)
+        if index is not None and index not in protected:
+            protected.append(index)
+
+    chosen = set(protected)
+    fill = window - len(chosen)
+    for index in range(len(items)):
+        if fill <= 0:
+            break
+        if index not in chosen:
+            chosen.add(index)
+            fill -= 1
+
+    order = sorted(chosen) + [i for i in range(len(items)) if i not in chosen]
+    outside = sum(
+        1
+        for node_id in [*place_ids, *warn_ids]
+        if node_id in position and position[node_id] not in chosen
+    )
+    return [items[i] for i in order], outside
+
+
 def _build_chroma_where(
     spaces: list[str] | None = None,
     pack_ids: list[str] | None = None,
@@ -1072,7 +1122,9 @@ class HybridQuery:
         that only care about results are unaffected. Results with the same
         pack and the same stored bodies can be folded into one. The rules
         and the exceptions are in docs/ARCHITECTURE.md, "질의 결과의 동일
-        본문 접기".
+        본문 접기". The BM25 and FTS top hits are kept in the returned
+        results, and a leg top hit outside them adds a ``fusion:`` warning
+        (docs/ARCHITECTURE.md, "결합 결과의 레그 1위").
         """
         result_lists: list[list[dict[str, Any]]] = []
         include_unpackaged = False
@@ -1182,6 +1234,7 @@ class HybridQuery:
                 result_lists.append(_tag_fold_bodies(fts_hits))
 
         # --- Stage 3: Graph expansion from vector/BM25/FTS anchor nodes ---
+        graph_results: list[QueryResult] = []
         anchor_ids = _ordered_unique(
             [hit.node_id for hit in vector_hits if hit.node_id]
             + [hit.get("node_id") for hit in bm25_hits]
@@ -1260,6 +1313,27 @@ class HybridQuery:
         # ReBAC engine are set), every folded member already passed it.
         # Contract: docs/ARCHITECTURE.md, "질의 결과의 동일 본문 접기".
         merged = _fold_identical_bodies(merged)
+
+        # --- Stage 7: Keep leg top hits in the returned window (#556) ---
+        # Contract: docs/ARCHITECTURE.md, "결합 결과의 레그 1위".
+        if limit >= 1:
+            window = limit if rerank_cap is None else min(limit, rerank_cap)
+            place_ids: list[str] = []
+            warn_ids: list[str] = []
+            for hits, target in (
+                ([h.get("node_id") for h in bm25_hits[:1]], place_ids),
+                ([h.get("node_id") for h in fts_hits[:1]], place_ids),
+                ([h.node_id for h in vector_hits[:1]], warn_ids),
+                ([h.node_id for h in graph_results[:1]], warn_ids),
+            ):
+                for node_id in hits:
+                    if node_id and node_id not in place_ids and node_id not in warn_ids:
+                        target.append(node_id)
+            merged, outside = _reserve_leg_tops(merged, place_ids, warn_ids, window)
+            if outside:
+                warnings.append(
+                    f"fusion: {outside} leg top hit(s) fall outside the returned results"
+                )
         if rerank_cap is not None:
             merged = merged[:rerank_cap]
 
