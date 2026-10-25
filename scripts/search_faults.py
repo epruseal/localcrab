@@ -1832,8 +1832,8 @@ def sc_r1(sc: Scenario) -> None:
     sc.inject(st, "first pass on the memory path", svc.memory_entries > 0, svc.memory_entries)
     sc.judge_pass(st, observed)
     st = sc.step("writes during backfill", "explicit_error")
-    # Small steps keep the backfill running long enough for writes to land between steps.
-    child = sc.spawn("backfill", "--batch", str(max(1, ctx.batch // 10)))
+    # The child rests between backfill steps so writes land while it runs (design 4.6).
+    child = sc.spawn("backfill", "--batch", str(max(1, ctx.node_count // 200)), "--step-delay", "0.02")
     sc.wait_progress(child, 1)
     writes: list[dict[str, Any]] = []
     n = 0
@@ -2129,6 +2129,15 @@ def _actor_cli(role: str, directory: Path, args: argparse.Namespace) -> int:
 
     def make(settings: Any, doc: bool = False, **_kw: Any) -> Any:
         store = _actor_store(directory)
+        if args.step_delay > 0:
+            step = store.node_bm25_backfill_step
+
+            def slow_step(*a: Any, **kw: Any) -> Any:
+                result = step(*a, **kw)
+                time.sleep(args.step_delay)
+                return result
+
+            store.node_bm25_backfill_step = slow_step
         _tag("opened", {"available": store.available, "supports": store.supports_node_bm25})
         _wait_go(args)
         return SimpleNamespace(doc=store)
@@ -2362,6 +2371,7 @@ def main(argv: list[str] | None = None) -> int:
     actor.add_argument("--debug-drain", action="store_true")
     actor.add_argument("--size", type=int, default=0)
     actor.add_argument("--pause-at", type=int, default=-1)
+    actor.add_argument("--step-delay", type=float, default=0.0)
     actor.add_argument("--yes", action="store_true", help="accepted for drop; the actor always confirms")
     sub.add_parser("selftest")
     args = parser.parse_args(argv)
