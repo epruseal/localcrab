@@ -13,7 +13,7 @@ import random
 from collections import Counter
 from typing import Any
 
-from opencrab.ontology.bm25 import _B, _K1, BM25Index, _node_text
+from opencrab.ontology.bm25 import _B, _DELTA, _K1, BM25Index, _node_text
 from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.ontology.text_cues import tokenize
 
@@ -47,7 +47,9 @@ def _oracle_search(
             tf = tf_map.get(term, 0)
             num = tf * (_K1 + 1)
             den = tf + _K1 * (1 - _B + _B * dl / max(index._avgdl, 1))
-            score += index._idf[term] * (num / den)
+            # #550: BM25+ lower bound for a term the document holds.
+            if tf > 0:
+                score += index._idf[term] * (num / den + _DELTA)
         if score > 0:
             scores.append((i, score))
     scores.sort(key=lambda x: x[1], reverse=True)

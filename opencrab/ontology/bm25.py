@@ -7,6 +7,7 @@ Provides fast, deterministic keyword matching as a complement to vector search.
 BM25 parameters:
   k1 = 1.5  (term frequency saturation)
   b  = 0.75 (length normalisation)
+  delta = 1.0 (BM25+ lower bound, #550)
 """
 
 from __future__ import annotations
@@ -26,6 +27,11 @@ logger = logging.getLogger(__name__)
 # BM25 hyper-parameters
 _K1 = 1.5
 _B = 0.75
+# #550: BM25+ (Lv and Zhai, CIKM 2011). Each query term that the document
+# contains adds at least idf * _DELTA, so length normalisation cannot push a
+# long document that holds a rare term below short documents that only repeat
+# a common term. 1.0 is the fixed value of the paper.
+_DELTA = 1.0
 
 # Properties to include when building the text representation of a node
 _TEXT_FIELDS = (
@@ -83,16 +89,22 @@ def bm25_score(
     ``q_tokens`` keeps the query order and duplicates. ``tf_map`` maps a term to
     its count in the document. The memory index and the SQLite node index call
     this one function, so both add the same floats in the same order.
+
+    #550: a term with ``tf > 0`` also adds ``idf * _DELTA`` (BM25+). A term
+    with ``tf == 0`` adds nothing, so the set of documents that score above 0
+    does not change.
     """
     score = 0.0
     for term in q_tokens:
         if term not in idf:
             continue
         tf = tf_map.get(term, 0)
+        if tf <= 0:
+            continue
         term_idf = idf[term]
         numerator = tf * (_K1 + 1)
         denominator = tf + _K1 * (1 - _B + _B * dl / max(avgdl, 1))
-        score += term_idf * (numerator / denominator)
+        score += term_idf * (numerator / denominator + _DELTA)
     return score
 
 
