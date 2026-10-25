@@ -495,7 +495,8 @@ def locked_write(run_dir: Path, docs: Any, vec: Any, hq: Any, rows: dict[str, An
     """Write one document and invalidate BM25 inside one write.lock block.
 
     The production ingest tools run the store writes and the invalidation
-    inside the same write.lock (design 8.3). Returns the lock wait in seconds.
+    inside the same write.lock (design 8.3). The function returns the lock
+    wait in seconds.
     """
     from opencrab.locking import write_lock
 
