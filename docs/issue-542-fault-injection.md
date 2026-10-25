@@ -1,0 +1,267 @@
+# #542 노드 BM25 DB 색인 장애 주입 시험
+
+이 문서는 `docs/issue-542-search-baseline.md` 10절이 #541 구현 뒤로 미룬 장애 주입 시험을 정한다. 대상은 #541이 만든 노드 BM25 DB 색인 경로(`docs/issue-541-db-bm25.md`)다. 앞부분은 설계이고 마지막 절은 실행 가이드다. 살아 있는 문서이므로 관측 수치를 적지 않는다. 관측 수치는 날짜를 박은 기록(`docs/records/`)과 PR 본문에 둔다.
+
+## 1. 범위
+
+이 단계가 하는 일은 다음과 같다.
+
+- 여섯 장애(타임아웃, 취소, 디스크 부족, 색인 오류, 중단 후 재개, 재시작 수렴)를 S1 합성 코퍼스의 격리 사본에 주입하는 하네스 `scripts/search_faults.py`를 둔다.
+- 장애마다 결과가 설계 10절의 판정 "명시 오류 또는 검증된 fallback, 부분 결과를 완전 결과로 보고하지 않음"을 지키는지 판정한다.
+- 장애 뒤 문서화된 명령(`opencrab packs bm25-index backfill`, `verify`, `drop --yes`)과 프로세스 재시작만으로 색인과 원본의 정합이 복구되는지 확인한다. 이것이 #542 받아들임 기준 "장애 후 색인과 원본의 정합성이 복구되며 서비스 재시작이 재현 불가 수작업에 의존하지 않는다"의 확인 수단이다.
+- S1에서 측정해 날짜를 박은 기록으로 남긴다.
+
+이 단계는 제품 코드를 바꾸지 않는다. 장애 주입에서 제품 결함이 나오면 재현 조건과 근거를 기록하고 리드에게 보고한다. S2 이상 측정, #550과 #552의 수정, 라이브 서비스와 라이브 데이터와 라이브 backfill은 범위 밖이다. S1에 `partial_silent`(#550의 `top-k-pressure-1`)가 남아 있으므로 `docs/issue-542-search-baseline.md` 10절에 따라 다음 단계로 넘어가지 않는다.
+
+## 2. 대상 경로 (소스 근거)
+
+장애가 닿는 지점과 그 지점의 현재 처리는 다음과 같다. 함수 이름은 `opencrab/stores/local_sql_doc_store.py`, `opencrab/stores/_node_bm25_sqlite.py`, `opencrab/ontology/query.py`, `opencrab/cli.py`의 것이다.
+
+| 지점 | 현재 처리 |
+|---|---|
+| 저장소 노드 쓰기 `_exec_node_write` | `_tx()` 한 트랜잭션에서 `doc_nodes` 쓰기와 `reindex_key`를 한다. `reindex_key` 예외는 SAVEPOINT만 되돌리고 경고 로그를 남긴다. 트리거가 넣은 pending 행은 남는다. 트랜잭션 자체의 실패(잠금, 쓰기 오류)는 호출자에게 예외로 나간다. |
+| 검색 진입 `HybridQuery._node_index_store` | `node_bm25_ready()`가 참이 아니거나 예외를 내면 메모리 창 경로로 간다. |
+| 검색 중 소진 `_node_bm25_try_drain` | 내부 잠금을 `acquire(blocking=False)`로 시도하고 `busy_timeout`을 50ms로 낮춘다. 시간 예산은 0.25초다. 모든 `Exception`을 debug 로그로 삼킨다. |
+| 검색 스냅숏 `_nbm.search` | 스냅숏의 pending 수가 0보다 크면 pending 경고를 낸다. 상태가 `ready`가 아니면 `NotReadyError`로 메모리 경로에 돌아간다. 그 밖의 예외는 `_node_index_search`가 받아 빈 결과와 `BM25 coverage unavailable` 경고로 바꾼다. |
+| 메모리 경로 `_bm25_search_state` | cold 구축이나 검색이 예외를 내면 빈 결과와 빈 경고를 낸다. #541 이전부터 있던 처리다. |
+| backfill CLI | 단계마다 `BEGIN IMMEDIATE` 하나다. `Exception`이면 JSON 오류를 출력하고 종료 코드 1로 끝난다. `KeyboardInterrupt`는 잡지 않는다. `--max-seconds`가 끝나면 상태를 출력하고 종료 코드 0으로 끝난다. |
+| verify CLI | 한 읽기 스냅숏에서 대조한다. 불일치면 종료 코드 1이다. 대조 중 SQLite 오류는 잡지 않는다. |
+| 열기 `_init_node_bm25` | 형식이나 `max_text_chars`가 다르거나, `ready`이고 pending이 비었는데 행 수가 stats와 다르면 색인을 초기화하고 `backfill`로 둔다. 실패하면 `unsupported`다. |
+
+MCP `ontology_query`에는 질의 시간 제한과 취소 장치가 없다(`opencrab/mcp/tools/`에 해당 코드가 없다). 그래서 이 문서의 타임아웃은 SQLite 잠금 대기와 소진 시간 예산이고, 취소는 SQLite 문장 중단(진행 처리기)과 backfill 프로세스에 보내는 신호다.
+
+## 3. 판정
+
+### 3.1 기준 상태
+
+하네스는 시작할 때 적재 디렉터리를 복사한 기준 사본에서 두 가지를 잰다.
+
+- 기준 분류: 질의 세트 전부를 한 번씩 돌려 `search_baseline.judge_bundle`로 질의별 레그별 분류와 자동 선택 판정을 얻는다.
+- 오라클 일치: 질의마다 BM25 레그의 요청(질의문, `spaces`, `_profile_for_query`의 `bm25_limit`, 기준 선택의 `effective_pack_ids`)으로 DB 색인 결과와 `BM25Index.build(전량)` 결과를 비교한다. 비교는 항목의 `node_id`, `space`, `node_type`, `score`, `pack_id`, `text`, `properties`와 순서다.
+
+기준 사본이 `ready`가 아니거나, pending이 남았거나, `verify`가 불일치거나, 오라클과 다른 질의가 하나라도 있으면 실행은 `INCOMPLETE`다. 기준 분류에 있는 `partial_silent`는 #550이며 장애의 결과로 세지 않는다.
+
+### 3.2 질의 표면 판정
+
+장애 중이나 장애 뒤의 질의 세트 실행(이하 "질의 통과")은 기준 분류와 질의별로 비교한다. 아래 가운데 하나라도 있으면 위반이다.
+
+- 분류가 `leak`, `dup`, `scope_error`, `warning_dropped` 가운데 하나다.
+- 기준에 없던 `partial_silent`가 생긴다.
+- 분류가 기준과 다르고, 아래 "표시된 저하"도 아니다.
+- 기준에 없던 `wrong_pack`이 생겼는데 선택 경고에 `auto_pack_probe_coverage`가 없다.
+
+표시된 저하는 두 형태다. 하나는 `partial_flagged`다. 다른 하나는 결합 분류 `miss`이면서 결합 경고에 `BM25 coverage` 경고가 있는 경우다. 둘 다 누락을 경고와 함께 알린 결과다.
+
+### 3.3 단계 판정
+
+backfill, verify, drop 같은 운영 명령과 저장소 쓰기 호출은 다음으로 판정한다.
+
+- 명시 실패: 종료 코드가 0이 아니거나 신호로 끝났다. 또는 쓰기 호출이 예외를 냈다. 이때 원본 행은 실패한 호출 앞의 상태이거나, 커밋된 행의 키가 pending에 남아 있다.
+- 정직한 성공: 종료 코드가 0이고, 출력한 상태가 DB의 실제 상태와 같다. `--max-seconds`로 멈춘 backfill은 `backfill`을 출력해야 한다.
+- 위반: 종료 코드 0으로 `ready`를 출력했는데 `verify`가 불일치다. 또는 쓰기 호출이 성공을 돌려줬는데 그 행이 원본에 없다. 또는 성공을 돌려준 쓰기의 키가 pending에도 색인에도 현재 행으로 없다.
+
+### 3.4 색인 불변식
+
+장애 직후 색인 객체는 다음을 지켜야 한다. 확인은 읽기 전용 연결(`file:<경로>?mode=ro`)로 하며 저장소 생성자를 쓰지 않는다. 생성자는 열기 점검으로 색인을 바꿀 수 있기 때문이다.
+
+- `ready` 상태: `_nbm.verify`가 pending 키를 뺀 비교에서 불일치 0이다.
+- `backfill` 상태이고 그동안 다른 쓰기가 없었다: 색인 문서 키 집합이 커서 이하의 `doc_nodes` 키 집합과 정확히 같다. 색인된 문서마다 `pack_id`, `dl`, `updated_at`, 용어 지문이 원본과 같다. stats가 색인 문서의 합과 같다. 이것이 "부분 단계가 남지 않는다"(설계 #541 5.3절)의 확인이다.
+- `backfill` 상태이고 그동안 다른 쓰기가 있었다: 위 조건에서 키 집합 조건만 "커서 이하 키 집합이 색인 키 집합에 포함되고, 차집합은 그동안 쓴 키다"로 바꾼다.
+
+### 3.5 복구 판정
+
+장애마다 복구 절차는 문서화된 명령과 재시작으로만 이루어진다. 복구 뒤 다음을 모두 만족해야 복구됐다고 본다.
+
+- 상태가 `ready`이고 pending이 0이다.
+- `verify` CLI가 종료 코드 0이다.
+- 질의마다 DB 색인 결과가 그 시점 원본 전량의 오라클과 같다.
+- 질의 통과의 분류가 기준 분류와 같다.
+
+보고서는 장애마다 실제로 실행한 복구 명령 목록을 남긴다.
+
+### 3.6 장애별 판정 값
+
+| 값 | 뜻 |
+|---|---|
+| `explicit_error` | 장애가 명시 실패(3.3절)나 BM25 coverage 경고로 드러났고, 3.2절과 3.4절 위반이 없고, 복구됐다. |
+| `verified_fallback` | 장애가 메모리 경로 사용으로 이어졌고, 그 질의 통과에 3.2절 위반이 없고, 3.4절 위반이 없고, 복구됐다. |
+| `silent_partial` | 3.2절이나 3.3절의 위반이 있다. 판정 기준을 어긴 결과다. |
+| `inconsistent` | 3.4절 위반이 있거나 3.5절의 복구가 성립하지 않는다. |
+| `not_injected` | 하네스가 장애 발생을 확인하지 못했다(4절의 장애별 주입 확인). |
+
+`silent_partial`과 `inconsistent`는 제품 결함 후보이며 실행 실패가 아니다. `not_injected`가 하나라도 있으면 실행 판정이 `INCOMPLETE`다. 한 장애에 여러 단계가 있으면 가장 나쁜 값을 장애의 값으로 둔다. 순서는 `inconsistent`, `silent_partial`, `explicit_error`, `verified_fallback`이다.
+
+## 4. 장애 시나리오
+
+모든 시나리오는 적재 디렉터리를 새 시나리오 디렉터리로 복사한 사본에서 돈다(4.0). 질의 통과, 오라클, 불변식, 복구는 3절의 정의다. "backfill 사본"은 사본의 색인 객체를 저장소 `node_bm25_drop`으로 지운 뒤 저장소를 다시 열어 `backfill` 상태로 만든 것이다. 색인 표가 없는 옛 DB에 새 코드를 배포한 상태와 같다(#541 12절 3번).
+
+### 4.0 공통 준비
+
+- 사본: `search_baseline._copy_db_files`로 `doc.db`, `vectors.db`, `sql.db`와 WAL, SHM을 복사하고 `search_baseline.observed_state`로 적재 완료 표시의 기대 상태와 대사한다. 다르면 그 시나리오는 `not_injected`다.
+- pending 만들기: 다른 연결의 직접 SQL `UPDATE doc_nodes SET properties=properties WHERE node_id IN (...)`. 행 내용은 그대로이고 트리거가 키를 pending에 넣는다. 대상은 질의 세트 정답 문서 전부다.
+- 자식 프로세스: 장애 일부는 하네스가 띄운 자식 프로세스(`search_faults.py actor ...`)에서 일어난다. 자식은 같은 systemd 단위 안에 있으므로 같은 자원 상한을 받는다. 자식은 시작할 때 `signal.alarm`으로 자기 시간 상한을 건다. 하네스는 자식의 `Popen` 객체로만 신호를 보낸다.
+- backfill과 verify와 drop은 실제 CLI 함수(`opencrab.cli`의 `packs_bm25_index_*` click 명령)를 자식에서 부른다. 저장소 생성만 시나리오 경로로 바꾼다(`cli._make_stores`를 시나리오의 `LocalSQLDocStore`를 돌려주는 함수로 대체한다). 자식 환경의 `LOCAL_DATA_DIR`은 시나리오 디렉터리이고 `LOCALCRAB_ENV_FILE`은 실행 루트의 빈 파일이다.
+
+### 4.1 타임아웃 (T1, T2, T3)
+
+- T1 잠금 중 검색: `ready` 사본에 pending을 만든다. 다른 연결이 `BEGIN IMMEDIATE`로 SQLite 쓰기 잠금을 쥔 동안 질의 통과를 한다. 이어서 다른 스레드가 저장소 내부 잠금(`docs._lock`)을 쥔 동안 한 번 더 한다. 잠금을 풀고 한 번 더 한다.
+  - 기대: 잠금 중 두 통과는 pending 정답이 빠지고 pending 경고가 있다(표시된 저하). 각 BM25 레그 호출이 잠금 해제를 기다리지 않는다. 잠금을 푼 뒤의 통과는 기준 분류와 같다.
+  - 주입 확인: 잠금 중 통과가 끝난 뒤에도 pending 수가 줄지 않았다.
+  - 지연: 잠금 중 BM25 레그 지연의 최댓값과 p95를 기록하고 `docs/issue-542-search-baseline.md` 4.3절의 레그 하나 요구치와 대조한다.
+- T2 잠금 중 쓰기: 다른 연결이 쓰기 잠금을 쥔 동안 자식 `writer`가 새 노드 하나를 저장소 메서드로 쓴다.
+  - 기대: 쓰기 호출이 `busy_timeout` 뒤 예외로 끝난다(명시 실패). 그 키는 원본, pending, 색인 어디에도 없다.
+  - 주입 확인: 자식이 예외를 보고했다.
+- T3 잠금 중 backfill: backfill 사본에서 다른 연결이 쓰기 잠금을 쥔 동안 자식 backfill CLI를 돌린다. 그동안 하네스의 저장소로 질의 통과를 한다. 잠금을 풀고 backfill CLI를 다시 돌린다.
+  - 기대: 첫 backfill은 종료 코드 1과 JSON 오류로 끝나고 커서와 상태가 그대로다. 잠금 중 질의 통과는 메모리 경로이며 3.2절 위반이 없다(`verified_fallback`). 다시 돈 backfill이 복구한다.
+  - 주입 확인: 첫 backfill의 종료 코드가 0이 아니다.
+
+### 4.2 취소 (C1, C2, C3)
+
+SQLite 문장 취소는 연결의 진행 처리기(`set_progress_handler`)로 주입한다. 처리기는 정해진 횟수째 호출에서 한 번만 1을 돌려 그 시점의 문장을 `interrupted`로 끝낸다. `Connection.interrupt()`와 같은 오류 경로이며 시점을 결정적으로 고를 수 있다.
+
+- C1 DB 경로 검색 취소: `ready` 사본에서 pending을 만든 뒤, 취소 없이 한 번의 BM25 레그 호출이 부르는 처리기 횟수 `n`을 센다. 취소 시점 `k`를 처음 20개와, 나머지 구간에서 고르게 40개 고른다. 시점마다 pending을 다시 만들고 같은 호출을 한 번 한다. 질의는 정답이 노드 형태인 명시 단일 팩 질의 하나다.
+  - 시점마다 허용 결과는 셋이다. 첫째, 경고 없는 결과가 그 시점 원본 오라클과 같다. 둘째, `BM25 coverage` 경고가 있다. 셋째, 진입 점검이 취소되어 메모리 경로로 갔고 그 결과가 같은 오라클과 같다.
+  - 시점마다 호출 뒤 연결에 열린 트랜잭션이 없고, 내부 잠금을 바로 얻을 수 있고, 색인 불변식(3.4절)이 성립한다.
+  - 처리기를 지운 뒤의 질의 통과가 기준 분류와 같다.
+  - 주입 확인: 취소를 받은 시점이 하나 이상 있다.
+- C2 메모리 경로 검색 취소: backfill 사본에서 같은 방식으로 한다. 메모리 경로의 cold 구축이 들어가므로 시점마다 새 `HybridQuery`를 만든다. 시점은 `n`에 고르게 10개다. 허용 결과는 C1과 같다. 경고 없는 빈 결과나 오라클과 다른 경고 없는 결과는 `silent_partial`이다.
+- C3 backfill 취소: backfill 사본에서 자식 backfill CLI(`--batch 200`)를 띄운다. 색인 문서 수가 원본의 25%를 넘으면 `SIGINT`를, 다시 띄워 50%를 넘으면 `SIGTERM`을 보낸다. 세 번째는 `--max-seconds`를 걸어 스스로 멈추게 한다. 매번 뒤에 색인 불변식을 확인하고 그 상태에서 질의 통과를 한다. 마지막으로 제한 없이 backfill CLI를 돌려 복구한다.
+  - 기대: 신호로 끝난 두 실행은 신호 종료이거나 종료 코드가 0이 아니다. `--max-seconds` 실행은 종료 코드 0과 `backfill` 상태를 출력한다. 세 번 모두 부분 단계가 없고 질의 통과는 메모리 경로에서 3.2절 위반이 없다.
+  - 주입 확인: 신호를 보낸 시점에 상태가 `backfill`이었고 실행 뒤에도 `backfill`이다.
+
+### 4.3 디스크 부족 (D1, D2, D3)
+
+root 권한 없이 쓰기 실패를 만드는 수단을 찾아봤다. loop 장치 마운트는 root가 필요하다. 사용자 FUSE 파일 시스템은 `/dev/fuse`와 `fusermount`는 있으나 크기 제한 파일 시스템 도구(bindfs 등)가 설치되어 있지 않다. 쓸 수 있는 수단은 셋이다.
+
+- 크기 제한 tmpfs: 비특권 사용자 네임스페이스와 마운트 네임스페이스(`unshare -Urm`) 안에서는 root 없이 tmpfs를 `size=` 옵션으로 마운트할 수 있다. 한도를 넘는 쓰기는 실제 `ENOSPC`로 실패하고 SQLite는 `SQLITE_FULL`(`database or disk is full`)을 낸다. 마운트는 그 네임스페이스의 프로세스가 끝나면 사라진다. 그래서 자식은 tmpfs에 DB 파일을 복사하고, 명령을 돌리고, 끝난 뒤 DB 파일(WAL과 SHM 포함)을 시나리오 디렉터리로 되돌려 복사한다. 이 장치는 이 수단이 된다. 비특권 사용자 네임스페이스를 막은 환경(일부 CI 러너)에서는 쓸 수 없다.
+- 자식 프로세스의 `RLIMIT_FSIZE`: Python은 `SIGXFSZ`를 무시하므로 한도를 넘는 `write`는 `EFBIG`로 실패하고 SQLite는 `disk I/O error`를 낸다. 실제 `ENOSPC`의 오류 코드와 다르다.
+- 연결의 `PRAGMA max_page_count`: 한도를 넘는 페이지 할당에서 SQLite가 `SQLITE_FULL`을 낸다. OS 쓰기 오류가 아니라 SQLite 안의 한도다.
+
+세 수단 모두 실제 파일 시스템을 채우지 않는다. 제품 코드는 세 오류를 모두 `Exception`으로 받으므로 처리 경로는 같다. 보고서는 단계마다 쓴 수단과 받은 오류 문구를 남긴다.
+
+`RLIMIT_FSIZE`는 파일 오프셋의 상한이므로 하네스는 자식을 띄우기 전에 사본의 WAL을 `wal_checkpoint(TRUNCATE)`로 비우고, 한도를 WAL이 자랄 수 있는 크기로 정한다. `doc.db` 본체는 한도보다 크지만 읽기는 실패하지 않고, 본체에 쓰는 checkpoint만 실패한다.
+
+- D1 backfill 중 디스크 부족: 두 변형을 각각 따로 backfill 사본에서 돈다. D1a는 자식 backfill CLI에 `RLIMIT_FSIZE`를 건다. D1b는 크기 제한 tmpfs 안에서 자식 backfill CLI를 돈다. 두 변형 모두 한도는 단계 몇 개가 들어갈 크기다. 실패 뒤 색인 불변식과 질의 통과를 확인하고, 한도 없이 backfill CLI를 돌려 복구한다.
+  - 기대: 종료 코드 1과 JSON 오류, 부분 단계 없음, 메모리 경로 질의 통과에 위반 없음.
+  - 주입 확인: 종료 코드가 0이 아니고 오류 문구가 쓰기 오류다. 실패 전 커서가 하나 이상 전진했다.
+  - D1b는 `unshare -Urm`이 실패하는 환경에서 `unavailable`로 기록하고 실행 판정의 `not_injected`로 세지 않는다. 이 경우 디스크 부족 장애의 판정은 D1a, D2, D3로만 한다. 보고서는 이 사실을 남긴다.
+- D2 쓰기 중 디스크 부족: 두 단계다.
+  - 자식 `writer`에 `RLIMIT_FSIZE`를 걸고 측정 전용 팩에 새 노드를 하나씩 쓴다. 자식은 쓰기마다 성공이면 `ack`, 예외면 `err`를 표준 출력에 한 줄씩 낸다. 표준 출력은 파이프이므로 한도를 받지 않는다. 실패가 네 번 나면 멈춘다.
+  - 하네스의 저장소 연결에 `max_page_count`를 현재 페이지 수로 걸고 새 노드를 쓴다. 한도를 되돌리고 다음 검색을 한다.
+  - 기대: `ack`한 키는 모두 원본에 있고 다음 검색에서 표지 토큰으로 찾힌다. `err`한 키는 원본에 없거나, 원본에 있으면 pending에 있고 검색이 pending 경고를 낸다. 한도를 푼 뒤 소진으로 복구된다.
+  - 주입 확인: `err`가 하나 이상 있다.
+- D3 소진 중 디스크 부족: `ready` 사본에서 pending을 만들고 WAL을 비운 뒤, `RLIMIT_FSIZE`를 건 자식 `search`가 질의 세트의 BM25 레그를 돈다. 자식은 질의마다 결과 ID와 경고를 표준 출력에 낸다.
+  - 기대: pending 정답이 걸린 질의는 pending 경고가 있다. 자식이 끝난 뒤 pending이 남아 있고 색인 불변식이 성립한다. 하네스의 다음 질의 통과가 소진하고 기준 분류와 같다.
+  - 주입 확인: 자식 종료 뒤 pending 수가 0보다 크다.
+
+### 4.4 색인 오류 (E1, E2, E3)
+
+- E1 키 하나의 색인 실패: backfill 사본에서 자식 backfill CLI가 `--fail-key`로 지정한 키(원본 키 순서의 가운데)의 `reindex_key`에서 예외를 낸다. 주입은 자식이 `_node_bm25_sqlite.reindex_key`를 감싸는 방식이다. 이어서 주입 없이 다시 돌려 복구한다.
+  - 기대: 종료 코드 1, 오류 문구에 그 키가 있음, 커서가 그 키 앞, 그 키가 색인에 없음, 부분 단계 없음. 키를 건너뛰고 `ready`가 되면 `silent_partial`이다.
+  - 주입 확인: 자식이 주입 지점을 지났다고 표준 오류에 표시했다.
+- E2 FTS5 저장 구조 손상: `ready` 사본에서 FTS5 그림자 표 `doc_nodes_bm25_fts_data`를 손상시킨 두 변형을 각각 따로 사본에 만든다. E2a는 구조 레코드(`id=10`)의 바이트를 뒤집는다. E2b는 시드로 고른 잎 블록들의 바이트 일부를 뒤집는다. 각 변형에서 질의 통과, verify CLI, 다시 열기를 확인하고, `drop --yes` CLI, 다시 열기, backfill CLI, verify CLI 순서로 복구한다.
+  - 기대: 손상을 읽은 검색은 `BM25 coverage unavailable` 경고로 끝난다. verify CLI는 종료 코드가 0이 아니다. 손상이 SQLite 오류 없이 다른 결과로 읽히면 3.2절 판정이 그 결과를 가른다.
+  - 주입 확인: 손상 뒤 FTS5 `integrity-check` 명령이 실패한다.
+- E3 색인 표의 논리 변조: `ready` 사본에서 SQLite가 잡지 못하는 두 변조를 한다. 하나는 한 정답 문서의 색인 항목(docs 행과 FTS 행)을 지우고 stats는 그대로 두는 것이다. 다른 하나는 한 금지 문서의 docs 행 `pack_id`를 그 질의의 요청 팩으로 바꾸는 것이다. 질의 통과, verify CLI, 다시 열기를 확인하고 E2와 같이 복구한다.
+  - 기대: 둘째 변조는 검색 6단계의 현재 행 재검사가 막아 누출이 없다. 첫째 변조는 색인 표를 직접 바꾼 경우로, #541 4.4절의 감지 범위(트리거가 보는 `doc_nodes` 쓰기) 밖이다. 검색이 경고 없이 정답을 놓치면 `silent_partial`로 기록하고, verify CLI가 찾는지 함께 기록한다.
+  - 주입 확인: 변조한 행 수가 각 하나다.
+
+### 4.5 중단 후 재개 (K1, K2, K3)
+
+- K1 backfill 강제 종료: backfill 사본에서 자식 backfill CLI(`--batch 200`)를 띄우고 색인 문서 수가 원본의 25%, 50%, 75%를 넘을 때마다 `SIGKILL`을 보내고 다시 띄운다. 매번 뒤에 색인 불변식(다른 쓰기 없음)과 커서의 단조 증가를 확인한다. 마지막에 끝까지 돌려 복구한다.
+  - 주입 확인: 매번 종료 뒤 상태가 `backfill`이다.
+- K2 쓰기 프로세스 강제 종료: `ready` 사본에서 자식 `writer`가 새 노드 쓰기, 기존 노드 본문 수정, 노드 삭제를 섞어 반복하고 쓰기마다 `ack`를 낸다. 일정 수의 `ack` 뒤 `SIGKILL`을 보낸다. 다시 연 저장소에서 `ack`한 변경이 모두 원본에 있고 색인 불변식이 성립하는지 확인한다.
+  - 주입 확인: 종료 시점에 자식이 쓰기 중이었다(마지막 `ack` 뒤 다음 쓰기를 시작했다는 `begin` 줄이 있다).
+- K3 소진 중 강제 종료: `ready` 사본에서 대형 팩 하나의 모든 행을 직접 SQL로 pending에 넣는다. 자식 `search`가 검색을 반복해 소진하는 동안 pending이 줄기 시작하면 `SIGKILL`을 보낸다. 다시 연 저장소에서 색인 불변식을 확인하고 질의 통과가 소진을 마쳐 복구되는지 본다.
+  - 주입 확인: 종료 뒤 pending 수가 처음보다 작고 0보다 크다.
+
+### 4.6 재시작 수렴 (R1, R2, R3)
+
+- R1 backfill 중 서비스 지속: backfill 사본에서 하네스가 서비스 역할의 `HybridQuery`를 만들어 메모리 경로로 질의 통과를 한다. 자식 backfill CLI가 도는 동안 하네스는 측정 전용 팩에 저장소 메서드로 새 노드를 쓰고 기존 측정 팩 노드 몇 개를 직접 SQL로 고친다. 새 노드 ID는 정답표에 측정 팩 문서로 등록한다. backfill이 끝나면 같은 `HybridQuery`가 재시작 없이 DB 경로로 바뀌는지, 질의 통과와 오라클이 맞는지 본다. 자식 `search`를 새 프로세스로 띄워 같은 결과를 내는지도 본다.
+- R2 설정이 바뀐 재시작: 자식이 `OPENCRAB_BM25_MAX_NODE_CHARS`를 다른 값으로 두고 저장소를 연다(설정이 바뀐 재시작). 상태가 `backfill`로 초기화되는지, 그동안 하네스의 질의 통과가 메모리 경로에서 위반이 없는지 본다. 다시 원래 설정으로 연 뒤 backfill CLI로 복구한다.
+- R3 표 재생성 뒤 재시작: 직접 SQL로 `doc_nodes`를 같은 스키마의 새 표로 바꾸면서 어느 질의도 참조하지 않는 문서 하나를 뺀다. 표를 지우면 트리거도 함께 지워진다. 저장소를 다시 열면 트리거가 다시 생기고 행 수 점검이 `backfill`로 되돌리는지 본다. 그동안 질의 통과는 메모리 경로다. backfill CLI로 복구한다. 행 수가 같은 재생성은 #541 4.4절의 문서화된 경계이며 이 시나리오에 넣지 않는다.
+
+세 시나리오의 주입 확인은 각각 다음과 같다. R1은 backfill 시작 때 상태가 `backfill`이고 하네스의 첫 통과가 메모리 경로였다. R2는 자식이 연 뒤 상태가 `backfill`이다. R3은 다시 연 뒤 상태가 `backfill`이다.
+
+## 5. 하네스
+
+### 5.1 구성
+
+`scripts/search_faults.py`는 하위 명령 셋을 둔다.
+
+- `run --corpus <코퍼스> --work <적재 디렉터리> --run-root <실행 루트> --out <보고서> [--scenarios <쉼표 목록>]`: 4절의 시나리오를 차례로 돈다. 한 번에 시나리오 하나만 돈다.
+- `actor <역할> --dir <시나리오 디렉터리> [옵션]`: 자식 역할 `backfill`, `verify`, `drop`, `open`, `writer`, `search`. `--fsize-limit`, `--fail-key`, `--batch`, `--max-seconds`, `--count`를 받는다.
+- `selftest`: 판정 함수(3.2절, 3.3절, 3.6절)에 위반과 허용을 하나씩 심은 입력을 주고 기대한 값이 나오는지 확인한다. 파일을 쓰지 않는다.
+
+입력 코퍼스와 적재 디렉터리는 `scripts/search_corpus.py generate`와 `scripts/search_baseline.py load`의 산출물을 그대로 쓴다. 재사용하는 함수는 `search_baseline`의 `check_write_paths`, `corpus_is_smoke`, `Watchdog`, `_open_stores`, `_close`, `_copy_db_files`, `expected_state`, `observed_state`, `_read_corpus`, `_iter_docs`, `judge_bundle`, `doc_rows`, `_principal`, `HashEmbedding`, `NoGraph`, `_atomic_json`이다. 질의 통과의 요청과 레그 호출은 `search_baseline.cmd_run`의 `request`와 `leg_calls`와 같은 호출 계약(`resolve_packs` 결과의 `effective_pack_ids`, `_profile_for_query`의 요청 크기)으로 새로 쓴다. `cmd_run`의 두 함수는 지연 측정과 감시 슬롯이 얽힌 내부 함수라서, 꺼내 바꾸면 측정 하네스의 동작을 바꾸게 되기 때문이다.
+
+판정 함수는 store와 프로세스를 모르는 순수 함수로 둔다. 질의 통과 판정은 기준 분류, 장애 분류, 선택 경고만 받는다. 단계 판정은 종료 코드, 출력, 관측 상태만 받는다.
+
+### 5.2 자원 위치
+
+| 자원 | 위치 | 소유 |
+|---|---|---|
+| 기준 사본과 시나리오 사본 | `<실행 루트>/<시나리오 ID>/`의 `doc.db`, `vectors.db`, `sql.db`와 WAL, SHM, `write.lock` | 하네스. 시나리오가 끝나도 지우지 않는다. |
+| 자식 출력 | 표준 출력과 표준 오류 파이프. 하네스가 받아 `<실행 루트>/<시나리오 ID>/actor-<순번>.log`에 쓴다 | 하네스 |
+| 자식 프로세스 | 하네스의 `Popen` 객체. PID는 보고서에 남는다 | 하네스. 신호는 이 객체로만 보낸다 |
+| D1b의 tmpfs | `<실행 루트>/<시나리오 ID>/enospc-mnt/`에 자식의 마운트 네임스페이스 안에서만 보인다. 자식이 끝나면 사라진다. 그 안의 DB 파일은 자식이 끝나기 전에 시나리오 디렉터리로 되돌려 복사한다. 되돌림이 실패하면 자식은 0이 아닌 별도 코드로 끝나고 그 단계는 `not_injected`다 | 자식 |
+| 잠금 보유 연결 | 하네스 프로세스 안의 별도 `sqlite3` 연결 | 하네스. 시나리오 단계가 끝나면 `rollback`하고 닫는다 |
+| 진행 처리기 | 하네스 저장소의 그 스레드 연결 | 하네스. 시점마다 지운다 |
+| 보고서 | `--out` 경로. 시나리오가 끝날 때마다 원자적으로 다시 쓴다 | 하네스 |
+| 중단 기록 | 감시 조건이 걸리면 보고서에 `ABORTED` | `Watchdog` |
+
+### 5.3 중단과 재개 인식
+
+하네스 자신이 중간에 끝나면(감시 중단, 장치 재시작) 보고서에는 끝난 시나리오까지만 있다. 다시 돌릴 때는 새 실행 루트와 새 보고서 경로를 쓴다. `run`은 실행 루트나 보고서가 이미 있으면 거부한다. 남은 시나리오만 돌리려면 `--scenarios`로 고른다. 시나리오마다 적재 디렉터리에서 새로 복사하므로 앞선 실행의 사본 상태를 읽지 않는다. 적재 디렉터리는 읽기만 한다.
+
+자식이 시간 상한을 넘으면 하네스가 그 `Popen`에 `SIGKILL`을 보내고 그 시나리오를 `not_injected`로 둔다. 하네스가 감시 중단으로 먼저 끝나면 자식은 자기 `alarm`으로 끝난다. systemd 단위 안에서는 주 프로세스가 끝날 때 단위의 남은 프로세스도 정리된다.
+
+### 5.4 보고서
+
+보고서는 JSON이다. 첫 키 `verdict`는 `COMPLETE`, `INCOMPLETE`(사유 포함), `ABORTED`(조건 포함) 가운데 하나다. `COMPLETE`는 기준 상태가 3.1절을 지키고 계획한 시나리오가 모두 돌았고 `not_injected`가 없다는 뜻이다. 그 아래에 환경(Python, SQLite 버전, `/proc/self/limits`의 주소 공간 상한, cgroup `cpu.max`), 코퍼스 digest, 기준 분류 요약, 시나리오별 단계 기록과 판정 값과 복구 명령, 장애별 판정 값 요약을 둔다.
+
+## 6. 격리와 안전
+
+- 경로 검사와 RAM 파일 시스템 거부는 `search_baseline.check_write_paths`를 그대로 쓴다. 쓰기 경로는 실행 루트와 보고서이고 읽기 원본은 코퍼스와 적재 디렉터리다. `TMPDIR`이 없으면 시작하지 않는다.
+- 감시는 `search_baseline.Watchdog`을 쓴다. 조건은 `docs/issue-542-search-baseline.md` 9.2절과 같다. 시간 예산만 이 하네스의 값으로 바꾼다: S0 15분, S1 120분.
+- 자식 시간 상한은 S0 120초, S1 900초다. 하네스가 기다리는 상한도 같다.
+- 하네스는 라이브 서비스, 라이브 데이터, MCP 엔드포인트, 원격 서버, docker 자원을 쓰지 않는다. 신호는 자기 자식에게만 보낸다. 디스크 부족은 4.3절의 두 수단만 쓴다.
+- 모든 실행은 `docs/issue-542-search-baseline.md` 4.1절의 transient systemd 서비스로 묶는다(실행 가이드).
+
+## 7. 시험 전략
+
+`tests/test_search_faults.py`를 둔다. 시험은 `tmp_path`만 쓰고 pytest 기본 basetemp에서도 돈다.
+
+- 판정기 검출력: `selftest`와 같은 심은 입력으로 3.6절의 각 값이 나온다. 역변이로 확인한다: 3.2절 판정에서 `partial_silent` 검사를 끄면 이 시험이 실패해야 한다(`docs/gate-recipes.md` 6절 역변이 소절).
+- S0 종단: S0 코퍼스를 만들고 적재한 뒤 `run`을 모든 시나리오로 돈다. 보고서가 `COMPLETE`이고, 모든 시나리오가 주입을 확인했고, `inconsistent`가 없다. `silent_partial`은 제품 결함 후보의 관측이므로 이 시험이 단언하지 않는다. 고정하면 결함을 시험으로 굳히기 때문이다.
+
+### 7.1 SOLID 판정
+
+- 단일 책임: 판정 함수(순수), 시나리오 실행(사본, 주입, 관측), 자식 역할을 서로 다른 함수로 둔다. 판정 함수의 호출자는 시나리오 실행과 `selftest`와 시험이며, 모두 같은 입력 모양만 쓴다.
+- 개방 폐쇄: 시나리오는 ID와 함수의 등록표로 둔다. 시나리오마다 본문이 다르므로 분기를 데이터로 바꾸지 않는다.
+- 리스코프 치환: 해당 없음. 대체 구현을 만들지 않는다.
+- 인터페이스 분리: 판정 함수는 분류, 경고, 종료 코드, 관측 상태만 받는다.
+- 의존 역전: 시나리오 함수는 공용 문맥 객체(경로, 코퍼스, 기준)를 인자로 받는다. 구현이 하나뿐이므로 인터페이스 타입을 만들지 않는다.
+
+## 8. 받아들임 기준
+
+- 이 문서가 Codex 설계 검증에서 PASS를 받는다.
+- `selftest`와 `tests/test_search_faults.py`가 통과하고 판정기 역변이에서 시험이 실패한다.
+- transient systemd 서비스 안에서 S1(seed 542) `run`이 `COMPLETE` 보고서를 낸다. 실행 중 주 PID의 `/proc/<pid>/limits`와 cgroup `cpu.max`를 기록한다.
+- 여섯 장애마다 판정 값과 근거가 `docs/records/`의 날짜 기록에 있다. `silent_partial`이나 `inconsistent`가 나온 장애는 재현 조건, 관측 결과, 기대 결과를 따로 적는다.
+- 제품 코드를 바꾸지 않는다.
+
+## 9. 범위 밖
+
+S2 이상 측정, 제품 결함의 수정(#550, #552 포함), 라이브 서비스와 데이터와 backfill, PostgreSQL과 MongoDB 문서 저장소, 여러 서비스 프로세스가 서로 다른 `OPENCRAB_BM25_MAX_NODE_CHARS`로 같은 파일을 쓰는 경우(#541 5.2절의 운영 경계), 행 수가 같은 표 재생성(#541 4.4절의 경계), 실제 `ENOSPC`와 실제 전원 차단은 하지 않는다.
+
+## 10. 실행 가이드
+
+명령은 저장소 루트에서 실행한다. 설치와 import 경로 확인은 `docs/gate-recipes.md` 1절과 2절을 따른다. 실행 틀은 `docs/issue-542-search-baseline.md` 14절의 transient systemd 서비스와 같다.
+
+1. 판정기 점검: `scripts/search_faults.py selftest`
+2. S0 시험: `-m pytest tests/test_search_faults.py -p no:cacheprovider --basetemp=<스크래치>/basetemp`
+3. 코퍼스와 적재: `docs/issue-542-search-baseline.md` 14절의 3번과 4번
+4. 장애 주입: `scripts/search_faults.py run --corpus <스크래치>/corpus-S1 --work <스크래치>/work-S1 --run-root <스크래치>/faults-S1 --out <스크래치>/report-faults-S1.json`
+
+판정 기준: `verdict`가 `COMPLETE`가 아니면 측정이 무효다. `COMPLETE`이면 `faults`의 장애별 값이 3.6절 판정이다. 시나리오별 근거는 `scenarios[*].steps`에 있다.
