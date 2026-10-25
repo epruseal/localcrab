@@ -164,7 +164,7 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 
 `opencrab packs bm25-index backfill`이 수행한다. 서비스가 자동으로 시작하지 않는다. 운영자가 백업과 승인 뒤 실행한다(12절).
 
-- 한 단계는 `BEGIN IMMEDIATE` 트랜잭션 하나다. 커서 `(cursor_space, cursor_node_id)` 다음 키부터 기본 키 순서로 묶음 하나를 읽는다. 키마다 `reindex_key`를 부르고 커서를 마지막 키로 옮긴다. 묶음이 비면 남은 pending을 소진하고 상태를 `ready`로 바꾼다.
+- 한 단계는 `BEGIN IMMEDIATE` 트랜잭션 하나다. 커서 `(cursor_space, cursor_node_id)` 다음 키부터 기본 키 순서로 묶음 하나를 읽는다. 키마다 `reindex_key`를 부르고 커서를 마지막 키로 옮긴다. 묶음이 비면 남은 pending을 소진하고 상태를 `ready`로 바꾼다. 단계는 시작할 때 같은 트랜잭션에서 `meta.format`이 이 코드의 형식과 같은지 확인하고, 다르면 아무것도 바꾸지 않고 `IndexFormatMismatch`로 끝난다. 처리할 키가 없는 마지막 단계도 같다.
 - 자원 위치: 진행 상태는 `doc_nodes_bm25_meta`의 커서와 상태 행 두 곳에만 있다. 색인 행은 `doc_nodes_bm25_docs`, `doc_nodes_bm25_fts`, stats에 있다. 진행 중 변경은 `doc_nodes_bm25_pending`에 있다. 프로세스 메모리에는 묶음 하나의 행만 있다.
 - 중단: 단계 도중 프로세스가 죽거나 예외가 나면 SQLite가 그 트랜잭션을 되돌린다. 커서와 색인 행은 단계 시작 전 상태로 남는다. 부분 단계가 남지 않는다.
 - 재개: 다시 실행하면 커서를 읽어 다음 키부터 간다. 커서 앞 키라도 그 뒤 바뀌었으면 쓰기 동기화나 pending이 처리한다. 커서 뒤 키를 쓰기 동기화가 미리 색인했어도 `reindex_key`가 멱등이므로 다시 처리해도 같다.
