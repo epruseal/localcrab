@@ -60,6 +60,18 @@ UPSERT_1K_WALL_MAX_S = 5.0
 UPSERT_STATEMENTS = 3
 
 
+def _in_node_index_sync(statement: str) -> bool:
+    """True for a statement of the #541 node index sync in an upsert."""
+    return (
+        "node_bm25" in statement
+        or "doc_nodes_bm25" in statement
+        or statement.startswith("-- ")  # FTS5 internal statements of the index
+        or statement.startswith(
+            "SELECT space, node_id, node_type, properties, updated_at FROM doc_nodes"
+        )
+    )
+
+
 def _props(i: int) -> dict[str, Any]:
     return {"key": i, "name": f"Node {i}"}
 
@@ -183,11 +195,26 @@ def test_upsert_is_single_statement_transaction(tmp_path):
     empty = LocalSQLDocStore(str(tmp_path / "empty.db"))
     seeded = _seed_sql(str(tmp_path / "seeded.db"), SMALL_N)
 
+    counts: list[int] = []
     for store in (empty, seeded):
         _, statements = _statements(
             store, lambda store=store: store.upsert_node_doc("sp", "T", "node_extra", _props(-1))
         )
-        assert len(statements) == UPSERT_STATEMENTS, statements
+        # #541: the node index sync runs inside the same transaction, between
+        # SAVEPOINT and RELEASE. Its statement count is fixed per key, so the
+        # upsert shape still does not depend on the table size.
+        # The trace callback repeats the outer INSERT text once per trigger
+        # program step (the #541 pending triggers), so consecutive repeats
+        # count as one statement.
+        core: list[str] = []
+        for st in statements:
+            if not _in_node_index_sync(st) and (not core or core[-1] != st):
+                core.append(st)
+        assert len(core) == UPSERT_STATEMENTS, statements
+        # FTS5's own internal statements ("-- ...") vary with its segment
+        # merges; the statements this code issues do not vary with table size.
+        counts.append(len([st for st in statements if not st.startswith("-- ")]))
+    assert counts[0] == counts[1], counts
 
 
 # ----------------------------------------------------------------------

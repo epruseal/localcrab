@@ -1668,6 +1668,89 @@ def packs_reindex_bm25() -> None:
     )
 
 
+@packs.group("bm25-index")
+def packs_bm25_index() -> None:
+    """Manage the persisted node BM25 index (#541, docs/issue-541-db-bm25.md)."""
+
+
+def _node_index_doc_store():
+    from opencrab.config import get_settings
+
+    docs = _make_stores(get_settings(), doc=True).doc
+    if not getattr(docs, "available", False):
+        console.print("[red]Doc store unavailable.[/red]")
+        raise SystemExit(1)
+    if getattr(docs, "supports_node_bm25", False) is not True:
+        console.print_json(json.dumps({"state": "unsupported"}))
+        raise SystemExit(1)
+    return docs
+
+
+@packs_bm25_index.command("status")
+def packs_bm25_index_status() -> None:
+    """Print the index state, pending count, document count and cursor."""
+    docs = _node_index_doc_store()
+    console.print_json(json.dumps(docs.node_bm25_status(), ensure_ascii=False, default=str))
+
+
+@packs_bm25_index.command("backfill")
+@click.option("--batch", type=int, default=500, show_default=True, help="Rows per step.")
+@click.option(
+    "--max-seconds", type=float, default=None,
+    help="Stop after this many seconds; run again to resume.",
+)
+def packs_bm25_index_backfill(batch: int, max_seconds: float | None) -> None:
+    """Index existing rows step by step; resumable. Ends in state ready."""
+    import time as _time
+
+    docs = _node_index_doc_store()
+    started = _time.monotonic()
+    processed = 0
+    try:
+        while True:
+            step = docs.node_bm25_backfill_step(batch)
+            processed += int(step.get("processed", 0))
+            if step.get("state") == "ready":
+                break
+            if max_seconds is not None and _time.monotonic() - started >= max_seconds:
+                break
+        status = docs.node_bm25_status()
+        if status.get("state") == "ready":
+            remaining_budget = None
+            if max_seconds is not None:
+                remaining_budget = max(0.0, max_seconds - (_time.monotonic() - started))
+            docs.node_bm25_sync_pending(max_seconds=remaining_budget)
+            status = docs.node_bm25_status()
+    except Exception as exc:  # noqa: BLE001 -- report and fail; the step rolled back
+        console.print_json(json.dumps({"error": str(exc), "processed": processed},
+                                      ensure_ascii=False, default=str))
+        raise SystemExit(1) from exc
+    status["processed"] = processed
+    console.print_json(json.dumps(status, ensure_ascii=False, default=str))
+
+
+@packs_bm25_index.command("verify")
+def packs_bm25_index_verify() -> None:
+    """Compare the index with doc_nodes in one snapshot; non-zero exit on mismatch."""
+    docs = _node_index_doc_store()
+    report = docs.node_bm25_verify()
+    console.print_json(json.dumps(report, ensure_ascii=False, default=str))
+    if not report.get("ok"):
+        raise SystemExit(1)
+
+
+@packs_bm25_index.command("drop")
+@click.option("--yes", is_flag=True, help="Confirm the removal.")
+def packs_bm25_index_drop(yes: bool) -> None:
+    """Remove the index triggers and objects. Stop the services first."""
+    if not yes:
+        console.print("[red]Refusing to drop without --yes.[/red]")
+        raise SystemExit(1)
+    docs = _node_index_doc_store()
+    docs.node_bm25_drop()
+    console.print_json(json.dumps({"dropped": True}))
+
+
 # ---------------------------------------------------------------------------
 # user group (#144)
 # ---------------------------------------------------------------------------

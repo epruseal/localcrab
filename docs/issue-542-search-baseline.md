@@ -52,6 +52,8 @@
 - 기본 설정: 세 값을 코드 기본값과 같게 둔다(행 상한 50000, 문자 예산 200000000, 노드당 토큰화 글자 65536). 하네스는 import한 모듈의 기본 상수와 넣은 값이 같은지 대조하고, 다르면 보고서에 그 차이를 적는다.
 - 축소 상한 설정: 행 상한만 전체 노드 수의 25%(올림)로 둔다. S2 이상에서 생길 창 밖 누락을 소형 규모에서 재현한다.
 
+#541 이후 SQLite 문서 저장소의 노드 BM25는 DB 전량 색인이며 이 세 값의 행 상한과 문자 예산을 쓰지 않는다. 노드당 토큰화 글자는 색인 설정으로 남는다. 하네스는 보고서 `environment.bm25_index`에 경로(`db` 또는 `memory`)를 남기고, `load`는 `updated_at` 일괄 갱신 뒤 색인 pending을 비운다.
+
 생성기와 하네스는 다음 불변식을 확인한다. 하나라도 어기면 `run`은 측정을 시작하지 않고 `INCOMPLETE`로 끝난다.
 
 - 기본 설정에서 모든 `doc_nodes` 행의 저장 properties 길이 합이 문자 예산보다 작다. 그래서 기본 설정의 창은 전량을 담는다.
@@ -111,7 +113,7 @@ cold 요구치: 프로세스 시작 뒤 첫 결합 질의는 15초 안에 답한
 ### 4.5 자원 요구치 (프로세스 하나)
 
 - peak RSS(`VmHWM`) 1.0GiB 이하. 인스턴스 둘이면 운영 총량은 2GiB다.
-- 검색 색인이 차지하는 디스크는 원문 본문 바이트의 2배 이하. 검색 색인은 FTS shadow table(`doc_sources_fts`로 시작하는 테이블)과 #541 이후의 노드 색인이다. 바이트는 SQLite `dbstat` 가상 테이블의 `pgsize` 합으로 잰다. `dbstat`을 쓸 수 없으면 이 항목은 `unmeasured`이며 충족으로 치지 않는다.
+- 검색 색인이 차지하는 디스크는 원문 본문 바이트의 2배 이하. 검색 색인은 FTS shadow table(`doc_sources_fts`로 시작하는 테이블)과 #541 이후의 노드 색인이다. 바이트는 SQLite `dbstat` 가상 테이블의 `pgsize` 합으로 잰다. `dbstat`을 쓸 수 없으면 이 항목은 `unmeasured`이며 충족으로 치지 않는다. 요구치 키 `fts_index_ratio`는 base와 head가 같은 정의로 비교되도록 source FTS 바이트를 source 본문 바이트로 나눈 값으로 둔다. #541 이후 하네스는 노드 색인(이름에 `doc_nodes_bm25`가 든 모든 `dbstat` 객체)과 노드 검색 본문(`_node_text`의 UTF-8 바이트)을 `resources`의 `node_index_bytes`, `node_text_bytes`에 남기고, (source FTS + 노드 색인) / (source 본문 + 노드 검색 본문)을 `search_index_ratio_all`에 남긴다. 이 항목의 2배 판정은 #541 대조 보고가 이 비율로 한다.
 - 측정 끝에 `PRAGMA wal_checkpoint(TRUNCATE)`가 `busy=0`으로 끝나고, 그 뒤 WAL 파일이 512MiB 이하다. `busy`가 0이 아니면 이 항목은 미충족이다.
 - 동시 질의 중 노드 쓰기 하나의 지연 p95는 500ms 이하.
 - 쓰기 잠금 대기 p95는 2초 이하. 잠금 대기는 쓰기마다 `opencrab.locking.write_lock(<실행 디렉터리>)`에 들어가기까지 걸린 시간이다. 이 단계의 쓰기 주체는 하나이므로 이 값은 경합 없는 기준선이다. 다른 쓰기 주체(백업, 두 번째 인스턴스)와의 경합은 S2 이후에 넣는다.

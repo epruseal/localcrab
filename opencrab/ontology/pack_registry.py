@@ -515,6 +515,20 @@ def _choose_by_content(
     spaces: list[str] | None,
     min_score: float | None = None,
 ) -> tuple[list[tuple[PackInfo, float, list[str]]], list[str]]:
+    """``_choose_by_content_with_warnings`` without the probe warnings."""
+    candidates, truncated, _warnings = _choose_by_content_with_warnings(
+        question, registry, hybrid, spaces, min_score
+    )
+    return candidates, truncated
+
+
+def _choose_by_content_with_warnings(
+    question: str,
+    registry: list[PackInfo],
+    hybrid: Any,
+    spaces: list[str] | None,
+    min_score: float | None = None,
+) -> tuple[list[tuple[PackInfo, float, list[str]]], list[str], list[str]]:
     """``choose_packs``가 빈 리스트를 낸 뒤에만 호출되는 콘텐츠 폴백.
 
     팩별로 개별 조회한다(§4.2) -- 전역 한 번 조회는 작은 팩의 히트가 큰
@@ -524,6 +538,8 @@ def _choose_by_content(
     ``(candidates, truncated_packs)``: ``truncated_packs``는 히트 수가
     ``PER_PACK_PROBE_LIMIT``에 닿아 그 팩의 실제 매치가 더 있을 수 있음을
     관측용으로 알리는 목록이다(§7 항목9, 선택 결과 자체에는 영향 없음).
+    셋째 값은 BM25 탐침이 낸 coverage 경고다(#541). 호출자는 이 값으로
+    선택이 불완전한 색인에서 나왔음을 응답에 남긴다.
 
     선택 기준은 (겹친 고유 토큰 수, 누적 BM25/FTS 점수, pack_id) 내림차순 --
     더 많은 서로 다른 질의어를 커버하는 팩을 우선하고, 동점이면 결정론적으로
@@ -533,7 +549,7 @@ def _choose_by_content(
     보고 점수도 그 값을 따른다).
     """
     if not registry or hybrid is None:
-        return [], []
+        return [], [], []
     threshold = _env_min_score() if min_score is None else float(min_score)
 
     pack_hits: dict[str, set[str]] = {}
@@ -556,8 +572,22 @@ def _choose_by_content(
     # 지문 확인(전 테이블 COUNT)이 돈다. 지원하는 hybrid 는 한 번 확인하고
     # 고정한 상태로 팩별 결과를 낸다. None 이면 팩별 루프로 돌아간다.
     bm25_by_pack: dict[str, list[dict[str, Any]]] | None = None
+    probe_warnings: list[str] = []
+    per_pack_bm25_w = getattr(hybrid, "_bm25_search_per_pack_with_warnings", None)
     per_pack_bm25 = getattr(hybrid, "_bm25_search_per_pack", None)
-    if per_pack_bm25 is not None:
+    if callable(per_pack_bm25_w):
+        result_w = per_pack_bm25_w(  # noqa: SLF001 (내부 프로브 전용 호출)
+            question,
+            spaces,
+            PER_PACK_PROBE_LIMIT,
+            pack_ids=[p.pack_id for p in registry],
+        )
+        if isinstance(result_w, tuple) and len(result_w) == 2:
+            if isinstance(result_w[0], dict):
+                bm25_by_pack = result_w[0]
+            if isinstance(result_w[1], list):
+                probe_warnings = [w for w in result_w[1] if isinstance(w, str)]
+    elif per_pack_bm25 is not None:
         result = per_pack_bm25(  # noqa: SLF001 (내부 프로브 전용 호출)
             question,
             spaces,
@@ -584,12 +614,12 @@ def _choose_by_content(
         _accumulate(question, pid, bm25_hits, fts_hits, pack_hits, pack_hit_scores)
 
     if not pack_hits:
-        return [], truncated_packs
+        return [], truncated_packs, probe_warnings
 
     best_pid = max(pack_hits, key=lambda k: (len(pack_hits[k]), pack_hit_scores.get(k, 0.0), k))
     pack = next(p for p in registry if p.pack_id == best_pid)
     matched_tokens = sorted(pack_hits[best_pid])
-    return [(pack, threshold, matched_tokens)], truncated_packs
+    return [(pack, threshold, matched_tokens)], truncated_packs, probe_warnings
 
 
 def build_candidate_registry(

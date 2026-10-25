@@ -33,6 +33,9 @@ INCLUDE_UNPACKAGED_NOOP = "include_unpackaged_noop"
 # and "someone else's private pack" arrive here through the SAME branch and
 # must stay indistinguishable in the response (#143 invariant 7).
 PACK_IDS_OUT_OF_SCOPE = "pack_ids_out_of_scope"
+# #541: the auto_pack content probe ran on a BM25 index that reported a
+# coverage gap (pending changes, unavailable index, or a partial memory window).
+AUTO_PACK_PROBE_COVERAGE = "auto_pack_probe_coverage"
 
 
 @dataclass(frozen=True)
@@ -110,7 +113,7 @@ def resolve_packs(
     reproduces the pre-#400 behaviour exactly.
     """
     from opencrab.ontology.pack_registry import (
-        _choose_by_content,
+        _choose_by_content_with_warnings,
         build_candidate_registry,
         choose_packs,
         load_pack_registry,
@@ -180,9 +183,11 @@ def resolve_packs(
                     # came back empty, so it can never displace a lexical
                     # match (#400's stated non-goal: no score comparison
                     # across the two mechanisms).
-                    candidates, truncated_packs = _choose_by_content(
-                        question, registry, hybrid, spaces
+                    candidates, truncated_packs, probe_warnings = (
+                        _choose_by_content_with_warnings(question, registry, hybrid, spaces)
                     )
+                    if probe_warnings:
+                        warnings.append(PackWarning(AUTO_PACK_PROBE_COVERAGE))
                     if truncated_packs:
                         logger.info(
                             "auto_pack content fallback: probe limit reached for %s",
@@ -244,6 +249,10 @@ _MCP_WARNINGS = {
         "packs you can read"
     ),
     PACK_IDS_OUT_OF_SCOPE: "one or more requested pack_ids are unavailable",
+    AUTO_PACK_PROBE_COVERAGE: (
+        "auto_pack chose from a keyword index that reported incomplete coverage; "
+        "the choice may differ once the index catches up"
+    ),
 }
 
 _CLI_WARNINGS = {
@@ -257,6 +266,10 @@ _CLI_WARNINGS = {
         "to the packs you can read."
     ),
     PACK_IDS_OUT_OF_SCOPE: "warning: one or more --pack-id values are unavailable.",
+    AUTO_PACK_PROBE_COVERAGE: (
+        "warning: --auto-pack chose from a keyword index that reported incomplete "
+        "coverage; the choice may differ once the index catches up."
+    ),
 }
 
 

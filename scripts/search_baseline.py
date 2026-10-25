@@ -675,6 +675,12 @@ def cmd_load(corpus: Path, work: Path) -> int:
                          ids=[b[0] for b in batch])
     with docs._tx() as conn:
         conn.executemany("UPDATE doc_nodes SET updated_at=? WHERE space=? AND node_id=?", stamps)
+    # #541: the direct UPDATE above puts every row in the node index pending
+    # table. Drain it, as an operator does after a bulk direct SQL write.
+    if getattr(docs, "supports_node_bm25", False) is True:
+        if docs.node_bm25_sync_pending() != 0:
+            print(json.dumps({"load": "MISMATCH", "problems": ["node index pending not drained"]}))
+            return 2
     load_seconds = time.monotonic() - started
     _close(docs, vec, sql)
     expected = expected_state(corpus)
@@ -963,6 +969,24 @@ def _environment(config: str, env_values: dict[str, int], module_defaults: dict[
     }
 
 
+def _node_text_bytes(conn: sqlite3.Connection) -> int:
+    """UTF-8 bytes of the BM25 search text of every doc_nodes row (#541)."""
+    from opencrab.ontology.bm25 import _node_text
+
+    total = 0
+    for space, node_id, node_type, props in conn.execute(
+            "SELECT space, node_id, node_type, properties FROM doc_nodes"):
+        try:
+            properties = json.loads(props) if props else {}
+        except ValueError:
+            properties = {}
+        if not isinstance(properties, dict):
+            properties = {}
+        node = {"space": space, "node_id": node_id, "node_type": node_type, "properties": properties}
+        total += len(_node_text(node).encode("utf-8"))
+    return total
+
+
 def _copy_db_files(src: Path, dst: Path) -> None:
     dst.mkdir(parents=True)
     for base in ("doc.db", "vectors.db", "sql.db"):
@@ -1110,6 +1134,8 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
     scope = read_scope(sql, principal_a)
     hq = HybridQuery(vec, NoGraph())
     hq._doc_store = docs
+    # #541: record which BM25 path serves this run.
+    report["environment"]["bm25_index"] = "db" if hq._node_index_store() is not None else "memory"
     build_times: list[float] = []
     original_ensure = hq._bm25.ensure_built
 
@@ -1414,13 +1440,22 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
             dbstat = {}
         raw_bytes = conn.execute(
             "SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) FROM doc_sources").fetchone()[0]
+        node_text_bytes = _node_text_bytes(conn)
     finally:
         conn.close()
+    # #541: the node index is reported apart from the fts_index_ratio
+    # requirement, whose definition stays the same for base and head.
+    node_index_bytes = sum(v for k, v in dbstat.items() if "doc_nodes_bm25" in k) if dbstat else None
+    search_index_ratio_all = None
+    if index_bytes is not None and node_index_bytes is not None and (raw_bytes + node_text_bytes):
+        search_index_ratio_all = (index_bytes + node_index_bytes) / (raw_bytes + node_text_bytes)
     hwm = _read_kib("/proc/self/status", "VmHWM")
     report["resources"] = {
         "vm_hwm_bytes": hwm, "phase_cpu_s": {k: round(v, 3) for k, v in phase_cpu.items()},
         "files_bytes": files, "checkpoints": checkpoints, "dbstat_bytes": dbstat,
         "fts_index_bytes": index_bytes, "source_text_bytes": raw_bytes,
+        "node_index_bytes": node_index_bytes, "node_text_bytes": node_text_bytes,
+        "search_index_ratio_all": search_index_ratio_all,
     }
     _close(docs, vec, sql)
 

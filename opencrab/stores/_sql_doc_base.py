@@ -282,6 +282,14 @@ class _SqlDocStoreBase(abc.ABC):
     @abc.abstractmethod
     def _exec_write_many(self, statements: list[tuple[str, dict[str, Any]]]) -> list[int]: ...
 
+    def _exec_node_write(self, sql: str, params: dict[str, Any], space: str, node_id: str) -> int:
+        """Write one ``doc_nodes`` row and return the rowcount.
+
+        #541: a store that keeps a node search index overrides this to update
+        the index in the same transaction. The default is a plain write.
+        """
+        return self._exec_write(sql, params)
+
     @abc.abstractmethod
     def _row_get(self, row: Any, name: str) -> Any: ...
 
@@ -331,7 +339,7 @@ class _SqlDocStoreBase(abc.ABC):
             update_cols=["node_type", "properties", "updated_at"],
             json_columns=["properties"],
         )
-        self._exec_write(
+        self._exec_node_write(
             sql,
             {
                 "space": space,
@@ -340,6 +348,8 @@ class _SqlDocStoreBase(abc.ABC):
                 "properties": dump_props(properties),
                 "updated_at": self._dialect.bind_value_for_timestamp(now),
             },
+            space,
+            node_id,
         )
         return f"{space}::{node_id}"
 
@@ -443,7 +453,7 @@ class _SqlDocStoreBase(abc.ABC):
             ["space", "node_id", "node_type", "properties", "updated_at"],
             json_columns=["properties"],
         ) + "\nON CONFLICT (space, node_id) DO NOTHING"
-        rowcount = self._exec_write(
+        rowcount = self._exec_node_write(
             sql,
             {
                 "space": space,
@@ -452,6 +462,8 @@ class _SqlDocStoreBase(abc.ABC):
                 "properties": dump_props(properties),
                 "updated_at": self._dialect.bind_value_for_timestamp(now),
             },
+            space,
+            node_id,
         )
         return "created" if rowcount else "exists"
 
@@ -685,7 +697,7 @@ class _SqlDocStoreBase(abc.ABC):
     def delete_node_doc(self, space: str, node_id: str) -> bool:
         self._require_available()
         sql = f"DELETE FROM {self._table('doc_nodes')} WHERE space=:space AND node_id=:node_id"
-        rowcount = self._exec_write(sql, {"space": space, "node_id": node_id})
+        rowcount = self._exec_node_write(sql, {"space": space, "node_id": node_id}, space, node_id)
         return rowcount > 0
 
     # ------------------------------------------------------------------

@@ -605,6 +605,8 @@ opencrab query "test"
 
 ## 6. BM25 커버리지 경고
 
+> **#541 이후:** SQLite 문서 저장소(local, kuzu)의 노드 BM25는 `doc_store.db` 안의 전량 색인을 쓴다. 아래 창과 경고는 PostgreSQL, MongoDB, 색인 `backfill` 상태, 킬 스위치(`OPENCRAB_BM25_DB_INDEX=0`)에서 쓰는 기존 메모리 경로의 설명이다. DB 색인 경로의 경고(`BM25 coverage pending changes`, `BM25 coverage unavailable`)와 운영 절차는 [issue-541-db-bm25.md](./issue-541-db-bm25.md)에 있다.
+
 ### 현재 설정
 
 ```python
