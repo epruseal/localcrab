@@ -34,7 +34,7 @@
 - T1: 정답 키 45개를 pending으로 둔 채 다른 연결이 SQLite 쓰기 잠금을 쥐었다. 질의 통과 동안 pending이 45개 그대로였고 질의 42개 가운데 39개의 BM25 결과에 pending 경고가 붙었다. 나머지 셋을 포함해 3.2절 위반은 0이다. BM25 호출 지연은 p50 50.9ms, p95 53.6ms, 최댓값 54.7ms였다(레그 요구치 500ms). 내부 잠금을 다른 스레드가 쥔 경우도 pending이 그대로였고 위반이 0이었다(p95 2.9ms). 두 잠금 단계 모두 잠금을 쥔 채, 풀기 전에 pending 45개를 뺀 `verify`가 일치했다. 잠금을 푼 뒤 다음 검색이 pending을 모두 소진했고 질의별 분류와 `wrong_pack`이 기준과 같았다.
 - T2: 잠금 중 새 노드 쓰기가 `OperationalError('database is locked')`로 실패했다. 그 키는 원본에도 pending에도 없었고 직후 `verify`가 일치했다.
 - T3: 저장소를 연 뒤 잠금을 쥐자 backfill 단계가 종료 코드 1과 `{"error": "database is locked", "processed": 0}`로 끝났다. 커서, 상태, 색인 문서 수가 그대로였다. 같은 시간의 질의 통과는 메모리 경로였고 위반이 0이다.
-- T4: 잠금을 `busy_timeout`보다 길게 쥔 동안 연 저장소 인스턴스는 사용 가능(`available`)이지만 색인이 `unsupported`였다. 잠금을 푼 뒤에도 그 인스턴스는 `unsupported`로 남았다. 그 인스턴스의 질의 42개는 모두 메모리 경로였고 경고 없는 결과가 오라클과 같았다. 그 인스턴스로 쓴 새 노드는 요청한 본문으로 원본에 있었고 키는 pending에 남았다. 자식이 끝난 직후 pending 1개를 뺀 `verify`가 일치했다. 새로 연 프로세스가 pending을 소진했다.
+- T4: 잠금을 `busy_timeout`보다 길게 쥔 동안 연 저장소 인스턴스는 사용 가능(`available`)이지만 색인이 `unsupported`였다. 잠금을 푼 뒤에도 그 인스턴스는 `unsupported`로 남았다. 그 인스턴스의 질의 42개는 모두 메모리 경로였고 경고 없는 결과가 오라클과 같았다. 그 인스턴스로 쓴 새 노드는 요청한 본문으로 원본에 있었고 키는 pending에 남았다. 자식이 끝난 직후 pending 1개를 뺀 `verify`가 일치했다. 하네스가 저장소를 다시 열자(재시작) DB 경로였고, 복구 판정의 검색이 그 pending을 소진했다. 복구 판정 뒤 상태 `ready`와 pending 0을 확인했다.
 
 ### 취소
 
@@ -53,7 +53,7 @@
 
 - E1: 키 순서 가운데 키(`evidence`, `l1-006926`)의 재색인 실패를 주입한 backfill은 10050개를 처리한 뒤 종료 코드 1과 그 키를 담은 오류로 끝났다. 커서는 그 키 앞에 멈췄고 상태는 `backfill`이며 부분 단계가 없었다. 그 키를 건너뛰고 `ready`가 되는 일은 없었다.
 - E2a: 아래 "제품 결함 후보" 1번.
-- E2b: 시드로 고른 잎 블록 8개의 바이트를 뒤집었다. `integrity-check`와 `instance` 어휘 표 읽기가 `database disk image is malformed`를 냈다. 질의 42개의 결과는 손상 블록에 닿지 않아 모두 오라클과 같았다(3.2절 위반 0). `verify` CLI는 같은 SQLite 오류의 traceback과 종료 코드 1로 끝났다.
+- E2b: 시드로 고른 잎 블록 8개의 바이트를 뒤집었다. `integrity-check`와 `instance` 어휘 표 읽기가 `database disk image is malformed`를 냈다. 질의 42개의 검색은 SQLite 오류나 `BM25 coverage unavailable` 경고 없이 끝났고, 결과가 모두 오라클과 같았다(3.2절 위반 0). `verify` CLI는 같은 SQLite 오류의 traceback과 종료 코드 1로 끝났다.
 - E3: E3ii(금지 문서의 색인 `pack_id`를 요청 팩으로 바꿈)는 후보 SQL에 그 문서가 들어온 것을 확인했지만 검색의 현재 행 재검사가 걸러 누출이 0이었다. E3i는 아래 "제품 결함 후보" 2번.
 
 ### 중단 후 재개
@@ -78,11 +78,11 @@
 
 ### 2. 색인 표에서 지운 항목이 경고 없이 빠진다 (E3i)
 
-- 재현 조건: `ready` 색인에서 노드 형태 정답 하나의 `doc_nodes_bm25_docs` 행과 FTS 행을 지우고 stats는 그대로 둔다(`--scenarios E3`).
-- 관측 결과: 그 정답의 질의(`exact-recent-0`)가 BM25 `pass`에서 `partial_silent`로 바뀌었고 경고가 없었다. 다시 연 저장소는 stats의 문서 수가 원본 행 수와 같으므로 초기화하지 않았다. `verify` CLI는 `missing` 1, `mismatched_meta` 1, `stats_ok` false와 종료 코드 1로 찾았다. 같은 명령으로 복구됐다.
-- 기대 결과: #541 4.4절은 감지 범위를 `doc_nodes` 쓰기(트리거)로 정하고 색인 표의 직접 변경은 `verify`로 찾는다고 둔다. 이 관측은 그 경계가 검색 표면에서는 조용한 부분 결과로 드러난다는 사실이다. 설계 10절 판정 기준으로는 위반이다.
+- 재현 조건: `ready` 색인에서 노드 형태 정답 하나(`exact-recent-0`의 정답)의 `doc_nodes_bm25_docs` 행과 FTS 행을 지우고 stats는 그대로 둔다. 하네스의 E3 시나리오(`--scenarios E3`)는 같은 사본에 E3ii 변경(`scope-filter-0`의 금지 문서 하나의 docs 행 `pack_id`를 요청 팩으로 바꿈)도 함께 넣는다.
+- 관측 결과: 그 정답의 질의(`exact-recent-0`)가 BM25 `pass`에서 `partial_silent`로 바뀌었고 경고가 없었다. 다시 연 저장소는 stats의 문서 수가 원본 행 수와 같으므로 초기화하지 않았다. 두 변경을 함께 넣은 사본에서 `verify` CLI는 `missing` 1, `mismatched_meta` 1, `stats_ok` false와 종료 코드 1을 냈다. `missing` 1과 `stats_ok` false는 E3i에서, `mismatched_meta` 1은 E3ii의 `pack_id` 변경에서 나온다. 실행 채널이 각 변경만 넣은 사본에서 따로 확인했다(E3i만: `missing` 1, `mismatched_meta` 0, `stats_ok` false). 같은 명령으로 복구됐다.
+- 기대 결과: #541 4.4절은 외부 쓰기의 감지 범위를 트리거가 보는 `doc_nodes` 쓰기로 정한다. 색인 표를 직접 바꾸는 경우는 그 범위 밖이다. #541 5.4절의 `verify`는 docs 행 집합, 행별 `pack_id`와 `dl`과 `updated_at`, 용어 다중집합, stats를 원본과 대조하므로 이 경우를 찾는다. 이 관측은 그 경계 밖의 변경이 검색 표면에서는 조용한 부분 결과로 드러난다는 사실이다. 설계 10절 판정 기준으로는 위반이다.
 
 ## 판정 밖 관측
 
-- T4: 열기 때 잠금 대기가 `busy_timeout`을 넘은 저장소 인스턴스는 수명 동안 `unsupported`이며 잠금이 풀려도 DB 경로로 돌아오지 않는다. S1 기본 설정에서는 메모리 창이 전량을 담아 결과가 오라클과 같았다. 창이 전량을 담지 못하는 규모에서는 coverage 경고가 붙는 기존 경로가 되며, 재시작해야 DB 경로로 돌아온다.
+- T4: 열기 때 잠금 대기가 `busy_timeout`을 넘은 저장소 인스턴스는 잠금이 풀린 뒤에도 `unsupported`였다(관측). 그 표지는 열기 때만 정해지므로 그 인스턴스는 수명 동안 DB 경로로 돌아오지 않는다(소스 근거). S1 기본 설정에서는 메모리 창이 전량을 담아 결과가 오라클과 같았다(관측). 창이 전량을 담지 못하는 규모에서는 coverage 경고가 붙는 기존 경로가 될 것이다. 이 문장은 #541 설계와 이 설계 3.2절에서 끌어낸 추론이며 이번 측정에서 재지 않았다. 다시 연 저장소는 DB 경로였다(관측).
 - 디스크 부족의 `RLIMIT_FSIZE` 수단은 SQLite `disk I/O error`를, tmpfs와 `max_page_count` 수단은 `database or disk is full`을 냈다. 제품 처리 경로는 같았다.
