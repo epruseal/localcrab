@@ -19,7 +19,6 @@ import bisect
 import hashlib
 import json
 import math
-import os
 import random
 import sys
 from datetime import UTC, datetime, timedelta
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 GENERATOR_VERSION = 1
+TIMING_FILE = "generate-timing.json"
 LIMIT = 10
 
 # Fixed principal ids. opencrab.auth.create_user draws random ids, and a random
@@ -564,16 +564,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "generate":
         out = Path(args.out).resolve()
-        guard = os.environ.get("SEARCH_BASELINE_SKIP_WATCHDOG") != "1"
-        if guard:
-            sys.path.insert(0, str(Path(__file__).resolve().parent))
-            from search_baseline import Watchdog, check_write_paths
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from search_baseline import Watchdog, check_write_paths
 
-            check_write_paths([out])
-            out.parent.mkdir(parents=True, exist_ok=True)
-            watchdog = Watchdog(args.preset, "generate", out.parent / f"{out.name}.aborted.json", [out.parent])
-            watchdog.start()
+        check_write_paths([out])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        watchdog = Watchdog(args.preset, "generate", out.parent / f"{out.name}.aborted.json", [out.parent])
+        watchdog.start()
         manifest = generate(args.preset, args.seed, out)
+        # Outside manifest["files"], so the corpus digest stays deterministic.
+        # load subtracts this from the shared generate+load budget (design 9.2).
+        (out / TIMING_FILE).write_text(
+            json.dumps({"generate_seconds": round(watchdog.elapsed(), 3)}) + "\n", encoding="utf-8")
         print(json.dumps({"node_count": manifest["node_count"], "query_count": manifest["query_count"],
                           "files": manifest["files"]}, sort_keys=True))
     return 0

@@ -129,23 +129,30 @@ def test_row_contract_matches_the_production_writers(tmp_path):
         assert _read_rows(contract_dir, doc["id"]) == _read_rows(real_dir, doc["id"]), doc["id"]
 
 
-def _run(args: list[str], tmp_path: Path) -> subprocess.CompletedProcess:
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", TMPDIR=str(tmp_path))
+def _run(args: list[str], tmp_path: Path, script: str = "search_baseline.py") -> subprocess.CompletedProcess:
+    # TMPDIR is a sibling of corpus, work and run, so the source-overlap check
+    # accepts the normal layout (design 9.1).
+    tmp = tmp_path / "tmp"
+    tmp.mkdir(exist_ok=True)
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", TMPDIR=str(tmp))
     return subprocess.run(
-        [sys.executable, str(REPO_ROOT / "scripts" / "search_baseline.py"), *args],
+        [sys.executable, str(REPO_ROOT / "scripts" / script), *args],
         cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=600,
     )
 
 
 def _run_args(corpus: Path, work: Path, run_dir: Path, report: Path) -> list[str]:
     return ["run", "--corpus", str(corpus), "--work", str(work), "--run-dir", str(run_dir),
-            "--out", str(report), "--repeats", "1", "--fresh-timeout", "15",
+            "--out", str(report), "--repeats", "2", "--fresh-timeout", "15",
             "--concurrent-seconds", "2"]
 
 
 def test_s0_end_to_end_and_tampered_state(tmp_path):
     corpus = tmp_path / "corpus"
-    corpus_gen.generate("S0", 542, corpus)
+    generated = _run(["generate", "--preset", "S0", "--seed", "542", "--out", str(corpus)],
+                     tmp_path, script="search_corpus.py")
+    assert generated.returncode == 0, generated.stdout + generated.stderr
+    assert (corpus / corpus_gen.TIMING_FILE).exists()
     work = tmp_path / "work"
     loaded = _run(["load", "--corpus", str(corpus), "--work", str(work)], tmp_path)
     assert loaded.returncode == 0, loaded.stdout + loaded.stderr
@@ -158,11 +165,17 @@ def test_s0_end_to_end_and_tampered_state(tmp_path):
     assert report["verdict"] == "COMPLETE"
     queries = json.loads((corpus / "queries.json").read_text(encoding="utf-8"))
     assert [q["qid"] for q in report["queries"]] == [q["qid"] for q in queries]
-    classes = report["summary"]["classes"]
-    for leg in classes.values():
-        for bad in ("leak", "dup", "scope_error", "warning_dropped", "partial_silent"):
-            assert leg.get(bad, 0) == 0, classes
+    assert all(count == 0 for count in report["summary"]["repeat_defects"].values()), report["summary"]
     assert report["environment"]["bm25_defaults_match"] is True
+
+    # A report path that already exists is refused, so a rerun cannot
+    # overwrite evidence.
+    again = _run(_run_args(corpus, work, tmp_path / "run-again", report_path), tmp_path)
+    assert again.returncode != 0 and "report already exists" in again.stderr
+
+    # The report is a valid compare input against itself.
+    compared = _run(["compare", str(report_path), str(report_path)], tmp_path)
+    assert "COMPARE: INVALID" not in compared.stdout, compared.stdout
 
     tampers = {
         "node_type": ("doc.db", "UPDATE doc_nodes SET node_type='Other' WHERE rowid=1"),
@@ -193,10 +206,66 @@ def test_s0_end_to_end_and_tampered_state(tmp_path):
         assert any("initial state mismatch" in r for r in tampered["reasons"]), name
 
 
-@pytest.mark.parametrize("bad", ["repo", "live"])
-def test_write_paths_inside_the_repo_or_live_dir_are_refused(bad, tmp_path):
+def _report(**over) -> dict:
+    base = {
+        "verdict": "COMPLETE",
+        "corpus": {"manifest_digest": "d", "preset": "S0", "seed": 1},
+        "environment": {"config": "default", "bm25_env": {"OPENCRAB_BM25_NODE_LIMIT": 1}},
+        "summary": {"repeat_defects": {"leak": 0, "dup": 0}},
+        "queries": [{"qid": "q1", "legs": {leg: {"class": "pass"}
+                                            for leg in ("bm25", "fts", "vector", "combined")}}],
+        "requirements": {"r": {"met": False}},
+    }
+    base.update(over)
+    return base
+
+
+def test_compare_refuses_reports_it_cannot_compare():
+    base = _report()
+    assert harness.compare_preconditions(base, _report()) == []
+    assert harness.compare_preconditions(base, _report(queries=[]))
+    one_leg_less = _report(queries=[{"qid": "q1", "legs": {"bm25": {"class": "pass"}}}])
+    assert harness.compare_preconditions(base, one_leg_less)
+    other_corpus = _report(corpus={"manifest_digest": "e", "preset": "S0", "seed": 1})
+    assert harness.compare_preconditions(base, other_corpus)
+    assert harness.compare_preconditions(base, _report(verdict="INCOMPLETE"))
+
+
+def test_compare_flags_a_defect_from_any_repeat():
+    base = _report()
+    head = _report(summary={"repeat_defects": {"leak": 0, "dup": 1}})
+    assert harness.compare_preconditions(base, head) == []
+    # The final-repeat classes are all pass and the requirement is unmet on
+    # both sides, yet an earlier repeat's duplicate is still a regression.
+    assert any("dup" in line for line in harness.compare_reports(base, head))
+    assert harness.compare_reports(base, _report()) == []
+
+
+@pytest.mark.parametrize("bad", ["repo", "live", "inside_source", "contains_source"])
+def test_write_paths_are_refused(bad, tmp_path, monkeypatch):
     from opencrab.config import get_settings
 
-    path = REPO_ROOT / "scratch-run" if bad == "repo" else Path(get_settings().local_data_dir) / "x"
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(tmp))
+    source = tmp_path / "corpus"
+    paths = {
+        "repo": REPO_ROOT / "scratch-run",
+        "live": Path(get_settings().local_data_dir) / "x",
+        "inside_source": source / "out.json",
+        "contains_source": tmp_path,
+    }
     with pytest.raises(SystemExit):
-        harness.check_write_paths([path])
+        harness.check_write_paths([paths[bad]], sources=[source])
+
+
+def test_tmpdir_must_be_set_and_off_the_system_tmp(tmp_path, monkeypatch):
+    target = tmp_path / "run"
+    monkeypatch.delenv("TMPDIR", raising=False)
+    with pytest.raises(SystemExit):
+        harness.check_write_paths([target])
+    monkeypatch.setenv("TMPDIR", "/tmp")
+    with pytest.raises(SystemExit):
+        harness.check_write_paths([target])
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    harness.check_write_paths([target])

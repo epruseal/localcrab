@@ -57,7 +57,7 @@
 - 기본 설정에서 모든 `doc_nodes` 행의 저장 properties 길이 합이 문자 예산보다 작다. 그래서 기본 설정의 창은 전량을 담는다.
 - "오래됨" 문서는 전역으로 가장 오래된 30%다. 생성기는 모든 팩의 오래된 문서에 다른 모든 문서보다 이른 `updated_at`을 준다. 축소 상한의 창(최근 25%)에 오래된 문서가 하나도 없다.
 - "최근" 문서는 전역으로 가장 최근 10%다. 축소 상한의 창에 최근 문서가 전부 있다.
-- 하네스는 측정 전에 `list_nodes(limit=행 상한)`의 결과로 위 두 포함 관계를 실제 store에서 다시 확인한다.
+- 하네스는 측정 전에 BM25 구축이 쓰는 창 읽기 API(`list_nodes_within_budget(limit, max_chars)`, 실패 시 `list_nodes(limit)`에 같은 문자 예산 규칙)로 위 두 포함 관계를 실제 store에서 다시 확인한다.
 
 ## 4. 요구치
 
@@ -255,6 +255,10 @@ source 형태의 `node_id`는 `source_id`와 같다. `doc_sources`의 메타데�
 - 변경 뒤 `leak`, `dup`, `scope_error`, `warning_dropped`, `partial_silent`가 하나라도 생긴다.
 - 변경 뒤 요구치를 어기는 지연, freshness, 자원 항목이 base보다 늘어난다.
 
+둘째 회귀는 마지막 반복의 분류만이 아니라 head 보고서의 `summary.repeat_defects`(warm 모든 반복의 독립 결함 표지 수와 동시 쓰기 구간의 누출과 중복 수)도 본다. 어느 표지든 0보다 크면 base의 같은 값과 무관하게 회귀다.
+
+대조 전제는 다섯이다. 두 보고서가 `COMPLETE`다. 코퍼스 manifest digest, 프리셋, 시드가 같다. 설정과 BM25 환경 값이 같다. 질의 ID 집합이 같고 질의마다 레그 이름 집합이 같다. 요구치 키 집합이 같다. 하나라도 어기면 `compare`는 회귀를 내지 않고 `INVALID`와 사유를 출력하고 종료 코드 2로 끝난다.
+
 토큰화나 순위가 달라져 분류가 바뀌면 질의마다 원인을 적는다. 근거 없이 등가라고 주장하지 않는다.
 
 ## 8. 측정 하네스
@@ -320,7 +324,8 @@ source 형태의 `node_id`는 `source_id`와 같다. `doc_sources`의 메타데�
 | `TMPDIR` | 라이브러리 임시 파일 | 라이브러리 임시 파일 |
 
 - 하네스는 위 경로를 모두 인자로 받고 store를 그 경로로 직접 만든다. SQL URL은 `sqlite:///<디렉터리>/sql.db`로 하네스가 만들며 `Settings`의 URL을 쓰지 않는다. `resolve_packs`의 `local_data_dir`는 실행 디렉터리이며 manifest가 없으므로 enrichment는 비어 있다.
-- 하네스는 모든 쓰기 경로가 저장소 트리 밖이고 `Settings().local_data_dir`와 같지도 그 안도 아님을 확인한 뒤에만 시작한다.
+- 하네스는 모든 쓰기 경로가 저장소 트리 밖이고 `Settings().local_data_dir`와 같지도 그 안도 아님을 확인한 뒤에만 시작한다. 쓰기 경로가 읽기 원본(코퍼스 디렉터리, 적재 디렉터리) 안이거나 그것을 포함해도 거부한다. `run`은 보고서 경로가 이미 있으면 거부한다.
+- 모든 하위 명령은 환경 변수 `TMPDIR`이 설정되어 있고 위 검사를 통과할 때만 시작한다. `TMPDIR`이 `/tmp`나 `/dev/shm` 아래이면 거부한다.
 - 하네스는 KURE 임베딩 함수, 원격 서버, MCP 엔드포인트, docker 자원을 쓰지 않는다.
 - 모든 실행(`generate`, `load`, `run`, `selftest`)은 4.1절의 transient systemd 서비스로 묶는다. 이 커널은 memory cgroup을 끈 상태라 `MemoryMax`가 동작하지 않는다. 메모리 보호는 `LimitAS`와 아래 감시 조건이 맡는다.
 
@@ -330,9 +335,9 @@ source 형태의 `node_id`는 `source_id`와 같다. `doc_sources`의 메타데�
 
 - 프로세스 RSS가 1.6GiB를 넘는다(`LimitAS=2G` 앞의 여유).
 - 장치의 `MemAvailable`이 1GiB 아래로 내려가거나 남은 swap이 1GiB 아래로 내려간다.
-- 질의 하나가 60초를 넘는다(`run`).
+- store를 부르는 호출 하나가 60초를 넘는다(`run`). 주 스레드의 요청, 레그 호출, freshness 확인과 쓰기 스레드의 쓰기 하나를 각자의 감시 슬롯으로 잰다.
 - 쓰기 경로 파일 시스템의 남은 공간이 10GiB 아래로 내려간다.
-- 시간 예산을 넘는다. `generate`와 `load`를 합친 예산은 S0 5분, S1 30분, S2 60분, S3 120분, S4 240분이다. `run`의 예산은 S0 5분, S1 30분, S2 60분, S3 90분, S4 180분이다.
+- 시간 예산을 넘는다. `generate`와 `load`를 합친 예산은 S0 5분, S1 30분, S2 60분, S3 120분, S4 240분이다. `run`의 예산은 S0 5분, S1 30분, S2 60분, S3 90분, S4 180분이다. 생성기는 끝날 때 코퍼스 디렉터리에 경과 시간 파일(`generate-timing.json`, manifest의 digest 대상 밖)을 쓰고, `load`는 합계 예산에서 그 시간을 뺀 나머지를 예산으로 쓴다. 그 파일이 없는 코퍼스는 `load`가 거부한다.
 
 ## 10. 단계 확대 계획
 

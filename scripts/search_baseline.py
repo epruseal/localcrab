@@ -81,20 +81,38 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def check_write_paths(paths: list[Path]) -> None:
-    """Refuse any write path inside the repository or the live data dir."""
-    live: Path | None = None
+_SYSTEM_TMP_ROOTS = (Path("/tmp"), Path("/dev/shm"))
+
+
+def check_write_paths(paths: list[Path], sources: list[Path] | None = None) -> None:
+    """Refuse write paths inside the repository, the live data dir or a read source.
+
+    ``sources`` are the read-only inputs (corpus and load directories). A write
+    path inside a source, or one that contains a source, is refused. The
+    process ``TMPDIR`` must be set, must pass the same checks and must not be
+    under a system temporary root (design 9.1).
+    """
     try:
         from opencrab.config import get_settings
 
         live = Path(get_settings().local_data_dir).expanduser()
     except Exception as exc:  # noqa: BLE001 -- refuse when the live dir is unknown
         raise SystemExit(f"cannot resolve the live data dir, refusing to start: {type(exc).__name__}")
-    for path in paths:
+    tmpdir = os.environ.get("TMPDIR")
+    if not tmpdir:
+        raise SystemExit("TMPDIR is not set; set it to a disk path outside the repository")
+    tmp_path = Path(tmpdir)
+    if any(_inside(tmp_path, root) for root in _SYSTEM_TMP_ROOTS):
+        raise SystemExit(f"TMPDIR is under a system temporary root: {tmp_path}")
+    sources = sources or []
+    for path in [*paths, tmp_path]:
         if _inside(path, REPO_ROOT):
             raise SystemExit(f"write path is inside the repository: {path}")
         if _inside(path, live) or _inside(live, path):
             raise SystemExit(f"write path overlaps the live data dir: {path}")
+        for source in sources:
+            if _inside(path, source) or _inside(source, path):
+                raise SystemExit(f"write path overlaps a read source: {path}")
 
 
 def _read_kib(path: str, key: str) -> int | None:
@@ -118,25 +136,32 @@ def _atomic_json(path: Path, data: dict[str, Any]) -> None:
 class Watchdog(threading.Thread):
     """Stop the process when a design section 9.2 condition holds."""
 
-    def __init__(self, preset: str, phase: str, abort_path: Path, disk_paths: list[Path]) -> None:
+    def __init__(self, preset: str, phase: str, abort_path: Path, disk_paths: list[Path],
+                 *, spent_seconds: float = 0.0) -> None:
         super().__init__(name="search-baseline-watchdog", daemon=True)
         budgets = BUDGET_RUN if phase == "run" else BUDGET_GENERATE_LOAD
-        self.budget = float(budgets.get(preset, budgets["S4"]))
+        # generate and load share one budget: load receives what generate left.
+        self.budget = float(budgets.get(preset, budgets["S4"])) - spent_seconds
         self.phase = phase
         self.abort_path = abort_path
         self.disk_paths = disk_paths
         self.started = time.monotonic()
         self.peak_rss = 0
-        self._op_started: float | None = None
-        self._op_name = ""
+        # One slot per thread that makes store calls (main and writer).
+        self._ops: dict[str, tuple[str, float]] = {}
+        self._ops_lock = threading.Lock()
         self.extra: dict[str, Any] = {}
 
-    def op_start(self, name: str) -> None:
-        self._op_name = name
-        self._op_started = time.monotonic()
+    def op_start(self, name: str, slot: str = "main") -> None:
+        with self._ops_lock:
+            self._ops[slot] = (name, time.monotonic())
 
-    def op_end(self) -> None:
-        self._op_started = None
+    def op_end(self, slot: str = "main") -> None:
+        with self._ops_lock:
+            self._ops.pop(slot, None)
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
 
     def _condition(self) -> str | None:
         rss = _read_kib("/proc/self/status", "VmRSS") or 0
@@ -150,14 +175,17 @@ class Watchdog(threading.Thread):
         swap_free = _read_kib("/proc/meminfo", "SwapFree")
         if swap_total and swap_free is not None and swap_free < SWAP_FREE_MIN:
             return "swap_free"
-        op = self._op_started
-        if op is not None and time.monotonic() - op > QUERY_MAX_SECONDS:
-            return f"query_timeout:{self._op_name}"
+        with self._ops_lock:
+            ops = list(self._ops.items())
+        now = time.monotonic()
+        for slot, (name, started) in ops:
+            if now - started > QUERY_MAX_SECONDS:
+                return f"operation_timeout:{slot}:{name}"
         for path in self.disk_paths:
             probe = path if path.exists() else path.parent
             if probe.exists() and shutil.disk_usage(probe).free < DISK_FREE_MIN:
                 return "disk_free"
-        if time.monotonic() - self.started > self.budget:
+        if self.elapsed() > self.budget:
             return "time_budget"
         return None
 
@@ -465,14 +493,19 @@ def write_doc(docs: Any, vec: Any, rows: dict[str, Any]) -> None:
 
 def cmd_load(corpus: Path, work: Path) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from search_corpus import manifest_digest
+    from search_corpus import TIMING_FILE, manifest_digest
 
-    check_write_paths([work])
+    check_write_paths([work], sources=[corpus])
     if work.exists():
         raise SystemExit(f"load directory already exists: {work}")
+    timing = corpus / TIMING_FILE
+    if not timing.exists():
+        raise SystemExit(f"{TIMING_FILE} missing: generate the corpus with search_corpus.py first")
+    spent = float(json.loads(timing.read_text(encoding="utf-8"))["generate_seconds"])
     manifest, packs, _queries = _read_corpus(corpus)
     work.mkdir(parents=True)
-    watchdog = Watchdog(manifest["preset"], "load", work / "aborted.json", [work])
+    watchdog = Watchdog(manifest["preset"], "load", work / "aborted.json", [work],
+                        spent_seconds=spent)
     watchdog.start()
     digest = manifest_digest(corpus)
     started = time.monotonic()
@@ -583,6 +616,12 @@ def judge_bundle(entry: dict[str, Any], truth: dict[str, tuple[str, str]], reada
             "decoy_above_gold": decoy_above(ids),
             "coverage_warnings": cov,
         }
+        silent = name == "bm25" and bool(missing) and not cov
+        # Independent defect flags. The class below picks one by priority, so
+        # a leaking id returned twice is class "leak" with flags["dup"] true.
+        result["flags"] = {"leak": bool(result["leak"]), "dup": result["dup"] > 0,
+                           "scope_error": scope_error, "warning_dropped": False,
+                           "partial_silent": silent}
         if result["leak"]:
             cls = "leak"
         elif result["dup"]:
@@ -598,14 +637,20 @@ def judge_bundle(entry: dict[str, Any], truth: dict[str, tuple[str, str]], reada
         result["class"] = cls
         out["legs"][name] = result
 
+    # Leak and duplicate checks see every returned representative and member.
+    # Gold presence counts only the top ``limit`` representatives and their
+    # members (design 7.1).
     flat: list[str] = []
     rep_ids: list[str] = []
-    for item in combined["items"]:
+    top_flat: list[str] = []
+    for rank, item in enumerate(combined["items"]):
         rep_ids.append(item["id"])
-        flat.append(item["id"])
-        flat.extend(item.get("members", []))
+        group = [item["id"], *item.get("members", [])]
+        flat.extend(group)
+        if rank < limit:
+            top_flat.extend(group)
     must = entry["must_hit"]["combined"]
-    missing = [g for g in must if g not in flat]
+    missing = [g for g in must if g not in top_flat]
     cov = _coverage(combined.get("warnings", []))
     dropped = sorted(set(bm25_cov) - set(cov))
     result = {
@@ -618,6 +663,9 @@ def judge_bundle(entry: dict[str, Any], truth: dict[str, tuple[str, str]], reada
         "warning_dropped": dropped,
     }
     bm25_missed = [g for g in missing if g in set(entry["must_hit"]["bm25"])]
+    result["flags"] = {"leak": bool(result["leak"]), "dup": result["dup"] > 0,
+                       "scope_error": scope_error, "warning_dropped": bool(dropped),
+                       "partial_silent": bool(bm25_missed) and not cov}
     if result["leak"]:
         cls = "leak"
     elif result["dup"]:
@@ -706,6 +754,19 @@ def selftest_cases() -> list[tuple[str, str, str]]:
         results.append((name, expected, actual))
     judged = judge_bundle(entry(auto_pack=True, expect_pack="p2"), truth, readable, sel, legs(), comb())
     results.append(("wrong pack", "wrong_pack", "wrong_pack" if judged["wrong_pack"] else "no_flag"))
+    # Gold past the top limit does not count as found (design 7.1).
+    gold_past_limit = [{"id": "d1", "members": []}, {"id": "g1", "members": []}]
+    judged = judge_bundle(entry(limit=1), truth, readable, sel, legs(), comb(gold_past_limit))
+    results.append(("combined gold past limit, bm25 must-hit", "partial_silent",
+                    judged["combined"]["class"]))
+    no_bm25 = entry(limit=1, must_hit={"bm25": [], "fts": ["g1"], "vector": [], "combined": ["g1"]})
+    judged = judge_bundle(no_bm25, truth, readable, sel, legs(bm25=[]), comb(gold_past_limit))
+    results.append(("combined gold past limit, no bm25 must-hit", "miss", judged["combined"]["class"]))
+    # A leaking id returned twice: class leak, and the dup flag stays set.
+    judged = judge_bundle(entry(), truth, readable, sel, legs(fts=["g1", "f1", "f1"]), comb())
+    fts = judged["legs"]["fts"]
+    results.append(("leak returned twice keeps the dup flag", "leak+dup",
+                    f"{fts['class']}+{'dup' if fts['flags']['dup'] else 'nodup'}"))
     return results
 
 
@@ -781,14 +842,30 @@ def _invariants(run_dir: Path, corpus: Path, cap25: int, cap: int, char_budget: 
     conn = _ro(run_dir / "doc.db")
     try:
         stored = conn.execute("SELECT COALESCE(SUM(LENGTH(properties)), 0) FROM doc_nodes").fetchone()[0]
-        if stored >= char_budget:
-            problems.append("stored properties reach the character budget")
-        window25 = {r[0] for r in conn.execute(
-            "SELECT node_id FROM doc_nodes ORDER BY updated_at DESC, space, node_id LIMIT ?", (cap25,))}
-        window = {r[0] for r in conn.execute(
-            "SELECT node_id FROM doc_nodes ORDER BY updated_at DESC, space, node_id LIMIT ?", (cap,))}
     finally:
         conn.close()
+    if stored >= char_budget:
+        problems.append("stored properties reach the character budget")
+
+    # Read the windows with the API the BM25 build uses
+    # (_Bm25CacheWorker._read_window): the budgeted query, and on failure
+    # list_nodes cut by the same budget rule.
+    from opencrab.ontology.bm25 import trim_to_budget
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    store = LocalSQLDocStore(str(run_dir / "doc.db"))
+    try:
+        def window_ids(limit: int) -> set[str]:
+            try:
+                nodes = store.list_nodes_within_budget(limit=limit, max_chars=char_budget)
+            except Exception:  # noqa: BLE001 -- same fallback as _read_window
+                nodes = trim_to_budget(store.list_nodes(limit=limit), max_chars=char_budget)
+            return {n["node_id"] for n in nodes}
+
+        window25 = window_ids(cap25)
+        window = window_ids(cap)
+    finally:
+        store.close()
     if window25 & old:
         problems.append("old documents inside the scaled-cap window")
     if not recent <= window25:
@@ -809,9 +886,11 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
 
     corpus, work = Path(args.corpus).resolve(), Path(args.work).resolve()
     run_dir, out = Path(args.run_dir).resolve(), Path(args.out).resolve()
-    check_write_paths([run_dir, out])
+    check_write_paths([run_dir, out], sources=[corpus, work])
     if run_dir.exists():
         raise SystemExit(f"run directory already exists: {run_dir}")
+    if out.exists():
+        raise SystemExit(f"report already exists: {out}")
     manifest, packs, queries = _read_corpus(corpus)
     watchdog = Watchdog(manifest["preset"], "run", out, [run_dir, out.parent])
     watchdog.start()
@@ -957,21 +1036,38 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
     shape_lat: dict[str, list[float]] = {}
     leg_lat: dict[str, list[float]] = {"bm25": [], "fts": [], "vector": []}
     per_query: list[dict[str, Any]] = []
-    repeat_violations = {"leak": 0, "dup": 0}
-    for q in queries:
-        bundle_judged = None
-        for attempt in range(3):
-            g0 = generation()
-            sel, outcome, _ = request(q)
-            legs, _ = leg_calls(q, sel.effective_pack_ids)
-            if generation() == g0:
-                break
-        else:
-            report["reasons"].append(f"unstable BM25 generation: {q['qid']}")
-        for rep in range(args.repeats):
+    flag_names = ("leak", "dup", "scope_error", "warning_dropped", "partial_silent")
+    repeat_defects: dict[str, int] = dict.fromkeys(flag_names, 0)
+    repeat_classes: dict[str, dict[str, int]] = {}
+    discarded_bundles = 0
+
+    def stable_bundle(q: dict[str, Any]) -> tuple[Any, Any, float, dict[str, Any], dict[str, float]] | None:
+        """Build one bundle whose BM25 generation did not change (design 7.1).
+
+        A bundle whose generation changed is discarded with its latency
+        samples and rebuilt. Three changes in a row return None.
+        """
+        nonlocal discarded_bundles
+        for _attempt in range(3):
             g0 = generation()
             sel, outcome, ms = request(q)
             legs, timings = leg_calls(q, sel.effective_pack_ids)
+            if generation() == g0:
+                return sel, outcome, ms, legs, timings
+            discarded_bundles += 1
+        return None
+
+    for q in queries:
+        if stable_bundle(q) is None:  # warm-up bundle, not recorded
+            report["reasons"].append(f"unstable BM25 generation: {q['qid']}")
+            continue
+        last = None
+        for _rep in range(args.repeats):
+            built = stable_bundle(q)
+            if built is None:
+                report["reasons"].append(f"unstable BM25 generation: {q['qid']}")
+                break
+            sel, outcome, ms, legs, timings = built
             shape_lat.setdefault(q["shape"], []).append(ms)
             for name, value in timings.items():
                 leg_lat[name].append(value)
@@ -979,13 +1075,16 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
                          "warnings": [w.code for w in sel.warnings]}
             combined = {"items": _items_from_results(outcome.results), "warnings": list(outcome.warnings)}
             judged = judge_bundle(q, truth, readable, selection, legs, combined)
-            for part in [*judged["legs"].values(), judged["combined"]]:
-                repeat_violations["leak"] += bool(part["leak"])
-                repeat_violations["dup"] += bool(part["dup"])
-            if generation() != g0 and rep == args.repeats - 1:
-                report["reasons"].append(f"unstable BM25 generation in final repeat: {q['qid']}")
-            bundle_judged = (judged, selection, [w for w in outcome.warnings])
-        judged, selection, warnings = bundle_judged
+            parts = {**judged["legs"], "combined": judged["combined"]}
+            for leg_name, part in parts.items():
+                for flag in flag_names:
+                    repeat_defects[flag] += bool(part["flags"][flag])
+                counts = repeat_classes.setdefault(leg_name, {})
+                counts[part["class"]] = counts.get(part["class"], 0) + 1
+            last = (judged, selection, list(outcome.warnings))
+        if last is None:
+            continue
+        judged, selection, warnings = last
         per_query.append({"qid": q["qid"], "kind": q["kind"], "shape": q["shape"],
                           "selection": selection, "combined_warnings": warnings,
                           "wrong_pack": judged["wrong_pack"],
@@ -1011,6 +1110,13 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
     profile = qmod._profile_for_query(fresh_marker1, 10, 1)
 
     def leg_state(leg: str, query_text: str) -> tuple[bool, str | None]:
+        watchdog.op_start(f"freshness:{leg}")
+        try:
+            return _leg_state(leg, query_text)
+        finally:
+            watchdog.op_end()
+
+    def _leg_state(leg: str, query_text: str) -> tuple[bool, str | None]:
         if leg == "bm25":
             hits, _w = hq._bm25_search_with_warnings(query_text, None, profile.bm25_limit,
                                                      pack_ids=[measure_pack])
@@ -1102,6 +1208,7 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
             doc = {"id": node_id, "pack": "measure", "form": "N", "space": "evidence",
                    "node_type": "Evidence", "title": "concurrent", "text": f"qdconc{i} filler text"}
             try:
+                watchdog.op_start(f"write:{node_id}", slot="writer")
                 t0 = time.perf_counter()
                 with write_lock(str(run_dir), timeout=30.0, purpose="search-baseline"):
                     t1 = time.perf_counter()
@@ -1112,6 +1219,8 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
                 write_ms.append((t2 - t0) * 1000.0)
             except Exception as exc:  # noqa: BLE001 -- recorded in the report
                 write_errors.append(type(exc).__name__)
+            finally:
+                watchdog.op_end(slot="writer")
 
     thread = threading.Thread(target=writer, name="search-baseline-writer", daemon=True)
     thread.start()
@@ -1128,8 +1237,8 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
             empty_legs = {name: {"ids": [], "warnings": []} for name in ("bm25", "fts", "vector")}
             combined = {"items": _items_from_results(outcome.results), "warnings": list(outcome.warnings)}
             judged = judge_bundle(q, truth, readable, selection, empty_legs, combined)
-            conc_violations["leak"] += bool(judged["combined"]["leak"])
-            conc_violations["dup"] += bool(judged["combined"]["dup"])
+            conc_violations["leak"] += bool(judged["combined"]["flags"]["leak"])
+            conc_violations["dup"] += bool(judged["combined"]["flags"]["dup"])
             conc_violations["requests"] += 1
     thread.join()
     report["concurrent"] = {
@@ -1188,8 +1297,12 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
             classes[leg][part["class"]] = classes[leg].get(part["class"], 0) + 1
     latency = {shape: _summary(v) for shape, v in shape_lat.items()}
     legs_summary = {leg: _summary(v) for leg, v in leg_lat.items()}
+    defects = dict(repeat_defects)
+    defects["concurrent_leak"] = conc_violations["leak"]
+    defects["concurrent_dup"] = conc_violations["dup"]
     report["summary"] = {"classes": classes, "latency": latency, "leg_latency": legs_summary,
-                         "repeat_violations": repeat_violations,
+                         "repeat_defects": defects, "repeat_classes": repeat_classes,
+                         "discarded_bundles": discarded_bundles,
                          "wrong_pack": sum(1 for e in per_query if e["wrong_pack"])}
 
     def met(value: Any, limit: float) -> bool | None:
@@ -1197,20 +1310,19 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
 
     req: dict[str, Any] = {}
     non_pass = {leg: sum(n for c, n in v.items() if c != "pass") for leg, v in classes.items()}
-    req["quality_leak"] = {"observed": sum(v.get("leak", 0) for v in classes.values())
-                           + repeat_violations["leak"] + conc_violations["leak"], "limit": 0}
-    req["quality_dup"] = {"observed": sum(v.get("dup", 0) for v in classes.values())
-                          + repeat_violations["dup"] + conc_violations["dup"], "limit": 0}
+    # Independent flag counts over every warm repeat (design 4.2, fix of #542
+    # verification round 1). Concurrent requests add leak and dup.
+    req["quality_leak"] = {"observed": defects["leak"] + defects["concurrent_leak"], "limit": 0}
+    req["quality_dup"] = {"observed": defects["dup"] + defects["concurrent_dup"], "limit": 0}
     req["quality_combined_non_pass"] = {"observed": non_pass.get("combined", 0), "limit": 0}
     req["quality_leg_non_pass"] = {"observed": {k: v for k, v in non_pass.items() if k != "combined"},
                                    "limit": 0}
-    req["quality_partial_silent"] = {"observed": sum(v.get("partial_silent", 0) for v in classes.values()),
-                                     "limit": 0}
-    req["quality_scope_error"] = {"observed": sum(v.get("scope_error", 0) for v in classes.values()),
-                                  "limit": 0}
+    req["quality_partial_silent"] = {"observed": defects["partial_silent"], "limit": 0}
+    req["quality_scope_error"] = {"observed": defects["scope_error"], "limit": 0}
+    req["quality_warning_dropped"] = {"observed": defects["warning_dropped"], "limit": 0}
     req["quality_wrong_pack"] = {"observed": report["summary"]["wrong_pack"], "limit": 0}
     for key in ("quality_leak", "quality_dup", "quality_combined_non_pass", "quality_partial_silent",
-                "quality_scope_error", "quality_wrong_pack"):
+                "quality_scope_error", "quality_warning_dropped", "quality_wrong_pack"):
         req[key]["met"] = req[key]["observed"] == 0
     req["quality_leg_non_pass"]["met"] = all(v == 0 for v in req["quality_leg_non_pass"]["observed"].values())
     for shape, limit in REQ_LATENCY_P95_MS.items():
@@ -1259,24 +1371,53 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
 # ---------------------------------------------------------------------------
 
 _HARD = {"leak", "dup", "scope_error", "warning_dropped", "partial_silent"}
+_LEGS = {"bm25", "fts", "vector", "combined"}
+
+
+def compare_preconditions(base: dict[str, Any], head: dict[str, Any]) -> list[str]:
+    """Return why two reports cannot be compared (design 7.4). Empty means valid."""
+    problems: list[str] = []
+    for report, name in ((base, "base"), (head, "head")):
+        if report.get("verdict") != "COMPLETE":
+            problems.append(f"{name} report is not COMPLETE")
+    if problems:
+        return problems
+    for key in ("manifest_digest", "preset", "seed"):
+        if base["corpus"].get(key) != head["corpus"].get(key):
+            problems.append(f"corpus {key} differs")
+    for key in ("config", "bm25_env"):
+        if base["environment"].get(key) != head["environment"].get(key):
+            problems.append(f"environment {key} differs")
+    base_q = {q["qid"]: q for q in base.get("queries", [])}
+    head_q = {q["qid"]: q for q in head.get("queries", [])}
+    if set(base_q) != set(head_q):
+        problems.append("query id sets differ")
+    for qid in sorted(set(base_q) & set(head_q)):
+        for report_q, name in ((base_q[qid], "base"), (head_q[qid], "head")):
+            if set(report_q["legs"]) != _LEGS:
+                problems.append(f"{name} {qid} leg set differs")
+    if set(base.get("requirements", {})) != set(head.get("requirements", {})):
+        problems.append("requirement key sets differ")
+    return problems
 
 
 def compare_reports(base: dict[str, Any], head: dict[str, Any]) -> list[str]:
+    """Return regressions of head against base. Call compare_preconditions first."""
     regressions: list[str] = []
-    for report, name in ((base, "base"), (head, "head")):
-        if report.get("verdict") != "COMPLETE":
-            regressions.append(f"{name} report is not COMPLETE")
+    for flag, count in head.get("summary", {}).get("repeat_defects", {}).items():
+        if count:
+            regressions.append(f"head repeat defect {flag}: {count}")
     base_q = {q["qid"]: q for q in base.get("queries", [])}
     for q in head.get("queries", []):
-        old = base_q.get(q["qid"])
+        old = base_q[q["qid"]]
         for leg, part in q["legs"].items():
             if part["class"] in _HARD:
                 regressions.append(f"{q['qid']}:{leg}: {part['class']}")
-            if old is not None and old["legs"].get(leg, {}).get("class") == "pass" and part["class"] != "pass":
+            if old["legs"][leg]["class"] == "pass" and part["class"] != "pass":
                 regressions.append(f"{q['qid']}:{leg}: pass -> {part['class']}")
     base_req, head_req = base.get("requirements", {}), head.get("requirements", {})
     for key, value in head_req.items():
-        if value.get("met") is False and base_req.get(key, {}).get("met") is not False:
+        if value.get("met") is False and base_req[key].get("met") is not False:
             regressions.append(f"requirement newly unmet: {key}")
     return regressions
 
@@ -1284,6 +1425,12 @@ def compare_reports(base: dict[str, Any], head: dict[str, Any]) -> list[str]:
 def cmd_compare(base_path: str, head_path: str) -> int:
     base = json.loads(Path(base_path).read_text(encoding="utf-8"))
     head = json.loads(Path(head_path).read_text(encoding="utf-8"))
+    problems = compare_preconditions(base, head)
+    if problems:
+        for line in problems:
+            print(f"INVALID {line}")
+        print("COMPARE: INVALID")
+        return 2
     regressions = compare_reports(base, head)
     for line in regressions:
         print(f"REGRESSION {line}")
