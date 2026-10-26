@@ -27,7 +27,7 @@
 - FTS: `_fts_search`가 `doc_sources_fts`(FTS5, `unicode61` 토크나이저)를 검색한다. 대상은 `doc_nodes`가 아니라 `doc_sources`의 본문이다. 기본 적재 경로(`text_as_node=True`)는 `doc_sources`를 쓰지 않으므로 FTS는 source로 적재한 문서만 찾는다. `unicode61`은 n-gram을 만들지 않으므로 조사가 붙은 한글 어절은 어간 질의와 맞지 않는다. FTS 결과의 `node_id`는 `metadata.node_id`가 없으면 `source_id`다. 요청 크기는 `bm25_limit`이다.
 - graph: 앵커 노드에서 이웃을 넓힌다. #541과 무관하므로 이 단계는 graph store를 `available=False`로 두어 이 레그를 끈다.
 
-결합 결과는 레그 결과의 rerank, 동일 본문 접기(#482), 상위 `limit` 자르기의 결과다.
+결합 결과는 레그 결과의 rerank, 동일 본문 접기(#482), 레그 1위의 반환 창 보장(#556, BM25와 FTS 1위를 창 안에 두고 창 밖에 남은 레그 1위는 `fusion:` 경고로 알린다), 상위 `limit` 자르기의 결과다.
 
 권한 경계는 `read_scope`(주체가 소유하거나 `private`가 아닌 `ready` 팩)와 `in_pack_scope`(엄격한 `pack_id` 일치)로 정해진다. `resolve_packs`는 명시 `pack_ids`를 `narrow`로 읽기 범위와 교차한다. 하나라도 빠지면 `pack_ids_out_of_scope` 경고를 낸다. 교차 결과가 비면 `HybridQuery.query`는 store를 부르지 않고 빈 결과를 낸다. 팩을 명시하지 않으면 읽기 범위 전체가 대상이다. `auto_pack`이면 `choose_packs`가 SQL 팩 행과 manifest의 제목, 설명, 키워드, 태그, source label로 점수를 매긴다. 임계값을 넘는 후보가 없을 때만 `_choose_by_content`가 팩별 BM25와 FTS probe로 한 팩을 고른다.
 

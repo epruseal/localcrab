@@ -951,6 +951,32 @@ docstring은 이 절을 가리킨다.
 .venv/bin/pytest tests/test_query_duplicate_fold.py -q
 ```
 
+### 결합 결과의 레그 1위 (#556)
+
+이 소절은 `HybridQuery.query()`가 접기 뒤에 레그 1위를 다루는 계약의 정본이다.
+설계와 근거는 `docs/issue-556-fusion.md`에 있다.
+
+- 이 단계는 접기 뒤, rerank 상한 자르기 앞에 한 번 돈다. rerank 경로와 평면 병합
+  경로가 함께 거친다. `limit`이 1 이상일 때만 돈다.
+- 반환 창의 크기는 rerank 경로에서 `min(limit, rerank_limit)`, 평면 병합에서
+  `limit`이다.
+- BM25 레그와 FTS 레그의 1위는 반환 창 안에 둔다. 보장하는 결과는 창 크기의
+  절반(내림)까지다. 그래서 창이 4칸 이상이면 두 1위가 모두 창 안에 든다. 1위가
+  접힌 구성원이면 그 그룹의 대표가 창 안에 든다.
+- 반환 창은 원래 점수 순서의 부분열이다. 결과는 계속 점수 내림차순이다. 이
+  단계는 결과를 더하거나 빼지 않고 결과 객체를 고치지 않는다.
+- vector 레그와 graph 레그의 1위는 옮기지 않는다.
+- 새 창 밖에 남은 레그 1위(옮기지 못한 BM25와 FTS 1위, 창 밖의 vector와 graph
+  1위)가 있으면 `warnings`에 `fusion: {n} leg top hit(s) fall outside the
+  returned results`를 더한다. 정책 필터가 지운 결과는 세지 않는다.
+- 레그 2위 이하는 이 단계가 다루지 않는다. RRF와 평면 병합의 순서가 정한다.
+
+재현 명령:
+
+```bash
+.venv/bin/pytest tests/test_query_lexical_reservation.py -q
+```
+
 ## 11. 질의 응답 크기 처리 (#511)
 
 이 절은 MCP `ontology_query`, REST `/api/query`, CLI `query --json-envelope` 응답의 크기 처리 계약의 정본이다. 설계와 결정표는
