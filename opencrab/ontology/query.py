@@ -323,9 +323,9 @@ def _ordered_unique(values: list[str | None], limit: int) -> list[str]:
 # 본문 접기".
 _FOLD_BODIES = "_fold_bodies"
 _FOLDED_MEMBERS = "_folded_members"
-# #571: how many hits of each lexical leg (BM25, FTS) the combined result
-# keeps in the returned window. Contract: docs/ARCHITECTURE.md, "결합 결과의
-# 레그 상위".
+# #571: the number of hits per lexical leg (BM25, FTS) that the query passes
+# to _reserve_leg_tops as candidates. Contract: docs/ARCHITECTURE.md, "결합
+# 결과의 레그 상위".
 _LEXICAL_TOP_DEPTH = 2
 _FOLD_METADATA_KEY = "folded_duplicates"
 _PRIVATE_PROVENANCE = "_query_provenance"
@@ -448,9 +448,12 @@ def _reserve_leg_tops(
     """Keep the lexical leg top hits inside the returned window (#556, #571).
 
     ``items`` is the folded result list in final score order. ``place_ids``
-    are the BM25 and FTS hits to keep inside the first ``window`` items, in
-    priority order. This function keeps at most ``window // 2`` groups.
-    ``warn_ids`` are the vector and graph top hits. This function does not move them. The second
+    are the BM25 and FTS candidate hits in priority order. This function
+    walks ``place_ids`` in order and protects the group of each candidate
+    that is in ``items``, until it protects ``window // 2`` groups. It fills
+    the other places of the first ``window`` items in score order, so an
+    unprotected candidate can also be inside. ``warn_ids`` are the vector and
+    graph top hits. This function does not move them. The second
     return value counts the ids of both lists that are in ``items`` but
     outside the new window. The count skips an id that is not in ``items``
     (for example, an id that the policy filter removed). This function
@@ -1132,10 +1135,10 @@ class HybridQuery:
         that only care about results are unaffected. Results with the same
         pack and the same stored bodies can be folded into one. The rules
         and the exceptions are in docs/ARCHITECTURE.md, "질의 결과의 동일
-        본문 접기". The first two BM25 and FTS hits are kept in the
-        returned results, and a kept hit or a vector or graph top hit outside
-        them adds a ``fusion:`` warning (docs/ARCHITECTURE.md, "결합 결과의
-        레그 상위").
+        본문 접기". A later step can reorder the results to keep some BM25
+        and FTS hits in the returned results. That step can also add a
+        ``fusion:`` warning. The rules are in docs/ARCHITECTURE.md, "결합
+        결과의 레그 상위".
         """
         result_lists: list[list[dict[str, Any]]] = []
         include_unpackaged = False

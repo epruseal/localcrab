@@ -1,9 +1,7 @@
 """#556 and #571: leg top hits in the combined result.
 
 Designs: docs/issue-556-fusion.md, docs/issue-571-fusion-rank.md.
-The lexical legs (BM25, FTS) keep their first two hits inside the returned
-window. A kept hit that stays outside the window, or a vector or graph top
-hit outside it, adds a ``fusion:`` warning.
+Contract: docs/ARCHITECTURE.md, "결합 결과의 레그 상위".
 """
 
 from __future__ import annotations
