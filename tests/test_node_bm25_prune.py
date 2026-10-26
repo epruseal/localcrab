@@ -319,6 +319,17 @@ def test_row_check_drop_falls_back_to_the_full_scan(tmp_path, monkeypatch, force
     assert "node row" in caplog.text or "missing row" in caplog.text
 
 
+def test_eligibility_rules():
+    idf = {"t": 1.0}
+    assert prune.eligible(3, prune.FULL_SCAN_CF_MAX + 1, False, 10, idf)
+    assert not prune.eligible(3, prune.FULL_SCAN_CF_MAX, False, 10, idf)
+    assert prune.eligible(3, 0, True, 10, idf)
+    assert not prune.eligible(3, 10**9, False, 0, idf)
+    assert not prune.eligible(prune.PRUNE_MAX_TERMS + 1, 10**9, False, 10, idf)
+    # A computed idf of 0 (huge document counts) breaks the strict upper bound.
+    assert not prune.eligible(3, 10**9, False, 10, {"t": 1.0, "u": 0.0})
+
+
 def test_switch_off_skips_the_pruned_path(tmp_path, monkeypatch, forced):
     store = _store(tmp_path)
     _skewed(store, n_rare=5, n_common=20)
