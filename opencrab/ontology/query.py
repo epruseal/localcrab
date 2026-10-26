@@ -441,11 +441,12 @@ def _reserve_leg_tops(
 
     ``items`` is the folded result list in final score order. ``place_ids``
     are the BM25 and FTS top hits to keep inside the first ``window`` items.
-    At most ``window // 2`` groups are kept. ``warn_ids`` are the vector and
-    graph top hits. They are not moved. The second return value counts the
-    ids of both lists that are in ``items`` but outside the new window. An id
-    that is not in ``items`` (for example, removed by the policy filter) is
-    not counted. Only the order changes. The result objects are the same.
+    This function keeps at most ``window // 2`` groups. ``warn_ids`` are the
+    vector and graph top hits. This function does not move them. The second
+    return value counts the ids of both lists that are in ``items`` but
+    outside the new window. The count skips an id that is not in ``items``
+    (for example, an id that the policy filter removed). This function
+    changes only the order and keeps the same result objects.
     Contract: docs/ARCHITECTURE.md, "결합 결과의 레그 1위".
     """
     position: dict[str, int] = {}

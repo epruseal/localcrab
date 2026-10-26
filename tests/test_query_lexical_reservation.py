@@ -170,3 +170,51 @@ def test_limit_zero_and_negative_keep_the_old_slice():
     full = _hybrid(**legs).query("q", pack_ids=["pack-a"], limit=100)
     assert [r.node_id for r in neg.results] == [r.node_id for r in full.results][:-2]
     assert _fusion(neg.warnings) == []
+
+
+def _flat_hybrid(vector, bm25=(), fts=()):
+    """Flat merge keeps the vector value of a node that the vector leg also returns."""
+    hybrid = HybridQuery(MagicMock(available=False), MagicMock(available=False))
+    hybrid._doc_store = MagicMock()
+    hybrid._vector_search = MagicMock(return_value=[
+        QueryResult(source="vector", node_id=nid, score=score, text=text, metadata=dict(meta))
+        for nid, score, text, meta in vector
+    ])
+    hybrid._bm25_search = MagicMock(return_value=[
+        {"source": "bm25", "node_id": nid, "score": 5.0, "text": f"b {nid}", "metadata": {}}
+        for nid in bm25
+    ])
+    hybrid._fts_search = MagicMock(return_value=[
+        {"source": "keyword", "node_id": nid, "score": 3.0, "text": f"k {nid}", "metadata": {}}
+        for nid in fts
+    ])
+    return hybrid
+
+
+def test_query_keeps_fts_top_that_was_already_inside_the_window():
+    hybrid = _flat_hybrid(
+        vector=[("A", 1.0, "va", {}), ("B", 0.9, "vb", {}), ("C", 0.8, "vc", {}),
+                ("F", 0.7, "vf", {}), ("M", 0.05, "vm", {})],
+        bm25=["M"],
+        fts=["F"],
+    )
+    outcome = hybrid.query("q", pack_ids=["pack-a"], limit=4, use_rerank=False)
+    assert [r.node_id for r in outcome.results] == ["A", "B", "F", "M"]
+    assert _fusion(outcome.warnings) == []
+
+
+def test_query_moves_the_group_of_a_folded_member_top():
+    same = {"pack_id": "pack-a"}
+    hybrid = _flat_hybrid(
+        vector=[("A", 1.0, "va", {}), ("B", 0.9, "vb", {}), ("C", 0.8, "vc", {}),
+                ("D", 0.7, "vd", {}), ("R", 0.2, "same body", same),
+                ("M1", 0.1, "same body", same)],
+        bm25=["M1"],
+    )
+    outcome = hybrid.query("q", pack_ids=["pack-a"], limit=4, use_rerank=False)
+    assert [r.node_id for r in outcome.results] == ["A", "B", "C", "R"]
+    rep = outcome.results[-1]
+    assert [m.node_id for m in rep.folded_members] == ["M1"]
+    flat = [x for r in outcome.results for x in [r.node_id, *(m.node_id for m in r.folded_members)]]
+    assert len(flat) == len(set(flat))
+    assert _fusion(outcome.warnings) == []
