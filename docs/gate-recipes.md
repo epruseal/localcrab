@@ -190,14 +190,19 @@ diff <("<워크트리>/.venv/bin/ruff" check --show-files . 2>&1 | sort) \
   판정 절차 2번이 XML 유무와 관계없이 미완주로 거른다. XML을 쓴 뒤 정리
   단계에서 끊긴 실행도 같다. scope를 시작하지 못하면(속성 오류, 실행 파일
   없음) 종료 코드는 1이지만 pytest가 돌지 않아 XML이 없으므로 3번이
-  거른다. 이 성질은 시험 실행 경로에 SIGTERM을 0이나 1로 바꾸는 처리기가
+  거른다. scope는 시작했지만 래퍼 뒤의 명령을 찾지 못하면(python 경로
+  오류) 127, 찾았지만 실행하지 못하면 126이 나온다. 이 값도 0이나 1이
+  아니므로 2번이 거른다. 이 성질은 시험 실행 경로에 SIGTERM을 0이나 1로 바꾸는 처리기가
   없다는 전제에 선다(재확인:
   `git grep -n -E 'signal\.signal\(|SIGTERM|add_signal_handler' -- opencrab tests`).
 
-  **`MALLOC_ARENA_MAX=2`가 필요한 이유**: 이 변수 없이 주소공간 상한만 걸면
-  `tests/test_issue74_ingest_graph_parity.py`가 도중에 끝없이 멈춘다. 전체
-  스위트는 같은 파일에서 abort로 죽거나, 그 파일을 빼면 다른 파일에서 pytest
-  `INTERNALERROR ... MemoryError`로 끝난다. 변수를 걸면 전량 완주한다.
+  **`MALLOC_ARENA_MAX=2`가 필요한 이유**: 이 변수 없이 주소공간 상한만 걸고
+  `tests/test_issue74_ingest_graph_parity.py`를 돌린 실행 가운데 도중에 멈춰
+  끝나지 않은 실행이 있었다. 멈추지 않고 통과한 실행에서도 가상 메모리
+  정점(`VmPeak`)이 상한 가까이 올랐다. 변수 없이 돌린 전체 스위트 실행은
+  같은 파일에서 abort로 죽었고, 그 파일을 뺀 실행은 다른 파일에서 pytest
+  `INTERNALERROR ... MemoryError`로 끝났다. 변수를 걸면 전량 완주했고
+  `VmPeak`도 상한보다 한참 아래에 머물렀다.
   확인한 사실과 추정은 다음과 같다.
   - 사실: 멈춘 프로세스는 가상 메모리 정점(`VmPeak`)이 상한과 같았고
     실행 중인 스레드가 없었다. 주소공간의 대부분은 64MiB 경계에 정렬된
