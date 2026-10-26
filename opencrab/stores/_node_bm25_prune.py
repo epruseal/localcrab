@@ -197,8 +197,9 @@ def select(
     k = limit
     mult = Counter(t for t in q_terms if t in idf)
     ub = {t: mult[t] * idf[t] * (_K1 + 1 + _DELTA) for t in idf}
-    # Design 6.2 and 6.4: M covers every rounding of the compared values.
-    margin = 2.0 ** -20 * (len(q_terms) + 32) * math.fsum(ub.values())
+    # Design 6.2 and 6.4: every compared value is a sum of non-negative terms,
+    # so its rounding error is relative to the value. rho covers it many times.
+    rho = 2.0 ** -30 * (len(q_terms) + 32)
     pending = sorted(idf, key=lambda t: (-ub[t], t))
     scanned: set[str] = set()
     want = set(idf)
@@ -253,8 +254,8 @@ def select(
                 retokenise(top)
             theta = _kth(cand.lower(), cand.grp, groups, k)
             upper = np.where(cand.has_exact, cand.exact, cand.part + rest)
-            cand.keep(upper + margin >= theta[cand.grp] - margin)
-            closed |= theta - margin > rest + margin
+            cand.keep(upper * (1 + rho) >= theta[cand.grp] * (1 - rho))
+            closed |= theta * (1 - rho) > rest * (1 + rho)
         nonexact = np.flatnonzero(~cand.has_exact)
         if closed.all():
             scan_cost = SCAN_US * sum(cf[t] for t in pending)
@@ -303,7 +304,7 @@ def select(
         return []
     low = cand.lower()
     theta = _kth(low, cand.grp, groups, k)
-    chosen = np.flatnonzero(low >= theta[cand.grp] - 2 * margin)
+    chosen = np.flatnonzero(low >= theta[cand.grp] * (1 - 2 * rho))
     log["chosen"] = int(chosen.size)
     scored_idx: list[tuple[float, int]] = []
     for j in chosen:
