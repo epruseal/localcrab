@@ -1,7 +1,9 @@
-"""#556: leg top hits in the combined result (docs/issue-556-fusion.md).
+"""#556 and #571: leg top hits in the combined result.
 
-The lexical legs (BM25, FTS) keep their top hit inside the returned window.
-A leg top hit that stays outside the window adds a ``fusion:`` warning.
+Designs: docs/issue-556-fusion.md, docs/issue-571-fusion-rank.md.
+The lexical legs (BM25, FTS) keep their first two hits inside the returned
+window. A kept hit that stays outside the window, or a vector or graph top
+hit outside it, adds a ``fusion:`` warning.
 """
 
 from __future__ import annotations
@@ -215,6 +217,95 @@ def test_query_moves_the_group_of_a_folded_member_top():
     assert [r.node_id for r in outcome.results] == ["A", "B", "C", "R"]
     rep = outcome.results[-1]
     assert [m.node_id for m in rep.folded_members] == ["M1"]
+    flat = [x for r in outcome.results for x in [r.node_id, *(m.node_id for m in r.folded_members)]]
+    assert len(flat) == len(set(flat))
+    assert _fusion(outcome.warnings) == []
+
+
+# --- #571: the lexical legs keep their first two hits ---
+
+
+def test_rerank_keeps_two_bm25_hits_that_only_one_leg_returns():
+    decoys = _decoys(16)
+    hybrid = _hybrid(
+        vector=[(d, 1.0 - i * 0.01) for i, d in enumerate(decoys)],
+        bm25=[("gold1", 50.0), ("gold2", 49.0)] + [(d, 40.0 - i) for i, d in enumerate(decoys)],
+        fts=[(d, 9.0 - i * 0.1) for i, d in enumerate(decoys)],
+    )
+    outcome = hybrid.query("rare common", pack_ids=["pack-a"], limit=8)
+    ids = [r.node_id for r in outcome.results]
+    assert len(ids) == 8
+    assert ids[-2:] == ["gold1", "gold2"]
+    assert _fusion(outcome.warnings) == []
+    scores = [r.score for r in outcome.results]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_flat_merge_keeps_the_bm25_second_hit_that_vector_ranked_low():
+    decoys = _decoys(8)
+    hybrid = _hybrid(
+        vector=[(d, 0.9 - i * 0.01) for i, d in enumerate(decoys)]
+        + [("gold1", 0.02), ("gold2", 0.01)],
+        bm25=[("gold1", 50.0), ("gold2", 49.0)],
+    )
+    outcome = hybrid.query("q", pack_ids=["pack-a"], limit=4, use_rerank=False, use_fts=False)
+    assert [r.node_id for r in outcome.results] == ["d00", "d01", "gold1", "gold2"]
+    assert _fusion(outcome.warnings) == []
+
+
+def _ladder(limit):
+    hybrid = _flat_hybrid(
+        vector=[("A", 1.0, "va", {}), ("B", 0.9, "vb", {}), ("C", 0.8, "vc", {}),
+                ("D", 0.7, "vd", {}), ("E", 0.6, "ve", {}), ("M1", 0.05, "vm1", {}),
+                ("M2", 0.04, "vm2", {}), ("F1", 0.03, "vf1", {})],
+        bm25=["M1", "M2"],
+        fts=["F1"],
+    )
+    return hybrid.query("q", pack_ids=["pack-a"], limit=limit, use_rerank=False)
+
+
+def test_window_four_keeps_both_first_hits_before_a_second_hit():
+    outcome = _ladder(4)
+    assert [r.node_id for r in outcome.results] == ["A", "B", "M1", "F1"]
+    assert len(_fusion(outcome.warnings)) == 1
+
+
+def test_window_five_warns_for_the_second_hit_past_the_cap():
+    outcome = _ladder(5)
+    assert [r.node_id for r in outcome.results] == ["A", "B", "C", "M1", "F1"]
+    assert _fusion(outcome.warnings) == [
+        "fusion: 1 leg top hit(s) fall outside the returned results"
+    ]
+
+
+def test_window_eight_keeps_every_lexical_second_hit():
+    outcome = _ladder(8)
+    assert [r.node_id for r in outcome.results] == ["A", "B", "C", "D", "E", "M1", "M2", "F1"]
+    assert _fusion(outcome.warnings) == []
+
+
+def test_query_keeps_the_fts_second_hit():
+    hybrid = _flat_hybrid(
+        vector=[("A", 1.0, "va", {}), ("B", 0.9, "vb", {}), ("C", 0.8, "vc", {}),
+                ("D", 0.7, "vd", {}), ("F2", 0.05, "vf2", {})],
+        fts=["A", "F2"],
+    )
+    outcome = hybrid.query("q", pack_ids=["pack-a"], limit=4, use_rerank=False, use_bm25=False)
+    assert [r.node_id for r in outcome.results] == ["A", "B", "C", "F2"]
+    assert _fusion(outcome.warnings) == []
+
+
+def test_query_moves_the_group_of_a_folded_second_hit():
+    same = {"pack_id": "pack-a"}
+    hybrid = _flat_hybrid(
+        vector=[("A", 1.0, "va", {}), ("B", 0.9, "vb", {}), ("C", 0.8, "vc", {}),
+                ("D", 0.7, "vd", {}), ("R", 0.2, "same body", same),
+                ("M2", 0.1, "same body", same)],
+        bm25=["A", "M2"],
+    )
+    outcome = hybrid.query("q", pack_ids=["pack-a"], limit=4, use_rerank=False, use_fts=False)
+    assert [r.node_id for r in outcome.results] == ["A", "B", "C", "R"]
+    assert [m.node_id for m in outcome.results[-1].folded_members] == ["M2"]
     flat = [x for r in outcome.results for x in [r.node_id, *(m.node_id for m in r.folded_members)]]
     assert len(flat) == len(set(flat))
     assert _fusion(outcome.warnings) == []
