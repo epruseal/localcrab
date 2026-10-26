@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import sqlite3
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from typing import Any
+
+from opencrab.stores import _node_bm25_prune as _prune
 
 logger = logging.getLogger(__name__)
 
@@ -394,44 +397,52 @@ def search(
 
     uniq = list(dict.fromkeys(q_terms))
     idf: dict[str, float] = {}
-    for term, df in conn.execute(
-        f"SELECT term, doc FROM {VROW} WHERE term IN ({_placeholders(len(uniq))})", uniq
+    dfs: dict[str, int] = {}
+    cfs: dict[str, int] = {}
+    for term, df, cnt in conn.execute(
+        f"SELECT term, doc, cnt FROM {VROW} WHERE term IN ({_placeholders(len(uniq))})", uniq
     ):
         if df:
             idf[term] = bm25_idf(n_docs, int(df))
+            dfs[term] = int(df)
+            cfs[term] = int(cnt)
 
-    space_sql = ""
-    space_params: list[str] = []
-    if spaces:
-        space_sql = f" AND d.space IN ({_placeholders(len(spaces))})"
-        space_params = list(spaces)
-    tf_by_doc: dict[int, dict[str, int]] = defaultdict(dict)
-    info: dict[int, tuple[int, str, str, str, str]] = {}
-    for term in idf:
-        for doc_key, tf, dl, upd, space, node_id, pid in conn.execute(
-            f"SELECT v.doc, COUNT(*), d.dl, d.updated_at, d.space, d.node_id, d.pack_id "
-            f"FROM {VINST} v JOIN {DOCS} d ON d.doc_key = v.doc "
-            f"WHERE v.term = ? AND d.pack_id IN ({_placeholders(len(pack_set))}){space_sql} "
-            "GROUP BY v.doc",
-            [term, *pack_set, *space_params],
-        ):
-            tf_by_doc[doc_key][term] = int(tf)
-            info[doc_key] = (int(dl), upd, space, node_id, pid)
+    def full_scored() -> list[tuple]:
+        space_sql = ""
+        space_params: list[str] = []
+        if spaces:
+            space_sql = f" AND d.space IN ({_placeholders(len(spaces))})"
+            space_params = list(spaces)
+        tf_by_doc: dict[int, dict[str, int]] = defaultdict(dict)
+        info: dict[int, tuple[int, str, str, str, str]] = {}
+        for term in idf:
+            for doc_key, tf, dl, upd, space, node_id, pid in conn.execute(
+                f"SELECT v.doc, COUNT(*), d.dl, d.updated_at, d.space, d.node_id, d.pack_id "
+                f"FROM {VINST} v JOIN {DOCS} d ON d.doc_key = v.doc "
+                f"WHERE v.term = ? AND d.pack_id IN ({_placeholders(len(pack_set))}){space_sql} "
+                "GROUP BY v.doc",
+                [term, *pack_set, *space_params],
+            ):
+                tf_by_doc[doc_key][term] = int(tf)
+                info[doc_key] = (int(dl), upd, space, node_id, pid)
 
-    scored = []
-    for doc_key, tf_map in tf_by_doc.items():
-        dl, upd, space, node_id, pid = info[doc_key]
-        score = bm25_score(q_terms, tf_map, idf, dl, avgdl)
-        if score > 0:
-            scored.append((score, upd, space, node_id, pid))
-    # (-score, updated_at DESC, space, node_id): stable sorts, last key first.
-    scored.sort(key=lambda c: (c[2], c[3]))
-    scored.sort(key=lambda c: c[1], reverse=True)
-    scored.sort(key=lambda c: -c[0])
+        scored = []
+        for doc_key, tf_map in tf_by_doc.items():
+            dl, upd, space, node_id, pid = info[doc_key]
+            score = bm25_score(q_terms, tf_map, idf, dl, avgdl)
+            if score > 0:
+                scored.append((score, upd, space, node_id, pid))
+        # (-score, updated_at DESC, space, node_id): stable sorts, last key first.
+        scored.sort(key=lambda c: (c[2], c[3]))
+        scored.sort(key=lambda c: c[1], reverse=True)
+        scored.sort(key=lambda c: -c[0])
+        return scored
 
     allowed = set(pack_set)
 
-    def checked(cands: Iterator[tuple], want: int | None, same_pack: bool) -> list[dict[str, Any]]:
+    def checked(
+        cands: Iterator[tuple], want: int | None, same_pack: bool, strict: bool
+    ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for score, _upd, space, node_id, pid in cands:
             if want is not None and len(out) >= want:
@@ -439,18 +450,26 @@ def search(
             if conn.execute(
                 f"SELECT 1 FROM {PENDING} WHERE space=? AND node_id=?", (space, node_id)
             ).fetchone() is not None:
+                if strict:
+                    raise _prune.PruneFallbackError("pending row")
                 continue
             row = conn.execute(
                 f"SELECT {_NODE_COLUMNS} FROM doc_nodes WHERE space=? AND node_id=?",
                 (space, node_id),
             ).fetchone()
             if row is None:
+                if strict:
+                    raise _prune.PruneFallbackError("missing row")
                 continue
             node = row_to_node(row)
             cur_pid = scope_pack_id(node)
             if cur_pid is None or cur_pid not in allowed or (same_pack and cur_pid != pid):
+                if strict:
+                    raise _prune.PruneFallbackError("pack changed")
                 continue
             if spaces and node.get("space") not in spaces:
+                if strict:
+                    raise _prune.PruneFallbackError("space changed")
                 continue
             out.append({
                 "node_id": node.get("node_id"),
@@ -463,22 +482,44 @@ def search(
             })
         return out
 
-    # BM25Index.search applies ``scores[:limit]``; a non-positive limit keeps
-    # that slice meaning, so every candidate is checked first.
-    want = limit if limit > 0 else None
-    if not per_pack:
-        hits = checked(iter(scored), want, same_pack=False)
-        return (hits if limit > 0 else hits[:limit]), warnings
-    by_pack: dict[str, list[tuple]] = defaultdict(list)
-    for cand in scored:
-        by_pack[cand[4]].append(cand)
-    out: dict[str, list[dict[str, Any]]] = {}
-    for pid in pack_set:
-        hits = checked(iter(by_pack.get(pid, ())), want, same_pack=True)
-        hits = hits if limit > 0 else hits[:limit]
-        if hits:
-            out[pid] = hits
-    return out, warnings
+    def render(scored: list[tuple], strict: bool) -> Any:
+        # BM25Index.search applies ``scores[:limit]``; a non-positive limit keeps
+        # that slice meaning, so every candidate is checked first.
+        want = limit if limit > 0 else None
+        if not per_pack:
+            hits = checked(iter(scored), want, same_pack=False, strict=strict)
+            return hits if limit > 0 else hits[:limit]
+        by_pack: dict[str, list[tuple]] = defaultdict(list)
+        for cand in scored:
+            by_pack[cand[4]].append(cand)
+        out: dict[str, list[dict[str, Any]]] = {}
+        for pid in pack_set:
+            hits = checked(iter(by_pack.get(pid, ())), want, same_pack=True, strict=strict)
+            hits = hits if limit > 0 else hits[:limit]
+            if hits:
+                out[pid] = hits
+        return out
+
+    # #567: exact top-k pruning when the snapshot has no pending row (design 6.1).
+    if (
+        not n_pending
+        and idf
+        and os.getenv("OPENCRAB_BM25_PRUNE", "1") != "0"
+        and _prune.eligible(len(q_terms), sum(cfs.values()), per_pack, limit, idf)
+    ):
+        try:
+            pruned = _prune.select(
+                conn, row_to_node,
+                names={"fts": FTS, "vinst": VINST, "docs": DOCS},
+                q_terms=q_terms, idf=idf, df=dfs, cf=cfs, avgdl=avgdl,
+                pack_set=pack_set, spaces=spaces, limit=limit, per_pack=per_pack,
+                max_text_chars=_decode_chars(_meta(conn).get("max_text_chars")),
+                node_terms=node_terms, node_columns=_NODE_COLUMNS,
+            )
+            return render(pruned, strict=True), warnings
+        except _prune.PruneFallbackError as exc:
+            logger.warning("node BM25 pruned search fell back to the full scan: %s", exc)
+    return render(full_scored(), strict=False), warnings
 
 
 # ---------------------------------------------------------------------------

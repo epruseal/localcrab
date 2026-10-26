@@ -42,6 +42,15 @@ def test_generator_is_deterministic_and_keeps_its_invariants(tmp_path):
         assert set(q["must_hit"]["combined"]) == set(q["gold"]), q["qid"]
         if q["kind"] in ("auto-title", "korean-variant", "top-k-pressure"):
             continue
+        if "common_words" in q:
+            # #567: the marker is the token that is not a declared common word.
+            if not q["gold"] and not q["forbidden"]:
+                continue
+            markers = [t for t in q["text"].split() if t not in q["common_words"]]
+            assert len(markers) == 1, q["qid"]
+            holders = {doc_id for doc_id, text in texts.items() if markers[0] in text.split()}
+            assert holders == set(q["gold"]) | set(q["forbidden"]), q["qid"]
+            continue
         holders = {doc_id for doc_id, text in texts.items() if q["text"] in text.split()}
         assert holders == set(q["gold"]) | set(q["forbidden"]), q["qid"]
     n = len(docs)
