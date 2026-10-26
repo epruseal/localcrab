@@ -137,6 +137,89 @@ diff <("<워크트리>/.venv/bin/ruff" check --show-files . 2>&1 | sort) \
 - `OPENCRAB_SKIP_LIVE_GUARD`: `require_live_data()`는 이 변수를 읽지 않는다.
   라이브 데이터 가드와 무관하며, 게이트를 도는 사람이 설정하거나 지울
   이유가 없다.
+- **주소공간 상한 아래 실행(운영 장치, 이슈 #517)**: 운영 장치에서는 시험을
+  주소공간 상한과 CPU 상한 아래에서 돌린다. 이 커널은 memory cgroup을 끈
+  상태라 `MemoryMax`가 동작하지 않으므로 메모리 보호는 주소공간 상한이
+  맡는다. 상한 실행에는 `MALLOC_ARENA_MAX=2`와 시간 상한(`RuntimeMaxSec`)을
+  반드시 함께 건다. 6번 재현 명령의 상한 판은 아래와 같다. 자리 표시자의
+  뜻과 값은 6번과 같다. `<고유 유닛 이름>`은 진단과 정지에 쓸 scope 이름이고
+  `<시간 상한 초>`는 실행을 끊을 벽시계 시간이다:
+
+  ```bash
+  (
+    rm -f <임시 루트>/<워크트리 식별자>-run.log <임시 루트>/<워크트리 식별자>-run.xml
+    cd "<워크트리>" || exit 17
+    set -o pipefail
+    MALLOC_ARENA_MAX=2 PYTEST_ADDOPTS= PY_COLORS=0 OPENCRAB_PG_TEST_URL=<Makefile test-pg 타깃의 값> \
+    OPENCRAB_SMOKE_BIN_DIR="<워크트리>/.venv/bin" TMPDIR="<임시 루트>" \
+    systemd-run --user --scope --collect --expand-environment=no --unit=<고유 유닛 이름> \
+      -p CPUQuota=100% -p RuntimeMaxSec=<시간 상한 초> \
+      prlimit --as=2147483648 nice -n 39 ionice -c 2 -n 7 \
+      "<워크트리>/.venv/bin/python" -m pytest tests/ \
+        --basetemp=<임시 루트>/<워크트리 식별자>-basetemp \
+        --junit-xml=<임시 루트>/<워크트리 식별자>-run.xml \
+      2>&1 | tee <임시 루트>/<워크트리 식별자>-run.log
+    code=$?
+    echo "EXIT:$code" | tee -a <임시 루트>/<워크트리 식별자>-run.log
+    exit "$code"
+  )
+  echo "BLOCK_EXIT:$?"
+  ```
+
+  6번 명령과 다른 점은 환경변수 접두의 `MALLOC_ARENA_MAX=2`와 python 앞의
+  래퍼뿐이다. 시험 파일 하나만 돌릴 때는 `tests/`를 그 파일 경로로 바꾼다.
+  래퍼의 각 부분은 다음 이유로 이렇게 고른다.
+  - transient scope(`--scope`)는 명령을 호출 셸의 자식으로 실행하고 그
+    프로세스만 새 cgroup에 넣는다. 그래서 호출 셸의 환경변수 접두와 내보낸
+    변수를 그대로 상속하고, 종료 코드도 명령 자신의 값이 나온다. transient
+    service(`--pipe --wait`)는 호출 셸의 환경을 상속하지 않고(`-E`로 적은
+    변수만 전달된다), 시간 상한에 걸려 끊겨도 종료 코드 1을 낼 수 있어
+    pytest의 "실패 있음"과 구별되지 않는다.
+  - scope는 실행 속성(`LimitAS`, `Nice`, `IOScheduling*`)을 받지 않는다.
+    그래서 `prlimit --as=2147483648`(2GiB 주소공간), `nice -n 39`,
+    `ionice -c 2 -n 7`로 건다. `nice -n`은 현재 값에 더하는 상대값이고
+    결과는 -20부터 19 사이로 잘리므로, 증분 39는 어떤 시작값에서든
+    niceness 19가 된다.
+  - `--expand-environment=no`는 systemd가 명령줄의 `$`를 자기 변수로
+    확장하지 않게 한다. 위 인자에는 `$`가 없지만 기본값이 바뀌어도 같은
+    동작을 얻으려고 둔다.
+
+  판정은 아래 "판정 절차"를 그대로 쓴다. 시간 상한에 걸리면 systemd가 scope의
+  프로세스에 SIGTERM을 보내고, 무시하면 SIGKILL을 보낸다. 그러면 종료
+  코드가 143이나 137이 되고, abort는 134가 된다. 어느 값도 0이나 1이 아니므로
+  판정 절차 2번이 XML 유무와 관계없이 미완주로 거른다. XML을 쓴 뒤 정리
+  단계에서 끊긴 실행도 같다. scope를 시작하지 못하면(속성 오류, 실행 파일
+  없음) 종료 코드는 1이지만 pytest가 돌지 않아 XML이 없으므로 3번이
+  거른다. 이 성질은 시험 실행 경로에 SIGTERM을 0이나 1로 바꾸는 처리기가
+  없다는 전제에 선다(재확인:
+  `git grep -n -E 'signal\.signal\(|SIGTERM|add_signal_handler' -- opencrab tests`).
+
+  **`MALLOC_ARENA_MAX=2`가 필요한 이유**: 이 변수 없이 주소공간 상한만 걸면
+  `tests/test_issue74_ingest_graph_parity.py`가 도중에 끝없이 멈춘다. 전체
+  스위트는 같은 파일에서 abort로 죽거나, 그 파일을 빼면 다른 파일에서 pytest
+  `INTERNALERROR ... MemoryError`로 끝난다. 변수를 걸면 전량 완주한다.
+  확인한 사실과 추정은 다음과 같다.
+  - 사실: 멈춘 프로세스는 가상 메모리 정점(`VmPeak`)이 상한과 같았고
+    실행 중인 스레드가 없었다. 주소공간의 대부분은 64MiB 경계에 정렬된
+    64MiB 익명 영역이 차지했다. 같은 시험을 변수와 함께 돌리면 스레드 수는
+    비슷한데 가상 메모리는 상한보다 한참 아래에 머문다. 스레드는 주로
+    opencrab이 아니라 onnxruntime, OpenBLAS, chromadb의 rust 런타임,
+    tokenizers가 만든다.
+  - 추정: 그 64MiB 영역은 glibc malloc이 스레드가 늘 때 만드는 arena의
+    heap이다. arena 수의 기본 상한은 `mallopt(3)`이 "implementation-defined
+    and is usually calculated as a multiple of the number of available
+    CPUs"라고 적는 값이다. arena 예약이 주소공간을 다 쓰면 네이티브 코드의
+    할당이나 스레드 생성이 실패한다. 멈춘 프로세스의 주 스레드는
+    onnxruntime 안에서 다른 스레드의 종료(`pthread_join`)를 기다리고
+    있었다. 실패가 예외가 아니라 대기로 나타나는 정확한 경로는 심볼 없는
+    바이너리라 확인하지 못했다.
+  - 재현과 진단: 위 명령에서 `MALLOC_ARENA_MAX=2`를 빼고 시험 경로를
+    `tests/test_issue74_ingest_graph_parity.py`로 바꾼다. 진행이 멈추면
+    `systemctl --user show -p ControlGroup --value <고유 유닛 이름>.scope`로
+    cgroup 경로를 얻고, `/sys/fs/cgroup<그 경로>/cgroup.procs`에서 PID를
+    읽는다. 그 PID의 `/proc/<pid>/status`(`VmPeak`, `VmSize`, `Threads`)와
+    `/proc/<pid>/maps`(64MiB 정렬 익명 영역의 수)를 본다. 진단이 끝나면
+    `systemctl --user stop <고유 유닛 이름>.scope`로 멈춘다.
 
 ## 5. 상존 실패의 성질과 재현 명령
 
@@ -159,7 +242,8 @@ diff <("<워크트리>/.venv/bin/ruff" check --show-files . 2>&1 | sort) \
   (동시 실행 금지: 공유 `opencrab_test` DB 오염). `scripts/select_targets.sh`
   는 이 저장소에 없으므로 전체 스위트 대사로 갈음한다. 회귀 대사는
   `tests/` 전량을 base와 작업 양쪽에서 돌리며 변경 모듈에 맞춘 부분 집합으로
-  갈음하지 않는다.
+  갈음하지 않는다. 운영 장치에서는 4번의 "주소공간 상한 아래 실행" 판으로
+  base와 작업을 같은 상한, 같은 변수로 돌린다.
 
   `<임시 루트>`는 저장소 밖 디스크 경로다. 이 머신의 시스템 임시 디렉터리(메모리
   tmpfs)는 쓰지 않는다. `TMPDIR`을 `<임시 루트>`로 두고 `--basetemp`를 그 아래에 둔다. 일부 시험은 basetemp가 `tempfile.gettempdir()`나 시스템 임시 디렉터리 아래에 있기를 요구한다.
