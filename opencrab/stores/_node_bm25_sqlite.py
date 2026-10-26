@@ -505,7 +505,7 @@ def search(
         not n_pending
         and idf
         and os.getenv("OPENCRAB_BM25_PRUNE", "1") != "0"
-        and _prune.eligible(len(q_terms), sum(cfs.values()), per_pack, limit)
+        and _prune.eligible(len(q_terms), sum(cfs.values()), per_pack, limit, idf)
     ):
         try:
             pruned = _prune.select(

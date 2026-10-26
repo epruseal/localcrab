@@ -47,9 +47,13 @@ class PruneFallbackError(Exception):
 RowToNode = Callable[[Any], dict[str, Any]]
 
 
-def eligible(n_terms: int, cf_sum: int, per_pack: bool, limit: int) -> bool:
+def eligible(n_terms: int, cf_sum: int, per_pack: bool, limit: int,
+             idf: dict[str, float]) -> bool:
     """True when ``select`` may run (the caller checks the switch and pending)."""
     if limit <= 0 or n_terms > PRUNE_MAX_TERMS:
+        return False
+    # Design 6.1: a computed idf of 0 would break the strict upper bound.
+    if not idf or not all(v > 0 for v in idf.values()):
         return False
     return per_pack or cf_sum > FULL_SCAN_CF_MAX
 
