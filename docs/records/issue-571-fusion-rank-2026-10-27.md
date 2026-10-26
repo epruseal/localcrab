@@ -4,9 +4,9 @@
 
 ## 1. 조건
 
-- 코드: 이 브랜치의 분기점(`origin/main`, #556과 #567 포함). probe는 저장소 파일을 바꾸지 않았다.
+- 코드: 측정 시점의 `origin/main`(#556과 #567 포함). probe는 저장소 파일을 바꾸지 않았다.
 - 코퍼스: `scripts/search_corpus.py generate --preset <S1|S2|S3> --seed 542`. 질의는 셋 모두 48이다. 적재는 같은 코드의 `scripts/search_baseline.py load`이고 셋 모두 `COMPLETE`였다(노드 20150, 61100, 120000).
-- 실행: 생성, 적재, probe를 transient systemd 서비스(`CPUQuota=100%`, `Nice=19`, `IOSchedulingClass=best-effort`, `IOSchedulingPriority=7`, `LimitAS=2G`, `RuntimeMaxSec`, `MALLOC_ARENA_MAX=2`, `PYTHONDONTWRITEBYTECODE=1`, `TMPDIR`은 디스크 경로)로 하나씩 돌렸다. 각 서비스는 python을 실행하기 직전에 같은 PID의 셸에서 주소 공간 상한, cgroup `cpu.max`, nice, ionice, 환경 변수를 파일로 남겼다. 모든 서비스에서 주소 공간 상한 2147483648바이트, `cpu.max` `100000 100000`, nice 19, best-effort 7, `MALLOC_ARENA_MAX=2`였다.
+- 실행: 생성, 적재, probe를 transient systemd 서비스(`CPUQuota=100%`, `Nice=19`, `IOSchedulingClass=best-effort`, `IOSchedulingPriority=7`, `LimitAS=2G`, `RuntimeMaxSec`, `MALLOC_ARENA_MAX=2`, `PYTHONDONTWRITEBYTECODE=1`, `TMPDIR`은 디스크 경로)로 하나씩 돌렸다. 각 서비스는 python을 실행하기 직전에 같은 PID의 셸에서 주소 공간 상한, cgroup `cpu.max`, nice, ionice, 환경 변수를 파일로 남겼다. 모든 서비스에서 주소 공간 상한 2GiB, `cpu.max` `100000 100000`, nice 19, best-effort 7, `MALLOC_ARENA_MAX=2`였다.
 - 장치 등급: 8GB RAM, 4코어 aarch64.
 
 ## 2. 착수 전 probe: 후보 비교
@@ -102,4 +102,83 @@
 - S2(두 설정 같음): `common-heavy-0`, `common-heavy-1`, `common-heavy-2`, `common-only-0`, `common-only-1`, `common-only-2`. 모두 정답도 대조군도 아닌 결과끼리 바뀌었다.
 - S3(두 설정 같음): `common-heavy-1`(정답이 들어옴), `top-k-pressure-0`, `-1`, `-2`(대조군끼리 바뀜), `common-heavy-0`, `common-only-0`, `-1`, `-2`(정답도 대조군도 아닌 결과끼리).
 
-평면 병합의 질의별 변경은 구현 뒤 id 대조(이 기록의 뒤 절)에 함께 적는다.
+평면 병합의 질의별 변경은 7절에 적는다.
+
+## 4. 구현 뒤 재현 시험과 역변이
+
+- RED: 구현 전 코드(설계 커밋)에서 `tests/test_query_lexical_reservation.py`에 더한 시험 일곱 개를 돌렸다. 여섯 개가 기대한 이유로 실패했다(rerank 결과에 BM25 2위 정답 없음, 평면 병합 끝 칸이 2위 정답 아님, 창 4칸에서 경고 수 0, 창 5칸에서 경고 없음, FTS 2위가 창 밖, 접힌 구성원 2위의 대표가 창 밖). 창 8칸 시험은 구현 전에도 통과한다. 창이 결과 전체를 담는 불변 확인이기 때문이다.
+- 역변이: 구현 커밋의 폐기용 detached checkout에서 변이 셋을 하나씩 넣고 같은 시험 파일(시험 19개)을 돌렸다. 각 실행은 그 checkout의 `opencrab`을 import했다.
+  - 깊이를 1로 되돌림: 새 시험 여섯 개 실패.
+  - 순서를 BM25 1위, BM25 2위, FTS 1위, FTS 2위로 바꿈: 창 4칸 시험과 창 5칸 시험 실패.
+  - FTS 2위를 넣지 않음: FTS 2위 시험 실패.
+  - 변이 전과 복구 뒤의 대조군은 19개 모두 통과했다.
+
+## 5. 구현 뒤 전체 스위트 대사
+
+- 코드: base는 측정 시점의 `origin/main`(#567까지)의 detached worktree와 그 자신의 venv다. head는 구현 커밋이다. 측정 뒤 `origin/main`에 #542 S3 측정 기록(문서 하나)이 들어왔고 이 브랜치를 그 위로 옮겼다. 코드와 시험 파일은 바뀌지 않았으므로 측정을 다시 하지 않았다.
+- 실행: `docs/gate-recipes.md` 6절의 재현 명령을 transient 서비스 안에서 base, head 순으로 하나씩 돌렸다. basetemp와 `TMPDIR`은 같은 디스크 경로다. 실행 중 pytest 프로세스에서 주소 공간 상한 2GiB, cgroup `cpu.max` `100000 100000`, 환경의 `MALLOC_ARENA_MAX=2`, `PYTEST_ADDOPTS=`(빈 값), `PY_COLORS=0`, `OPENCRAB_SMOKE_BIN_DIR`(각 checkout의 venv)를 확인했다. `OPENCRAB_PG_TEST_URL`은 두 실행 모두 두지 않았다. 공유 PostgreSQL을 쓰지 않기 위해서이며, 두 실행이 같은 PG 시험을 똑같이 건너뛴다.
+- 결과: 두 요약 모두 `VERDICT:COMPLETE`. base는 tests 8903, skipped 508, 실패 6이다. head는 tests 8910, skipped 508, 실패 6이다. 실패 id 집합은 같다(`tests/test_issue80_sql_graph.py`의 PG와 Neo4j 런타임 시험 여섯 개, #556 기록 4절과 같은 필수 환경 변수 누락). 상태 대조에서 바뀐 항목은 새 시험 일곱 개 추가(모두 pass)뿐이다. pytest가 보고한 소요는 base 1842.9초, head 1820.9초였다.
+- CI 기본 환경: 사용자 이름을 별도로 두고 `TMPDIR` 없이 기본 basetemp(시스템 임시 디렉터리)로 `test_query_lexical_reservation.py`, `test_query_characterization.py`, `test_query_duplicate_fold.py`, `test_query_retrieval.py`, `test_search_baseline.py`, `test_search_faults.py`를 돌려 114개 모두 통과했다. #542 하네스 S0 시험과 장애 주입 하네스 S0 시험이 여기에 든다. 실행 뒤 그 사용자의 임시 디렉터리를 지웠다.
+- 하네스 `selftest`는 `SELFTEST: PASS`였다. 하네스 파일은 이 변경이 바꾸지 않았다.
+
+## 6. 구현 뒤 #542 하네스 대조 (base와 head)
+
+- 입력: 1절의 적재 한 벌(규모마다 하나)을 base와 head가 함께 썼다. `run`은 적재 디렉터리를 실행 디렉터리로 복사한 뒤 사본에서만 측정한다(#542 설계 8.2절). 적재는 base 코드로 했고, 이 변경은 적재 경로를 바꾸지 않는다.
+- 실행: S1, S2, S3 각각 기본 설정과 축소 상한 설정에서 base, head 순으로 하나씩 돌렸다. 세 규모 모두 두 설정을 전량 돌렸다(줄이지 않았다). 열두 보고서 모두 `verdict: COMPLETE`, `bm25_index`는 `db`, 보고서의 주소 공간 상한은 2GiB, `cgroup_cpu_max`는 `100000 100000`이다. 서비스 소요는 S1 약 1분 30초, S2 약 2분 30초, S3 약 4분 50초였다.
+
+| 규모와 설정 | base 결합 | head 결합 | `compare` |
+|---|---|---|---|
+| S1 기본 | pass 46, miss 1, partial_silent 1 | pass 47, miss 1 | CLEAN |
+| S1 축소 상한 | pass 46, miss 1, partial_silent 1 | pass 47, miss 1 | CLEAN |
+| S2 기본 | pass 47, miss 1 | pass 47, miss 1 | CLEAN |
+| S2 축소 상한 | pass 47, miss 1 | pass 47, miss 1 | CLEAN |
+| S3 기본 | pass 46, miss 1, partial_silent 1 | pass 47, miss 1 | REGRESSION 1(지연, 아래) |
+| S3 축소 상한 | pass 46, miss 1, partial_silent 1 | pass 47, miss 1 | CLEAN |
+
+- 레그 분류는 모든 보고서에서 BM25, FTS, vector 모두 pass 48이다.
+- 질의별 대조: 레그와 결합의 분류, 누락, 정답 순위, 대조군 수, 자동 선택 판정이 바뀐 질의는 S1과 S3의 `common-heavy-1` 결합 하나다(`partial_silent`에서 `pass`). S2는 바뀐 질의가 없다. 결합 `miss` 하나는 모든 보고서에서 `long-tail-1`이다.
+- 반복 결함 표지: 누출, 중복, 범위 오류, 경고 누락, 동시 쓰기 누출과 중복은 모든 보고서에서 0이다. 조용한 부분 결과 표지는 base의 S1과 S3에서 5(결합, 다섯 반복), head에서 모두 0이다.
+- 요구치: base의 S1과 S3에서 미충족이던 `quality_partial_silent`가 head에서 충족됐다. `quality_combined_non_pass`는 `long-tail-1` 때문에 양쪽 모두 미충족이다.
+- `fusion:` 경고가 켜진 질의(결합, 마지막 반복)는 모든 규모와 설정에서 base와 head가 같다. S1은 `common-heavy-0`, `common-heavy-1`, `common-heavy-2`, `common-only-1`, `top-k-pressure-2`. S2는 `common-heavy-0`, `common-heavy-1`, `common-only-0`, `common-only-1`, `top-k-pressure-0`, `-1`, `-2`. S3는 `common-heavy-2`, `common-only-1`, `common-only-2`, `top-k-pressure-2`.
+
+### 6.1 S3 기본 설정의 지연 회귀 판정
+
+- `compare`가 S3 기본 설정에서 `latency_whole_scope_p95_ms`(상한 2000ms)를 새 미충족으로 냈다. base 1995.9ms, head 2011.5ms였다. 같은 S3 축소 상한은 base 1969.8ms, head 1985.3ms로 둘 다 충족이었다.
+- 같은 적재에서 S3 기본 설정을 head, base 순으로 한 번 더 돌렸다. head 1988.9ms(충족), base 2029.4ms(미충족)였고 `compare`는 CLEAN이었다. 두 번째 쌍의 결합 분류는 첫 쌍과 같았다(base pass 46, miss 1, partial_silent 1, head pass 47, miss 1).
+- #542 S3 측정 기록(`docs/records/issue-542-s3-2026-10-27.md` 8절)도 같은 코드의 이 항목이 2065.1ms, 2000.1ms, 2004.3ms로 상한 근처에서 갈렸다고 적었다. 하네스의 p95는 표본 30개의 둘째로 큰 값이다.
+- 이 변경은 Stage 7에서 보장 후보 목록을 넷까지 만들 뿐이고 레그 호출과 결합 계산을 바꾸지 않는다. 그래서 이 미충족은 상한 근처 항목의 실행 간 변동으로 판정한다. 이 판정은 위 두 쌍의 관측에 근거한다.
+- 다른 지연 요구치의 충족 여부는 모든 규모와 설정에서 base와 head가 같았다. S3의 동시 쓰기 중 전체 범위 p95와 쓰기 지연 p95는 양쪽 모두 미충족이다(#565).
+
+## 7. 구현 뒤 id 대조와 `fusion:` 경고 목록
+
+- 방법: base checkout과 head checkout이 각각 같은 적재의 새 사본에서 질의 48개의 자동 선택, BM25, FTS, vector 레그, rerank 결합, 평면 병합의 id 목록과 결합 `warnings`를 냈다(2절의 probe 스크립트, RRF 변형 없이). 각 프로세스가 자기 checkout의 `opencrab`을 import했음을 출력으로 확인했다. 세 규모, 두 설정 모두 돌렸다.
+- 자동 선택과 세 레그의 id 목록은 모든 규모와 설정에서 질의 48개 모두 같다. `fusion:`이 아닌 경고도 같다.
+- `fusion:` 경고가 켜진 질의는 모든 규모, 설정, 경로에서 base와 head가 같다. rerank는 6절의 목록과 같고 평면 병합은 base와 head 모두 0개다.
+- 반환 창에서 정답의 위치가 내려가거나 정답이 창을 떠난 질의는 없다.
+- 두 설정의 결과는 규모마다 같다. 창이 바뀐 질의와 판정은 다음과 같다. 판정 규칙은 설계 8절이다.
+
+| 규모 | 경로 | 질의 | 판정 |
+|---|---|---|---|
+| S1 | rerank | `common-heavy-1` | 개선. BM25 2위 정답이 창 밖에서 10위로 옴. 나간 결과는 정답도 대조군도 아님. |
+| S1 | rerank | `common-heavy-2` | 중립. 정답 10위에서 9위. 정답 아닌 결과끼리 바뀜. |
+| S1 | rerank | `common-heavy-0`, `common-only-0`, `-1`, `-2` | 중립. 정답 아닌 결과끼리 바뀜. 정답 위치 같음. |
+| S1 | 평면 | `common-heavy-1` | 개선. BM25 2위 정답이 창 밖에서 9위로 옴. |
+| S1 | 평면 | `common-heavy-2` | 중립. 정답 9위에서 7위. |
+| S1 | 평면 | `korean-variant-0`, `-1`, `-2`, `top-k-pressure-2` | 중립(따로 적음). 대조군이 정답도 대조군도 아닌 결과를 밀어냄. 정답 위치 같음. |
+| S1 | 평면 | `top-k-pressure-0`, `-1` | 중립. 대조군끼리 바뀜. |
+| S1 | 평면 | `auto-title-0`, `common-heavy-0`, `common-only-0`, `-1`, `-2` | 중립. 정답 아닌 결과끼리 바뀜. `auto-title-0`과 `common-only`는 정답이 없는 질의다. |
+| S2 | rerank | `common-heavy-0`, `-1`, `-2`, `common-only-0`, `-1`, `-2` | 중립. 정답 아닌 결과끼리 바뀜. 정답 위치 같음. |
+| S2 | 평면 | `common-heavy-1` | 중립. 정답 10위에서 9위. |
+| S2 | 평면 | `korean-variant-0`, `-2`, `top-k-pressure-2` | 중립(따로 적음). 대조군이 정답도 대조군도 아닌 결과를 밀어냄. |
+| S2 | 평면 | `top-k-pressure-1` | 중립. 대조군끼리 바뀜. |
+| S2 | 평면 | `common-heavy-0`, `-2`, `common-only-1`, `-2` | 중립. 정답 아닌 결과끼리 바뀜. |
+| S3 | rerank | `common-heavy-1` | 개선. BM25 2위 정답이 창 밖에서 10위로 옴. |
+| S3 | rerank | `top-k-pressure-0`, `-1`, `-2` | 중립. 대조군끼리 바뀜. |
+| S3 | rerank | `common-heavy-0`, `common-only-0`, `-1`, `-2` | 중립. 정답 아닌 결과끼리 바뀜. |
+| S3 | 평면 | `common-heavy-1`, `whole-scope-0` | 개선. BM25 2위 정답이 창 밖에서 10위로 옴. |
+| S3 | 평면 | `korean-variant-0`, `-1`, `-2`, `top-k-pressure-2` | 중립(따로 적음). 대조군이 정답도 대조군도 아닌 결과를 밀어냄. |
+| S3 | 평면 | `top-k-pressure-0` | 중립(따로 적음). 대조군 둘이 들어오고 대조군 하나와 정답도 대조군도 아닌 결과 하나가 나감. |
+| S3 | 평면 | `top-k-pressure-1` | 중립. 대조군끼리 바뀜. |
+| S3 | 평면 | `common-heavy-0`, `-2` | 중립. 정답 아닌 결과끼리 바뀜. |
+
+- 퇴행으로 판정한 질의는 없다.
