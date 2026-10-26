@@ -86,8 +86,11 @@ KINDS = (
     "exact-recent", "exact-old", "explicit-multi", "explicit-mixed",
     "explicit-forbidden", "whole-scope", "auto-content", "auto-title",
     "scope-filter", "space-filter", "korean-variant", "long-tail",
-    "duplicate-body", "top-k-pressure",
+    "duplicate-body", "top-k-pressure", "common-heavy", "common-only",
 )
+
+# #567: common-term queries use this many top Zipf general words.
+COMMON_WORDS = 6
 
 # Hangul syllable index ranges (offset from U+AC00). General vocabulary and
 # reserved marker syllables come from disjoint ranges. The particles used by
@@ -260,7 +263,7 @@ class _Planner:
 
 def _plan_queries(
     preset: dict[str, Any], packs: dict[str, dict[str, Any]], docs: list[dict[str, Any]],
-    seed: int, reserved: _Reserved,
+    seed: int, reserved: _Reserved, vocab: _Vocab,
 ) -> tuple[list[dict[str, Any]], _Planner]:
     plan = _Planner(docs, packs, seed)
     large = [r for r, p in packs.items() if p["group"] == "large"]
@@ -273,7 +276,7 @@ def _plan_queries(
               auto: bool = False, spaces: list[str] | None = None,
               expect_scope_warning: bool = False, expect_empty: bool = False,
               expect_pack: str | None = None, long_tail: set[int] | None = None,
-              fts_exact: bool = True) -> None:
+              fts_exact: bool = True, common_words: list[str] | None = None) -> None:
         long_tail = long_tail or set()
         bm25 = [i for i in gold if i not in long_tail]
         fts = [i for i in gold if docs[i]["form"] == "S" and fts_exact]
@@ -294,6 +297,8 @@ def _plan_queries(
             "expect_scope_warning": expect_scope_warning, "expect_empty": expect_empty,
             "expect_pack": packs[expect_pack]["pack_id"] if expect_pack else None,
         })
+        if common_words is not None:
+            queries[-1]["common_words"] = list(common_words)
 
     for k in range(preset["per_kind"]):
         la, lb = large[k % len(large)], large[(k + 1) % len(large)]
@@ -412,6 +417,42 @@ def _plan_queries(
     for _ in range(max(0, extra)):
         role = large[plan.rng.randrange(len(large))]
         plan.long.add(plan.pick(role))
+    # #567: common-term queries are planned last, so the earlier queries, their
+    # documents and every earlier pick stay the same. The common words are the
+    # top Zipf general words that no pack title or description holds, so an
+    # auto_pack query reaches the content probe.
+    named = {w for p in packs.values() for w in f"{p['title']} {p['description']}".split()}
+    common = [w for w in vocab.words if w not in named][:COMMON_WORDS]
+    for k in range(preset["per_kind"]):
+        la, lb = large[k % len(large)], large[(k + 1) % len(large)]
+        sa = small[k % len(small)]
+        m = reserved.latin("qx")
+        text = f"{m} " + " ".join(common)
+        if k % 3 == 0:
+            g, f = plan.pick(la), plan.pick(lb)
+            plan.add(g, m)
+            plan.add(f, m)
+            query("common-heavy", k, text, pack_roles=[la], gold=[g], forbidden=[f],
+                  common_words=common)
+        elif k % 3 == 1:
+            g1, g2 = plan.pick(lb), plan.pick("bpub")
+            f1, f2, f3 = plan.pick("bpriv"), plan.pick("creating"), plan.pick(None)
+            for i in (g1, g2, f1, f2, f3):
+                plan.add(i, m)
+            query("common-heavy", k, text, pack_roles=None, gold=[g1, g2],
+                  forbidden=[f1, f2, f3], common_words=common)
+        else:
+            g, f = plan.pick(sa), plan.pick("bpriv")
+            plan.add(g, m)
+            plan.add(f, m)
+            query("common-heavy", k, text, pack_roles=None, gold=[g], forbidden=[f],
+                  auto=True, expect_pack=sa, common_words=common)
+    for k in range(preset["per_kind"]):
+        la = large[k % len(large)]
+        words = common[:3] if k % 3 < 2 else common
+        roles = [la] if k % 3 == 0 else None
+        query("common-only", k, " ".join(words), pack_roles=roles, gold=[], forbidden=[],
+              common_words=words)
     return queries, plan
 
 
@@ -475,13 +516,19 @@ def generate(preset_name: str, seed: int, out: Path) -> dict[str, Any]:
     reserved = _Reserved(seed)
     packs = _pack_table(preset, seed, vocab)
     docs = _doc_skeleton(preset, packs, seed)
-    queries, plan = _plan_queries(preset, packs, docs, seed, reserved)
+    queries, plan = _plan_queries(preset, packs, docs, seed, reserved, vocab)
 
-    # Invariant: marker tokens never occur in the general vocabulary.
+    # Invariant: marker tokens never occur in the general vocabulary. The
+    # declared common words of #567 queries are general words that no pack
+    # title or description holds.
     vocab_set = set(vocab.words)
+    named = {w for p in packs.values() for w in f"{p['title']} {p['description']}".split()}
     for q in queries:
+        common = set(q.get("common_words") or [])
+        if not common <= vocab_set or common & named:
+            raise RuntimeError(f"common word outside the contract: {q['qid']}")
         for token in q["text"].split():
-            if q["kind"] != "auto-title" and token in vocab_set:
+            if q["kind"] != "auto-title" and token not in common and token in vocab_set:
                 raise RuntimeError(f"marker collides with vocabulary: {q['qid']}")
 
     out.mkdir(parents=True)
