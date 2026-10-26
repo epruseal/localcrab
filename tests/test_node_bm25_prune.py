@@ -299,16 +299,40 @@ def test_inconsistencies_fall_back_to_the_full_scan(tmp_path, monkeypatch, force
     assert FALLBACK in caplog.text and "dl" in caplog.text
 
 
-def test_row_check_drop_falls_back_to_the_full_scan(tmp_path, monkeypatch, forced, caplog):
+def test_match_count_mismatch_falls_back(tmp_path, monkeypatch, forced, caplog):
+    store = _store(tmp_path)
+    _skewed(store)
+    caplog.set_level(logging.WARNING)
+    q = "qxrare alpha beta gamma"
+    full, _ = _full(store, monkeypatch, q, ["pa"], limit=10)
+    real_match = prune._match_docs
+
+    def wrong_df(*a):
+        *head, df_term = a
+        return real_match(*head, df_term + 1)
+
+    monkeypatch.setattr(prune, "_match_docs", wrong_df)
+    got, _ = _search(store, q, ["pa"], limit=10)
+    assert _shape(got) == _shape(full)
+    assert FALLBACK in caplog.text and "match count" in caplog.text
+
+
+def _drop_triggers(store) -> sqlite3.Connection:
+    raw = sqlite3.connect(store._db_path)
+    for name in nbm.TRIGGERS:
+        raw.execute(f'DROP TRIGGER "{name}"')
+    return raw
+
+
+def test_retokeniser_finds_a_row_removed_behind_the_triggers(tmp_path, monkeypatch, forced,
+                                                             caplog):
     store = _store(tmp_path)
     _skewed(store)
     caplog.set_level(logging.WARNING)
     q = "qxrare alpha"
     top = _full(store, monkeypatch, q, ["pa"], limit=5)[0][0]["node_id"]
     # Remove a top row behind the triggers: the snapshot has no pending key.
-    with sqlite3.connect(store._db_path) as raw:
-        for name in nbm.TRIGGERS:
-            raw.execute(f'DROP TRIGGER "{name}"')
+    with _drop_triggers(store) as raw:
         raw.execute("DELETE FROM doc_nodes WHERE node_id=?", (top,))
     full, _ = _full(store, monkeypatch, q, ["pa"], limit=5)
     got, _ = _search(store, q, ["pa"], limit=5)
@@ -317,6 +341,32 @@ def test_row_check_drop_falls_back_to_the_full_scan(tmp_path, monkeypatch, force
     # The seeding re-tokeniser or the row check finds the missing row.
     assert FALLBACK in caplog.text
     assert "node row" in caplog.text or "missing row" in caplog.text
+
+
+@pytest.mark.parametrize("change", ["delete", "move"])
+def test_row_check_falls_back_without_retokenising(tmp_path, monkeypatch, forced, caplog,
+                                                   change):
+    store = _store(tmp_path)
+    _skewed(store)
+    caplog.set_level(logging.WARNING)
+    q = "qxrare alpha"
+    top = _full(store, monkeypatch, q, ["pa"], limit=5)[0][0]["node_id"]
+    with _drop_triggers(store) as raw:
+        if change == "delete":
+            raw.execute("DELETE FROM doc_nodes WHERE node_id=?", (top,))
+        else:
+            raw.execute("UPDATE doc_nodes SET properties=json_set(properties, '$.pack_id', 'pz') "
+                        "WHERE node_id=?", (top,))
+    full, _ = _full(store, monkeypatch, q, ["pa"], limit=5)
+    monkeypatch.setattr(prune, "SEED_BUDGET_US", 0.0)
+    monkeypatch.setattr(prune, "RETOK_BASE_US", 1e12)
+    before = forced["retok"]
+    got, _ = _search(store, q, ["pa"], limit=5)
+    assert forced["retok"] == before
+    assert top not in {h["node_id"] for h in got}
+    assert _shape(got) == _shape(full)
+    reason = "missing row" if change == "delete" else "pack changed"
+    assert FALLBACK in caplog.text and reason in caplog.text
 
 
 def test_eligibility_rules():

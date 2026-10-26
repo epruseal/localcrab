@@ -109,7 +109,7 @@ pending 행이 남은 동안 N, df, avgdl에는 아직 반영되지 않은 변�
 
 탐침의 coverage 경고는 선택 결과에 전달한다. `HybridQuery`에 `(팩별 결과, 경고)`를 돌려주는 `_bm25_search_per_pack_with_warnings`를 두고, `pack_registry`에 경고를 함께 돌려주는 `_choose_by_content_with_warnings`를 둔다. 기존 `_bm25_search_per_pack`과 `_choose_by_content`는 이 둘을 감싸 기존 반환 모양을 유지한다. `resolve_packs`는 탐침 경고가 있으면 새 선택 경고 코드 `auto_pack_probe_coverage`를 더한다. 문구 표는 `_MCP_WARNINGS`와 `_CLI_WARNINGS` 둘이고 두 표 모두에 이 코드를 넣는다. MCP 응답과 REST 응답(`apps/api/main.py`)은 `mcp_warning_text`를, CLI는 `cli_warning_text`를 쓴다. 탐침 때 pending이나 색인 오류로 선택이 달라졌고 최종 검색 때 그 상태가 풀렸어도 응답에 탐침 당시의 사실이 남는다. 기존 메모리 경로의 팩별 탐침도 같은 메서드로 자기 coverage 경고를 전달한다.
 
-공통 용어(거의 모든 문서에 있는 토큰)를 담은 질의는 `vinst`가 그 용어의 모든 출현을 훑는다. 비용은 코퍼스 전체의 출현 수에 비례하고 요청 팩 크기와 무관하다. 기존 경로는 요청 팩의 모든 문서를 훑었다. #567이 정확한 상위 k를 지키는 MaxScore 계열 가지치기로 이 비용을 줄였다(`docs/issue-567-bm25-prune.md`). 결과는 이 절의 계산과 같고, pending이 있거나 `limit`이 0 이하인 질의와 출현이 적은 질의는 이 절의 계산을 그대로 쓴다.
+공통 용어(거의 모든 문서에 있는 토큰)를 담은 질의는 `vinst`가 그 용어의 모든 출현을 훑는다. 비용은 코퍼스 전체의 출현 수에 비례하고 요청 팩 크기와 무관하다. 기존 경로는 요청 팩의 모든 문서를 훑었다. #567이 정확한 상위 k를 지키는 MaxScore 계열 가지치기로 이 비용을 줄였다(`docs/issue-567-bm25-prune.md`). 결과는 이 절의 계산과 같고, pending이 있거나 `limit`이 0 이하인 질의와, 출현이 적은 비팩별 질의는 이 절의 계산을 그대로 쓴다.
 
 ### 4.6 pending 소진과 경고 계약
 
