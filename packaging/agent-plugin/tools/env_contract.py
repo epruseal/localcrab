@@ -98,6 +98,9 @@ ENV_CONTRACT: dict[str, str] = {
     # #541: "0" sends BM25 searches to the memory window instead of the
     # SQLite node index (rollback switch, docs/issue-541-db-bm25.md 5.5).
     "OPENCRAB_BM25_DB_INDEX": "튜너블",
+    # #567: "0" turns off the exact top-k pruning and keeps the full DB index
+    # scan (rollback switch, docs/issue-567-bm25-prune.md 6.7).
+    "OPENCRAB_BM25_PRUNE": "튜너블",
     "OPENCRAB_AUTO_PACK_MIN_SCORE": "튜너블",
     # opencrab/pack/jsonl_io.py 전용. opencrab/mcp/tools/pack.py 는 이 모듈을
     # 임포트하지 않는다(위 재현 명령으로 확인) -- 팩 CLI 저작 경로에서만 읽힌다.
