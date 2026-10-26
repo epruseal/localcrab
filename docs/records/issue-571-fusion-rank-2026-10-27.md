@@ -136,7 +136,7 @@
 | S3 축소 상한 | pass 46, miss 1, partial_silent 1 | pass 47, miss 1 | CLEAN |
 
 - 레그 분류는 모든 보고서에서 BM25, FTS, vector 모두 pass 48이다.
-- 질의별 대조: 레그와 결합의 분류, 누락, 정답 순위, 대조군 수, 자동 선택 판정이 바뀐 질의는 S1과 S3의 `common-heavy-1` 결합 하나다(`partial_silent`에서 `pass`). S2는 바뀐 질의가 없다. 결합 `miss` 하나는 모든 보고서에서 `long-tail-1`이다.
+- 질의별 대조: 하네스 보고서가 담는 레그와 결합의 분류, 누락, 대조군 수(`decoy_above_gold`), 레그가 놓친 정답의 순위(`gold_rank`), 자동 선택 판정을 비교했다. 바뀐 질의는 S1과 S3의 `common-heavy-1` 결합 하나다(`partial_silent`에서 `pass`). S2는 바뀐 질의가 없다. 보고서에는 결합 결과의 정답 위치가 없으므로 그 변화는 7절의 id 대조에 적었다. 예를 들어 S1 `common-heavy-2`의 정답은 rerank에서 10위에서 9위로 올랐다. 결합 `miss` 하나는 모든 보고서에서 `long-tail-1`이다.
 - 반복 결함 표지: 누출, 중복, 범위 오류, 경고 누락, 동시 쓰기 누출과 중복은 모든 보고서에서 0이다. 조용한 부분 결과 표지는 base의 S1과 S3에서 5(결합, 다섯 반복), head에서 모두 0이다.
 - 요구치: base의 S1과 S3에서 미충족이던 `quality_partial_silent`가 head에서 충족됐다. `quality_combined_non_pass`는 `long-tail-1` 때문에 양쪽 모두 미충족이다.
 - `fusion:` 경고가 켜진 질의(결합, 마지막 반복)는 모든 규모와 설정에서 base와 head가 같다. S1은 `common-heavy-0`, `common-heavy-1`, `common-heavy-2`, `common-only-1`, `top-k-pressure-2`. S2는 `common-heavy-0`, `common-heavy-1`, `common-only-0`, `common-only-1`, `top-k-pressure-0`, `-1`, `-2`. S3는 `common-heavy-2`, `common-only-1`, `common-only-2`, `top-k-pressure-2`.
