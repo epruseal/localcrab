@@ -89,8 +89,13 @@ KINDS = (
     "duplicate-body", "top-k-pressure", "common-heavy", "common-only",
 )
 
-# #567: common-term queries use this many top Zipf general words.
+# #567: common-term queries. The live observed common-term forms hold one
+# moderately common term and near-universal terms, so the three-word set takes
+# the two most frequent words and the word at rank COMMON_MID_RANK (in about
+# half of the documents). The six-word set takes the six most frequent words
+# (the residual form of docs/issue-567-bm25-prune.md section 12).
 COMMON_WORDS = 6
+COMMON_MID_RANK = 12
 
 # Hangul syllable index ranges (offset from U+AC00). General vocabulary and
 # reserved marker syllables come from disjoint ranges. The particles used by
@@ -422,34 +427,36 @@ def _plan_queries(
     # top Zipf general words that no pack title or description holds, so an
     # auto_pack query reaches the content probe.
     named = {w for p in packs.values() for w in f"{p['title']} {p['description']}".split()}
-    common = [w for w in vocab.words if w not in named][:COMMON_WORDS]
+    eligible = [w for w in vocab.words if w not in named]
+    common = eligible[:COMMON_WORDS]
+    common3 = eligible[:2] + [eligible[COMMON_MID_RANK - 1]]
     for k in range(preset["per_kind"]):
         la, lb = large[k % len(large)], large[(k + 1) % len(large)]
         sa = small[k % len(small)]
         m = reserved.latin("qx")
-        text = f"{m} " + " ".join(common)
+        text = f"{m} " + " ".join(common3)
         if k % 3 == 0:
             g, f = plan.pick(la), plan.pick(lb)
             plan.add(g, m)
             plan.add(f, m)
             query("common-heavy", k, text, pack_roles=[la], gold=[g], forbidden=[f],
-                  common_words=common)
+                  common_words=common3)
         elif k % 3 == 1:
             g1, g2 = plan.pick(lb), plan.pick("bpub")
             f1, f2, f3 = plan.pick("bpriv"), plan.pick("creating"), plan.pick(None)
             for i in (g1, g2, f1, f2, f3):
                 plan.add(i, m)
             query("common-heavy", k, text, pack_roles=None, gold=[g1, g2],
-                  forbidden=[f1, f2, f3], common_words=common)
+                  forbidden=[f1, f2, f3], common_words=common3)
         else:
             g, f = plan.pick(sa), plan.pick("bpriv")
             plan.add(g, m)
             plan.add(f, m)
             query("common-heavy", k, text, pack_roles=None, gold=[g], forbidden=[f],
-                  auto=True, expect_pack=sa, common_words=common)
+                  auto=True, expect_pack=sa, common_words=common3)
     for k in range(preset["per_kind"]):
         la = large[k % len(large)]
-        words = common[:3] if k % 3 < 2 else common
+        words = common3 if k % 3 < 2 else common
         roles = [la] if k % 3 == 0 else None
         query("common-only", k, " ".join(words), pack_roles=roles, gold=[], forbidden=[],
               common_words=words)
