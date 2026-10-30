@@ -790,3 +790,18 @@ find . -name '__pycache__' -type d -prune -exec rm -rf {} +
 
 추가로 CI는 issue80 Neo4j 계열까지 disposable 컨테이너로 띄워 실행하지만
 로컬 기본 게이트는 그렇게 하지 않는다(5번과 연결).
+
+## 합성 검색 trace 검사
+
+별도 승인한 새 소유 디스크 경로에서 실행한다. 운영 장치의 자원 제한과 직접 종료 판정은 4절을 따른다. 각 단계는 고유 service에서 순차 실행하며 CPUQuota 100%, LimitAS 2 GiB, Nice 19, IO best-effort 7, RuntimeMaxSec와 MALLOC_ARENA_MAX=2를 적용한다. 부모가 단계별 run ID와 nonce를 미리 정하고 각 lifecycle 경로는 아직 없어야 한다. TMPDIR은 corpus, work, run 및 출력과 겹치지 않는다.
+
+```bash
+<자원제한-service-접두> <워크트리>/.venv/bin/python scripts/search_corpus.py generate --preset S0 --seed 542 --out <새-corpus> --lifecycle-run-id <generate-id> --lifecycle-nonce <generate-nonce> --lifecycle-path <새-generate-lifecycle>
+<자원제한-service-접두> <워크트리>/.venv/bin/python scripts/search_baseline.py load --corpus <corpus> --work <새-work> --lifecycle-run-id <load-id> --lifecycle-nonce <load-nonce> --lifecycle-path <새-load-lifecycle>
+<자원제한-service-접두> <워크트리>/.venv/bin/python scripts/search_baseline.py run --corpus <corpus> --work <work> --run-dir <새-run> --out <새-report> --trace-out <새-trace> --repeats 1 --fresh-timeout 3 --concurrent-seconds 0.2 --concurrent-rate 5 --lifecycle-run-id <run-id> --lifecycle-nonce <run-nonce> --lifecycle-path <새-run-lifecycle>
+<자원제한-service-접두> <워크트리>/.venv/bin/python -m scripts.qa.search_trace <trace>
+```
+
+각 lifecycle 원문의 run_id, nonce와 cleanup을 부모의 기대값과 대조한다. 별도 새 경로에서 lifecycle 옵션 없이 같은 generate와 load를 실행하고 corpus 파일과 load 상태를 비교한다. run의 계측 및 비계측 비교는 동일 corpus와 종료된 공통 work를 사용한다. 두 run의 출력 경로는 분리한다. 보고서 selection과 warning 및 판정을 비교한다. 보고서는 전체 원시 반환을 보관하지 않는다. 전체 반환 비간섭은 `tests/test_query_duplicate_fold.py::test_trace_preserves_query_outcome`으로 별도 검사한다. trace terminal, checksum, ledger 및 replay 검증도 별도로 확인한다.
+
+두 child 시험은 `OPENCRAB_573_FIXTURE`가 없으면 pytest 임시 경로에 S0 corpus와 work를 생성한다. 이 변수를 지정하면 값은 `corpus`와 `work`를 포함한 입력 부모 경로여야 한다. 시험은 입력 정합을 검사하고 각 시험의 임시 경로로 복사한다. 빈 값이나 손상된 입력은 실패하며 자동 생성으로 대체하지 않는다.

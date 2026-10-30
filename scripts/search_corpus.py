@@ -615,25 +615,39 @@ def main(argv: list[str] | None = None) -> int:
     gen.add_argument("--preset", required=True, choices=sorted(PRESETS))
     gen.add_argument("--seed", type=int, required=True)
     gen.add_argument("--out", required=True)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from search_baseline import add_lifecycle_options
+    add_lifecycle_options(gen)
     args = parser.parse_args(argv)
     if args.command == "generate":
         out = Path(args.out).resolve()
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from search_baseline import Watchdog, check_write_paths, preset_is_smoke
+        from search_baseline import (
+            Watchdog,
+            check_write_paths,
+            lifecycle_prepare,
+            lifecycle_publish,
+            preset_is_smoke,
+            watchdog_scope,
+        )
 
         smoke = preset_is_smoke(args.preset)
+        context = lifecycle_prepare(args, [out], smoke)
         check_write_paths([out], smoke=smoke)
         out.parent.mkdir(parents=True, exist_ok=True)
         watchdog = Watchdog(args.preset, "generate", out.parent / f"{out.name}.aborted.json",
                             [out.parent], smoke=smoke)
-        watchdog.start()
-        manifest = generate(args.preset, args.seed, out)
-        # Outside manifest["files"], so the corpus digest stays deterministic.
-        # load subtracts this from the shared generate+load budget (design 9.2).
-        (out / TIMING_FILE).write_text(
-            json.dumps({"generate_seconds": round(watchdog.elapsed(), 3)}) + "\n", encoding="utf-8")
-        print(json.dumps({"node_count": manifest["node_count"], "query_count": manifest["query_count"],
-                          "files": manifest["files"]}, sort_keys=True))
+        if context:
+            context["owner"]["watchdog"] = watchdog
+        with watchdog_scope(watchdog):
+            manifest = generate(args.preset, args.seed, out)
+            # Outside manifest["files"], so the corpus digest stays deterministic.
+            # load subtracts this from the shared generate+load budget (design 9.2).
+            (out / TIMING_FILE).write_text(
+                json.dumps({"generate_seconds": round(watchdog.elapsed(), 3)}) + "\n", encoding="utf-8")
+            print(json.dumps({"node_count": manifest["node_count"], "query_count": manifest["query_count"],
+                              "files": manifest["files"]}, sort_keys=True))
+        lifecycle_publish(context, 0)
     return 0
 
 

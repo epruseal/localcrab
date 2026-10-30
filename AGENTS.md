@@ -8,6 +8,9 @@ OpenCrab은 OpenClaw 계열 에이전트 환경에 MetaOntology OS 문법을 노
 [`docs/gate-recipes.md`](docs/gate-recipes.md)에 있다. 명령을 추측하지 말고
 그 문서를 먼저 읽는다.
 
+제품 코드의 관측 경계와 기록 보호 규칙은
+[`docs/observability-rules.md`](docs/observability-rules.md)를 따른다.
+
 ## #154 재발 방지 규율
 
 머신 고유 절대경로(`/home/<사용자명>/...` 등)와 사설망 IP를 공개 텍스트(문서,
