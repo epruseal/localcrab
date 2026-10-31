@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from opencrab.common.pack_tags import canonicalize_pack_alias
+from opencrab.observability.search_trace import observed, span
 from opencrab.ontology import bm25 as _bm25_mod
 from opencrab.ontology.pack_provenance import in_pack_scope, scope_pack_id
 from opencrab.ontology.text_cues import QUERY_MULTIHOP_CUES as _MULTIHOP_QUERY_CUES
@@ -394,6 +395,7 @@ def _tag_fold_bodies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return items
 
 
+@observed("fold")
 def _fold_identical_bodies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fold results with the same pack and the same set of stored bodies.
 
@@ -431,6 +433,7 @@ def _fold_identical_bodies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
+@observed("reserve")
 def _reserve_leg_tops(
     items: list[dict[str, Any]],
     place_ids: list[str],
@@ -1064,6 +1067,7 @@ class HybridQuery:
         """Stop the background worker (called from server shutdown hooks)."""
         self._bm25.shutdown(timeout)
 
+    @observed("query")
     def query(
         self,
         question: str,
@@ -1284,26 +1288,27 @@ class HybridQuery:
             #     #482: the dropped occurrence's stored bodies still join the
             #     kept item's fold key (a union), so a node is folded only
             #     with nodes that collected the same set of stored bodies.
-            seen: dict[str | None, dict[str, Any]] = {}
-            merged = []
-            for lst in result_lists:
-                leg_max = max((item.get("score") or 0.0) for item in lst) if lst else 0.0
-                for item in lst:
-                    kept = seen.get(item.get("node_id"))
-                    if kept is not None:
-                        if item.get(_FOLD_BODIES):
-                            kept[_FOLD_BODIES] = (
-                                kept.get(_FOLD_BODIES, frozenset()) | item[_FOLD_BODIES]
-                            )
-                        # The flat merge keeps the first leg's item unchanged, so
-                        # its proof still matches its own text. The dropped
-                        # occurrence adds no text and needs no invalidation.
-                        continue
-                    seen[item.get("node_id")] = item
-                    item["raw_score"] = item.get("score", 0.0)
-                    item["score"] = (item["raw_score"] / leg_max) if leg_max > 0 else 0.0
-                    merged.append(item)
-            merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            with span("merge.flat"):
+                seen: dict[str | None, dict[str, Any]] = {}
+                merged = []
+                for lst in result_lists:
+                    leg_max = max((item.get("score") or 0.0) for item in lst) if lst else 0.0
+                    for item in lst:
+                        kept = seen.get(item.get("node_id"))
+                        if kept is not None:
+                            if item.get(_FOLD_BODIES):
+                                kept[_FOLD_BODIES] = (
+                                    kept.get(_FOLD_BODIES, frozenset()) | item[_FOLD_BODIES]
+                                )
+                            # The flat merge keeps the first leg's item unchanged, so
+                            # its proof still matches its own text. The dropped
+                            # occurrence adds no text and needs no invalidation.
+                            continue
+                        seen[item.get("node_id")] = item
+                        item["raw_score"] = item.get("score", 0.0)
+                        item["score"] = (item["raw_score"] / leg_max) if leg_max > 0 else 0.0
+                        merged.append(item)
+                merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
         # --- Stage 5: Policy-aware filter ---
         if subject_id and self._rebac is not None:
@@ -1380,7 +1385,8 @@ class HybridQuery:
             )
 
         # Convert back to QueryResult
-        results = [to_result(item) for item in merged[:limit]]
+        with span("result_convert"):
+            results = [to_result(item) for item in merged[:limit]]
         return QueryOutcome(results=results, warnings=warnings)
 
     def _bm25_probe_fingerprint(self) -> tuple[int, str] | None:
@@ -1532,6 +1538,7 @@ class HybridQuery:
             question, spaces, limit, pack_ids=pack_ids
         )[0]
 
+    @observed("selection.batch_bm25")
     def _bm25_search_per_pack_with_warnings(
         self,
         question: str,
@@ -1573,6 +1580,7 @@ class HybridQuery:
             logger.warning("BM25 per-pack search error: %s", exc)
             return None, []
 
+    @observed("query.bm25")
     def _bm25_search_with_warnings(
         self,
         question: str,
@@ -1619,6 +1627,7 @@ class HybridQuery:
         )
         return hits
 
+    @observed("query.fts")
     def _fts_search(
         self,
         question: str,
@@ -1666,6 +1675,7 @@ class HybridQuery:
             })
         return out
 
+    @observed("selection.batch_fts")
     def _fts_search_per_pack(
         self,
         question: str,
@@ -1712,6 +1722,7 @@ class HybridQuery:
             for pid, hits in raw.items()
         }
 
+    @observed("policy")
     def _policy_filter(
         self,
         results: list[dict[str, Any]],
@@ -1767,6 +1778,7 @@ class HybridQuery:
                 )
         return filtered
 
+    @observed("query.vector")
     def _vector_search(
         self,
         question: str,
@@ -1860,6 +1872,7 @@ class HybridQuery:
             logger.warning("Vector search error: %s", exc)
             return []
 
+    @observed("query.graph")
     def _graph_expand(
         self,
         anchor_ids: list[str],

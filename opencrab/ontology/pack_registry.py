@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from opencrab.observability.search_trace import decision, observed, span
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_AUTO_PACK_MIN_SCORE = 10.0
@@ -522,6 +524,7 @@ def _choose_by_content(
     return candidates, truncated
 
 
+@observed("selection.content")
 def _choose_by_content_with_warnings(
     question: str,
     registry: list[PackInfo],
@@ -596,19 +599,23 @@ def _choose_by_content_with_warnings(
         )
         if isinstance(result, dict):
             bm25_by_pack = result
+    decision("selection.dispatch", "batch_bm25" if bm25_by_pack is not None else "fallback_bm25")
+    decision("selection.dispatch", "batch_fts" if fts_by_pack is not None else "fallback_fts")
     for pid in (p.pack_id for p in registry):
         if bm25_by_pack is not None:
             bm25_hits = bm25_by_pack.get(pid, [])
         else:
-            bm25_hits = hybrid._bm25_search(  # noqa: SLF001 — 내부 프로브 전용 호출
-                question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
-            )
+            with span("selection.fallback_bm25"):
+                bm25_hits = hybrid._bm25_search(  # noqa: SLF001 — 내부 프로브 전용 호출
+                    question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
+                )
         if fts_by_pack is not None:
             fts_hits = fts_by_pack.get(pid, [])
         else:
-            fts_hits = hybrid._fts_search(  # noqa: SLF001 (내부 프로브 전용 호출)
-                question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
-            )
+            with span("selection.fallback_fts"):
+                fts_hits = hybrid._fts_search(  # noqa: SLF001 (내부 프로브 전용 호출)
+                    question, spaces, PER_PACK_PROBE_LIMIT, pack_ids=[pid]
+                )
         if len(bm25_hits) >= PER_PACK_PROBE_LIMIT or len(fts_hits) >= PER_PACK_PROBE_LIMIT:
             truncated_packs.append(pid)
         _accumulate(question, pid, bm25_hits, fts_hits, pack_hits, pack_hit_scores)

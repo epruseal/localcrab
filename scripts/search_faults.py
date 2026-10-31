@@ -610,10 +610,9 @@ class Ctx:
             return self._oracle[1]
         self._oracle = None
         gc.collect()
-        self.watchdog.op_start("oracle_build")
-        nodes = docs.list_nodes(limit=10**9)
-        index = bm25_mod.BM25Index.build(nodes, max_text_chars=bm25_mod.max_text_chars_setting())
-        self.watchdog.op_end()
+        with self.watchdog.operation("oracle_build"):
+            nodes = docs.list_nodes(limit=10**9)
+            index = bm25_mod.BM25Index.build(nodes, max_text_chars=bm25_mod.max_text_chars_setting())
         del nodes
         self._oracle = (digest, index)
         return index
@@ -671,41 +670,40 @@ def quality_pass(ctx: Ctx, svc: Svc) -> tuple[dict[str, dict[str, Any]], list[fl
     observed: dict[str, dict[str, Any]] = {}
     bm25_ms: list[float] = []
     for q in ctx.queries:
-        ctx.watchdog.op_start(f"pass:{q['qid']}")
-        sel = resolve_packs(q["text"], q["pack_ids"], q["auto_pack"], False, str(svc.dir),
-                            scope=svc.scope, raise_on_error=False, sql=svc.sql,
-                            principal=svc.principal, hybrid=svc.hq, spaces=q["spaces"])
-        # Design 3.2: the BM25 leg is the BM25 call inside the combined call.
-        calls: list[dict[str, Any]] = []
-        original = svc.hq._bm25_search_with_warnings
+        with ctx.watchdog.operation(f"pass:{q['qid']}"):
+            sel = resolve_packs(q["text"], q["pack_ids"], q["auto_pack"], False, str(svc.dir),
+                                scope=svc.scope, raise_on_error=False, sql=svc.sql,
+                                principal=svc.principal, hybrid=svc.hq, spaces=q["spaces"])
+            # Design 3.2: the BM25 leg is the BM25 call inside the combined call.
+            calls: list[dict[str, Any]] = []
+            original = svc.hq._bm25_search_with_warnings
 
-        def record(question: str, spaces: Any, limit: int, *, pack_ids: list[str],
-                   include_unpackaged: bool = False, _orig: Any = original,
-                   _calls: list[dict[str, Any]] = calls) -> Any:
-            started = time.perf_counter()
-            hits, warns = _orig(question, spaces, limit, pack_ids=pack_ids,
-                                include_unpackaged=include_unpackaged)
-            _calls.append({"ids": [h.get("node_id") for h in hits], "warnings": list(warns),
-                           "spaces": spaces, "limit": limit, "pack_ids": list(pack_ids),
-                           "ms": (time.perf_counter() - started) * 1000.0})
-            return hits, warns
+            def record(question: str, spaces: Any, limit: int, *, pack_ids: list[str],
+                       include_unpackaged: bool = False, _orig: Any = original,
+                       _calls: list[dict[str, Any]] = calls) -> Any:
+                started = time.perf_counter()
+                hits, warns = _orig(question, spaces, limit, pack_ids=pack_ids,
+                                    include_unpackaged=include_unpackaged)
+                _calls.append({"ids": [h.get("node_id") for h in hits], "warnings": list(warns),
+                               "spaces": spaces, "limit": limit, "pack_ids": list(pack_ids),
+                               "ms": (time.perf_counter() - started) * 1000.0})
+                return hits, warns
 
-        svc.hq._bm25_search_with_warnings = record
-        try:
-            outcome = svc.hq.query(q["text"], pack_ids=sel.effective_pack_ids, full_scope=svc.scope,
-                                   spaces=q["spaces"], limit=q["limit"])
-        finally:
-            del svc.hq._bm25_search_with_warnings
-        profile = _profile(q)
-        separate = not calls
-        if separate:
-            record(q["text"], q["spaces"], profile.bm25_limit, pack_ids=list(sel.effective_pack_ids))
-        call = calls[0]
-        bm25_ms.append(call["ms"])
-        fts = svc.hq._fts_search(q["text"], q["spaces"], profile.bm25_limit, pack_ids=sel.effective_pack_ids)
-        vec = svc.hq._vector_search(q["text"], q["spaces"], profile.vector_limit,
-                                    pack_ids=sel.effective_pack_ids)
-        ctx.watchdog.op_end()
+            svc.hq._bm25_search_with_warnings = record
+            try:
+                outcome = svc.hq.query(q["text"], pack_ids=sel.effective_pack_ids, full_scope=svc.scope,
+                                       spaces=q["spaces"], limit=q["limit"])
+            finally:
+                del svc.hq._bm25_search_with_warnings
+            profile = _profile(q)
+            separate = not calls
+            if separate:
+                record(q["text"], q["spaces"], profile.bm25_limit, pack_ids=list(sel.effective_pack_ids))
+            call = calls[0]
+            bm25_ms.append(call["ms"])
+            fts = svc.hq._fts_search(q["text"], q["spaces"], profile.bm25_limit, pack_ids=sel.effective_pack_ids)
+            vec = svc.hq._vector_search(q["text"], q["spaces"], profile.vector_limit,
+                                        pack_ids=sel.effective_pack_ids)
         warns = call["warnings"]
         legs = {"bm25": {"ids": call["ids"], "warnings": list(warns)},
                 "fts": {"ids": [h.get("node_id") for h in fts], "warnings": []},
@@ -2098,69 +2096,72 @@ def cmd_run(args: argparse.Namespace) -> int:
     watchdog = sb.Watchdog(manifest["preset"], "run", out, [root, out.parent], smoke=smoke)
     watchdog.budget = RUN_BUDGET[smoke]
     watchdog.extra["completed"] = []
-    watchdog.start()
-    ctx = Ctx(corpus, work, root, smoke, watchdog)
-    ctx.empty_env.write_text("", encoding="utf-8")
-    report: dict[str, Any] = {"verdict": "INCOMPLETE", "reasons": [], "environment": _environment(),
-                              "corpus": {"manifest_digest": manifest_digest(corpus),
-                                         "preset": manifest["preset"], "seed": manifest["seed"],
-                                         "node_count": manifest["node_count"],
-                                         "query_count": len(ctx.queries)}}
-    marker = work / "load-complete.json"
-    if not marker.exists() or json.loads(marker.read_text(encoding="utf-8")).get("expected") != ctx.expected:
-        report["reasons"].append("load-complete.json is missing or does not match the corpus")
-        sb._atomic_json(out, report)
-        return 2
-    problems = build_reference(ctx)
-    report["reference"] = {
-        "problems": problems, "index_bytes": ctx.index_bytes,
-        "classes": {leg: _count(c["classes"][leg] for c in ctx.reference.values())
-                    for leg in ("bm25", "fts", "vector", "combined")},
-        "partial_silent": sorted(q for q, r in ctx.reference.items() if "partial_silent" in r["classes"].values()),
-    }
-    if problems:
-        report["reasons"].extend(problems)
-        sb._atomic_json(out, report)
-        return 2
-    results = []
-    for sid in selected:
-        sc = Scenario(ctx, sid)
-        started = time.monotonic()
-        try:
-            SCENARIOS[sid](sc)
-        except NotInjectedError as exc:
-            sc.steps.append({"name": "injection", "mode": "explicit_error", "notes": {"error": str(exc)},
-                             "checks": [{"cat": "injection", "name": "confirmed", "ok": False,
-                                         "detail": str(exc)}]})
-        except Exception:  # noqa: BLE001 -- a harness failure makes the run INCOMPLETE
-            import traceback
+    owner = getattr(args, "_lifecycle_owner", None)
+    if owner is not None:
+        owner["watchdog"] = watchdog
+    with sb.watchdog_scope(watchdog):
+        ctx = Ctx(corpus, work, root, smoke, watchdog)
+        ctx.empty_env.write_text("", encoding="utf-8")
+        report: dict[str, Any] = {"verdict": "INCOMPLETE", "reasons": [], "environment": _environment(),
+                                  "corpus": {"manifest_digest": manifest_digest(corpus),
+                                             "preset": manifest["preset"], "seed": manifest["seed"],
+                                             "node_count": manifest["node_count"],
+                                             "query_count": len(ctx.queries)}}
+        marker = work / "load-complete.json"
+        if not marker.exists() or json.loads(marker.read_text(encoding="utf-8")).get("expected") != ctx.expected:
+            report["reasons"].append("load-complete.json is missing or does not match the corpus")
+            sb._atomic_json(out, report)
+            return 2
+        problems = build_reference(ctx)
+        report["reference"] = {
+            "problems": problems, "index_bytes": ctx.index_bytes,
+            "classes": {leg: _count(c["classes"][leg] for c in ctx.reference.values())
+                        for leg in ("bm25", "fts", "vector", "combined")},
+            "partial_silent": sorted(q for q, r in ctx.reference.items() if "partial_silent" in r["classes"].values()),
+        }
+        if problems:
+            report["reasons"].extend(problems)
+            sb._atomic_json(out, report)
+            return 2
+        results = []
+        for sid in selected:
+            sc = Scenario(ctx, sid)
+            started = time.monotonic()
+            try:
+                SCENARIOS[sid](sc)
+            except NotInjectedError as exc:
+                sc.steps.append({"name": "injection", "mode": "explicit_error", "notes": {"error": str(exc)},
+                                 "checks": [{"cat": "injection", "name": "confirmed", "ok": False,
+                                             "detail": str(exc)}]})
+            except Exception:  # noqa: BLE001 -- a harness failure makes the run INCOMPLETE
+                import traceback
 
-            sc.steps.append({"name": "harness error", "mode": "explicit_error", "notes": {},
-                             "checks": [{"cat": "injection", "name": "harness ran", "ok": False,
-                                         "detail": traceback.format_exc()[-3000:]}]})
-        finally:
-            sc.close_svc()
-        res = sc.result()
-        res["elapsed_s"] = round(time.monotonic() - started, 1)
-        sc.dir.mkdir(parents=True, exist_ok=True)
-        sb._atomic_json(sc.dir / "result.json", res)
-        results.append(res)
-        watchdog.extra["completed"] = [r["id"] for r in results]
-        sb._atomic_json(out, {**report, "reasons": [*report["reasons"], "running"], "scenarios": results})
-        print(json.dumps({"scenario": sid, "value": res["value"], "elapsed_s": res["elapsed_s"]}), flush=True)
-    report["scenarios"] = results
-    report["faults"] = {fault: worst([r["value"] for r in results if r["id"] in ids])
-                        for fault, ids in FAULTS.items() if any(r["id"] in ids for r in results)}
-    report["unavailable"] = [r["id"] for r in results if r["value"] == "unavailable"]
-    not_injected = [r["id"] for r in results if r["value"] == "not_injected"]
-    if not_injected:
-        report["reasons"].append(f"not injected: {not_injected}")
-    report["verdict"] = "COMPLETE" if not report["reasons"] else "INCOMPLETE"
-    report["peak_rss_bytes_sampled"] = watchdog.peak_rss
-    sb._atomic_json(out, report)
-    print(json.dumps({"verdict": report["verdict"], "faults": report["faults"],
-                      "reasons": report["reasons"]}, ensure_ascii=False))
-    return 0 if report["verdict"] == "COMPLETE" else 2
+                sc.steps.append({"name": "harness error", "mode": "explicit_error", "notes": {},
+                                 "checks": [{"cat": "injection", "name": "harness ran", "ok": False,
+                                             "detail": traceback.format_exc()[-3000:]}]})
+            finally:
+                sc.close_svc()
+            res = sc.result()
+            res["elapsed_s"] = round(time.monotonic() - started, 1)
+            sc.dir.mkdir(parents=True, exist_ok=True)
+            sb._atomic_json(sc.dir / "result.json", res)
+            results.append(res)
+            watchdog.extra["completed"] = [r["id"] for r in results]
+            sb._atomic_json(out, {**report, "reasons": [*report["reasons"], "running"], "scenarios": results})
+            print(json.dumps({"scenario": sid, "value": res["value"], "elapsed_s": res["elapsed_s"]}), flush=True)
+        report["scenarios"] = results
+        report["faults"] = {fault: worst([r["value"] for r in results if r["id"] in ids])
+                            for fault, ids in FAULTS.items() if any(r["id"] in ids for r in results)}
+        report["unavailable"] = [r["id"] for r in results if r["value"] == "unavailable"]
+        not_injected = [r["id"] for r in results if r["value"] == "not_injected"]
+        if not_injected:
+            report["reasons"].append(f"not injected: {not_injected}")
+        report["verdict"] = "COMPLETE" if not report["reasons"] else "INCOMPLETE"
+        report["peak_rss_bytes_sampled"] = watchdog.peak_rss
+        sb._atomic_json(out, report)
+        print(json.dumps({"verdict": report["verdict"], "faults": report["faults"],
+                          "reasons": report["reasons"]}, ensure_ascii=False))
+        return 0 if report["verdict"] == "COMPLETE" else 2
 
 
 def _count(values: Any) -> dict[str, int]:
@@ -2416,6 +2417,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--run-root", required=True)
     run.add_argument("--out", required=True)
     run.add_argument("--scenarios", default="")
+    sb.add_lifecycle_options(run)
     actor = sub.add_parser("actor")
     actor.add_argument("role", choices=("backfill", "verify", "drop", "status", "open", "writer",
                                         "search", "enospc"))
@@ -2441,7 +2443,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("selftest")
     args = parser.parse_args(argv)
     if args.command == "run":
-        return cmd_run(args)
+        corpus, work = Path(args.corpus).resolve(), Path(args.work).resolve()
+        context = sb.lifecycle_prepare(args, [corpus, work, Path(args.run_root).resolve(),
+                                              Path(args.out).resolve()], sb.corpus_is_smoke(corpus))
+        if context:
+            args._lifecycle_owner = context["owner"]
+        result = cmd_run(args)
+        sb.lifecycle_publish(context, result)
+        return result
     if args.command == "actor":
         return cmd_actor(args)
     return cmd_selftest()

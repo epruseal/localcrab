@@ -21,6 +21,7 @@ import logging
 from collections import Counter, defaultdict
 from typing import Any
 
+from opencrab.observability.search_trace import observed
 from opencrab.ontology.text_cues import RELATION_CUES as _RELATION_CUES
 from opencrab.ontology.text_cues import tokenize as _tokenize
 
@@ -173,6 +174,7 @@ class Reranker:
     (Compatible with QueryResult.to_dict().)
     """
 
+    @observed("rerank")
     def rerank(
         self,
         query: str,

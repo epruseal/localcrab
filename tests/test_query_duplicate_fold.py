@@ -122,6 +122,85 @@ def _run(hq: HybridQuery, rerank: bool, fold: bool = True, **kw: Any) -> QueryOu
         return hq.query("question", pack_ids=[PACK], use_rerank=rerank, limit=10, **kw)
 
 
+@pytest.mark.parametrize("outer_type", [RuntimeError, __import__("asyncio").CancelledError])
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_query_observer_cancel_in_outer_exception(outer_type, body_fails):
+    from contextlib import nullcontext
+
+    from opencrab.observability.search_trace import Trace, observe, request_span
+
+    trace = Trace("query-cancel")
+    original_emit = trace.emit
+    cancellation = __import__("asyncio").CancelledError("observer")
+    body = RuntimeError("body")
+    reached = []
+    def emit(kind, operation, **fields):
+        if kind == "end" and operation == "query":
+            reached.append(True)
+            raise cancellation
+        return original_emit(kind, operation, **fields)
+    trace.emit = emit
+    with observe(trace):
+        try:
+            raise outer_type("outer")
+        except outer_type:
+            with pytest.raises(RuntimeError if body_fails else type(cancellation)) as caught:
+                with request_span():
+                    with (patch.object(query_mod, "_profile_for_query", side_effect=body)
+                          if body_fails else nullcontext()):
+                        _run(_hq_with_legs(), False)
+            assert caught.value is (body if body_fails else cancellation)
+    assert reached == [True] and trace.failed
+    end = next(event for event in trace.events if event["kind"] == "end" and event["operation"] == "request")
+    assert end["status"] == ("error" if body_fails else "cancelled")
+
+
+@pytest.mark.parametrize("rerank", [True, False])
+def test_trace_preserves_query_outcome(rerank):
+    from dataclasses import fields
+
+    from opencrab.observability.search_trace import Trace, observe, request_span
+
+    def call():
+        legs = dict(vector=[_vec("a", "S", 0.9, doc="RED"), _vec("b", "S", 0.6, doc="BLUE")],
+                    bm25=[_bm("a", "DETAIL_RED", 5.0), _bm("b", "DETAIL_BLUE", 3.0)])
+        return _run(_hq_with_legs(**legs), rerank)
+
+    plain = call()
+    trace = Trace("query")
+    with observe(trace), request_span():
+        active = call()
+    assert len(plain) == len(active)
+    assert plain.warnings == active.warnings
+    def compare(left, right):
+        for field in fields(QueryResult):
+            a, b = getattr(left, field.name), getattr(right, field.name)
+            if field.name == "folded_members":
+                assert len(a) == len(b)
+                for child_a, child_b in zip(a, b):
+                    compare(child_a, child_b)
+            else:
+                assert a == b
+        assert left.to_dict() == right.to_dict()
+        assert left.to_cap_item() == right.to_cap_item()
+    assert len(plain) > 0
+    for index, (left, right) in enumerate(zip(plain, active)):
+        compare(left, right)
+        compare(plain[index], active[index])
+    assert any(event["operation"] == "query" and event["request_id"] is not None for event in trace.events)
+    failure = RuntimeError("query")
+    for enabled in (False, True):
+        hq = _hq_with_legs()
+        with patch.object(query_mod, "_profile_for_query", side_effect=failure):
+            with pytest.raises(RuntimeError) as caught:
+                if enabled:
+                    with observe(Trace("error")), request_span():
+                        _run(hq, rerank)
+                else:
+                    _run(hq, rerank)
+        assert caught.value is failure
+
+
 @pytest.mark.parametrize("rerank", [True, False])
 def test_member_keeps_every_field_it_had_unfolded(rerank):
     # Same stored body, different BM25-joined text and different raw scores.

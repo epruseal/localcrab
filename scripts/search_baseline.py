@@ -17,6 +17,7 @@ module reads ``OPENCRAB_BM25_NODE_LIMIT`` at import time.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import math
@@ -27,8 +28,11 @@ import sqlite3
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+import opencrab.observability.search_trace as trace_obs
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GIB = 1 << 30
@@ -264,6 +268,10 @@ class Watchdog(threading.Thread):
         # One slot per thread that makes store calls (main and writer).
         self._ops: dict[str, tuple[str, float]] = {}
         self._ops_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._wake = threading.Event()
+        self.state = "RUNNING"
+        self.failure = None
         self.extra: dict[str, Any] = {}
 
     def op_start(self, name: str, slot: str = "main") -> None:
@@ -273,6 +281,19 @@ class Watchdog(threading.Thread):
     def op_end(self, slot: str = "main") -> None:
         with self._ops_lock:
             self._ops.pop(slot, None)
+
+    @contextmanager
+    def operation(self, name: str, slot: str = "main"):
+        try:
+            self.op_start(name, slot)
+            yield
+        finally:
+            original = sys.exception()
+            try:
+                self.op_end(slot)
+            except BaseException:
+                if original is None:
+                    raise
 
     def elapsed(self) -> float:
         return time.monotonic() - self.started
@@ -303,21 +324,152 @@ class Watchdog(threading.Thread):
             return "time_budget"
         return None
 
+    def stop(self) -> None:
+        with self._state_lock:
+            if self.state == "RUNNING":
+                self.state = "STOPPED"
+            self._wake.set()
+
     def run(self) -> None:
-        while True:
-            condition = self._condition()
-            if condition is not None:
-                record = {"verdict": "ABORTED", "condition": condition, "phase": self.phase,
-                          "elapsed_s": round(time.monotonic() - self.started, 3),
-                          "peak_rss_bytes": self.peak_rss, **self.extra}
+        try:
+            while not self._wake.is_set():
+                condition = self._condition()
+                if condition is not None:
+                    with self._state_lock:
+                        if self.state != "RUNNING":
+                            return
+                        self.state = "ABORTING"
+                    try:
+                        try:
+                            record = {"verdict": "ABORTED", "condition": condition, "phase": self.phase,
+                                      "elapsed_s": round(time.monotonic() - self.started, 3),
+                                      "peak_rss_bytes": self.peak_rss, **self.extra}
+                            self.abort_path.parent.mkdir(parents=True, exist_ok=True)
+                            _atomic_json(self.abort_path, record)
+                        except BaseException:
+                            pass
+                        try:
+                            sys.stderr.write(f"ABORTED {condition}\n")
+                            sys.stderr.flush()
+                        except BaseException:
+                            pass
+                    finally:
+                        os._exit(3)
+                self._wake.wait(0.2)
+        except BaseException:
+            with self._state_lock:
+                if self.state != "ABORTING":
+                    self.state = "FAILED"
+                    self.failure = "condition_error"
+
+
+@contextmanager
+def watchdog_scope(watchdog: Watchdog):
+    started = False
+    try:
+        watchdog.start()
+        started = True
+        yield watchdog
+    finally:
+        original = sys.exception()
+        cleanup_error = None
+        try:
+            if getattr(watchdog, "writer_unresolved", False):
+                raise RuntimeError("writer cleanup failed")
+            watchdog.stop()
+            deadline = time.monotonic() + 5
+            if watchdog.ident is not None:
                 try:
-                    self.abort_path.parent.mkdir(parents=True, exist_ok=True)
-                    _atomic_json(self.abort_path, record)
-                finally:
-                    sys.stderr.write(f"ABORTED {condition}\n")
-                    sys.stderr.flush()
-                    os._exit(3)
-            time.sleep(0.2)
+                    watchdog.join(timeout=max(0, deadline - time.monotonic()))
+                except BaseException as exc:
+                    cleanup_error = exc
+                    try:
+                        watchdog.join(timeout=max(0, deadline - time.monotonic()))
+                    except BaseException:
+                        pass
+            with watchdog._state_lock:
+                failed = watchdog.state != "STOPPED" or watchdog.is_alive()
+            with watchdog._ops_lock:
+                failed = failed or bool(watchdog._ops)
+            failed = failed or not started
+            if failed:
+                raise RuntimeError("watchdog cleanup failed")
+            if cleanup_error is not None:
+                raise cleanup_error
+        except BaseException:
+            if original is None:
+                raise
+            try:
+                sys.stderr.write("watchdog cleanup failed\n")
+            except BaseException:
+                pass
+
+
+def add_lifecycle_options(parser):
+    parser.add_argument("--lifecycle-run-id")
+    parser.add_argument("--lifecycle-nonce")
+    parser.add_argument("--lifecycle-path")
+
+
+def lifecycle_prepare(args, sources, smoke):
+    values = (args.lifecycle_run_id, args.lifecycle_nonce, args.lifecycle_path)
+    if not any(values):
+        return None
+    if not all(values):
+        raise SystemExit("lifecycle options must be supplied together")
+    if (not args.lifecycle_run_id.isascii() or not args.lifecycle_nonce.isascii()
+            or not args.lifecycle_run_id.isalnum() or not args.lifecycle_nonce.isalnum()):
+        raise SystemExit("invalid lifecycle identity")
+    path = Path(args.lifecycle_path)
+    if not path.is_absolute() or any(part in (".", "..") for part in path.parts):
+        raise SystemExit("invalid lifecycle path")
+    for ancestor in (path, *path.parents):
+        if ancestor.is_symlink():
+            raise SystemExit("lifecycle path contains symlink")
+    if path.exists() or not path.parent.is_dir():
+        raise SystemExit("lifecycle path must be new")
+    check_write_paths([path], sources=sources, smoke=smoke)
+    return {"path": path, "run_id": args.lifecycle_run_id, "nonce": args.lifecycle_nonce,
+            "owner": {}}
+
+
+def lifecycle_observe(owner):
+    watchdog = owner.get("watchdog")
+    if watchdog is None:
+        return False
+    with watchdog._state_lock:
+        healthy = watchdog.state == "STOPPED" and not watchdog.is_alive()
+    with watchdog._ops_lock:
+        healthy = healthy and not watchdog._ops
+    writer = owner.get("writer")
+    if writer is not None:
+        state = owner.get("writer_state", {})
+        failed = owner.get("writer_execution_failed")
+        healthy = (healthy and failed is not None and not failed.is_set()
+                   and not writer.is_alive() and state.get("entered") is True
+                   and state.get("completed") is True and not owner["writer_record_failed"].is_set())
+    return healthy
+
+
+def lifecycle_publish(context, result):
+    if context is None:
+        return False
+    healthy = result == 0 and lifecycle_observe(context["owner"])
+    if not healthy:
+        return False
+    path = context["path"]
+    payload = {"run_id": context["run_id"], "nonce": context["nonce"], "cleanup": True}
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        with temp.open("x", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.link(temp, path)
+        temp.unlink()
+        return True
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -597,14 +749,17 @@ def _close(*stores: Any) -> None:
 
 def write_doc(docs: Any, vec: Any, rows: dict[str, Any]) -> None:
     space, node_type, node_id, props = rows["node"]
-    docs.upsert_node_doc(space, node_type, node_id, props)
+    with trace_obs.span("doc_upsert"):
+        docs.upsert_node_doc(space, node_type, node_id, props)
     if rows["source"] is not None:
         docs.upsert_source(*rows["source"])
     if rows["vector"] is not None:
         vid, vtext, vmeta = rows["vector"]
-        vec.upsert_texts(texts=[vtext], metadatas=[vmeta], ids=[vid])
+        with trace_obs.span("vector_upsert"):
+            vec.upsert_texts(texts=[vtext], metadatas=[vmeta], ids=[vid])
 
 
+@trace_obs.observed("writer.write")
 def locked_write(run_dir: Path, docs: Any, vec: Any, hq: Any, rows: dict[str, Any]) -> float:
     """Write one document and invalidate BM25 inside one write.lock block.
 
@@ -615,13 +770,15 @@ def locked_write(run_dir: Path, docs: Any, vec: Any, hq: Any, rows: dict[str, An
     from opencrab.locking import write_lock
 
     started = time.perf_counter()
-    with write_lock(str(run_dir), timeout=30.0, purpose="search-baseline"):
+    with trace_obs.measured_lock(write_lock(str(run_dir), timeout=30.0, purpose="search-baseline")):
         acquired = time.perf_counter()
         write_doc(docs, vec, rows)
-        hq.invalidate_bm25_cache()
+        with trace_obs.span("bm25_invalidate"):
+            hq.invalidate_bm25_cache()
     return acquired - started
 
 
+@trace_obs.observed("freshness.delete")
 def locked_delete(run_dir: Path, docs: Any, vec: Any, hq: Any, node_id: str) -> None:
     """Delete one source-form document and invalidate BM25 inside one write.lock block."""
     from opencrab.locking import write_lock
@@ -633,7 +790,7 @@ def locked_delete(run_dir: Path, docs: Any, vec: Any, hq: Any, node_id: str) -> 
         hq.invalidate_bm25_cache()
 
 
-def cmd_load(corpus: Path, work: Path) -> int:
+def cmd_load(corpus: Path, work: Path, *, lifecycle_owner=None) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from search_corpus import TIMING_FILE, manifest_digest
 
@@ -649,55 +806,58 @@ def cmd_load(corpus: Path, work: Path) -> int:
     work.mkdir(parents=True)
     watchdog = Watchdog(manifest["preset"], "load", work / "aborted.json", [work],
                         spent_seconds=spent, smoke=smoke)
-    watchdog.start()
-    digest = manifest_digest(corpus)
-    started = time.monotonic()
-    sql, docs, vec = _open_stores(work)
-    _create_users(sql)
-    _register_packs(sql, packs)
-    batch: list[tuple[str, str, dict[str, Any]]] = []
-    stamps: list[tuple[str, str, str]] = []
-    for doc in _iter_docs(corpus):
-        rows = doc_rows(doc, packs)
-        space, node_type, node_id, props = rows["node"]
-        docs.upsert_node_doc(space, node_type, node_id, props)
-        if rows["source"] is not None:
-            docs.upsert_source(*rows["source"])
-        if rows["vector"] is not None:
-            batch.append(rows["vector"])
-        stamps.append((doc["updated_at"], space, node_id))
-        if len(batch) >= 64:
+    if lifecycle_owner is not None:
+        lifecycle_owner["watchdog"] = watchdog
+    with watchdog_scope(watchdog):
+        digest = manifest_digest(corpus)
+        started = time.monotonic()
+        sql, docs, vec = _open_stores(work)
+        _create_users(sql)
+        _register_packs(sql, packs)
+        batch: list[tuple[str, str, dict[str, Any]]] = []
+        stamps: list[tuple[str, str, str]] = []
+        for doc in _iter_docs(corpus):
+            rows = doc_rows(doc, packs)
+            space, node_type, node_id, props = rows["node"]
+            with trace_obs.span("doc_upsert"):
+                docs.upsert_node_doc(space, node_type, node_id, props)
+            if rows["source"] is not None:
+                docs.upsert_source(*rows["source"])
+            if rows["vector"] is not None:
+                batch.append(rows["vector"])
+            stamps.append((doc["updated_at"], space, node_id))
+            if len(batch) >= 64:
+                vec.upsert_texts(texts=[b[1] for b in batch], metadatas=[b[2] for b in batch],
+                                 ids=[b[0] for b in batch])
+                batch = []
+        if batch:
             vec.upsert_texts(texts=[b[1] for b in batch], metadatas=[b[2] for b in batch],
                              ids=[b[0] for b in batch])
-            batch = []
-    if batch:
-        vec.upsert_texts(texts=[b[1] for b in batch], metadatas=[b[2] for b in batch],
-                         ids=[b[0] for b in batch])
-    with docs._tx() as conn:
-        conn.executemany("UPDATE doc_nodes SET updated_at=? WHERE space=? AND node_id=?", stamps)
-    # #541: the direct UPDATE above puts every row in the node index pending
-    # table. Drain it, as an operator does after a bulk direct SQL write.
-    if getattr(docs, "supports_node_bm25", False) is True:
-        if docs.node_bm25_sync_pending() != 0:
-            print(json.dumps({"load": "MISMATCH", "problems": ["node index pending not drained"]}))
+        with docs._tx() as conn:
+            conn.executemany("UPDATE doc_nodes SET updated_at=? WHERE space=? AND node_id=?", stamps)
+        # #541: the direct UPDATE above puts every row in the node index pending
+        # table. Drain it, as an operator does after a bulk direct SQL write.
+        if getattr(docs, "supports_node_bm25", False) is True:
+            if docs.node_bm25_sync_pending() != 0:
+                print(json.dumps({"load": "MISMATCH", "problems": ["node index pending not drained"]}))
+                return 2
+        load_seconds = time.monotonic() - started
+        _close(docs, vec, sql)
+        expected = expected_state(corpus)
+        observed, problems = observed_state(work)
+        diff = _state_diff(expected, observed)
+        if diff or problems:
+            print(json.dumps({"load": "MISMATCH", "tables": diff, "problems": problems}))
             return 2
-    load_seconds = time.monotonic() - started
-    _close(docs, vec, sql)
-    expected = expected_state(corpus)
-    observed, problems = observed_state(work)
-    diff = _state_diff(expected, observed)
-    if diff or problems:
-        print(json.dumps({"load": "MISMATCH", "tables": diff, "problems": problems}))
-        return 2
-    sizes = {p.name: p.stat().st_size for p in sorted(work.iterdir()) if p.is_file()}
-    _atomic_json(work / "load-complete.json", {
-        "manifest_digest": digest, "preset": manifest["preset"], "seed": manifest["seed"],
-        "expected": expected, "load_seconds": round(load_seconds, 3), "file_bytes": sizes,
-        "peak_rss_bytes": watchdog.peak_rss,
-    })
-    print(json.dumps({"load": "COMPLETE", "load_seconds": round(load_seconds, 3),
-                      "rows": {k: v["rows"] for k, v in expected.items()}}))
-    return 0
+        sizes = {p.name: p.stat().st_size for p in sorted(work.iterdir()) if p.is_file()}
+        _atomic_json(work / "load-complete.json", {
+            "manifest_digest": digest, "preset": manifest["preset"], "seed": manifest["seed"],
+            "expected": expected, "load_seconds": round(load_seconds, 3), "file_bytes": sizes,
+            "peak_rss_bytes": watchdog.peak_rss,
+        })
+        print(json.dumps({"load": "COMPLETE", "load_seconds": round(load_seconds, 3),
+                          "rows": {k: v["rows"] for k, v in expected.items()}}))
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +869,7 @@ def _coverage(warnings: list[str]) -> list[str]:
     return [w for w in warnings if isinstance(w, str) and w.startswith(COVERAGE_PREFIX)]
 
 
+@trace_obs.observed("judge")
 def judge_bundle(entry: dict[str, Any], truth: dict[str, tuple[str, str]], readable: set[str],
                  selection: dict[str, Any], legs: dict[str, dict[str, Any]],
                  combined: dict[str, Any]) -> dict[str, Any]:
@@ -1043,6 +1204,7 @@ def _invariants(run_dir: Path, corpus: Path, cap25: int, cap: int, char_budget: 
     return problems
 
 
+@trace_obs.observed("result_expand")
 def _items_from_results(results: list[Any]) -> list[dict[str, Any]]:
     return [{"id": r.node_id, "members": [m.node_id for m in (r.folded_members or [])]}
             for r in results]
@@ -1062,8 +1224,16 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
         raise SystemExit(f"report already exists: {out}")
     manifest, packs, queries = _read_corpus(corpus)
     watchdog = Watchdog(manifest["preset"], "run", out, [run_dir, out.parent], smoke=smoke)
-    watchdog.start()
+    owner = getattr(args, "_lifecycle_owner", None)
+    if owner is not None:
+        owner["watchdog"] = watchdog
+    with watchdog_scope(watchdog):
+        return _cmd_run_with_watchdog(args, corpus, work, run_dir, out, manifest, packs, queries, watchdog,
+                                      manifest_digest)
 
+
+def _cmd_run_with_watchdog(args, corpus, work, run_dir, out, manifest, packs, queries, watchdog,
+                           manifest_digest):
     report: dict[str, Any] = {"verdict": "INCOMPLETE", "reasons": []}
 
     def finish(code: int) -> int:
@@ -1144,7 +1314,12 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
         try:
             return original_ensure(doc_store)
         finally:
-            build_times.append(time.perf_counter() - started)
+            original = sys.exception()
+            try:
+                build_times.append(time.perf_counter() - started)
+            except BaseException:
+                if original is None:
+                    raise
 
     hq._bm25.ensure_built = timed_ensure
 
@@ -1155,38 +1330,123 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
         truth[doc["id"]] = (pack["pack_id"] if pack else "", space)
     measure_pack = packs["measure"]["pack_id"]
 
-    def request(q: dict[str, Any]) -> tuple[Any, Any, float]:
-        watchdog.op_start(f"request:{q['qid']}")
-        started = time.perf_counter()
-        selection = resolve_packs(
-            q["text"], q["pack_ids"], q["auto_pack"], False, str(run_dir), scope=scope,
-            raise_on_error=False, sql=sql, principal=principal_a, hybrid=hq, spaces=q["spaces"])
-        outcome = hq.query(q["text"], pack_ids=selection.effective_pack_ids, full_scope=scope,
-                           spaces=q["spaces"], limit=q["limit"])
-        elapsed = (time.perf_counter() - started) * 1000.0
-        watchdog.op_end()
-        return selection, outcome, elapsed
+    ledger = getattr(args, "_sample_ledger", None)
+    request_info = {}
+    attempt_info = {}
 
+    @contextmanager
+    def attempt_scope(q, phase, repeat, attempt):
+        request_info.clear()
+        attempt_info.clear()
+        attempt_info.update(phase=phase, repeat=repeat, attempt=attempt,
+                            qid=q["qid"], shape=q["shape"], request_id=None,
+                            status="ok", disposition="error", accepted_for_metric=False)
+        with trace_obs.metadata(phase=phase, qid=q["qid"], shape=q["shape"], repeat=repeat, attempt=attempt):
+            with trace_obs.span("attempt") as attempt_id:
+                attempt_info["attempt_id"] = attempt_id
+                try:
+                    yield
+                except BaseException as exc:
+                    status = "cancelled" if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)) else "error"
+                    attempt_info.update(status=status, disposition=status)
+                    raise
+                finally:
+                    if ledger is not None:
+                        original = sys.exception()
+                        try:
+                            ledger.append(**attempt_info)
+                        except BaseException as error:
+                            ledger.failed = True
+                            if original is None and not isinstance(error, Exception):
+                                raise
+
+    def request(q: dict[str, Any]) -> tuple[Any, Any, float]:
+        try:
+            watchdog.op_start(f"request:{q['qid']}")
+            return request_body(q)
+        finally:
+            original = sys.exception()
+            try:
+                watchdog.op_end()
+            except BaseException:
+                if original is None:
+                    raise
+
+    def request_body(q: dict[str, Any]) -> tuple[Any, Any, float]:
+        timer = trace_obs.RequestTimer()
+        try:
+            return request_timed(q, timer)
+        finally:
+            original = sys.exception()
+            try:
+                timer.close()
+            except BaseException:
+                if original is None:
+                    raise
+
+    def request_timed(q: dict[str, Any], timer: Any) -> tuple[Any, Any, float]:
+        attempt_info["request_id"] = timer.ident
+        started = time.perf_counter()
+        timer.start(started)
+        try:
+            selection = resolve_packs(
+                q["text"], q["pack_ids"], q["auto_pack"], False, str(run_dir), scope=scope,
+                raise_on_error=False, sql=sql, principal=principal_a, hybrid=hq, spaces=q["spaces"])
+            outcome = hq.query(q["text"], pack_ids=selection.effective_pack_ids, full_scope=scope,
+                               spaces=q["spaces"], limit=q["limit"])
+            ended = time.perf_counter()
+            elapsed = (ended - started) * 1000.0
+            timer.end(ended)
+            request_info.clear()
+            request_info.update(request_id=timer.ident, t0=started, t1=ended,
+                                elapsed_ms=elapsed, qid=q["qid"], shape=q["shape"])
+            attempt_info.update(request_info)
+            return selection, outcome, elapsed
+        except BaseException as exc:
+            try:
+                ended = time.perf_counter()
+            except BaseException:
+                if timer.trace is not None:
+                    timer.trace.failed = True
+                status = "cancelled" if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)) else "error"
+                attempt_info.update(status=status, disposition=status, accepted_for_metric=False)
+                raise exc
+            status = "cancelled" if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)) else "error"
+            try:
+                timer.end(ended, status)
+            except BaseException:
+                if timer.trace is not None:
+                    timer.trace.failed = True
+            request_info.clear()
+            request_info.update(request_id=timer.ident, t0=started, t1=ended,
+                                elapsed_ms=(ended - started) * 1000.0, qid=q["qid"],
+                                shape=q["shape"], disposition=status)
+            attempt_info.update(request_info)
+            raise
+
+    def record_request(disposition, *, accepted_for_metric=False):
+        attempt_info.update(disposition=disposition, accepted_for_metric=accepted_for_metric)
+
+    @trace_obs.observed("diagnostic_leg_call")
     def leg_calls(q: dict[str, Any], effective: list[str]) -> tuple[dict[str, Any], dict[str, float]]:
         profile = qmod._profile_for_query(q["text"], q["limit"], 1)
         timings: dict[str, float] = {}
         legs: dict[str, Any] = {}
-        watchdog.op_start(f"legs:{q['qid']}")
-        t = time.perf_counter()
-        hits, warns = hq._bm25_search_with_warnings(q["text"], q["spaces"], profile.bm25_limit,
-                                                    pack_ids=effective)
-        timings["bm25"] = (time.perf_counter() - t) * 1000.0
-        legs["bm25"] = {"ids": [h.get("node_id") for h in hits], "warnings": list(warns)}
-        t = time.perf_counter()
-        hits = hq._fts_search(q["text"], q["spaces"], profile.bm25_limit, pack_ids=effective)
-        timings["fts"] = (time.perf_counter() - t) * 1000.0
-        legs["fts"] = {"ids": [h.get("node_id") for h in hits], "warnings": []}
-        t = time.perf_counter()
-        results = hq._vector_search(q["text"], q["spaces"], profile.vector_limit, pack_ids=effective)
-        timings["vector"] = (time.perf_counter() - t) * 1000.0
-        legs["vector"] = {"ids": [r.node_id for r in results], "warnings": []}
-        watchdog.op_end()
-        return legs, timings
+        with watchdog.operation(f"legs:{q['qid']}"):
+            t = time.perf_counter()
+            hits, warns = hq._bm25_search_with_warnings(q["text"], q["spaces"], profile.bm25_limit,
+                                                        pack_ids=effective)
+            timings["bm25"] = (time.perf_counter() - t) * 1000.0
+            legs["bm25"] = {"ids": [h.get("node_id") for h in hits], "warnings": list(warns)}
+            t = time.perf_counter()
+            hits = hq._fts_search(q["text"], q["spaces"], profile.bm25_limit, pack_ids=effective)
+            timings["fts"] = (time.perf_counter() - t) * 1000.0
+            legs["fts"] = {"ids": [h.get("node_id") for h in hits], "warnings": []}
+            t = time.perf_counter()
+            results = hq._vector_search(q["text"], q["spaces"], profile.vector_limit, pack_ids=effective)
+            timings["vector"] = (time.perf_counter() - t) * 1000.0
+            legs["vector"] = {"ids": [r.node_id for r in results], "warnings": []}
+            return legs, timings
 
     def generation() -> int | None:
         state = hq._bm25.state
@@ -1195,52 +1455,31 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
     readable = set(scope)
     phase_cpu: dict[str, float] = {}
 
-    # Cold (design 8.3 step 3).
-    cpu0 = time.process_time()
-    _sel, _out, cold_ms = request(queries[0])
-    report["cold"] = {"first_request_ms": cold_ms,
-                      "bm25_first_build_ms": build_times[0] * 1000.0 if build_times else None}
-    phase_cpu["cold"] = time.process_time() - cpu0
+    with trace_obs.phase("phase.cold"):
+        # Cold (design 8.3 step 3).
+        cpu0 = time.process_time()
+        with attempt_scope(queries[0], "cold", 0, 0):
+            with trace_obs.metadata(phase="cold"), trace_obs.span("bundle"):
+                _sel, _out, cold_ms = request(queries[0])
+                record_request("cold")
+        report["cold"] = {"first_request_ms": cold_ms,
+                          "bm25_first_build_ms": build_times[0] * 1000.0 if build_times else None}
+        phase_cpu["cold"] = time.process_time() - cpu0
 
-    # Warm and quality (steps 4 and 5).
-    cpu0 = time.process_time()
-    shape_lat: dict[str, list[float]] = {}
-    leg_lat: dict[str, list[float]] = {"bm25": [], "fts": [], "vector": []}
-    per_query: list[dict[str, Any]] = []
-    flag_names = ("leak", "dup", "scope_error", "warning_dropped", "partial_silent")
-    repeat_defects: dict[str, int] = dict.fromkeys(flag_names, 0)
-    repeat_classes: dict[str, dict[str, int]] = {}
-    discarded_bundles = 0
+    with trace_obs.phase("phase.warm"):
+        # Warm and quality (steps 4 and 5).
+        cpu0 = time.process_time()
+        shape_lat: dict[str, list[float]] = {}
+        leg_lat: dict[str, list[float]] = {"bm25": [], "fts": [], "vector": []}
+        per_query: list[dict[str, Any]] = []
+        flag_names = ("leak", "dup", "scope_error", "warning_dropped", "partial_silent")
+        repeat_defects: dict[str, int] = dict.fromkeys(flag_names, 0)
+        repeat_classes: dict[str, dict[str, int]] = {}
+        discarded_bundles = 0
 
-    def stable_bundle(q: dict[str, Any]) -> tuple[Any, Any, float, dict[str, Any], dict[str, float]] | None:
-        """Build one bundle whose BM25 generation did not change (design 7.1).
-
-        The function discards a bundle whose generation changed, together
-        with its latency samples, and builds it again. Three changes in a row
-        return None.
-        """
-        nonlocal discarded_bundles
-        for _attempt in range(3):
-            g0 = generation()
-            sel, outcome, ms = request(q)
-            legs, timings = leg_calls(q, sel.effective_pack_ids)
-            if generation() == g0:
-                return sel, outcome, ms, legs, timings
-            discarded_bundles += 1
-        return None
-
-    for q in queries:
-        if stable_bundle(q) is None:  # warm-up bundle, not recorded
-            report["reasons"].append(f"unstable BM25 generation: {q['qid']}")
-            continue
-        last = None
-        for _rep in range(args.repeats):
-            built = stable_bundle(q)
-            if built is None:
-                report["reasons"].append(f"unstable BM25 generation: {q['qid']}")
-                break
-            sel, outcome, ms, legs, timings = built
+        def consume(q, sel, outcome, ms, legs, timings):
             shape_lat.setdefault(q["shape"], []).append(ms)
+            record_request("accepted", accepted_for_metric=True)
             for name, value in timings.items():
                 leg_lat[name].append(value)
             selection = {"effective": list(sel.effective_pack_ids),
@@ -1253,164 +1492,280 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: C901 -- one linear measur
                     repeat_defects[flag] += bool(part["flags"][flag])
                 counts = repeat_classes.setdefault(leg_name, {})
                 counts[part["class"]] = counts.get(part["class"], 0) + 1
-            last = (judged, selection, list(outcome.warnings))
-        if last is None:
-            continue
-        judged, selection, warnings = last
-        per_query.append({"qid": q["qid"], "kind": q["kind"], "shape": q["shape"],
-                          "selection": selection, "combined_warnings": warnings,
-                          "wrong_pack": judged["wrong_pack"],
-                          "legs": {**judged["legs"], "combined": judged["combined"]}})
-    phase_cpu["warm"] = time.process_time() - cpu0
-    report["queries"] = per_query
+            return judged, selection, list(outcome.warnings)
 
-    # Freshness (step 6).
-    cpu0 = time.process_time()
-    fresh_marker1 = "qxfreshone"
-    fresh_marker2 = "qxfreshtwo"
-    body1 = f"{fresh_marker1} " + " ".join(f"qdfa{i}" for i in range(20))
-    body2 = f"{fresh_marker2} " + " ".join(f"qdfb{i}" for i in range(20))
-    fresh_id = "fresh-000001"
-    truth[fresh_id] = (measure_pack, "evidence")
+        def stable_bundle(q, repeat, warmup=False):
+            nonlocal discarded_bundles
+            for attempt in range(3):
+                with attempt_scope(q, "warm", repeat, attempt):
+                    with trace_obs.metadata(phase="warm", qid=q["qid"], repeat=repeat, attempt=attempt):
+                        with trace_obs.span("bundle"):
+                            g0 = generation()
+                            sel, outcome, ms = request(q)
+                            legs, timings = leg_calls(q, sel.effective_pack_ids)
+                            if generation() != g0:
+                                record_request("discarded")
+                                discarded_bundles += 1
+                                continue
+                            if warmup:
+                                record_request("excluded_warmup")
+                                return True
+                            with trace_obs.metadata(related_request_id=request_info.get("request_id")):
+                                return consume(q, sel, outcome, ms, legs, timings)
+            return None
 
-    def fresh_doc(body: str) -> dict[str, Any]:
-        return {"id": fresh_id, "pack": "measure", "form": "S", "space": "evidence",
-                "node_type": "TextUnit", "title": "fresh", "text": body}
-
-    profile = qmod._profile_for_query(fresh_marker1, 10, 1)
-
-    def leg_state(leg: str, query_text: str) -> tuple[bool, str | None]:
-        watchdog.op_start(f"freshness:{leg}")
-        try:
-            return _leg_state(leg, query_text)
-        finally:
-            watchdog.op_end()
-
-    def _leg_state(leg: str, query_text: str) -> tuple[bool, str | None]:
-        if leg == "bm25":
-            hits, _w = hq._bm25_search_with_warnings(query_text, None, profile.bm25_limit,
-                                                     pack_ids=[measure_pack])
-            return fresh_id in [h.get("node_id") for h in hits][:10], None
-        if leg == "fts":
-            hits = hq._fts_search(query_text, None, profile.bm25_limit, pack_ids=[measure_pack])
-            return fresh_id in [h.get("node_id") for h in hits][:10], None
-        results = hq._vector_search(query_text, None, profile.vector_limit, pack_ids=[measure_pack])
-        for r in results[:10]:
-            if r.node_id == fresh_id:
-                return True, r.text
-        return False, None
-
-    def poll(conditions: dict[str, Any]) -> dict[str, Any]:
-        started = time.perf_counter()
-        pending = dict(conditions)
-        done: dict[str, Any] = {}
-        while pending and time.perf_counter() - started < args.fresh_timeout:
-            for leg in list(pending):
-                if pending[leg]():
-                    done[leg] = round(time.perf_counter() - started, 3)
-                    del pending[leg]
-            if pending:
-                time.sleep(0.1)
-        for leg in pending:
-            done[leg] = "not_converged"
-        return done
-
-    def write_fresh(body: str) -> None:
-        locked_write(run_dir, docs, vec, hq, doc_rows(fresh_doc(body), packs))
-
-    freshness: dict[str, Any] = {}
-    write_fresh(body1)
-    freshness["insert"] = poll({
-        "bm25": lambda: leg_state("bm25", fresh_marker1)[0],
-        "fts": lambda: leg_state("fts", fresh_marker1)[0],
-        "vector": lambda: leg_state("vector", body1)[0],
-    })
-    visible = {leg for leg, v in freshness["insert"].items() if v != "not_converged"}
-    write_fresh(body2)
-
-    def updated(leg: str) -> bool:
-        if leg == "vector":
-            found, text = leg_state("vector", body2)
-            return found and text == body2
-        return leg_state(leg, fresh_marker2)[0] and not leg_state(leg, fresh_marker1)[0]
-
-    freshness["update"] = poll({leg: (lambda leg=leg: updated(leg)) for leg in sorted(visible)})
-    for leg in ("bm25", "fts", "vector"):
-        if leg not in visible:
-            freshness["update"][leg] = "precondition_failed"
-    still = {leg for leg, v in freshness["update"].items() if isinstance(v, float)}
-    locked_delete(run_dir, docs, vec, hq, fresh_id)
-    freshness["delete"] = poll({
-        leg: (lambda leg=leg: not leg_state(leg, body2 if leg == "vector" else fresh_marker2)[0])
-        for leg in sorted(still)
-    })
-    for leg in ("bm25", "fts", "vector"):
-        if leg not in still:
-            freshness["delete"][leg] = "precondition_failed"
-    report["freshness"] = freshness
-    phase_cpu["freshness"] = time.process_time() - cpu0
-
-    # Concurrent writes (step 7).
-    cpu0 = time.process_time()
-    total_writes = int(round(args.concurrent_seconds * args.concurrent_rate))
-    conc_ids = [f"conc-{i:06d}" for i in range(total_writes)]
-    for node_id in conc_ids:
-        truth[node_id] = (measure_pack, "evidence")
-    write_ms: list[float] = []
-    lock_ms: list[float] = []
-    write_errors: list[str] = []
-    stop_writer = threading.Event()
-
-    def writer() -> None:
-        interval = 1.0 / args.concurrent_rate
-        start = time.perf_counter()
-        for i, node_id in enumerate(conc_ids):
-            due = start + i * interval
-            delay = due - time.perf_counter()
-            if delay > 0 and stop_writer.wait(delay):
-                return
-            doc = {"id": node_id, "pack": "measure", "form": "N", "space": "evidence",
-                   "node_type": "Evidence", "title": "concurrent", "text": f"qdconc{i} filler text"}
-            try:
-                watchdog.op_start(f"write:{node_id}", slot="writer")
-                t0 = time.perf_counter()
-                waited = locked_write(run_dir, docs, vec, hq, doc_rows(doc, packs))
-                t2 = time.perf_counter()
-                lock_ms.append(waited * 1000.0)
-                write_ms.append((t2 - t0) * 1000.0)
-            except Exception as exc:  # noqa: BLE001 -- recorded in the report
-                write_errors.append(type(exc).__name__)
-            finally:
-                watchdog.op_end(slot="writer")
-
-    thread = threading.Thread(target=writer, name="search-baseline-writer", daemon=True)
-    thread.start()
-    conc_lat: dict[str, list[float]] = {}
-    conc_violations = {"leak": 0, "dup": 0, "requests": 0}
-    while thread.is_alive():
         for q in queries:
-            if not thread.is_alive():
-                break
-            sel, outcome, ms = request(q)
-            conc_lat.setdefault(q["shape"], []).append(ms)
-            selection = {"effective": list(sel.effective_pack_ids),
-                         "warnings": [w.code for w in sel.warnings]}
-            empty_legs = {name: {"ids": [], "warnings": []} for name in ("bm25", "fts", "vector")}
-            combined = {"items": _items_from_results(outcome.results), "warnings": list(outcome.warnings)}
-            judged = judge_bundle(q, truth, readable, selection, empty_legs, combined)
-            conc_violations["leak"] += bool(judged["combined"]["flags"]["leak"])
-            conc_violations["dup"] += bool(judged["combined"]["flags"]["dup"])
-            conc_violations["requests"] += 1
-    thread.join()
-    report["concurrent"] = {
-        "seconds": args.concurrent_seconds, "rate_per_s": args.concurrent_rate,
-        "writes_planned": total_writes, "writes_done": len(write_ms), "write_errors": write_errors,
-        "write_latency": _summary(write_ms), "lock_wait": _summary(lock_ms),
-        "request_latency": {shape: _summary(v) for shape, v in conc_lat.items()},
-        "violations": conc_violations,
-    }
-    phase_cpu["concurrent"] = time.process_time() - cpu0
-    hq.shutdown_bm25()
+            if stable_bundle(q, -1, warmup=True) is None:
+                report["reasons"].append(f"unstable BM25 generation: {q['qid']}")
+                continue
+            last = None
+            for _rep in range(args.repeats):
+                built = stable_bundle(q, _rep)
+                if built is None:
+                    report["reasons"].append(f"unstable BM25 generation: {q['qid']}")
+                    break
+                last = built
+            if last is None:
+                continue
+            judged, selection, warnings = last
+            per_query.append({"qid": q["qid"], "kind": q["kind"], "shape": q["shape"],
+                              "selection": selection, "combined_warnings": warnings,
+                              "wrong_pack": judged["wrong_pack"],
+                              "legs": {**judged["legs"], "combined": judged["combined"]}})
+        phase_cpu["warm"] = time.process_time() - cpu0
+        report["queries"] = per_query
+
+    with trace_obs.phase("phase.freshness"):
+        # Freshness (step 6).
+        cpu0 = time.process_time()
+        fresh_marker1 = "qxfreshone"
+        fresh_marker2 = "qxfreshtwo"
+        body1 = f"{fresh_marker1} " + " ".join(f"qdfa{i}" for i in range(20))
+        body2 = f"{fresh_marker2} " + " ".join(f"qdfb{i}" for i in range(20))
+        fresh_id = "fresh-000001"
+        truth[fresh_id] = (measure_pack, "evidence")
+
+        def fresh_doc(body: str) -> dict[str, Any]:
+            return {"id": fresh_id, "pack": "measure", "form": "S", "space": "evidence",
+                    "node_type": "TextUnit", "title": "fresh", "text": body}
+
+        profile = qmod._profile_for_query(fresh_marker1, 10, 1)
+
+        @trace_obs.observed("freshness.poll")
+        def leg_state(leg: str, query_text: str) -> tuple[bool, str | None]:
+            with watchdog.operation(f"freshness:{leg}"):
+                return _leg_state(leg, query_text)
+
+        def _leg_state(leg: str, query_text: str) -> tuple[bool, str | None]:
+            if leg == "bm25":
+                hits, _w = hq._bm25_search_with_warnings(query_text, None, profile.bm25_limit,
+                                                         pack_ids=[measure_pack])
+                return fresh_id in [h.get("node_id") for h in hits][:10], None
+            if leg == "fts":
+                hits = hq._fts_search(query_text, None, profile.bm25_limit, pack_ids=[measure_pack])
+                return fresh_id in [h.get("node_id") for h in hits][:10], None
+            results = hq._vector_search(query_text, None, profile.vector_limit, pack_ids=[measure_pack])
+            for r in results[:10]:
+                if r.node_id == fresh_id:
+                    return True, r.text
+            return False, None
+
+        def poll(conditions: dict[str, Any]) -> dict[str, Any]:
+            started = time.perf_counter()
+            pending = dict(conditions)
+            done: dict[str, Any] = {}
+            while pending and time.perf_counter() - started < args.fresh_timeout:
+                for leg in list(pending):
+                    if pending[leg]():
+                        done[leg] = round(time.perf_counter() - started, 3)
+                        del pending[leg]
+                if pending:
+                    time.sleep(0.1)
+            for leg in pending:
+                done[leg] = "not_converged"
+            return done
+
+        @trace_obs.observed("freshness.write")
+        def write_fresh(body: str) -> None:
+            locked_write(run_dir, docs, vec, hq, doc_rows(fresh_doc(body), packs))
+
+        freshness: dict[str, Any] = {}
+        write_fresh(body1)
+        freshness["insert"] = poll({
+            "bm25": lambda: leg_state("bm25", fresh_marker1)[0],
+            "fts": lambda: leg_state("fts", fresh_marker1)[0],
+            "vector": lambda: leg_state("vector", body1)[0],
+        })
+        visible = {leg for leg, v in freshness["insert"].items() if v != "not_converged"}
+        write_fresh(body2)
+
+        def updated(leg: str) -> bool:
+            if leg == "vector":
+                found, text = leg_state("vector", body2)
+                return found and text == body2
+            return leg_state(leg, fresh_marker2)[0] and not leg_state(leg, fresh_marker1)[0]
+
+        freshness["update"] = poll({leg: (lambda leg=leg: updated(leg)) for leg in sorted(visible)})
+        for leg in ("bm25", "fts", "vector"):
+            if leg not in visible:
+                freshness["update"][leg] = "precondition_failed"
+        still = {leg for leg, v in freshness["update"].items() if isinstance(v, float)}
+        locked_delete(run_dir, docs, vec, hq, fresh_id)
+        freshness["delete"] = poll({
+            leg: (lambda leg=leg: not leg_state(leg, body2 if leg == "vector" else fresh_marker2)[0])
+            for leg in sorted(still)
+        })
+        for leg in ("bm25", "fts", "vector"):
+            if leg not in still:
+                freshness["delete"][leg] = "precondition_failed"
+        report["freshness"] = freshness
+        phase_cpu["freshness"] = time.process_time() - cpu0
+
+    with trace_obs.phase("phase.concurrent"):
+        # Concurrent writes (step 7).
+        cpu0 = time.process_time()
+        total_writes = int(round(args.concurrent_seconds * args.concurrent_rate))
+        conc_ids = [f"conc-{i:06d}" for i in range(total_writes)]
+        for node_id in conc_ids:
+            truth[node_id] = (measure_pack, "evidence")
+        write_ms: list[float] = []
+        lock_ms: list[float] = []
+        write_errors: list[str] = []
+        stop_writer = threading.Event()
+
+        def writer() -> bool:
+            interval = 1.0 / args.concurrent_rate
+            start = time.perf_counter()
+            for i, node_id in enumerate(conc_ids):
+                due = start + i * interval
+                delay = due - time.perf_counter()
+                if delay > 0 and stop_writer.wait(delay):
+                    return False
+                doc = {"id": node_id, "pack": "measure", "form": "N", "space": "evidence",
+                       "node_type": "Evidence", "title": "concurrent", "text": f"qdconc{i} filler text"}
+                try:
+                    with watchdog.operation(f"write:{node_id}", slot="writer"):
+                        t0 = time.perf_counter()
+                        with trace_obs.metadata(write_id=i, due=due, actual_start=t0):
+                            waited = locked_write(run_dir, docs, vec, hq, doc_rows(doc, packs))
+                        t2 = time.perf_counter()
+                        lock_ms.append(waited * 1000.0)
+                        write_ms.append((t2 - t0) * 1000.0)
+                except Exception as exc:  # noqa: BLE001 -- recorded in the report
+                    write_errors.append(type(exc).__name__)
+            return True
+
+        writer_trace = trace_obs.active()
+        owner = getattr(args, "_lifecycle_owner", None)
+        state_factory = owner.get("writer_state_factory", dict) if owner is not None else dict
+        writer_state = state_factory(entered=False, completed=False, reason=None)
+        record_failed = threading.Event()
+        execution_failed = threading.Event()
+
+        def writer_record(key, value):
+            try:
+                writer_state[key] = value
+            except BaseException:
+                record_failed.set()
+
+        def writer_entry():
+            writer_record("entered", True)
+            try:
+                if writer_trace is None:
+                    completed = writer()
+                else:
+                    with trace_obs.observe(writer_trace), trace_obs.span("writer"):
+                        completed = writer()
+                writer_record("completed", completed)
+            except BaseException as exc:
+                writer_record("reason", "cancelled" if isinstance(exc, asyncio.CancelledError) else "base_exception")
+                raise
+
+        thread = threading.Thread(target=writer_entry, name="search-baseline-writer", daemon=True)
+        owner = getattr(args, "_lifecycle_owner", None)
+        if owner is not None:
+            owner.update(writer=thread, writer_state=writer_state, writer_record_failed=record_failed,
+                         writer_execution_failed=execution_failed)
+        conc_lat: dict[str, list[float]] = {}
+        conc_violations = {"leak": 0, "dup": 0, "requests": 0}
+        writer_started = False
+        try:
+            thread.start()
+            writer_started = True
+            while thread.is_alive():
+                for q in queries:
+                    if not thread.is_alive():
+                        break
+                    with attempt_scope(q, "concurrent", conc_violations["requests"], 0):
+                        with trace_obs.metadata(phase="concurrent", qid=q["qid"]), trace_obs.span("bundle"):
+                            sel, outcome, ms = request(q)
+                            conc_lat.setdefault(q["shape"], []).append(ms)
+                            record_request("accepted", accepted_for_metric=True)
+                            selection = {"effective": list(sel.effective_pack_ids),
+                                         "warnings": [w.code for w in sel.warnings]}
+                            empty_legs = {name: {"ids": [], "warnings": []} for name in ("bm25", "fts", "vector")}
+                            combined = {"items": _items_from_results(outcome.results), "warnings": list(outcome.warnings)}
+                            judged = judge_bundle(q, truth, readable, selection, empty_legs, combined)
+                            conc_violations["leak"] += bool(judged["combined"]["flags"]["leak"])
+                            conc_violations["dup"] += bool(judged["combined"]["flags"]["dup"])
+                            conc_violations["requests"] += 1
+        finally:
+            original = sys.exception()
+            if original is not None:
+                execution_failed.set()
+            reaped = False
+            try:
+                stop_writer.set()
+                deadline = time.monotonic() + 5
+                join_error = None
+                if thread.ident is not None:
+                    joined = False
+                    try:
+                        thread.join(timeout=max(0, deadline - time.monotonic()))
+                        joined = True
+                    except BaseException as exc:
+                        join_error = exc
+                        execution_failed.set()
+                        try:
+                            thread.join(timeout=max(0, deadline - time.monotonic()))
+                            joined = True
+                        except BaseException:
+                            pass
+                    if joined:
+                        try:
+                            reaped = not thread.is_alive()
+                        except BaseException:
+                            if join_error is not None:
+                                raise join_error
+                            raise
+                if not reaped:
+                    watchdog.writer_unresolved = True
+                    if join_error is not None:
+                        raise join_error
+                    raise RuntimeError("writer cleanup failed")
+                if not writer_started:
+                    execution_failed.set()
+                if join_error is not None:
+                    raise join_error
+            except BaseException:
+                execution_failed.set()
+                if not reaped:
+                    watchdog.writer_unresolved = True
+                if original is None:
+                    raise
+                try:
+                    sys.stderr.write("writer cleanup failed\n")
+                except BaseException:
+                    pass
+        report["concurrent"] = {
+            "seconds": args.concurrent_seconds, "rate_per_s": args.concurrent_rate,
+            "writes_planned": total_writes, "writes_done": len(write_ms), "write_errors": write_errors,
+            "write_latency": _summary(write_ms), "lock_wait": _summary(lock_ms),
+            "request_latency": {shape: _summary(v) for shape, v in conc_lat.items()},
+            "violations": conc_violations,
+        }
+        phase_cpu["concurrent"] = time.process_time() - cpu0
+        hq.shutdown_bm25()
 
     # Resources (step 8).
     checkpoints: dict[str, Any] = {}
@@ -1614,11 +1969,14 @@ def main(argv: list[str] | None = None) -> int:
     load = sub.add_parser("load")
     load.add_argument("--corpus", required=True)
     load.add_argument("--work", required=True)
+    add_lifecycle_options(load)
     run = sub.add_parser("run")
     run.add_argument("--corpus", required=True)
     run.add_argument("--work", required=True)
     run.add_argument("--run-dir", required=True)
     run.add_argument("--out", required=True)
+    run.add_argument("--trace-out")
+    add_lifecycle_options(run)
     run.add_argument("--config", choices=("default", "scaled-cap"), default="default")
     run.add_argument("--repeats", type=int, default=5)
     run.add_argument("--fresh-timeout", type=float, default=30.0)
@@ -1630,9 +1988,55 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("selftest")
     args = parser.parse_args(argv)
     if args.command == "load":
-        return cmd_load(Path(args.corpus).resolve(), Path(args.work).resolve())
+        corpus, work = Path(args.corpus).resolve(), Path(args.work).resolve()
+        context = lifecycle_prepare(args, [corpus, work], corpus_is_smoke(corpus))
+        result = cmd_load(corpus, work, lifecycle_owner=context["owner"] if context else None)
+        lifecycle_publish(context, result)
+        return result
     if args.command == "run":
-        return cmd_run(args)
+        corpus, work = Path(args.corpus).resolve(), Path(args.work).resolve()
+        protected = [corpus, work, Path(args.run_dir).resolve(), Path(args.out).resolve()]
+        if args.trace_out:
+            protected.append(Path(args.trace_out).resolve())
+        context = lifecycle_prepare(args, protected, corpus_is_smoke(corpus))
+        if context:
+            args._lifecycle_owner = context["owner"]
+        if args.trace_out is None:
+            result = cmd_run(args)
+            lifecycle_publish(context, result)
+            return result
+        root = Path(args.trace_out).resolve()
+        sources = [Path(args.corpus).resolve(), Path(args.work).resolve(),
+                   Path(__file__).resolve().parents[1], Path(args.run_dir).resolve(),
+                   Path(args.out).resolve()]
+        check_write_paths([root], sources=sources, smoke=corpus_is_smoke(Path(args.corpus)))
+        files = trace_obs.TraceFiles(root, run_id=context["run_id"] if context else None,
+                                     nonce=context["nonce"] if context else None)
+        trace = trace_obs.Trace(files.run_id, mode="ledger")
+        args._sample_ledger = trace_obs.SampleLedger()
+        if context is None:
+            args._lifecycle_owner = {}
+        with trace_obs.observe(trace):
+            with trace_obs.span("run"):
+                result = cmd_run(args)
+        owner = args._lifecycle_owner
+        watchdog = owner.get("watchdog")
+        writer = owner.get("writer")
+        writer_state = owner.get("writer_state")
+        cleanup = False
+        if result == 0 and watchdog is not None and writer is not None and writer_state is not None:
+            with watchdog._state_lock:
+                cleanup = watchdog.state == "STOPPED" and not watchdog.is_alive()
+            with watchdog._ops_lock:
+                cleanup = cleanup and not watchdog._ops
+            cleanup = (cleanup and not writer.is_alive() and writer_state["entered"]
+                       and writer_state["completed"] and not owner["writer_record_failed"].is_set())
+        if context is not None:
+            cleanup = cleanup and lifecycle_publish(context, result)
+        if cleanup:
+            cleanup = files.finish(trace, args._sample_ledger, expected_mode="ledger", cleanup=True,
+                                   observation={"watchdog": True, "slots": True, "writer": True})
+        return result if result != 0 or cleanup else 1
     if args.command == "compare":
         return cmd_compare(args.base, args.head)
     return cmd_selftest()

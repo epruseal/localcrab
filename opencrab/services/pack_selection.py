@@ -21,6 +21,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from opencrab.observability.search_trace import observed
+
 logger = logging.getLogger(__name__)
 
 # Interface-neutral warning codes. Callers map these to their own wording.
@@ -65,6 +67,7 @@ class PackSelection:
     include_unpackaged_effective: bool = False
 
 
+@observed("selection")
 def resolve_packs(
     question: str,
     pack_ids: list[str] | None,
