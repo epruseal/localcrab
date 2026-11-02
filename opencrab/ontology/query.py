@@ -323,9 +323,9 @@ def _ordered_unique(values: list[str | None], limit: int) -> list[str]:
 # 본문 접기".
 _FOLD_BODIES = "_fold_bodies"
 _FOLDED_MEMBERS = "_folded_members"
-# #571: the number of hits per lexical leg (BM25, FTS) that the query passes
-# to _reserve_leg_tops as candidates. Contract: docs/ARCHITECTURE.md, "결합
-# 결과의 레그 상위".
+# #571: This constant sets how many hits of each lexical leg (BM25, FTS) the
+# query passes to _reserve_leg_tops as candidates. The contract is in
+# docs/ARCHITECTURE.md, "결합 결과의 레그 상위".
 _LEXICAL_TOP_DEPTH = 2
 _FOLD_METADATA_KEY = "folded_duplicates"
 _PRIVATE_PROVENANCE = "_query_provenance"
