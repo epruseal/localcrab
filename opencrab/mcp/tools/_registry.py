@@ -229,6 +229,29 @@ def tools_for_principal(principal: Principal) -> list[dict[str, Any]]:
     ]
 
 
+def tool_pool_kind(name: Any, principal: Principal) -> str | None:
+    """Which worker pool should run a ``tools/call`` for *name* (#577).
+
+    Returns ``"write"`` when the principal may call the tool and the tool
+    needs the cross-process write.lock (``spec.writes``), ``"read"`` when it
+    may call a tool that does not, and ``None`` when *name* is not a string,
+    is unhashable, is not registered, or is hidden from the principal. The
+    last case is the one ``dispatch_tool`` turns into ``UnknownToolError``
+    before it runs any tool code, so there is no tool body to run.
+
+    Reads ``_REGISTRY`` live, as ``dispatch_tool`` does. ``WRITE_TOOLS`` is an
+    import-time snapshot and would miss a tool registered later. Never
+    raises: the transport calls this on client-controlled JSON.
+    """
+    try:
+        spec = _REGISTRY.get(name)
+    except TypeError:  # unhashable name
+        return None
+    if spec is None or not _tool_allowed(spec, principal):
+        return None
+    return "write" if spec.writes else "read"
+
+
 def get_tool_catalog(principal: Principal) -> dict[str, Any]:
     """Principal-scoped tool catalog snapshot with a content fingerprint (#135).
 

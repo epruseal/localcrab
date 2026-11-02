@@ -17,12 +17,13 @@ ContextVar 전파 범위 (읽어야 하는 주의사항): ``current_principal()`
 ``principal_scope()`` 는 ``contextvars.ContextVar`` 하나로 구현된다. 같은
 코루틴이 만든 ``await`` 체인 안에서는 값이 그대로 보인다 -- Python
 contextvars 는 코루틴 실행 컨텍스트를 따라가기 때문이다. 하지만
-``opencrab/mcp/http_app.py`` 의 async 라우트가 ``opencrab/mcp/server.py``
-의 sync ``MCPServer.handle_request`` 를 스레드풀/executor(예:
-``asyncio.to_thread``, ``loop.run_in_executor``)로 옮겨 호출하면, 그
-경계에서 컨텍스트가 복사되지 않아 설정해둔 principal 이 보이지 않게 된다.
-그런 실행 경로에 이 모듈을 연결할 때는 principal 을 인자로 명시적으로
-넘기거나, 스레드 진입 시 ``contextvars.copy_context()`` 로 복사해야 한다.
+``loop.run_in_executor`` 는 컨텍스트를 복사하지 않으므로, 그 경로로 옮겨 호출하면
+설정해둔 principal 이 보이지 않게 된다(``asyncio.to_thread`` 는 복사한다).
+``opencrab/mcp/http_app.py`` 의 ``mcp_post`` 는 #577 부터 도구 호출(``tools/call``)을
+담은 요청의 sync ``MCPServer.handle_request`` 를 워커 스레드에서 실행하며, 넘기기 전에
+``contextvars.copy_context()`` 로 컨텍스트를 복사해 ``ctx.run`` 으로 실행한다.
+다른 실행 경로에 이 모듈을 연결할 때도 principal 을 인자로 명시적으로 넘기거나
+같은 방식으로 복사해야 한다.
 """
 
 from __future__ import annotations

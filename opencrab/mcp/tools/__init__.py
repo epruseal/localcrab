@@ -78,6 +78,7 @@ from ._registry import ForbiddenArgumentError as ForbiddenArgumentError
 from ._registry import UnknownToolError as UnknownToolError
 from ._registry import dispatch_tool as _registry_dispatch_tool
 from ._registry import safe_tool_error as safe_tool_error
+from ._registry import tool_pool_kind as tool_pool_kind
 from ._registry import tools_for_principal as tools_for_principal
 
 logger = logging.getLogger(__name__)
@@ -483,6 +484,7 @@ __all__ = [
     "schema_pack_install",
     "schema_pack_list",
     "schema_pack_uninstall",
+    "tool_pool_kind",
     "tool_search",
     "tools_for_principal",
 ]

@@ -9,6 +9,7 @@ from hanging. Time never decides a verdict, except the one real-timer test.
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 import threading
 import time
@@ -367,6 +368,13 @@ def test_concurrent_calls_and_releases_never_overlap(env) -> None:
     clock = _AlwaysDue()
     emb = env.make()
     emb._clock = clock
+    # #577: the inference lock keeps every caller inside its lease while it
+    # waits for the model. That is correct, because a model in use is not idle.
+    # It also leaves this stress loop almost no moment with zero leases, and in
+    # measured runs the loop did not reach the release count it needs. This test
+    # covers release versus call races. Inference serialisation is covered by
+    # tests/test_llamacpp_embedding_race.py, so the lock is neutral here.
+    emb._infer_lock = contextlib.nullcontext()
     # Yield the interpreter inside every embedding so that releases land both
     # between calls and while a call holds its lease.
     env.world.on_embed = lambda text: time.sleep(0)

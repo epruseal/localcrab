@@ -326,3 +326,96 @@ def test_two_contexts_get_independent_embedding_function_instances(tmp_path) -> 
             close = getattr(store, "close", None)
             if callable(close):
                 close()
+
+
+# ---------------------------------------------------------------------------
+# #577: inference calls on the shared model must not overlap.
+#
+# Before #577 the gateway ran one tool at a time, so a read tool (query
+# embedding) and a write tool (node embedding) never reached the one shared
+# Llama object together. With tool calls on worker threads they can. The test
+# follows the discipline of this file: a forced race point, an instrumented
+# lock that records acquire attempts, and a bounded wait. Not reaching the race
+# point FAILS the test; it never passes by timeout.
+# ---------------------------------------------------------------------------
+
+class _RaceLock(_InstrumentedLock):
+    """Records acquire attempts and signals the moment a SECOND thread tries."""
+
+    def __init__(self, race_point: threading.Event) -> None:
+        super().__init__()
+        self._race_point = race_point
+
+    def acquire(self, *args, **kwargs):
+        with self._guard:
+            self.attempts.append(threading.get_ident())
+            if len(set(self.attempts)) >= 2:
+                self._race_point.set()
+        return self._lock.acquire(*args, **kwargs)
+
+
+class _OverlapLlm:
+    """Fake Llama: the first call parks until the race point is reached; any
+    second ENTRY into create_embedding also reaches the race point."""
+
+    def __init__(self, race_point: threading.Event) -> None:
+        self._guard = threading.Lock()
+        self._race_point = race_point
+        self.entries = 0
+        self.active = 0
+        self.max_active = 0
+        self.first_inside = threading.Event()
+        # Result of the first call's bounded wait. A test that ignored it
+        # could pass without the lock when that wait expires and the second
+        # caller only runs afterwards.
+        self.first_wait_reached: bool | None = None
+
+    def create_embedding(self, text):  # noqa: ARG002
+        with self._guard:
+            n = self.entries
+            self.entries += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        if n == 0:
+            self.first_inside.set()
+            self.first_wait_reached = self._race_point.wait(timeout=_WAIT)
+        else:
+            self._race_point.set()
+        with self._guard:
+            self.active -= 1
+        return {"data": [{"embedding": [1.0, 0.0]}]}
+
+
+def test_inference_calls_on_one_model_never_overlap(tmp_path, monkeypatch) -> None:
+    race_point = threading.Event()
+    llm = _OverlapLlm(race_point)
+    _install_fake_llama_cpp(monkeypatch, lambda **kwargs: llm)  # noqa: ARG005
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"not a real gguf, never read by the fake Llama ctor")
+    emb = LlamaCppEmbeddingFunction(gguf_path=str(gguf), idle_unload_seconds=0)
+    # raising=False: before #577 the attribute does not exist; the assertions
+    # below then fail because the code never takes the lock.
+    probe = _RaceLock(race_point)
+    monkeypatch.setattr(emb, "_infer_lock", probe, raising=False)
+
+    box_a: dict = {}
+    box_b: dict = {}
+    thread_a = threading.Thread(target=lambda: box_a.setdefault("v", emb(["a"])), daemon=True)
+    thread_b = threading.Thread(target=lambda: box_b.setdefault("v", emb(["b"])), daemon=True)
+
+    thread_a.start()
+    assert llm.first_inside.wait(timeout=_WAIT), "A never entered create_embedding"
+    thread_b.start()
+    thread_a.join(timeout=_WAIT)
+    thread_b.join(timeout=_WAIT)
+
+    assert not thread_a.is_alive() and not thread_b.is_alive(), "a call never returned"
+    assert llm.first_wait_reached is True, (
+        "the first call left create_embedding before a second caller reached the race point"
+    )
+    assert race_point.is_set(), "the second caller never reached the race point"
+    # Independent of thread timing: with the lock in the code both threads
+    # attempt it; without the lock in the code nothing is ever recorded.
+    assert len(set(probe.attempts)) == 2, "the inference lock was not taken by both callers"
+    assert llm.max_active == 1, "two inference calls ran on the shared model at once"
+    assert len(box_a["v"]) == 1 and len(box_b["v"]) == 1
