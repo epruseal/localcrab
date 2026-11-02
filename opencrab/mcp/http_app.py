@@ -36,13 +36,31 @@ gets a 401 rather than falling back to the query parameter: without that
 rule, attaching a junk ``Authorization`` header would bypass the
 ``allow_query_token`` restriction entirely.
 
+THREADING (#577). The event loop must not run tool code. A write tool that
+embeds on the CPU fallback takes tens of seconds. While it ran on the loop
+thread, ``/healthz`` and every other request of the process stopped answering.
+``mcp_post`` hands ``tools/call`` work to two fixed pools: ``mcp-write`` (one
+thread) and ``mcp-read`` (four threads). A legacy JSON-RPC batch that contains
+a ``tools/call`` runs as one unit on one of these pools. A ``ping`` in that
+batch runs there too. The token check of every ``/mcp`` route runs on a third
+pool, ``mcp-auth`` (one thread). Single ``initialize``, ``tools/list`` and
+``ping`` requests, and batches without a ``tools/call``, stay on the loop. An
+error for a ``tools/call`` (for example an unknown tool name) is produced by
+``handle_request`` on the pool thread that call was sent to. See ``mcp_router``
+for the routing rules and the lock reasoning.
+
 Run with a single uvicorn worker — the underlying chroma PersistentClient is
 single-process only.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import logging
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import unquote
@@ -59,7 +77,9 @@ from opencrab.auth import (
 )
 from opencrab.common.json_transport import serialize_jsonrpc_response
 from opencrab.mcp import protocol
+from opencrab.mcp import tools as tools_pkg
 from opencrab.mcp.server import MCPServer
+from opencrab.mcp.tools import tool_pool_kind
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +266,72 @@ def _batch_is_modern(request: Request, body: list[Any]) -> bool:
     return False
 
 
+# #577: worker pools for tool calls and the token check. Their sizes are
+# fixed so the number of threads is fixed. The SQLite stores keep one
+# connection per thread in `_all_conns` and do not close the connections of
+# threads that have ended, so a fixed set of threads caps the connection
+# count. One write thread runs the MCP write calls one after another; the
+# auth pool has one thread.
+#
+# The pools belong to the PROCESS, not to a router. The gateway builds one app
+# and apps/api mounts one router, so the thread count is the same either way,
+# and a test session that builds many apps does not keep a set of idle
+# threads per app (each thread reserves stack address space, and the gate runs
+# under an address-space limit). They are created lazily, under a lock,
+# because several event loops (test clients, each on its own thread) can ask
+# at the same time.
+_READ_WORKERS = 4
+_POOLS: dict[str, ThreadPoolExecutor] = {}
+_POOLS_LOCK = threading.Lock()
+
+
+def _pool(name: str) -> ThreadPoolExecutor:
+    with _POOLS_LOCK:
+        pool = _POOLS.get(name)
+        if pool is None:
+            width = _READ_WORKERS if name == "read" else 1
+            pool = _POOLS[name] = ThreadPoolExecutor(
+                max_workers=width, thread_name_prefix=f"mcp-{name}"
+            )
+        return pool
+
+
+def _call_kind(item: Any, principal: Principal) -> str | None:
+    """Pool kind for one JSON-RPC item, or None when it is not a tools/call.
+
+    "write" / "read" come from ``tool_pool_kind``; a tools/call that names an
+    unknown or hidden tool is "unknown". Never raises on client-shaped JSON.
+    """
+    if not isinstance(item, dict) or item.get("method") != "tools/call":
+        return None
+    params = item.get("params")
+    name = params.get("name") if isinstance(params, dict) else None
+    return tool_pool_kind(name, principal) or "unknown"
+
+
+def _choose_pool(items: list[Any], principal: Principal) -> str | None:
+    """Which pool runs these request items; None keeps them on the loop.
+
+    Cold-context rule: while the MCP tool context is still empty, every call
+    that will reach a tool runs on the write pool, whatever its kind. Building
+    the context takes ``_context_init_lock`` and, in the store constructors,
+    ``write.lock``; a write tool takes ``write.lock`` first and then waits for
+    the init lock. With a reader building on another thread the two wait for
+    each other (the reader's ``write.lock`` wait ends at its timeout, the
+    writer's init-lock wait only when the reader lets go). One thread that
+    builds, the write thread, cannot do that. ``_context`` is rebound when the
+    build publishes, so it is read here as a package attribute, at call time.
+    """
+    kinds = [k for k in (_call_kind(item, principal) for item in items) if k is not None]
+    if not kinds:
+        return None
+    if "write" in kinds:
+        return "write"
+    if "read" in kinds:
+        return "read" if tools_pkg._context else "write"
+    return "read"  # only unknown or hidden tool names: rejected before any context use
+
+
 def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
     """
     Build the shared ``/mcp`` routes (POST / GET / DELETE).
@@ -279,20 +365,17 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
     # a database that does not exist yet cannot hold a valid token anyway.
     #
     # #302 reachability note: `_auth_store()` below has the same
-    # check-then-act shape as the embedding/BM25 sites this issue fixes (read
+    # check-then-act shape as the embedding/BM25 sites that issue fixed (read
     # `auth_sql`, maybe build+append), but it deliberately carries NO lock.
-    # `mcp_post()` is an `async def` route, and every step from `_check()`
-    # through `_auth_store()` runs with no `await` in between -- FastAPI never
-    # offloads an `async def` handler to the threadpool, so one event-loop
-    # thread runs that whole chain to completion before it can switch to
-    # another request. There is no OS-thread interleaving inside it today.
+    # What makes that safe is that exactly ONE thread ever runs `_check()`:
+    # since #577 that is the `mcp-auth` worker (see `_check_off_loop`), where
+    # before it was the event-loop thread. One thread cannot interleave with
+    # itself, so the closure's `auth_sql` list needs no lock.
     # This is a structural judgment, not an absence of observed incidents.
-    # It stops holding the moment either changes: an `await` appears anywhere
-    # between `_check()`'s entry and `auth_sql.append(store)`, or this route
-    # (or `_auth_store()` itself) is ever called from a `def` handler or an
-    # `asyncio.to_thread`/threadpool offload -- either would let two real OS
-    # threads race this closure's `auth_sql` list. If that happens, this site
-    # needs the same instance-level lock the embedding and BM25 sites got.
+    # It stops holding the moment `_check()` (or `_auth_store()` itself) can
+    # run on a second thread -- a second thread in the auth pool, a direct
+    # call from a route, a call from a tool worker. Any of those needs the same
+    # instance-level lock the embedding and BM25 sites got.
     auth_sql: list[Any] = []
 
     def _auth_store() -> Any | None:
@@ -372,13 +455,40 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
 
         raise _unauthorized()
 
+    async def _offload(pool_name: str, fn: Callable[..., Any], *args: Any) -> Any:
+        """Run ``fn(*args)`` on a pool thread without blocking the loop.
+
+        The context is copied first so ``current_principal()`` (bound by
+        ``principal_scope`` in the caller) is visible in the worker. If the
+        awaiting task is cancelled, the cancellation is passed on to the
+        executor future. A job the worker has not started by then does not run.
+        A job that has started finishes on its thread and its result is
+        dropped.
+        """
+        ctx = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(
+            _pool(pool_name), ctx.run, fn, *args
+        )
+
+    async def _check_off_loop(
+        request: Request, creds: HTTPAuthorizationCredentials | None
+    ) -> Principal:
+        # The token lookup is a database read; a write committing on the same
+        # file in this process could make it wait. Run it on the one auth
+        # thread so the loop never waits on the database (and see the #302
+        # note above for why one thread is also what keeps it lock free).
+        return await _offload("auth", _check, request, creds)
+
+    def _handle_batch(items: list[Any]) -> list[Any]:
+        return [r for r in (server.handle_request(item) for item in items) if r is not None]
+
     @router.post("/mcp")
     @router.post("/mcp/", include_in_schema=False)
     async def mcp_post(
         request: Request,
         creds: HTTPAuthorizationCredentials | None = Depends(bearer),
     ):
-        principal = _check(request, creds)
+        principal = await _check_off_loop(request, creds)
         with principal_scope(principal):
             try:
                 body = await request.json()
@@ -415,7 +525,11 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                         status_code=400,
                         headers=_NO_STORE,
                     )
-                out = [r for r in (server.handle_request(item) for item in body) if r is not None]
+                pool = _choose_pool(body, principal)
+                if pool is None:
+                    out = _handle_batch(body)
+                else:
+                    out = await _offload(pool, _handle_batch, body)
                 if not out:
                     return Response(status_code=202, headers=_NO_STORE)
                 return _jsonrpc_response(out, headers=_NO_STORE)
@@ -506,7 +620,11 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
                 # through: handle_request's legacy-disabled gate produces
                 # their error envelope, and the status mapping below applies.
                 return Response(status_code=400, headers=_NO_STORE)
-            resp = server.handle_request(body)
+            pool = _choose_pool([body], principal)
+            if pool is None:
+                resp = server.handle_request(body)
+            else:
+                resp = await _offload(pool, server.handle_request, body)
             # Notifications (no id) get no body → 202 Accepted
             if resp is None:
                 return Response(status_code=202, headers=_NO_STORE)
@@ -525,7 +643,7 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
         request: Request,
         creds: HTTPAuthorizationCredentials | None = Depends(bearer),
     ):
-        _check(request, creds)  # auth is checked before the stateless-405 response
+        await _check_off_loop(request, creds)  # auth before the stateless-405 response
         # Stateless server offers no server→client SSE stream; per spec, 405.
         # #136: 2026-07-28 removed the GET stream endpoint outright, and
         # DELETE is no longer allowed either -- Allow shrinks to POST.
@@ -537,7 +655,7 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
         request: Request,
         creds: HTTPAuthorizationCredentials | None = Depends(bearer),
     ):
-        _check(request, creds)
+        await _check_off_loop(request, creds)
         # #136: 2026-07-28 prescribes 405 for DELETE on the MCP endpoint, and
         # the legacy Streamable HTTP revisions equally allow 405 from a server
         # that never minted a session (this one never did). Auth-first is kept

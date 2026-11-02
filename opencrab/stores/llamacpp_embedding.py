@@ -95,6 +95,15 @@ class LlamaCppEmbeddingFunction:
         # 검사에 쓴다.
         self._llm_init_owner: threading.Thread | None = None
 
+        # #577: 한 Llama 객체의 create_embedding 호출끼리 겹치지 않게 한다. MCP
+        # HTTP 서버는 읽기 도구(질의 임베딩)와 쓰기 도구(노드 임베딩)를 서로 다른
+        # 워커 스레드에서 실행하므로 같은 모델에 동시에 닿을 수 있다. 텍스트 하나
+        # 단위로 잡아서, 한 호출의 배치 중간에 다른 호출이 들어갈 틈이 생긴다.
+        # 대기 시간의 상한은 보장하지 않는다(threading.Lock 은 공정성이 없다).
+        # 임대(_acquire/_return_lease) 안쪽, _llm_lock/_state_lock 바깥에서 잡고,
+        # 잡은 채로 다른 락을 얻지 않는다.
+        self._infer_lock = threading.Lock()
+
         # #508: 유휴 해제 상태. _state_lock 은 아래 필드를 읽고 쓰는 짧은 임계
         # 구역의 잠금이며, 이 잠금을 쥔 채 적재/해제/임베딩을 하지 않는다.
         self._idle_unload_seconds = idle_unload_seconds
@@ -123,7 +132,8 @@ class LlamaCppEmbeddingFunction:
             for text in input:
                 # create_embedding 은 단건씩 호출 (llama-cpp 내부 배치 없음).
                 # KURE 는 쿼리/패시지 프리픽스 불필요 (bge-m3 계열, 대칭 임베딩).
-                resp = llm.create_embedding(text)
+                with self._infer_lock:
+                    resp = llm.create_embedding(text)
                 vec = resp["data"][0]["embedding"]
                 result.append(l2_normalize(vec))
             return result
