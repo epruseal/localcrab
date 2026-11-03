@@ -240,7 +240,7 @@ def test_requests_without_a_usable_credential_stay_401_while_the_store_is_locked
 
 
 def test_store_flag_unavailable_does_not_gate_the_lookup(env):
-    """The REST store is built once at startup, and nothing refreshes its
+    """The app builds the REST store once at startup, and nothing refreshes its
     ``available`` flag. A store that was busy at startup but works now still
     authenticates."""
     env.sql._available = False
