@@ -171,9 +171,9 @@ SQLite 문장 취소는 연결의 진행 처리기(`set_progress_handler`)로 �
   - 처리기를 지운 뒤의 질의 통과가 기준 분류와 같다.
   - 주입 확인: 취소를 받은 시점이 하나 이상 있다.
 - C2 메모리 경로 검색 취소: backfill 사본에서 같은 방식으로 한다. 메모리 경로의 cold 구축이 들어가므로 시점마다 새 `HybridQuery`를 만든다. 시점은 `n`에 고르게 10개다. 허용 결과는 C1과 같다. 시점마다 열린 트랜잭션이 없고 내부 잠금을 바로 얻을 수 있어야 한다. 처리기를 지운 뒤 복구 전에 질의 통과를 한 번 한다. 경고 없는 빈 결과나 오라클과 다른 경고 없는 결과는 `silent_partial`이다.
-- C3 backfill 취소: backfill 사본에서 자식 backfill CLI(`--batch 200`)를 띄운다. 색인 문서 수가 원본의 25%를 넘으면 `SIGINT`를, 다시 띄워 50%를 넘으면 `SIGTERM`을 보낸다. 세 번째는 `--max-seconds`를 걸어 스스로 멈추게 한다. 매번 뒤에 색인 불변식을 확인하고 그 상태에서 질의 통과를 한다. 마지막으로 제한 없이 backfill CLI를 돌려 복구한다.
+- C3 backfill 취소: backfill 사본에서 자식 backfill CLI(`--batch 200`)를 `--hold-at-docs`로 띄운다. 자식은 색인이 원본 문서 수의 25%에 이르는 키에서 단계 트랜잭션 안에 멈추고 `held` 줄을 낸다. 하네스는 그 줄을 받은 뒤 `SIGINT`를 보낸다. 다시 띄워 50%에서 멈춘 자식에게 `SIGTERM`을 보낸다. 세 번째는 `--max-seconds 0`을 걸어 첫 단계 뒤에 스스로 멈추게 한다. 신호 시점을 문서 수 폴링으로 고르지 않는 이유는 `docs/issue-596-c3-flake.md`에 있다. 매번 뒤에 색인 불변식을 확인하고 그 상태에서 질의 통과를 한다. 마지막으로 제한 없이 backfill CLI를 돌려 복구한다.
   - 기대: 신호로 끝난 두 실행은 신호 종료이거나 종료 코드가 0이 아니다. `--max-seconds` 실행은 종료 코드 0과 `backfill` 상태를 출력한다. 세 번 모두 부분 단계가 없고 질의 통과는 메모리 경로에서 3.2절 위반이 없다.
-  - 주입 확인: 신호를 보낸 시점에 자식이 살아 있었고 상태가 `backfill`이었고 실행 뒤에도 `backfill`이다. 자식의 종료가 그 신호 때문임을 회수한 종료 상태로 확인한다. `SIGTERM`은 Python이 처리기를 두지 않으므로 신호 종료(`returncode == -SIGTERM`)여야 한다. `SIGINT`는 click이 `KeyboardInterrupt`를 받아 표준 오류에 `Aborted!`를 쓰고 종료 코드 1로 끝내므로, 종료 코드 1과 그 문구가 함께 있어야 한다. `Popen.send_signal`은 이미 끝난 자식에게 신호를 보내지 않으므로, 하네스는 신호를 보내기 직전에 `poll()`로 자식이 살아 있음을 확인하고 기록한다.
+  - 주입 확인: 신호를 보낸 시점에 자식이 살아 있었고 상태가 `backfill`이었고 실행 뒤에도 `backfill`이다. 자식의 종료가 그 신호 때문임을 회수한 종료 상태로 확인한다. `SIGTERM`은 Python이 처리기를 두지 않으므로 신호 종료(`returncode == -SIGTERM`)여야 한다. `SIGINT`는 click이 `KeyboardInterrupt`를 받아 표준 오류에 `Aborted!`를 쓰고 종료 코드 1로 끝내므로, 종료 코드 1과 그 문구가 함께 있어야 한다. `Popen.send_signal`은 이미 끝난 자식에게 신호를 보내지 않으므로, 하네스는 신호를 보내기 직전에 `poll()`로 자식이 살아 있음을 확인하고 기록한다. 자식이 `held` 줄을 낸 뒤 멈춰 있으므로 이 확인은 러너 속도와 무관하게 성립한다.
 
 ### 4.3 디스크 부족 (D1, D2, D3)
 
@@ -217,7 +217,7 @@ root 권한 없이 쓰기 실패를 만드는 수단을 찾아봤다. loop 장�
 
 ### 4.5 중단 후 재개 (K1, K2, K3)
 
-- K1 backfill 강제 종료: backfill 사본에서 자식 backfill CLI(`--batch 200`)를 띄우고 색인 문서 수가 원본의 25%, 50%, 75%를 넘을 때마다 `SIGKILL`을 보내고 다시 띄운다. 매번 뒤에 색인 불변식(다른 쓰기 없음)과 커서의 단조 증가를 확인한다. 마지막에 끝까지 돌려 복구한다.
+- K1 backfill 강제 종료: backfill 사본에서 자식 backfill CLI(`--batch 200`)를 `--hold-at-docs`로 띄우고 색인이 원본 문서 수의 25%, 50%, 75%에 이르러 자식이 `held` 줄을 낼 때마다 `SIGKILL`을 보내고 다시 띄운다. 매번 뒤에 색인 불변식(다른 쓰기 없음)과 커서의 단조 증가를 확인한다. 마지막에 끝까지 돌려 복구한다.
   - 주입 확인: 신호를 보내기 직전에 자식이 살아 있었고, 회수한 종료 상태가 `-SIGKILL`이며, 종료 뒤 상태가 `backfill`이다.
 - K2 쓰기 프로세스 강제 종료: `ready` 사본에서 자식 `writer`가 새 노드 쓰기, 기존 노드 본문 수정, 노드 삭제를 섞어 반복하고 쓰기마다 `ack`를 낸다. 쓰기 도중의 중단을 보장하려고 자식은 `--pause-at <순번>`으로 정한 쓰기에서 `_node_bm25_sqlite.reindex_key`를 감싼 함수 안에 멈춘다. 그 지점은 `_exec_node_write`의 트랜잭션 안이고 `doc_nodes` 쓰기 뒤, 커밋 전이다. 자식은 멈추기 직전에 `inside` 줄을 낸다. 하네스는 `inside`를 받은 뒤 `SIGKILL`을 보낸다. 다시 연 저장소에서 `ack`한 변경이 모두 원본에 있고, 응답 없는 쓰기가 3.3절의 조건을 지키고, 색인 불변식이 성립하는지 확인한다.
   - 주입 확인: `inside` 줄이 있고, 신호를 보내기 직전에 자식이 살아 있었고, 회수한 종료 상태가 `-SIGKILL`이다.
@@ -243,7 +243,7 @@ root 권한 없이 쓰기 실패를 만드는 수단을 찾아봤다. loop 장�
 `scripts/search_faults.py`는 하위 명령 셋을 둔다.
 
 - `run --corpus <코퍼스> --work <적재 디렉터리> --run-root <실행 루트> --out <보고서> [--scenarios <쉼표 목록>]`: 4절의 시나리오를 차례로 돈다. 한 번에 시나리오 하나만 돈다.
-- `actor <역할> --dir <시나리오 디렉터리> [옵션]`: 자식 역할 `backfill`, `verify`, `drop`, `open`, `writer`, `search`. `--fsize-limit`, `--fail-key`, `--batch`, `--max-seconds`, `--count`를 받는다.
+- `actor <역할> --dir <시나리오 디렉터리> [옵션]`: 자식 역할 `backfill`, `verify`, `drop`, `open`, `writer`, `search`. `--fsize-limit`, `--fail-key`, `--batch`, `--max-seconds`, `--count`, `--hold-at-docs`를 받는다.
 - `selftest`: 판정 함수(3.2절, 3.3절, 3.6절)에 위반과 허용을 하나씩 심은 입력을 주고 기대한 값이 나오는지 확인한다. 파일을 쓰지 않는다.
 
 입력 코퍼스와 적재 디렉터리는 `scripts/search_corpus.py generate`와 `scripts/search_baseline.py load`의 산출물을 그대로 쓴다. 재사용하는 함수는 `search_baseline`의 `check_write_paths`, `corpus_is_smoke`, `Watchdog`, `_open_stores`, `_close`, `_copy_db_files`, `expected_state`, `observed_state`, `_read_corpus`, `_iter_docs`, `judge_bundle`, `doc_rows`, `_principal`, `HashEmbedding`, `NoGraph`, `_atomic_json`이다. 질의 통과의 요청과 FTS, vector 레그 호출은 `search_baseline.cmd_run`의 `request`와 `leg_calls`와 같은 호출 계약(`resolve_packs` 결과의 `effective_pack_ids`, `_profile_for_query`의 요청 크기)으로 새로 쓴다. BM25 레그는 3.2절대로 결합 호출 안의 호출을 기록한다. `cmd_run`의 두 함수는 지연 측정과 감시 슬롯이 얽힌 내부 함수라서, 꺼내 바꾸면 측정 하네스의 동작을 바꾸게 되기 때문이다.

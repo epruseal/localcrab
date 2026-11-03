@@ -871,6 +871,16 @@ class Scenario:
             time.sleep(POLL)
         return False
 
+    def hold_backfill(self, target_docs: int) -> tuple[Child, bool]:
+        """Start a backfill child that stops inside a step once the index holds ``target_docs``.
+
+        The method returns the child and whether it announced the stop. The child stays alive
+        until the parent signals it or the alarm of the child ends it. The signal therefore does
+        not depend on how fast the runner is.
+        """
+        child = self.spawn("backfill", "--batch", str(self.ctx.batch), "--hold-at-docs", str(target_docs))
+        return child, child.wait_tag("held", self.ctx.child_timeout)
+
     # -- shared judgements -------------------------------------------------
 
     def judge_pass(self, st: dict[str, Any], observed: dict[str, dict[str, Any]],
@@ -1351,8 +1361,7 @@ def sc_c3(sc: Scenario) -> None:
     for sig, frac in ((signal.SIGINT, 0.25), (signal.SIGTERM, 0.5)):
         name = signal.Signals(sig).name
         st = sc.step(f"{name} at {int(frac * 100)}%", "explicit_error")
-        child = sc.spawn("backfill", "--batch", str(ctx.batch))
-        reached = sc.wait_progress(child, int(total * frac))
+        child, reached = sc.hold_backfill(int(total * frac))
         state_at = ro_status(sc.dir)["state"]
         alive = child.signal(sig)
         sc.finish(child)
@@ -1371,7 +1380,8 @@ def sc_c3(sc: Scenario) -> None:
         _stopped_pass(sc, f"search after {name}")
     # Design 3.6: an honest exit 0 is neither an error nor a fallback.
     st = sc.step("--max-seconds stop", None)
-    child = sc.run_child("backfill", "--batch", str(ctx.batch), "--max-seconds", "0.2")
+    # A zero budget ends the run after its first step, so the stop does not depend on runner speed.
+    child = sc.run_child("backfill", "--batch", str(ctx.batch), "--max-seconds", "0")
     out = child.json_out() or {}
     after = ro_status(sc.dir)
     sc.inject(st, "stopped before ready", after["state"] == "backfill", after)
@@ -1764,8 +1774,7 @@ def sc_k1(sc: Scenario) -> None:
     prev: tuple | None = None
     for frac in (0.25, 0.5, 0.75):
         st = sc.step(f"SIGKILL at {int(frac * 100)}%", "explicit_error")
-        child = sc.spawn("backfill", "--batch", str(ctx.batch))
-        reached = sc.wait_progress(child, int(total * frac))
+        child, reached = sc.hold_backfill(int(total * frac))
         alive = child.signal(signal.SIGKILL)
         sc.finish(child)
         after = ro_status(sc.dir)
@@ -2220,6 +2229,21 @@ def _actor_cli(role: str, directory: Path, args: argparse.Namespace) -> int:
             original(conn, row_to_node, space, node_id, meta)
 
         nbm.reindex_key = flaky
+    if args.hold_at_docs >= 0:
+        # C3, K1: stop inside a step transaction after the index reaches this many documents.
+        # The parent's signal then lands on a live child with an uncommitted write, however
+        # fast the runner is (design 4.2, issue 596). The alarm of the child still ends the wait.
+        original_index = nbm.reindex_key
+        indexed = {"n": ro_status(directory).get("doc_count") or 0}
+
+        def hold(conn: Any, row_to_node: Any, space: str, node_id: str, meta: Any = None) -> None:
+            original_index(conn, row_to_node, space, node_id, meta)
+            indexed["n"] += 1
+            if indexed["n"] >= args.hold_at_docs:
+                _tag("held", {"docs": indexed["n"]})
+                time.sleep(args.timeout + 60)
+
+        nbm.reindex_key = hold
     commands = {"backfill": cli.packs_bm25_index_backfill, "verify": cli.packs_bm25_index_verify,
                 "drop": cli.packs_bm25_index_drop, "status": cli.packs_bm25_index_status}
     argv: list[str] = []
@@ -2438,6 +2462,7 @@ def main(argv: list[str] | None = None) -> int:
     actor.add_argument("--debug-drain", action="store_true")
     actor.add_argument("--size", type=int, default=0)
     actor.add_argument("--pause-at", type=int, default=-1)
+    actor.add_argument("--hold-at-docs", type=int, default=-1)
     actor.add_argument("--step-delay", type=float, default=0.0)
     actor.add_argument("--yes", action="store_true", help="accepted for drop; the actor always confirms")
     sub.add_parser("selftest")

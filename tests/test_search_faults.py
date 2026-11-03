@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from scripts import search_faults as faults
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -32,7 +34,13 @@ def _run(args: list[str], tmp_path: Path, script: str) -> subprocess.CompletedPr
     )
 
 
-def test_s0_fault_run_injects_every_scenario(tmp_path):
+def _failed_checks(report: dict) -> list[tuple[str, str, str, object]]:
+    """Return the failed checks of each scenario step, so a CI failure names the step that missed its injection."""
+    return [(sc["id"], st["name"], c["name"], c["detail"])
+            for sc in report.get("scenarios", []) for st in sc["steps"] for c in st["checks"] if not c["ok"]]
+
+
+def _prepare_s0(tmp_path: Path) -> tuple[Path, Path]:
     corpus = tmp_path / "corpus"
     generated = _run(["generate", "--preset", "S0", "--seed", "542", "--out", str(corpus)],
                      tmp_path, "search_corpus.py")
@@ -40,12 +48,18 @@ def test_s0_fault_run_injects_every_scenario(tmp_path):
     work = tmp_path / "work"
     loaded = _run(["load", "--corpus", str(corpus), "--work", str(work)], tmp_path, "search_baseline.py")
     assert loaded.returncode == 0, loaded.stdout + loaded.stderr
+    return corpus, work
+
+
+def test_s0_fault_run_injects_every_scenario(tmp_path):
+    corpus, work = _prepare_s0(tmp_path)
 
     report_path = tmp_path / "faults.json"
     ran = _run(["run", "--corpus", str(corpus), "--work", str(work), "--run-root", str(tmp_path / "faults"),
                 "--out", str(report_path)], tmp_path, "search_faults.py")
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["verdict"] == "COMPLETE", (report.get("reasons"), ran.stdout[-3000:], ran.stderr[-3000:])
+    assert report["verdict"] == "COMPLETE", (report.get("reasons"), _failed_checks(report),
+                                             ran.stdout[-3000:], ran.stderr[-3000:])
     assert ran.returncode == 0
     values = {s["id"]: s["value"] for s in report["scenarios"]}
     assert set(values) == set(faults.SCENARIOS)
@@ -54,3 +68,32 @@ def test_s0_fault_run_injects_every_scenario(tmp_path):
     assert all(v != "unavailable" or sid == "D1b" for sid, v in values.items()), values
     for scenario in report["scenarios"]:
         assert (tmp_path / "faults" / scenario["id"] / "result.json").exists()
+
+
+@pytest.mark.parametrize(("ro_delay", "budget_scale", "scenarios"), [
+    pytest.param("0.5", "1", "C3,K1", id="parent_stall"),
+    pytest.param("0", "50", "C3", id="fast_runner"),
+])
+def test_signal_injection_does_not_depend_on_runner_speed(tmp_path, ro_delay, budget_scale, scenarios):
+    """#596: the C3 and K1 signals land on a live child when the parent stalls or the runner is fast.
+
+    The child script stalls the parent after every progress read by ``ro_delay``
+    seconds and scales the --max-seconds budget by ``budget_scale``. The harness
+    has to confirm the injection of every selected scenario anyway.
+    """
+    corpus, work = _prepare_s0(tmp_path)
+    report_path = tmp_path / "faults.json"
+    tmp = tmp_path / "tmp"
+    tmp.mkdir(exist_ok=True)
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", TMPDIR=str(tmp))
+    ran = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "tests" / "search_faults_timing_child_596.py"), ro_delay, budget_scale,
+         "run", "--corpus", str(corpus), "--work", str(work), "--run-root", str(tmp_path / "faults"),
+         "--out", str(report_path), "--scenarios", scenarios],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=1500)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["verdict"] == "COMPLETE", (report.get("reasons"), _failed_checks(report),
+                                             ran.stdout[-3000:], ran.stderr[-3000:])
+    values = {s["id"]: s["value"] for s in report["scenarios"]}
+    assert set(values) == set(scenarios.split(","))
+    assert all(v != "not_injected" for v in values.values()), values
