@@ -88,6 +88,24 @@ make_sql_store(settings)
 파생된다 — `config.py::_default_local_data_dir`, 회귀 방지는
 `tests/test_config_defaults.py`).
 
+### SQLite 스토어 생성자의 잠금 대기 계약 (#578)
+
+`LocalGraphStore`, `LocalSQLDocStore`, `SqliteVecStore`와 SQLite `SQLStore`는
+스키마 부트스트랩을 `write.lock` 안에서 한다. 이 획득이 `WRITE_LOCK_TIMEOUT`을
+넘기면 생성자는 `StoreBootstrapLockTimeoutError`(`TimeoutError`의 하위 클래스,
+`opencrab/locking.py`)를 올리고 이미 연 자원을 닫는다. 스토어를 `available=False`로
+남기지 않는다. 불가용 스토어를 가진 MCP 컨텍스트가 게시되면 이후 호출이 모두 그
+컨텍스트를 재사용하므로, 검색 레그가 경고 없이 빠진 채 프로세스 재시작 전까지 남기
+때문이다. 컨텍스트 빌드(`opencrab/mcp/tools/__init__.py`의 `_build_context`)는
+예외가 나면 아무것도 게시하지 않고 다음 호출이 처음부터 다시 만든다. 시작 가드
+(`serve`의 stdio 분기, `opencrab.mcp.server.main`, HTTP lifespan)는 이 예외로
+기동을 중단한다. 같은 잠금을 쓰는 ChromaStore의 `ChromaLockTimeoutError`와 같은
+방침이다.
+
+잠금과 무관한 초기화 실패(손상된 파일, 확장 로드 실패 등)는 종전대로
+`available=False`로 남는다. 재현 명령:
+`pytest tests/test_store_bootstrap_lock_timeout_578.py`.
+
 ---
 
 ## 2. LocalSQLDocStore 선택 근거

@@ -424,6 +424,8 @@ class SQLStore:
     # ------------------------------------------------------------------
 
     def _connect(self) -> None:
+        from opencrab.locking import StoreBootstrapLockTimeoutError, store_bootstrap_lock
+
         try:
             from sqlalchemy import create_engine, text  # type: ignore[import]
 
@@ -466,8 +468,14 @@ class SQLStore:
             if self._create_tables_on_connect:
                 # issue #141 항목 2: 부트스트랩 DDL을 write.lock 으로 감싼다
                 # (SQLite 전용, PG/in-memory 는 write_lock_for_store 가 no-op).
-                with write_lock_for_store(self):
+                with store_bootstrap_lock(write_lock_for_store(self)):
                     self._create_tables()
+        except StoreBootstrapLockTimeoutError:
+            # #578: propagate a busy write.lock instead of degrading (see
+            # LocalGraphStore._init_db). The engine and the connection it
+            # probed with already exist, so release them before raising.
+            self.close()
+            raise
         except Exception as exc:
             logger.warning("SQL store unavailable: %s", exc)
             self._available = False

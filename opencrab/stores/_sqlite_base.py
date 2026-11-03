@@ -314,10 +314,12 @@ class _SqliteConnMixin:
         (``ingest``/``extract`` 등) 안에서 스토어가 생성돼도 추가 대기 없이
         곧바로 진행된다.
         """
-        from opencrab.locking import write_lock
+        from opencrab.locking import store_bootstrap_lock, write_lock
 
         data_dir = os.path.dirname(os.path.abspath(self._db_path))
-        with write_lock(data_dir):
+        # #578: a busy write.lock surfaces as StoreBootstrapLockTimeoutError,
+        # which each store's _init_db lets propagate instead of degrading.
+        with store_bootstrap_lock(write_lock(data_dir)):
             yield
 
     def _require_available(self) -> None:

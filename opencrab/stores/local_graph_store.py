@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from opencrab.common.graph_identity import GraphSchemaMigrationRequired
+from opencrab.locking import StoreBootstrapLockTimeoutError
 from opencrab.stores._json import parse_props  # noqa: F401 — re-exported for tests/callers
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_graph_base import GRAPH_STORE_SCHEMA, GraphTx, _SqlGraphStoreBase
@@ -104,6 +105,12 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
                 # methods use the separate schema gate in the shared base.
                 self._available = state in {"target", "legacy", "partial"}
             logger.info("LocalGraphStore initialised at %s", self._db_path)
+        except StoreBootstrapLockTimeoutError:
+            # #578: a busy write.lock is not a store defect. Propagate it so
+            # the caller never keeps an unavailable store that nothing retries.
+            self._available = False
+            self.close()
+            raise
         except Exception as exc:
             self._schema_state = "partial_or_unknown"
             logger.warning("LocalGraphStore init failed: %s", exc)

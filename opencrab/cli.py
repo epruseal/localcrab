@@ -113,6 +113,7 @@ def _make_stores(
     ``export-neo4j-pack`` that never touches vectors. Callers request only
     the stores they use; unrequested attributes are ``None``.
     """
+    from opencrab.locking import StoreBootstrapLockTimeoutError
     from opencrab.stores.chroma_store import ChromaLockTimeoutError
     from opencrab.stores.factory import (
         make_doc_store,
@@ -149,12 +150,14 @@ def _make_stores(
                     close()
                 except Exception:  # noqa: BLE001, S110 - the original error wins
                     pass
-        if isinstance(exc, ChromaLockTimeoutError):
+        if isinstance(exc, (ChromaLockTimeoutError, StoreBootstrapLockTimeoutError)):
             # Same operator-facing shape the rest of this module uses for a
             # deployment problem: an actionable message and exit 1, not a
-            # traceback. The vector-store call sits outside every command's
+            # traceback. The store calls sit outside every command's
             # `except RuntimeError` block, so the translation belongs here --
-            # one place that all vector-using commands pass through.
+            # one place that all store-using commands pass through. The
+            # SQLite stores raise StoreBootstrapLockTimeoutError when
+            # write.lock stays busy (#578).
             err_console.print(f"[red]{exc}[/red]")
             raise SystemExit(1) from exc
         raise
@@ -382,9 +385,13 @@ def serve(
         from opencrab.stores.factory import make_graph_store, make_sql_store
 
         cfg = get_settings()
-        startup_sql = make_sql_store(cfg)
-        startup_graph = make_graph_store(cfg)
+        # Both stores are built inside the try (#578): a store constructor can
+        # now raise on a busy write.lock, and the finally must close the one
+        # built before it.
+        startup_sql = startup_graph = None
         try:
+            startup_sql = make_sql_store(cfg)
+            startup_graph = make_graph_store(cfg)
             assert_registry_covers_graph(startup_sql, startup_graph)
         except RuntimeError as exc:
             err_console.print(f"[red]{exc}[/red]")

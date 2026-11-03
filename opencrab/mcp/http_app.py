@@ -781,9 +781,13 @@ async def _startup_registry_check(app: FastAPI) -> Any:
     from opencrab.stores.factory import make_graph_store, make_sql_store
 
     cfg = get_settings()
-    startup_sql = make_sql_store(cfg)
-    startup_graph = make_graph_store(cfg)
+    # Both stores are built inside the try (#578): a store constructor can now
+    # raise on a busy write.lock, and the finally must close the one built
+    # before it.
+    startup_sql = startup_graph = None
     try:
+        startup_sql = make_sql_store(cfg)
+        startup_graph = make_graph_store(cfg)
         assert_registry_covers_graph(startup_sql, startup_graph)
     finally:
         for store in (startup_sql, startup_graph):

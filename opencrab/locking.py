@@ -10,7 +10,7 @@ import os
 import stat
 import threading
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import UTC, datetime
 from time import monotonic, sleep
 from typing import BinaryIO
@@ -795,4 +795,35 @@ def write_lock(
             raise TimeoutError(write_lock_busy_message(path, resolved)) from exc
         finally:
             _held.pending_purpose = None
+        yield
+
+
+class StoreBootstrapLockTimeoutError(TimeoutError):
+    """A store constructor timed out waiting for the lock its bootstrap needs (#578).
+
+    A ``TimeoutError`` subclass, so callers that catch ``TimeoutError`` keep
+    working. The text is the :func:`write_lock` message, which names the lock
+    file and, when readable, the holder. The class exists so a store
+    constructor can tell "the lock was busy" from every other initialisation
+    failure: the first must propagate, because a store that swallows it
+    leaves a context built from unavailable stores that nothing retries.
+    """
+
+
+@contextmanager
+def store_bootstrap_lock(lock: AbstractContextManager[object]) -> Iterator[None]:
+    """Hold *lock* for a store's schema bootstrap, naming an acquisition timeout (#578).
+
+    Wraps the context manager a store builds with :func:`write_lock` or
+    ``write_lock_for_store``. Only the acquisition is converted: a
+    ``TimeoutError`` raised by the protected block keeps its own type and
+    message, the restriction :func:`write_lock` and :func:`chroma_lock_held`
+    document for their own acquisitions. Any other acquisition failure
+    propagates unchanged.
+    """
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(lock)
+        except TimeoutError as exc:
+            raise StoreBootstrapLockTimeoutError(str(exc)) from exc
         yield
