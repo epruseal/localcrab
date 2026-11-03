@@ -12,6 +12,7 @@ Queries go through the real handlers ``query_ontology`` (REST) and
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 from unittest.mock import patch
 
@@ -243,6 +244,48 @@ def test_close_context_waits_for_the_bm25_worker_before_closing_stores(
     assert not closer.is_alive()
     assert join_calls == [None], join_calls
     assert worker_alive_at_close == [False]
+
+
+class _IdleSpyEvent(threading.Event):
+    """A wake event that reports when a thread is blocked in ``wait``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = threading.Event()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waiting.set()
+        try:
+            return super().wait(timeout)
+        finally:
+            self.waiting.clear()
+
+
+def test_close_context_stops_an_idle_bm25_worker(world, monkeypatch):
+    """An idle worker sleeps on its wake event; the stop signal alone does not wake it."""
+    monkeypatch.setenv("OPENCRAB_BM25_DB_INDEX", "0")  # force the memory path
+    ctx = _rest_ctx(world, monkeypatch)
+    spy = _IdleSpyEvent()
+    monkeypatch.setattr(ctx.hybrid._bm25, "_wake", spy)
+    ctx.hybrid.invalidate_bm25_cache()
+    worker = ctx.hybrid._bm25_worker
+    assert worker is not None
+
+    deadline = time.monotonic() + WAIT
+    while time.monotonic() < deadline:
+        if ctx.hybrid._bm25.state is not None and spy.waiting.is_set():
+            break
+        time.sleep(0.01)
+    assert ctx.hybrid._bm25.state is not None and spy.waiting.is_set(), "worker never went idle"
+
+    closer = threading.Thread(target=api._close_context, args=(ctx,), daemon=True)
+    closer.start()
+    closer.join(WAIT)
+    try:
+        assert not closer.is_alive(), "_close_context hung on an idle worker"
+        assert not worker.is_alive()
+    finally:
+        spy.set()  # let a hung worker exit if the assertion failed
 
 
 def test_close_context_does_not_wait_without_a_worker(world, monkeypatch):

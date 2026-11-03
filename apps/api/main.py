@@ -396,14 +396,13 @@ def _build_context() -> ApiContext:
 
 
 def _stop_bm25_worker(hybrid: Any) -> None:
-    """Stop the BM25 rebuild worker before the stores it reads are closed (#568).
+    """Stop the BM25 rebuild worker, then wait until it ends (#568).
 
-    The doc store connection makes REST ingest start that worker. Closing the
-    store under a worker that is mid-read leaves a thread using a closed
-    store, so this waits for the worker to finish. The wait has no time limit
-    and ends when the worker's current round ends: shutdown time follows the
-    build in progress. docs/issue-568-rest-doc-store.md section 3.3 has the
-    contract.
+    REST ingest starts that worker once the query object has a doc store. A
+    store that closes under a worker in mid-read leaves a thread that uses a
+    closed store. The wait has no time limit. It ends when the worker finishes
+    its current round, so shutdown time follows the build in progress. Section
+    3.3 of docs/issue-568-rest-doc-store.md states the contract.
     """
     if hybrid is None:
         return
