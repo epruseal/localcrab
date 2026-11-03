@@ -799,27 +799,27 @@ def write_lock(
 
 
 class StoreBootstrapLockTimeoutError(TimeoutError):
-    """A store constructor timed out waiting for the lock its bootstrap needs (#578).
+    """A store constructor timed out while it waited for its bootstrap lock (#578).
 
-    A ``TimeoutError`` subclass, so callers that catch ``TimeoutError`` keep
-    working. The text is the :func:`write_lock` message, which names the lock
-    file and, when readable, the holder. The class exists so a store
-    constructor can tell "the lock was busy" from every other initialisation
-    failure: the first must propagate, because a store that swallows it
-    leaves a context built from unavailable stores that nothing retries.
+    This class is a subclass of ``TimeoutError``, so handlers of
+    ``TimeoutError`` keep working. The message is the ``write_lock`` message.
+    It names the lock file and, when the record is readable, the holder.
+
+    A store constructor uses this class to tell a busy lock from other
+    failures. A busy lock must propagate. If the constructor hides it, the
+    MCP context keeps an unavailable store and nothing retries it.
     """
 
 
 @contextmanager
 def store_bootstrap_lock(lock: AbstractContextManager[object]) -> Iterator[None]:
-    """Hold *lock* for a store's schema bootstrap, naming an acquisition timeout (#578).
+    """Hold *lock* for the schema bootstrap of a store and name a timeout (#578).
 
-    Wraps the context manager a store builds with :func:`write_lock` or
-    ``write_lock_for_store``. Only the acquisition is converted: a
-    ``TimeoutError`` raised by the protected block keeps its own type and
-    message, the restriction :func:`write_lock` and :func:`chroma_lock_held`
-    document for their own acquisitions. Any other acquisition failure
-    propagates unchanged.
+    The argument is the context manager that a store builds with
+    ``write_lock`` or ``write_lock_for_store``. This function converts only the
+    acquisition timeout. A ``TimeoutError`` from the protected block keeps its
+    type and its message. Any other failure of the acquisition propagates
+    without change.
     """
     with ExitStack() as stack:
         try:

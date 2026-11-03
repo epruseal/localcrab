@@ -113,7 +113,6 @@ def _make_stores(
     ``export-neo4j-pack`` that never touches vectors. Callers request only
     the stores they use; unrequested attributes are ``None``.
     """
-    from opencrab.locking import StoreBootstrapLockTimeoutError
     from opencrab.stores.chroma_store import ChromaLockTimeoutError
     from opencrab.stores.factory import (
         make_doc_store,
@@ -150,14 +149,12 @@ def _make_stores(
                     close()
                 except Exception:  # noqa: BLE001, S110 - the original error wins
                     pass
-        if isinstance(exc, (ChromaLockTimeoutError, StoreBootstrapLockTimeoutError)):
+        if isinstance(exc, ChromaLockTimeoutError):
             # Same operator-facing shape the rest of this module uses for a
             # deployment problem: an actionable message and exit 1, not a
-            # traceback. The store calls sit outside every command's
+            # traceback. The vector-store call sits outside every command's
             # `except RuntimeError` block, so the translation belongs here --
-            # one place that all store-using commands pass through. The
-            # SQLite stores raise StoreBootstrapLockTimeoutError when
-            # write.lock stays busy (#578).
+            # one place that all vector-using commands pass through.
             err_console.print(f"[red]{exc}[/red]")
             raise SystemExit(1) from exc
         raise

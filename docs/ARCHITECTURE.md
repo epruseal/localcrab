@@ -92,15 +92,19 @@ make_sql_store(settings)
 
 `LocalGraphStore`, `LocalSQLDocStore`, `SqliteVecStore`와 SQLite `SQLStore`는
 스키마 부트스트랩을 `write.lock` 안에서 한다. 이 획득이 `WRITE_LOCK_TIMEOUT`을
-넘기면 생성자는 `StoreBootstrapLockTimeoutError`(`TimeoutError`의 하위 클래스,
-`opencrab/locking.py`)를 올리고 이미 연 자원을 닫는다. 스토어를 `available=False`로
-남기지 않는다. 불가용 스토어를 가진 MCP 컨텍스트가 게시되면 이후 호출이 모두 그
-컨텍스트를 재사용하므로, 검색 레그가 경고 없이 빠진 채 프로세스 재시작 전까지 남기
-때문이다. 컨텍스트 빌드(`opencrab/mcp/tools/__init__.py`의 `_build_context`)는
-예외가 나면 아무것도 게시하지 않고 다음 호출이 처음부터 다시 만든다. 시작 가드
-(`serve`의 stdio 분기, `opencrab.mcp.server.main`, HTTP lifespan)는 이 예외로
-기동을 중단한다. 같은 잠금을 쓰는 ChromaStore의 `ChromaLockTimeoutError`와 같은
-방침이다.
+넘기면 생성자는 이미 연 자원을 닫고 `StoreBootstrapLockTimeoutError`
+(`TimeoutError`의 하위 클래스, `opencrab/locking.py`)를 올린다. 스토어를
+`available=False`로 남기지 않는다. 불가용 스토어로 이뤄진 MCP 컨텍스트가 게시되면
+이후 모든 호출이 그 컨텍스트를 재사용한다. 그러면 검색 레그가 경고 없이 빠진 채
+프로세스를 재시작할 때까지 남는다.
+
+컨텍스트 빌드(`opencrab/mcp/tools/__init__.py`의 `_build_context`)는 예외가 나면
+아무것도 게시하지 않고, 다음 호출이 처음부터 다시 만든다. 시작 가드(`serve`의
+stdio 분기, `opencrab.mcp.server.main`, HTTP lifespan)는 이 예외로 기동을
+중단한다. `_optional_store`(`status`, `packs repair-registry`, `packs repair-anchors`)는
+예외를 잡아 `None`을 돌려주므로 해당 명령은 계속 진행한다. 이 방침은 ChromaStore가
+`chroma.lock` 시간 초과를 `ChromaLockTimeoutError`로 전파하는 방침과 같다.
+두 잠금 파일은 다르다.
 
 잠금과 무관한 초기화 실패(손상된 파일, 확장 로드 실패 등)는 종전대로
 `available=False`로 남는다. 재현 명령:

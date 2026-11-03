@@ -319,18 +319,38 @@ def test_tool_boundary_reports_clear_error_then_recovers(real_context, tmp_path,
 # ---------------------------------------------------------------------------
 
 
-def test_cli_make_stores_reports_the_timeout_as_an_operator_error(tmp_path, short_lock, monkeypatch):
+def test_cli_optional_store_returns_none_on_lock_timeout_and_recovers(tmp_path, short_lock, monkeypatch):
+    """``packs repair-registry``/``status`` 가 쓰는 ``_optional_store`` 의 계약은 "스토어 하나가
+    안 열려도 명령은 계속"이다. 잠금 시간 초과는 ``SystemExit`` 가 아니라 ``None`` 으로
+    끝나야 하고(호출자는 ``None`` 을 "알 수 없음"으로 처리한다), 풀린 뒤에는 가용 스토어다."""
     from opencrab import cli as cli_mod
-    from opencrab.config import Settings
 
     monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
     get_settings.cache_clear()
-    cfg = Settings(LOCAL_DATA_DIR=str(tmp_path))
+    cfg = get_settings()
     with _Holder(str(tmp_path)) as holder:
-        with pytest.raises(SystemExit) as caught:
+        assert cli_mod._optional_store(cfg, "graph") is None
+        assert holder.alive()
+    store = cli_mod._optional_store(cfg, "graph")
+    try:
+        assert store is not None and store.available is True
+    finally:
+        store.close()
+
+
+def test_cli_make_stores_lets_the_lock_timeout_propagate(tmp_path, short_lock, monkeypatch):
+    """직접 ``_make_stores`` 를 부르는 명령은 시간 초과 예외를 그대로 받는다. ``SystemExit`` 로
+    바꾸면 ``_optional_store`` 의 ``except Exception`` 을 지나쳐 명령 전체가 끝난다."""
+    from opencrab import cli as cli_mod
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    cfg = get_settings()
+    with _Holder(str(tmp_path)) as holder:
+        with pytest.raises(TimeoutError, match="write.lock") as caught:
             cli_mod._make_stores(cfg, graph=True)
         assert holder.alive()
-    assert caught.value.code == 1
+    assert type(caught.value).__name__ == _TIMEOUT_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -414,4 +434,3 @@ def test_cli_serve_stdio_guard_closes_sql_store_when_graph_store_times_out(monke
     # CliRunner 는 일반 예외도 종료 코드 1로 바꾸므로 예외 종류와 정리를 함께 단언한다.
     assert isinstance(result.exception, _FakeLockTimeoutError), repr(result.exception)
     assert sql.closed == 1
-
