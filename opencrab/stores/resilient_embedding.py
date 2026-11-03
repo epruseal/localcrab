@@ -24,8 +24,9 @@ ResilientEmbeddingFunction — 다중 원격(LM Studio 등) ↔ 로컬 GGUF 자�
     연속 실패하면 건너뜀 간격을 두 배씩 늘려 max_backoff(기본 120s)까지 키운다
     (15, 30, 60, 120, 120...). 성공하면 연속 실패 횟수가 0으로 돌아간다.
   - attempt_budget 이 있으면 한 호출에서 첫 시도 이후 경과 시간이 예산 이상일 때
-    남은 primary 를 시도하지 않고 폴백으로 간다(호출당 실패 시도 시간 상한).
-    예산에 걸려 시도하지 못한 첫 primary 는 다음 호출의 첫 후보가 된다(굶김 방지).
+    이미 실패한 적이 있는 primary(재시도 대상)를 더 시도하지 않는다(호출당 실패
+    시도 시간 상한). 한 번도 실패하지 않은 primary 는 예산과 무관하게 시도한다.
+    예산에 걸려 건너뛴 첫 재시도 대상은 다음 호출의 첫 후보가 된다(굶김 방지).
     설계: docs/issue-581-embed-backoff.md
   - 이름(name())은 첫 primary 와 동일 반환 → 컬렉션 재사용 보장(모든
     엔드포인트가 동일 모델 KURE-v1 이라는 전제, name()="kure_v1").
@@ -99,10 +100,12 @@ class ResilientEmbeddingFunction:
         건너뜀 간격의 상한(초). 기본 120s. 실제 상한은 max(max_backoff,
         health_ttl). health_ttl 과 같게 두면 백오프가 꺼진다.
     attempt_budget : float | None
-        한 호출에서 첫 시도 이후 경과 시간이 이 값(초) 이상이면 남은 primary
-        를 시도하지 않고 폴백으로 간다. None 이면 상한 없음. 양수여야 한다.
-        호출당 실패 시도 시간은 attempt_budget + (마지막 시도 하나의 소요
-        시간) 미만이다.
+        한 호출에서 첫 시도 이후 경과 시간이 이 값(초) 이상이면 이미 실패한
+        적이 있는 primary(재시도 대상)를 더 시도하지 않는다. 한 번도 실패하지
+        않은 primary 는 예산과 무관하게 시도한다. None 이면 상한 없음. 양수여야
+        한다. 호출당 실패 시도 시간은 attempt_budget + D + F 미만이다(D: 마지막
+        재시도 대상 시도 하나의 소요 시간, F: 그 호출에서 처음 실패한 primary
+        들의 실패 시간 합. 모든 primary 가 이미 실패한 적이 있으면 F=0).
     clock : Callable[[], float]
         시계. 기본 time.monotonic. 시험이 가상 시계를 넣는다.
     """
@@ -131,8 +134,8 @@ class ResilientEmbeddingFunction:
         self._unhealthy_until: list[float] = [0.0] * len(self._primaries)
         # primary 별 연속 실패 횟수(성공하면 0). 건너뜀 간격 계산에 쓴다.
         self._failures: list[int] = [0] * len(self._primaries)
-        # 다음 호출이 스캔을 시작할 위치. 예산에 걸려 시도하지 못한 첫 primary
-        # 의 위치를 기록해 뒤쪽 primary 가 굶지 않게 한다. 평소 0.
+        # 다음 호출이 스캔을 시작할 위치. 예산에 걸려 건너뛴 첫 재시도 대상의
+        # 위치를 기록해 그 대상이 굶지 않게 한다. 평소 0.
         self._resume = 0
         # _unhealthy_until/_failures/_resume 의 읽기·쓰기를 보호한다(#577 이후
         # 도구가 여러 스레드에서 같은 인스턴스를 쓴다). 쥔 채 원격 호출은 하지 않는다.
@@ -149,11 +152,13 @@ class ResilientEmbeddingFunction:
     # ------------------------------------------------------------------
 
     def _embed_chain(self, input: list[str]) -> list[list[float]]:
-        """시도 대상 primary 를 순서대로 시도 → 전부 실패/건너뜀/예산 소진 시 fallback.
+        """시도 대상 primary 를 순서대로 시도 → 전부 실패/건너뜀 시 fallback.
 
         시도 대상: 한 번도 실패하지 않았거나 건너뜀 기한이 지난 primary.
-        스캔은 _resume 위치부터 시작해 한 바퀴 돈다. 호출의 첫 시도는 예산
-        검사를 받지 않는다."""
+        스캔은 _resume 위치부터 시작해 한 바퀴 돈다. 예산은 이미 실패한 적이
+        있는 primary(재시도 대상)에만 걸리고, 호출의 첫 시도는 예산 검사를
+        받지 않는다. 예산에 걸린 재시도 대상은 건너뛰고 스캔을 계속한다(뒤에
+        한 번도 실패하지 않은 primary 가 있을 수 있다)."""
         if not input:
             return []
 
@@ -162,7 +167,7 @@ class ResilientEmbeddingFunction:
         with self._state_lock:
             start = self._resume
         attempted = False
-        budget_exhausted = False
+        first_skipped: int | None = None
         for k in range(count):
             i = (start + k) % count
             ef = self._primaries[i]
@@ -172,11 +177,11 @@ class ResilientEmbeddingFunction:
                 attempted
                 and self._attempt_budget is not None
                 and self._clock() - t0 >= self._attempt_budget
+                and self._has_failed(i)
             ):
-                with self._state_lock:
-                    self._resume = i
-                budget_exhausted = True
-                break
+                if first_skipped is None:
+                    first_skipped = i
+                continue
             attempted = True
             try:
                 out = ef(input)
@@ -192,18 +197,18 @@ class ResilientEmbeddingFunction:
             with self._state_lock:
                 self._failures[i] = 0
                 self._unhealthy_until[i] = 0.0
-                self._resume = 0
+                # 건너뛴 재시도 대상이 있으면 성공해도 그 차례를 남긴다.
+                self._resume = 0 if first_skipped is None else first_skipped
             return out
-        else:
-            # 예산에 걸리지 않고 한 바퀴를 다 돌았다.
-            with self._state_lock:
-                self._resume = 0
+
+        with self._state_lock:
+            self._resume = 0 if first_skipped is None else first_skipped
 
         # 모든 primary 가 unhealthy 이거나 실패 → fallback 경로
         self._fallback_calls += 1
-        if budget_exhausted:
+        if first_skipped is not None:
             logger.info(
-                "임베딩 폴백: 로컬 GGUF (시도 예산 %.0fs 소진, 남은 primary 미시도)",
+                "임베딩 폴백: 로컬 GGUF (시도 예산 %.0fs 소진, 재시도 대상 primary 미시도)",
                 self._attempt_budget,
             )
         else:
@@ -266,6 +271,11 @@ class ResilientEmbeddingFunction:
         """건너뜀 기한이 지났으면(또는 실패한 적이 없으면) True."""
         with self._state_lock:
             return self._clock() >= self._unhealthy_until[index]
+
+    def _has_failed(self, index: int) -> bool:
+        """연속 실패 횟수가 양수이면(재시도 대상) True."""
+        with self._state_lock:
+            return self._failures[index] > 0
 
     def _mark_unhealthy(self, index: int) -> None:
         """연속 실패 횟수를 올리고 건너뜀 기한을 정한다. 간격은 health_ttl 에서

@@ -782,8 +782,9 @@ make_vector_store(settings)
   않는다. 모든 primary가 실패/건너뜀이면 로컬 GGUF 폴백. 복구된 primary는 건너뜀이 끝난 뒤 다시
   쓰인다(`force_check()`로 즉시 해제 가능).
 - **호출당 실패 시도 시간 예산**: 팩토리가 `attempt_budget = 2 * OPENAI_TIMEOUT`을 넘긴다. 한 호출에서
-  첫 시도 이후 경과 시간이 예산 이상이면 남은 primary를 시도하지 않고 폴백으로 간다. 예산에 밀린
-  primary는 다음 호출의 첫 후보가 된다(굶김 방지). 설계와 보장 범위: `docs/issue-581-embed-backoff.md`.
+  첫 시도 이후 경과 시간이 예산 이상이면 이미 실패한 적이 있는 primary(재시도 대상)를 더 시도하지
+  않는다. 한 번도 실패하지 않은 primary는 예산과 무관하게 시도한다. 예산에 밀린 첫 재시도 대상은
+  다음 호출의 첫 후보가 된다(굶김 방지). 설계와 보장 범위: `docs/issue-581-embed-backoff.md`.
 - **GGUF 자동 다운로드**: `LOCAL_GGUF_PATH` 미설정·파일 없으면 HuggingFace에서 자동 다운로드.
 - **컬렉션 분리**: minilm(384d)과 KURE(1024d)는 차원이 달라 별도 컬렉션 유지. 롤백 즉시 가능.
 

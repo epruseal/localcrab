@@ -454,12 +454,19 @@ def test_three_dead_primaries_call_cost_bounded_by_budget() -> None:
     costs: list[float] = []
     while clk() < t_start + 600:
         costs.append(_call(ef, clk, led, gap=1.0))
-    assert max(costs) < 16.0 + 8.0
-    assert all(p.attempts for p in prims)  # 예산에 밀린 셋째도 시도된다
+    # 첫 호출: 한 번도 실패하지 않은 primary 는 예산과 무관하다 → 세 시간 초과를 전부 치른다.
+    assert costs[0] == 24.0
+    # 그 뒤 세 primary 는 재시도 대상이다: 호출당 실패 시간이 예산 + T 미만이다.
+    assert max(costs[1:]) < 16.0 + 8.0
+    assert all(len(p.attempts) >= 2 for p in prims)  # 예산에 밀린 셋째도 재시도된다
 
-    # 대조군: 예산이 없으면 첫 호출이 세 시간 초과를 전부 치른다(base 동작).
+    # 대조군: 예산이 없으면 첫 호출 뒤에도 세 시간 초과를 전부 치르는 호출이 있다.
     ef0, clk0, led0, _, _ = _build(3, budget=None)
-    assert _call(ef0, clk0, led0, gap=1.0) == 24.0
+    t0 = clk0()
+    costs0: list[float] = []
+    while clk0() < t0 + 600:
+        costs0.append(_call(ef0, clk0, led0, gap=1.0))
+    assert max(costs0[1:]) >= 24.0
 
 
 @pytest.mark.parametrize(
@@ -467,10 +474,12 @@ def test_three_dead_primaries_call_cost_bounded_by_budget() -> None:
     [(8.0, 121.0, 0.7), (8.0, 1.0, 121.0), (17.0, 121.0, 0.7)],
     ids=["sparse-calls", "slow-fallback", "attempt-longer-than-budget"],
 )
-def test_alive_third_primary_is_not_starved_by_dead_ones(
+def test_recovered_third_retry_target_is_not_starved_by_dead_ones(
     cost: float, gap: float, fb_cost: float
 ) -> None:
-    ef, clk, led, prims, _ = _build(3, cost=cost, fb_cost=fb_cost, alive=(2,))
+    ef, clk, led, prims, _ = _build(3, cost=cost, fb_cost=fb_cost)
+    _call(ef, clk, led, gap=gap)  # 셋 다 한 번 실패한다(이후 모두 재시도 대상)
+    prims[2].alive = True  # 셋째만 복구
     served: list[int] = []
     total = 40
     for idx in range(total):
@@ -483,6 +492,60 @@ def test_alive_third_primary_is_not_starved_by_dead_ones(
     assert served[0] < n
     assert all(b - a <= n for a, b in zip(served, served[1:], strict=False))
     assert total - 1 - served[-1] < n
+
+
+def test_skipped_retry_target_keeps_its_turn_even_when_a_later_primary_succeeds() -> None:
+    # A, B 는 실패에 17초(예산 16 이상), C 는 처음부터 정상이다.
+    ef, clk, led, prims, _ = _build(3, cost=17.0, alive=(2,))
+    _call(ef, clk, led, gap=121.0)  # A, B 가 한 번씩 실패하고 C 가 처리한다
+    assert [len(p.attempts) for p in prims] == [1, 1, 1]
+    prims[1].alive = True  # B 복구
+    served: list[int] = []
+    for idx in range(30):
+        before = prims[1].successes
+        _call(ef, clk, led, gap=121.0)
+        if prims[1].successes > before:
+            served.append(idx)
+    assert served and served[0] < 3
+    assert all(b - a <= 3 for a, b in zip(served, served[1:], strict=False))
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "dead-pair-then-alive",
+        "attempt-longer-than-budget",
+        "bulk-call-dies-midway",
+        "skipped-retry-target-before-fresh-primary",
+    ],
+)
+def test_alive_primary_that_never_failed_is_not_skipped_by_budget(scenario: str) -> None:
+    if scenario == "dead-pair-then-alive":
+        ef, clk, led, prims, fb = _build(3, alive=(2,))
+        t_end = clk() + 300
+        while clk() < t_end:
+            _call(ef, clk, led, gap=1.0)
+        assert fb.calls == 0
+        assert prims[2].successes == ef.primary_calls
+    elif scenario == "attempt-longer-than-budget":
+        ef, clk, led, prims, fb = _build(2, cost=17.0, alive=(1,))
+        _call(ef, clk, led, gap=1.0)
+        assert fb.calls == 0
+        assert prims[1].successes == 1
+    elif scenario == "skipped-retry-target-before-fresh-primary":
+        # 재시도 대상 A, B 뒤에 한 번도 실패하지 않은 C: B 는 예산으로 건너뛰어지고 C 가 처리한다.
+        ef, clk, led, prims, fb = _build(3, cost=17.0, alive=(2,))
+        for _ in range(6):
+            _call(ef, clk, led, gap=121.0)
+        assert fb.calls == 0
+        assert prims[2].successes == 6
+        assert len(prims[0].attempts) > 1  # A 는 재시도 대상으로 계속 시도된다
+    else:
+        # 라이브형 primary 2개: 첫 primary 가 20초 뒤(여러 배치를 처리한 뒤) 실패한다.
+        ef, clk, led, prims, fb = _build(2, cost=20.0, alive=(1,))
+        _call(ef, clk, led, gap=1.0)
+        assert fb.calls == 0
+        assert prims[1].successes == 1
 
 
 def test_recovered_primary_is_reused_after_backoff_expires() -> None:
@@ -544,11 +607,13 @@ def test_recovered_after_many_slow_dead_primaries_is_reused_within_n_calls() -> 
 
 def test_budget_skip_makes_unattempted_primary_first_in_next_call() -> None:
     ef, clk, led, prims, _ = _build(3)
-    _call(ef, clk, led, gap=121.0)  # p0, p1 이 시간 초과, 셋째는 예산에 밀린다
-    assert [len(p.attempts) for p in prims] == [1, 1, 0]
-    _call(ef, clk, led, gap=121.0)  # 백오프가 모두 만료됐어도 셋째가 맨 앞이다
-    assert len(prims[2].attempts) == 1
-    assert prims[2].attempts[0] < prims[0].attempts[1]
+    _call(ef, clk, led, gap=121.0)  # 셋 다 한 번 실패한다(한 번도 실패하지 않은 primary 는 예산과 무관)
+    assert [len(p.attempts) for p in prims] == [1, 1, 1]
+    _call(ef, clk, led, gap=121.0)  # p0, p1 이 재시도돼 예산을 쓰고 p2 는 건너뛰어진다
+    assert [len(p.attempts) for p in prims] == [2, 2, 1]
+    _call(ef, clk, led, gap=121.0)  # 백오프가 모두 만료됐어도 p2 가 맨 앞이다
+    assert len(prims[2].attempts) == 2
+    assert prims[2].attempts[1] < prims[0].attempts[2]
 
 
 def test_one_dead_primary_never_causes_fallback_when_another_is_alive() -> None:
@@ -617,21 +682,25 @@ def test_factory_sets_attempt_budget_from_openai_timeout() -> None:
 
 def test_first_attempt_of_a_call_ignores_budget_even_if_time_passes_before_it() -> None:
     # 시계를 읽을 때마다 가상 시간이 흐른다(잠금 대기와 스케줄링 지연의 모사).
-    # 예산이 지연보다 작아도 호출의 첫 시도는 일어나야 한다.
+    # 재시도 대상의 호출 첫 시도는 예산이 지연보다 작아도 일어나야 한다.
     class _TickClock(_VClock):
         def __call__(self) -> float:
             self.t += 0.01
             return self.t
 
     clk, led = _TickClock(), _Ledger()
-    prim = _TimedEF(clk, led, "p0", alive=True)
+    prim = _TimedEF(clk, led, "p0")
     fb = _TimedFallback(clk)
     ef = ResilientEmbeddingFunction(
         primary=[prim], fallback=fb, attempt_budget=0.001, clock=clk
     )
+    ef(["x"])  # 한 번 실패한다 → 재시도 대상
+    assert fb.calls == 1
+    clk.t += 100.0  # 백오프 만료
+    prim.alive = True
     ef(["x"])
     assert prim.successes == 1
-    assert fb.calls == 0
+    assert fb.calls == 1
 
 
 def test_fallback_log_names_budget_exhaustion_only_when_budget_cut_the_call(
@@ -646,27 +715,28 @@ def test_fallback_log_names_budget_exhaustion_only_when_budget_cut_the_call(
             if r.name == logger_name and r.getMessage().startswith("임베딩 폴백")
         ]
 
-    # 앞 둘이 시간 초과로 실패하고 셋째(정상)가 예산에 밀린 호출.
-    ef, clk, led, prims, _ = _build(3, alive=(2,))
+    ef, clk, led, prims, _ = _build(3)
+    # 셋 다 처음 실패한 호출: 예산이 아니라 모든 primary 실패가 폴백 사유다.
     with caplog.at_level(logging.INFO, logger=logger_name):
-        _call(ef, clk, led, gap=1.0)
-    assert [len(p.attempts) for p in prims] == [1, 1, 0]
-    reasons = fallback_reasons()
-    assert len(reasons) == 1
-    assert "예산" in reasons[0]
-    assert "모든 primary 장애" not in reasons[0]
-
-    # 모든 primary 가 실패한 호출은 종전 문구를 쓴다.
-    ef2, clk2, led2, _, _ = _build(2)
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger=logger_name):
-        _call(ef2, clk2, led2, gap=1.0)
+        _call(ef, clk, led, gap=121.0)
     reasons = fallback_reasons()
     assert len(reasons) == 1
     assert "모든 primary 장애" in reasons[0]
     assert "예산" not in reasons[0]
 
-    # 모든 primary 가 백오프 중인 호출도 종전 문구다.
+    # 재시도 대상 둘이 예산을 쓰고 셋째가 건너뛰어진 호출.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        _call(ef, clk, led, gap=121.0)
+    assert [len(p.attempts) for p in prims] == [2, 2, 1]
+    reasons = fallback_reasons()
+    assert len(reasons) == 1
+    assert "예산" in reasons[0]
+    assert "모든 primary 장애" not in reasons[0]
+
+    # 모든 primary 가 백오프 중인 호출은 종전 문구다.
+    ef2, clk2, led2, _, _ = _build(2)
+    _call(ef2, clk2, led2, gap=1.0)
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=logger_name):
         _call(ef2, clk2, led2, gap=1.0)
