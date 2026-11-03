@@ -103,9 +103,10 @@ class ResilientEmbeddingFunction:
         한 호출에서 첫 시도 이후 경과 시간이 이 값(초) 이상이면 이미 실패한
         적이 있는 primary(재시도 대상)를 더 시도하지 않는다. 한 번도 실패하지
         않은 primary 는 예산과 무관하게 시도한다. None 이면 상한 없음. 양수여야
-        한다. 호출당 실패 시도 시간은 attempt_budget + D + F 미만이다(D: 마지막
-        재시도 대상 시도 하나의 소요 시간, F: 그 호출에서 처음 실패한 primary
-        들의 실패 시간 합. 모든 primary 가 이미 실패한 적이 있으면 F=0).
+        한다. 호출당 실패 시도 시간은 attempt_budget + D + F 미만이다(D: 경과 시간이
+        예산 미만일 때 시작한 마지막 시도 하나의 소요 시간, F: 경과 시간이 예산
+        이상일 때 시작한 시도들의 실패 시간 합. 그 시도는 실패 이력이 없다고
+        읽은 primary 뿐이다).
     clock : Callable[[], float]
         시계. 기본 time.monotonic. 시험이 가상 시계를 넣는다.
     """
