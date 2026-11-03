@@ -42,12 +42,21 @@ thread, ``/healthz`` and every other request of the process stopped answering.
 ``mcp_post`` hands ``tools/call`` work to two fixed pools: ``mcp-write`` (one
 thread) and ``mcp-read`` (four threads). A legacy JSON-RPC batch that contains
 a ``tools/call`` runs as one unit on one of these pools. A ``ping`` in that
-batch runs there too. The token check of every ``/mcp`` route runs on a third
-pool, ``mcp-auth`` (one thread). Single ``initialize``, ``tools/list`` and
+batch runs there too. The token lookup of every ``/mcp`` route runs on a third
+worker, ``mcp-auth`` (one thread, a bounded queue, #580). Single ``initialize``, ``tools/list`` and
 ``ping`` requests, and batches without a ``tools/call``, stay on the loop. An
 error for a ``tools/call`` (for example an unknown tool name) is produced by
 ``handle_request`` on the pool thread that call was sent to. See ``mcp_router``
 for the routing rules and the lock reasoning.
+
+AUTH AVAILABILITY (#580). A token lookup that cannot finish because the token
+store is busy or unreachable is not an invalid token. It answers 503 with
+``Retry-After`` and no ``WWW-Authenticate`` (a 401 sends clients into an OAuth
+flow this server does not offer). The same 503 answers a lookup that waits
+longer than ``_AUTH_DEADLINE_SECONDS`` and a full auth queue
+(``_AUTH_QUEUE_LIMIT``). Requests that need no lookup (no credential, a non-Bearer
+header, a blank token) stay 401 and never enter the queue. See
+``docs/issue-580-auth-unavailable.md``.
 
 Run with a single uvicorn worker — the underlying chroma PersistentClient is
 single-process only.
@@ -58,7 +67,10 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import queue
+import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -270,8 +282,8 @@ def _batch_is_modern(request: Request, body: list[Any]) -> bool:
 # fixed so the number of threads is fixed. The SQLite stores keep one
 # connection per thread in `_all_conns` and do not close the connections of
 # threads that have ended, so a fixed set of threads caps the connection
-# count. One write thread runs the MCP write calls one after another; the
-# auth pool has one thread.
+# count. One write thread runs the MCP write calls one after another. The auth
+# worker (below, #580) is one thread too and lives in the same table.
 #
 # The pools belong to the PROCESS, not to a router. The gateway builds one app
 # and apps/api mounts one router, so the thread count is the same either way,
@@ -281,7 +293,7 @@ def _batch_is_modern(request: Request, body: list[Any]) -> bool:
 # because several event loops (test clients, each on its own thread) can ask
 # at the same time.
 _READ_WORKERS = 4
-_POOLS: dict[str, ThreadPoolExecutor] = {}
+_POOLS: dict[str, Any] = {}
 _POOLS_LOCK = threading.Lock()
 
 
@@ -294,6 +306,197 @@ def _pool(name: str) -> ThreadPoolExecutor:
                 max_workers=width, thread_name_prefix=f"mcp-{name}"
             )
         return pool
+
+
+# #580: the token lookup runs on its own worker instead of a pool, so that the
+# bound on waiting work is the queue itself. `ThreadPoolExecutor.submit` puts the
+# item on its queue and then starts a thread, and a failure between the two
+# leaves the caller unable to tell whether the item is queued. `put_nowait`
+# either queues the item or raises `queue.Full`.
+#
+# The deadline is longer than the SQLite busy timeout that `SQLStore` sets
+# (`connect_args["timeout"]`, 5 seconds): a lookup that starts at once and meets
+# a lock fails by itself at the busy timeout and is classified, instead of being
+# cut off by the deadline. A request that waited behind that lookup may reach
+# the deadline first. Both answer 503.
+_AUTH_DEADLINE_SECONDS = 8.0
+_AUTH_QUEUE_LIMIT = 16
+_AUTH_RETRY_AFTER = "5"
+_UNAVAILABLE_LOG_INTERVAL = 10.0
+_UNAVAILABLE_LOGGED: dict[str, float] = {}
+_UNAVAILABLE_LOG_LOCK = threading.Lock()
+_STOP = object()
+
+
+def _log_unavailable(reason: str) -> None:
+    """One WARNING per reason per interval. Only the fixed reason code is
+    logged: exception text carries SQL and parameters."""
+    now = time.monotonic()
+    with _UNAVAILABLE_LOG_LOCK:
+        last = _UNAVAILABLE_LOGGED.get(reason)
+        if last is not None and now - last < _UNAVAILABLE_LOG_INTERVAL:
+            return
+        _UNAVAILABLE_LOGGED[reason] = now
+    logger.warning("MCP token check unavailable (%s); answering 503", reason)
+
+
+def _unavailable(reason: str) -> HTTPException:
+    """503 for a token check that could not finish. No ``WWW-Authenticate``: a
+    401 challenge starts an OAuth flow this server does not offer."""
+    _log_unavailable(reason)
+    return HTTPException(
+        status_code=503,
+        detail="Authentication temporarily unavailable",
+        headers={"Retry-After": _AUTH_RETRY_AFTER, **_NO_STORE},
+    )
+
+
+# SQLSTATE values of a server-type database that mean "try again": class 08
+# (connection exception), 57P01-57P03 (shutdown, cannot connect now), 53300
+# (too many connections).
+_RETRYABLE_SQLSTATES = frozenset({"57P01", "57P02", "57P03", "53300"})
+
+
+def _unavailable_reason(exc: BaseException) -> str | None:
+    """Reason code when *exc* means the token store could not answer right now,
+    else None (the caller keeps the pre-#580 behavior: 401).
+
+    A SQLite lock is told apart by its result code. Any other SQLite failure
+    (no such table or column, cannot open the file, I/O error) is not
+    something a retry fixes. For a server-type database, a failure before the
+    session exists carries no SQLSTATE and counts as unavailable.
+    """
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    if isinstance(exc, PoolTimeoutError):
+        return "store-unavailable"
+    if not isinstance(exc, OperationalError):
+        return None
+    orig = getattr(exc, "orig", None)
+    if isinstance(orig, sqlite3.Error):
+        code = getattr(orig, "sqlite_errorcode", None)
+        # SQLITE_BUSY (5) and SQLITE_LOCKED (6), including extended codes.
+        return "store-busy" if isinstance(code, int) and code & 0xFF in (5, 6) else None
+    if exc.connection_invalidated:
+        return "store-unavailable"
+    sqlstate = getattr(orig, "pgcode", None)
+    if sqlstate is None or sqlstate.startswith("08") or sqlstate in _RETRYABLE_SQLSTATES:
+        return "store-unavailable"
+    return None
+
+
+class _AuthJob:
+    """One token lookup handed to the auth worker.
+
+    The request that waits for it may give up (deadline, cancellation). It then
+    calls ``abandon()``. The job stays on the queue and the worker skips it when
+    it reaches it, so the queue size stays the bound.
+    """
+
+    def __init__(
+        self,
+        fn: Callable[[str], Any],
+        arg: str,
+        loop: asyncio.AbstractEventLoop,
+        future: asyncio.Future,
+    ) -> None:
+        self._fn = fn
+        self._arg = arg
+        self._loop = loop
+        self._future = future
+        self._abandoned = threading.Event()
+
+    def abandon(self) -> None:
+        self._abandoned.set()
+
+    def run(self) -> None:
+        """Run on the worker thread. Never raises: the outcome, a
+        ``BaseException`` included, goes to the waiting request."""
+        if self._abandoned.is_set():
+            return
+        result: Any = None
+        error: BaseException | None = None
+        try:
+            result = self._fn(self._arg)
+        except BaseException as exc:  # noqa: BLE001
+            error = exc
+        future = self._future
+
+        def settle() -> None:
+            if future.done():  # the request gave up and cancelled it
+                return
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(result)
+
+        try:
+            self._loop.call_soon_threadsafe(settle)
+        except RuntimeError:  # the loop is closed; nobody is waiting
+            pass
+
+
+class _AuthWorker:
+    """One daemon thread (``mcp-auth``) fed by a queue of fixed size.
+
+    Only ``submit`` takes ``_lock``. The worker thread takes none of ours.
+    Process-wide, like the pools above: see ``_auth_worker``.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._queue: queue.Queue = queue.Queue(maxsize=limit)
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def queued(self) -> int:
+        return self._queue.qsize()
+
+    def submit(self, job: _AuthJob) -> bool:
+        """Queue *job*. False when the queue is full.
+
+        A missing or dead thread is replaced first. When the thread start fails,
+        the exception leaves before anything joins the queue. The next
+        submission tries again. The queue outlives a dead thread, and the
+        replacement serves its items.
+        """
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                thread = threading.Thread(target=self._loop, name="mcp-auth", daemon=True)
+                thread.start()
+                self._thread = thread
+            try:
+                self._queue.put_nowait(job)
+            except queue.Full:
+                return False
+        return True
+
+    def _loop(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is _STOP:
+                return
+            job.run()
+
+    def stop_for_tests(self, timeout: float = 10.0) -> None:
+        """For test fixtures only: end the thread so that a test session does not
+        collect one thread per test. Product code never calls this; the worker
+        is a daemon thread of the process. The caller empties the queue first:
+        requests still queued get no answer."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return
+        self._queue.put(_STOP, timeout=timeout)
+        thread.join(timeout)
+
+
+def _auth_worker() -> _AuthWorker:
+    with _POOLS_LOCK:
+        worker = _POOLS.get("auth")
+        if worker is None:
+            worker = _POOLS["auth"] = _AuthWorker(_AUTH_QUEUE_LIMIT)
+        return worker
 
 
 def _call_kind(item: Any, principal: Principal) -> str | None:
@@ -367,21 +570,21 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
     # #302 reachability note: `_auth_store()` below has the same
     # check-then-act shape as the embedding/BM25 sites that issue fixed (read
     # `auth_sql`, maybe build+append), but it deliberately carries NO lock.
-    # What makes that safe is that exactly ONE thread ever runs `_check()`:
+    # What makes that safe is that exactly ONE thread ever runs `_lookup()`:
     # since #577 that is the `mcp-auth` worker (see `_check_off_loop`), where
     # before it was the event-loop thread. One thread cannot interleave with
     # itself, so the closure's `auth_sql` list needs no lock.
     # This is a structural judgment, not an absence of observed incidents.
-    # It stops holding the moment `_check()` (or `_auth_store()` itself) can
-    # run on a second thread -- a second thread in the auth pool, a direct
+    # It stops holding the moment `_lookup()` (or `_auth_store()` itself) can
+    # run on a second thread -- a second auth worker thread, a direct
     # call from a route, a call from a tool worker. Any of those needs the same
     # instance-level lock the embedding and BM25 sites got.
     auth_sql: list[Any] = []
 
     def _auth_store() -> Any | None:
         """The lookup store, or None when there is demonstrably nothing to
-        look up. Returns None rather than raising: a caller who cannot be
-        authenticated gets a 401 either way.
+        look up (the caller answers 401). If a store cannot connect,
+        ``_auth_store`` returns it unchanged, and ``_lookup`` answers 503 for it.
         """
         if not auth_sql:
             from pathlib import Path
@@ -412,48 +615,59 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
             auth_sql.append(store)
         return auth_sql[0]
 
-    def _verify(presented: str | None) -> Principal | None:
-        if not presented:
-            return None
+    def _lookup(presented: str) -> Principal | None:
+        """Look the token up. Runs on the ``mcp-auth`` worker thread.
+
+        Returns a Principal for a valid token. Returns None when the answer is
+        "not authenticated". Three cases give None. First, the store confirmed
+        that the token is not valid. Second, there is nothing to look up.
+        Third, the lookup failed and the code does not classify the failure as
+        temporary (a missing table, an unclassified driver error). The third case keeps
+        the answer from before #580 and is no proof that the token is invalid.
+        A store that cannot answer right now raises a 503 instead (#580). That
+        says nothing about the token, and a 401 would send the client into an
+        OAuth flow.
+        """
         store = _auth_store()
-        if store is None or not getattr(store, "available", False):
+        if store is None:
             return None
+        if not getattr(store, "available", False):
+            raise _unavailable("store-unavailable")
         # verify_token does a hash-equality lookup (opencrab/auth.py), not a
         # string compare, so there is no separate timing side-channel to defend
         # with hmac.compare_digest here (unlike the deleted shared-secret path).
         try:
             return verify_token(store, presented)
-        except Exception:  # noqa: BLE001
-            # No users table yet, or a transient query failure. Either way the
-            # caller is not authenticated; a 401 is the honest answer and the
-            # driver error is already in the store's own log line.
+        except Exception as exc:  # noqa: BLE001
+            reason = _unavailable_reason(exc)
+            if reason is not None:
+                raise _unavailable(reason) from None
+            # No users table yet, or another failure a retry does not fix.
+            # Either way the caller is not authenticated, and the answer stays
+            # the 401 it was before #580. The driver error is not logged here.
             return None
 
-    def _check(request: Request, creds: HTTPAuthorizationCredentials | None) -> Principal:
-        # A present Authorization header decides the request outright -- valid
-        # or not. Checking the raw header rather than `creds` is deliberate:
-        # HTTPBearer(auto_error=False) also yields None for a malformed or
-        # non-Bearer header, so `creds is None` cannot distinguish "no header"
-        # from "bad header". Falling back to the query parameter on a bad
-        # header would let anyone bypass allow_query_token by attaching junk.
-        # `is not None`, not truthiness: an empty `Authorization:` is still a
-        # header the client chose to send. Treating it as absent would route
-        # it to the query-parameter branch -- harmless today (that branch is
-        # off by default) but it makes the rule "a header decides the request"
-        # conditional on the header's *value*, which is not the rule.
+    def _presented(request: Request, creds: HTTPAuthorizationCredentials | None) -> str | None:
+        """The token the request offers, or None when it offers none.
+
+        No I/O, so it runs on the event loop. A present Authorization header
+        decides the request outright -- valid or not. Checking the raw header
+        rather than `creds` is deliberate: HTTPBearer(auto_error=False) also
+        yields None for a malformed or non-Bearer header, so `creds is None`
+        cannot distinguish "no header" from "bad header". Falling back to the
+        query parameter on a bad header would let anyone bypass
+        allow_query_token by attaching junk. `is not None`, not truthiness: an
+        empty `Authorization:` is still a header the client chose to send.
+        Treating it as absent would route it to the query-parameter branch --
+        harmless today (that branch is off by default) but it makes the rule
+        "a header decides the request" conditional on the header's *value*,
+        which is not the rule.
+        """
         if request.headers.get("authorization") is not None:
-            presented = creds.credentials if (creds and creds.scheme.lower() == "bearer") else None
-            principal = _verify(presented)
-            if principal is not None:
-                return principal
-            raise _unauthorized()
-
+            return creds.credentials if (creds and creds.scheme.lower() == "bearer") else None
         if allow_query_token:
-            principal = _verify(request.query_params.get("token"))
-            if principal is not None:
-                return principal
-
-        raise _unauthorized()
+            return request.query_params.get("token")
+        return None
 
     async def _offload(pool_name: str, fn: Callable[..., Any], *args: Any) -> Any:
         """Run ``fn(*args)`` on a pool thread without blocking the loop.
@@ -473,11 +687,41 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
     async def _check_off_loop(
         request: Request, creds: HTTPAuthorizationCredentials | None
     ) -> Principal:
+        # A request that offers no usable token needs no lookup: answer 401 here
+        # and never queue it (a full queue must not turn it into a 503).
+        presented = _presented(request, creds)
+        if presented is None or not presented.strip():
+            raise _unauthorized()
         # The token lookup is a database read; a write committing on the same
         # file in this process could make it wait. Run it on the one auth
         # thread so the loop never waits on the database (and see the #302
         # note above for why one thread is also what keeps it lock free).
-        return await _offload("auth", _check, request, creds)
+        # The wait has a deadline and the queue a bound (#580); both answer 503.
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        job = _AuthJob(_lookup, presented, loop, future)
+        try:
+            queued = _auth_worker().submit(job)
+        except BaseException:
+            job.abandon()
+            raise
+        if not queued:
+            raise _unavailable("queue-full")
+        try:
+            done, _ = await asyncio.wait({future}, timeout=_AUTH_DEADLINE_SECONDS)
+        except BaseException:
+            # Cancelled while waiting. The job stays queued; the worker skips it.
+            job.abandon()
+            future.cancel()
+            raise
+        if not done:
+            job.abandon()
+            future.cancel()
+            raise _unavailable("deadline")
+        principal = future.result()  # may raise the 503 from _lookup
+        if principal is None:
+            raise _unauthorized()
+        return principal
 
     def _handle_batch(items: list[Any]) -> list[Any]:
         return [r for r in (server.handle_request(item) for item in items) if r is not None]

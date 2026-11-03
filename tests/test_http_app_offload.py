@@ -128,6 +128,7 @@ class _Env:
         self.secret = secret
         self.user_id = user_id
         self.created = created  # recording executors, in creation order
+        self.auth_baseline: frozenset = frozenset()  # mcp-auth threads that predate the test
 
     @property
     def headers(self) -> dict[str, str]:
@@ -177,8 +178,13 @@ def env(tmp_path, monkeypatch):
     state = _State()
     try:
         with _registered(state):
-            yield _Env(state, secret, user_id, created)
+            test_env = _Env(state, secret, user_id, created)
+            test_env.auth_baseline = frozenset(
+                t for t in threading.enumerate() if t.name == "mcp-auth"
+            )
+            yield test_env
     finally:
+        _stop_auth_workers()
         for executor in created:
             executor.shutdown(wait=True)
         get_settings.cache_clear()
@@ -218,6 +224,24 @@ async def _post(client, env: _Env, body):
 
 def _text(resp) -> dict:
     return json.loads(resp.json()["result"]["content"][0]["text"])
+
+
+def _auth_threads(env: _Env) -> list[threading.Thread]:
+    """Live ``mcp-auth`` threads that this test created. The fixture ignores
+    threads that predate it: they belong to the process-wide worker of other
+    test modules."""
+    return [
+        t
+        for t in threading.enumerate()
+        if t.name == "mcp-auth" and t.is_alive() and t not in env.auth_baseline
+    ]
+
+
+def _stop_auth_workers() -> None:
+    for pool in list(http_mod._POOLS.values()):
+        stop = getattr(pool, "stop_for_tests", None)
+        if stop is not None:
+            stop()
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +314,10 @@ def test_write_calls_share_one_thread_and_do_not_overlap(env):
     assert state.threads["a"] == state.threads["b"]
     assert state.threads["a"].startswith("mcp-write")
     assert state.threads["r1"].startswith("mcp-read")
-    assert env.widths() == {"mcp-write": 1, "mcp-read": 4, "mcp-auth": 1}
+    assert env.widths() == {"mcp-write": 1, "mcp-read": 4}
+    # The auth worker is not an executor any more (#580). Its width is one live
+    # thread, counted from the threads themselves.
+    assert len(_auth_threads(env)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -301,11 +328,19 @@ def test_write_calls_share_one_thread_and_do_not_overlap(env):
 def test_tools_and_token_check_run_off_the_loop_with_the_principal(env, monkeypatch):
     state = env.state
     verify_threads: list[str] = []
+    verify_thread_objects: list[threading.Thread] = []
+    active = {"now": 0, "max": 0}
     real_verify = http_mod.verify_token
 
     def spy(store, presented):
         verify_threads.append(threading.current_thread().name)
-        return real_verify(store, presented)
+        verify_thread_objects.append(threading.current_thread())
+        active["now"] += 1
+        active["max"] = max(active["max"], active["now"])
+        try:
+            return real_verify(store, presented)
+        finally:
+            active["now"] -= 1
 
     monkeypatch.setattr(http_mod, "verify_token", spy)
     loop_thread: list[str] = []
@@ -330,7 +365,55 @@ def test_tools_and_token_check_run_off_the_loop_with_the_principal(env, monkeypa
     for tag in ("r0", "r1", "r2", "r3", "w1"):
         assert state.threads[tag] != loop_thread[0]
         assert state.principals[tag] == env.user_id
-    assert env.widths()["mcp-auth"] == 1
+    # Auth concurrency is one: every lookup ran on the same thread object, one
+    # at a time, and exactly one `mcp-auth` thread is alive.
+    assert len(set(verify_thread_objects)) == 1
+    assert active["max"] == 1
+    assert len(_auth_threads(env)) == 1
+
+
+def test_auth_lookups_run_one_at_a_time_on_one_thread(env, monkeypatch):
+    """Auth width one, asserted by behaviour. Since #580 the auth worker is no
+    executor, so a recording executor cannot show its width. While the first
+    lookup holds, the second request's lookup waits in the queue and does not
+    start. Afterwards both lookups ran on one thread object, and exactly one
+    ``mcp-auth`` thread is alive. The wait below checks an absence. It can miss
+    a second thread but never fails the single-thread code."""
+    real_verify = http_mod.verify_token
+    started = threading.Event()
+    release = threading.Event()
+    second_started = threading.Event()
+    guard = threading.Lock()
+    seen: list[threading.Thread] = []
+
+    def spy(store, presented):
+        with guard:
+            seen.append(threading.current_thread())
+            first = len(seen) == 1
+        if first:
+            started.set()
+            assert release.wait(timeout=_HOLD)
+        else:
+            second_started.set()
+        return real_verify(store, presented)
+
+    monkeypatch.setattr(http_mod, "verify_token", spy)
+
+    async def scenario(client):
+        a = asyncio.create_task(_post(client, env, _call("probe_r", {"tag": "a"}, rid=1)))
+        await _until(started.is_set, "first lookup start")
+        b = asyncio.create_task(_post(client, env, _call("probe_r", {"tag": "b"}, rid=2)))
+        await asyncio.sleep(0.3)
+        second_before_release = second_started.is_set()
+        release.set()
+        return second_before_release, await a, await b
+
+    second_before_release, a, b = _run(scenario)
+
+    assert not second_before_release, "a second lookup ran while the first was held"
+    assert a.status_code == 200 and b.status_code == 200
+    assert len(seen) == 2 and len(set(seen)) == 1
+    assert len(_auth_threads(env)) == 1
 
 
 def _get_and_delete_scenario(env):
@@ -613,6 +696,7 @@ def cold_real(tmp_path, monkeypatch):
     try:
         yield _Env(_State(), secret, user_id, created), str(tmp_path)
     finally:
+        _stop_auth_workers()
         for executor in created:
             executor.shutdown(wait=True)
         get_settings.cache_clear()

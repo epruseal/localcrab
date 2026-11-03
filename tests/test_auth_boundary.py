@@ -538,7 +538,11 @@ class TestAuthStoreDoesNotCacheFailure:
         monkeypatch.setattr(store_mod.SQLStore, "__init__", _flaky)
         client = TestClient(create_app())
 
-        assert _post(client, headers=auth).status_code == 401, "outage should reject"
+        # #580: an outage says nothing about the token. A 401 would send the client
+        # into an OAuth flow; the answer is a retryable 503.
+        down = _post(client, headers=auth)
+        assert down.status_code == 503, "outage should be a retryable 503"
+        assert down.headers["retry-after"] and "www-authenticate" not in down.headers
         assert _post(client, headers=auth).status_code == 200, "still bricked after recovery"
 
 
