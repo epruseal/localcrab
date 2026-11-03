@@ -801,8 +801,8 @@ def write_lock(
 class StoreBootstrapLockTimeoutError(TimeoutError):
     """A store constructor timed out while it waited for its bootstrap lock (#578).
 
-    This class is a subclass of ``TimeoutError``, so handlers of
-    ``TimeoutError`` keep working. The message is the ``write_lock`` message.
+    This class is a subclass of ``TimeoutError``, so existing handlers of
+    ``TimeoutError`` still catch it. The message is the ``write_lock`` message.
     It names the lock file and, when the record is readable, the holder.
 
     A store constructor uses this class to tell a busy lock from other

@@ -317,8 +317,8 @@ class _SqliteConnMixin:
         from opencrab.locking import store_bootstrap_lock, write_lock
 
         data_dir = os.path.dirname(os.path.abspath(self._db_path))
-        # #578: a busy write.lock surfaces as StoreBootstrapLockTimeoutError,
-        # which each store's _init_db lets propagate instead of degrading.
+        # #578: a busy write.lock raises StoreBootstrapLockTimeoutError. Each
+        # store's _init_db raises it again instead of degrading.
         with store_bootstrap_lock(write_lock(data_dir)):
             yield
 

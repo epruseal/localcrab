@@ -118,7 +118,7 @@ _STORES = [
 
 @pytest.fixture
 def cleanup_probe(monkeypatch):
-    """실패한 생성 직후 정리 호출을 관측한다(재시도·시험 정리 전에 단언한다)."""
+    """실패한 생성 직후 정리 호출을 관측한다(재시도와 시험 정리 전에 단언한다)."""
     from sqlalchemy.engine import Engine
 
     from opencrab.stores._sqlite_base import _SqliteConnMixin
@@ -381,7 +381,7 @@ def _install_guard_fakes(monkeypatch, *, error: BaseException):
 
 class _FakeLockTimeoutError(TimeoutError):
     """그래프 생성자가 올리는 잠금 시간 초과의 대역. 가드가 이 예외를 그대로 전파하고
-    먼저 만든 스토어를 닫는지만 본다(실제 클래스는 스토어·컨텍스트 시험이 다룬다)."""
+    먼저 만든 스토어를 닫는지만 본다(실제 클래스는 스토어 시험과 컨텍스트 시험이 다룬다)."""
 
 
 def test_http_startup_guard_closes_sql_store_when_graph_store_times_out(monkeypatch):

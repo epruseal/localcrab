@@ -106,8 +106,8 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
                 self._available = state in {"target", "legacy", "partial"}
             logger.info("LocalGraphStore initialised at %s", self._db_path)
         except StoreBootstrapLockTimeoutError:
-            # #578: a busy write.lock is not a store defect. Propagate it so
-            # the caller never keeps an unavailable store that nothing retries.
+            # #578: a busy write.lock is not a store defect. Raise it, so the
+            # caller never keeps an unavailable store that nothing retries.
             self._available = False
             self.close()
             raise

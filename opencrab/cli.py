@@ -382,9 +382,9 @@ def serve(
         from opencrab.stores.factory import make_graph_store, make_sql_store
 
         cfg = get_settings()
-        # Both stores are built inside the try (#578): a store constructor can
-        # now raise on a busy write.lock, and the finally must close the one
-        # built before it.
+        # Build both stores inside the try (#578). A constructor raises when
+        # write.lock stays busy. The finally block then closes the store that
+        # already exists.
         startup_sql = startup_graph = None
         try:
             startup_sql = make_sql_store(cfg)
