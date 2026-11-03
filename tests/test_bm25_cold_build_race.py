@@ -287,24 +287,3 @@ def test_ensure_built_propagates_a_list_nodes_failure(monkeypatch) -> None:
     hybrid = _hybrid(doc_store)
     with pytest.raises(RuntimeError, match="list_nodes boom"):
         hybrid._bm25.ensure_built(doc_store)
-
-
-# ---------------------------------------------------------------------------
-# Reachability boundary (#302 requirement 3): REST never reaches BM25 today
-# because apps/api/main.py's _build_context() never attaches a doc store to
-# its HybridQuery -- _bm25_search() short-circuits entirely on
-# self._doc_store is None. This guards the PR's documented reachability
-# judgment against silent staleness if a future change attaches one.
-# ---------------------------------------------------------------------------
-
-def test_rest_context_never_attaches_a_doc_store_to_hybrid_query() -> None:
-    import inspect
-
-    from apps.api.main import _build_context
-
-    source = inspect.getsource(_build_context)
-    assert "_doc_store =" not in source and "_doc_store=" not in source, (
-        "_build_context() now assigns _doc_store -- re-examine the #302 "
-        "REST-cannot-reach-BM25 judgment (and its PR-body documentation) "
-        "before trusting it; this test existing to fail is the point."
-    )

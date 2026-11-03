@@ -1038,6 +1038,7 @@ docstring은 이 절을 가리킨다.
 - 응답에는 private 증거(`_query_provenance` 계열 키, `source_integrity`, `_source_classification`)가 어느 깊이에도 실리지 않는다. 모든 공개 cap(결과 항목, 접힌 member, `selected_packs`, REST keyword fallback)은 같은 재귀 sanitizer를 거친다.
 - 앞 4000자만 남은 경우의 `original_chars`(source 전체 길이)는 병합이 만든 값이며 cap은 그 값과 저장 원문의 관계를 따로 인증하지 않는다.
 - `ontology_get_node(node_id)`의 graph-scoped 동작은 바뀌지 않는다. 이 도구는 locator의 원문 읽기 경로가 아니다.
+- REST `/api/query` 응답도 같은 조건에서 `source_locator`와 `full_text_tool`을 싣는다(#568, #545). REST와 MCP의 질의 객체가 같은 문서 저장소를 연결하기 때문이다. REST에는 locator를 읽는 경로가 없다. 읽는 길은 MCP 도구 `ontology_get_source_range`뿐이고, 같은 원문 저장소에 접근할 수 있어야 하며 호출 주체가 해당 팩의 읽기 권한을 가져야 한다. 설계: `docs/issue-568-rest-doc-store.md`.
 
 ### 응답 예산
 

@@ -386,7 +386,7 @@ def _build_context() -> ApiContext:
             vector=vector,
             docs=docs,
             sql=sql,
-            hybrid=HybridQuery(vector, graph),
+            hybrid=HybridQuery(vector, graph, doc_store=docs),
             impact=ImpactEngine(graph, sql),
         )
     except BaseException:
@@ -395,10 +395,32 @@ def _build_context() -> ApiContext:
         raise
 
 
+def _stop_bm25_worker(hybrid: Any) -> None:
+    """Stop the BM25 rebuild worker, then wait until it ends (#568).
+
+    REST ingest starts that worker once the query object has a doc store. A
+    store that closes under a worker in mid-read leaves a thread that uses a
+    closed store. The wait has no time limit. It ends when the worker finishes
+    its current round, so shutdown time follows the build in progress. Section
+    3.3 of docs/issue-568-rest-doc-store.md states the contract.
+    """
+    if hybrid is None:
+        return
+    try:
+        hybrid.shutdown_bm25()
+        worker = hybrid._bm25_worker  # noqa: SLF001 -- the join API is this class's own
+        if worker is not None and worker.is_alive():
+            logger.warning("BM25 rebuild worker still running; waiting for it before closing stores")
+            hybrid._bm25_join()  # noqa: SLF001
+    except Exception as exc:
+        logger.debug("Failed to stop the BM25 worker: %s", exc)
+
+
 def _close_context(ctx: ApiContext | None) -> None:
     if ctx is None:
         return
 
+    _stop_bm25_worker(getattr(ctx, "hybrid", None))
     for store_name in ("graph", "docs", "vector", "sql"):
         store = getattr(ctx, store_name, None)
         close = getattr(store, "close", None)
@@ -690,6 +712,8 @@ def query_ontology(
         raise_on_error=False,
         sql=ctx.sql,
         principal=auth.principal,
+        hybrid=ctx.hybrid,
+        spaces=payload.spaces,
     )
 
     outcome = ctx.hybrid.query(
