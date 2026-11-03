@@ -153,6 +153,19 @@ def test_rest_and_mcp_choose_the_same_pack_for_auto_pack(world, monkeypatch):
     assert _legs(rest) == _legs(mcp)
 
 
+def test_rest_and_mcp_auto_pack_probe_honors_the_spaces_filter(world, monkeypatch):
+    """The probe reads ``spaces``: a space that holds no match selects no pack."""
+    ctx = _rest_ctx(world, monkeypatch)
+    mcp_ctx = _mcp_ctx(world, monkeypatch)
+    hit = _rest_ask(ctx, world, RARE, auto_pack=True, spaces=["resource"])
+    assert [p["pack_id"] for p in hit["selected_packs"]] == [PACK]
+    rest = _rest_ask(ctx, world, RARE, auto_pack=True, spaces=["no-such-space"])
+    mcp = _mcp_ask(mcp_ctx, world, RARE, auto_pack=True, spaces=["no-such-space"])
+    assert mcp["selected_packs"] == []
+    assert rest["selected_packs"] == mcp["selected_packs"]
+    assert rest["pack_filter"]["pack_ids"] == mcp["pack_filter"]["pack_ids"]
+
+
 def test_rest_response_carries_source_locator_like_mcp(world, monkeypatch):
     """#545: a cut text gets a locator when the query object has a doc store."""
     flow.install_vector_leg(world["vec"], monkeypatch, PACK, [LONG_ID], LONG_TEXT)
