@@ -649,9 +649,13 @@ def main() -> None:
     from opencrab.stores.factory import make_graph_store, make_sql_store
 
     cfg = get_settings()
-    startup_sql = make_sql_store(cfg)
-    startup_graph = make_graph_store(cfg)
+    # Build both stores inside the try (#578). A constructor raises when
+    # write.lock stays busy. The finally block then closes the store that
+    # already exists.
+    startup_sql = startup_graph = None
     try:
+        startup_sql = make_sql_store(cfg)
+        startup_graph = make_graph_store(cfg)
         assert_registry_covers_graph(startup_sql, startup_graph)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)

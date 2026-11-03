@@ -49,6 +49,7 @@ import logging
 import time
 from typing import Any
 
+from opencrab.locking import StoreBootstrapLockTimeoutError
 from opencrab.stores import _node_bm25_sqlite as _nbm
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
@@ -110,7 +111,8 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         # 실패만 걸린다. FTS5 블록은 (양쪽 검증자가 지적한 대로) 반드시
         # with 본문 "안"에 있어야 한다 — 밖으로 나가면 백필 INSERT 가
         # write.lock 없이 돌아 항목2 가 막으려던 프로세스 간 TOCTOU 가
-        # 되돌아온다.
+        # 되돌아온다. 획득 시간 초과(StoreBootstrapLockTimeoutError)는 이
+        # 삼킴에서 빠진다: 아래 전용 except 가 닫고 전파한다(#578).
         try:
             with self._bootstrap_lock():
                 try:
@@ -160,6 +162,12 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                     logger.warning("FTS5 keyword index unavailable (graceful): %s", exc)
                     self._fts_ok = False
                 self._init_node_bm25()
+        except StoreBootstrapLockTimeoutError:
+            # #578: propagate a busy write.lock instead of degrading (see
+            # LocalGraphStore._init_db).
+            self._available = False
+            self.close()
+            raise
         except Exception as exc:
             logger.warning("LocalSQLDocStore bootstrap lock failed: %s", exc)
             self._available = False

@@ -95,6 +95,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from opencrab.locking import StoreBootstrapLockTimeoutError
 from opencrab.stores._graph_common import IDENT_RE as _IDENT_RE
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sqlite_base import _SqliteConnMixin
@@ -331,6 +332,12 @@ class SqliteVecStore(_SqliteConnMixin):
                 self._ann or "off",
                 self._has_bit_column,
             )
+        except StoreBootstrapLockTimeoutError:
+            # #578: propagate a busy write.lock instead of degrading (see
+            # LocalGraphStore._init_db).
+            self._available = False
+            self.close()
+            raise
         except Exception as exc:  # pragma: no cover - init failure path
             logger.warning("SqliteVecStore init failed: %s", exc)
             self._available = False

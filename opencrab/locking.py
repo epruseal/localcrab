@@ -10,7 +10,7 @@ import os
 import stat
 import threading
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import UTC, datetime
 from time import monotonic, sleep
 from typing import BinaryIO
@@ -795,4 +795,35 @@ def write_lock(
             raise TimeoutError(write_lock_busy_message(path, resolved)) from exc
         finally:
             _held.pending_purpose = None
+        yield
+
+
+class StoreBootstrapLockTimeoutError(TimeoutError):
+    """A SQLite store timed out while it waited for its bootstrap lock (#578).
+
+    This class is a subclass of ``TimeoutError``, so existing handlers of
+    ``TimeoutError`` still catch it. The message is the ``write_lock`` message.
+    It names the lock file and, when the record is readable, the holder.
+
+    A store uses this class to tell a busy lock from other failures. A busy
+    lock must propagate. If the store hides it, the MCP context keeps an
+    unavailable store and nothing retries it.
+    """
+
+
+@contextmanager
+def store_bootstrap_lock(lock: AbstractContextManager[object]) -> Iterator[None]:
+    """Hold *lock* for the schema bootstrap of a store and name a timeout (#578).
+
+    The argument is the context manager that a store builds with
+    ``write_lock`` or ``write_lock_for_store``. This function converts only the
+    acquisition timeout. A ``TimeoutError`` from the protected block keeps its
+    type and its message. Any other failure of the acquisition propagates
+    without change.
+    """
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(lock)
+        except TimeoutError as exc:
+            raise StoreBootstrapLockTimeoutError(str(exc)) from exc
         yield
