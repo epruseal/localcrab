@@ -47,4 +47,4 @@ python tests/search_faults_timing_child_596.py 0   2  run --corpus <코퍼스> -
 
 - 제품 코드는 바꾸지 않는다. 취소 경로와 `--max-seconds` 동작은 설계대로다.
 - 시험 시간과 다른 시나리오(T 계열, D 계열)의 시간 의존 점검은 이 이슈가 다루지 않는다.
-- K3도 pending 폴링 뒤 `SIGKILL`을 보내는 같은 형태다. 후속 이슈 #597이 다룬다.
+- K3도 pending 폴링 뒤 `SIGKILL`을 보내는 같은 형태였다. 후속 이슈 #597이 `docs/issue-597-k3-flake.md`에서 고쳤다.

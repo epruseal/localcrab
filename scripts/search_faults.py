@@ -1857,19 +1857,20 @@ def sc_k3(sc: Scenario) -> None:
     p0 = make_pending(sc.dir, keys)
     search_file = _write_search_file(sc, "search.json", ctx.queries[:1])
     st = sc.step("SIGKILL during the search-time drain", "explicit_error")
-    child = sc.spawn("search", "--search-file", str(search_file), "--loop", "--slow-drain")
-    deadline = time.monotonic() + ctx.child_timeout
-    seen = p0
-    while time.monotonic() < deadline and child.p.poll() is None:
-        seen = len(ro_pending(sc.dir))
-        if 0 < seen < p0:
-            break
-        time.sleep(POLL)
+    # The child stops inside its second non-empty drain transaction (design 4.5, issue 597), so the
+    # signal lands on a live child whatever the speed of the runner. The first transaction is
+    # committed and the second holds uncommitted work.
+    child = sc.spawn("search", "--search-file", str(search_file), "--loop", "--slow-drain",
+                     "--hold-at-drain", "2")
+    reached = child.wait_tag("held", ctx.child_timeout)
+    held = (child.tags("held") or [{}])[0]
+    seen = len(ro_pending(sc.dir))
     alive = child.signal(signal.SIGKILL)
     sc.finish(child)
     p1 = len(ro_pending(sc.dir))
-    sc.inject(st, "kill landed mid-drain", alive and child.rc == -signal.SIGKILL and 0 < p1 < p0,
-              {"alive": alive, "rc": child.rc, "p0": p0, "seen": seen, "p1": p1})
+    sc.inject(st, "kill landed mid-drain",
+              reached and (held.get("done") or 0) > 0 and alive and child.rc == -signal.SIGKILL and 0 < p1 < p0,
+              {"reached": reached, "held": held, "alive": alive, "rc": child.rc, "p0": p0, "seen": seen, "p1": p1})
     verify = ro_verify(sc.dir)
     sc.check(st, "invariant", "verify excluding pending", verify["ok"], verify)
     svc = sc.open_svc()
@@ -2357,6 +2358,25 @@ def _actor_search(directory: Path, args: argparse.Namespace) -> int:
         # K3: slow the drain so a kill lands between drain transactions.
         store._NODE_BM25_DRAIN_BATCH = 16
         store._NODE_BM25_DRAIN_SECONDS = 0.01
+    if args.hold_at_drain >= 0:
+        # K3: stop inside the N-th drain call that processed keys, before the caller commits.
+        # The parent's signal then lands on a live child with an uncommitted drain, however
+        # fast the runner is (design 4.5, issue 597). The alarm of the child still ends the wait.
+        from opencrab.stores import _node_bm25_sqlite as nbm
+
+        original_drain = nbm.drain
+        drains = {"n": 0}
+
+        def hold_drain(conn: Any, row_to_node: Any, max_rows: int) -> int:
+            done = original_drain(conn, row_to_node, max_rows)
+            if done > 0:
+                drains["n"] += 1
+                if drains["n"] >= args.hold_at_drain:
+                    _tag("held", {"drain": drains["n"], "done": done})
+                    time.sleep(args.timeout + 60)
+            return done
+
+        nbm.drain = hold_drain
     rows = json.loads(Path(args.search_file).read_text(encoding="utf-8"))
     if not args.loop:
         _search_rows(hq, rows)
@@ -2463,6 +2483,7 @@ def main(argv: list[str] | None = None) -> int:
     actor.add_argument("--size", type=int, default=0)
     actor.add_argument("--pause-at", type=int, default=-1)
     actor.add_argument("--hold-at-docs", type=int, default=-1)
+    actor.add_argument("--hold-at-drain", type=int, default=-1)
     actor.add_argument("--step-delay", type=float, default=0.0)
     actor.add_argument("--yes", action="store_true", help="accepted for drop; the actor always confirms")
     sub.add_parser("selftest")

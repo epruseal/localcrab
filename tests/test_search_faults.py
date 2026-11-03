@@ -73,9 +73,10 @@ def test_s0_fault_run_injects_every_scenario(tmp_path):
 @pytest.mark.parametrize(("ro_delay", "budget_scale", "scenarios"), [
     pytest.param("0.5", "1", "C3,K1", id="parent_stall"),
     pytest.param("0", "50", "C3", id="fast_runner"),
+    pytest.param("5", "1", "K3", id="parent_stall_drain"),
 ])
 def test_signal_injection_does_not_depend_on_runner_speed(tmp_path, ro_delay, budget_scale, scenarios):
-    """#596: the C3 and K1 signals land on a live child when the parent stalls or the runner is fast.
+    """#596, #597: the C3, K1 and K3 signals land on a live child when the parent stalls or the runner is fast.
 
     The child script stalls the parent after every progress read by ``ro_delay``
     seconds and scales the --max-seconds budget by ``budget_scale``. The harness

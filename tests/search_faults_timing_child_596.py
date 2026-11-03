@@ -2,7 +2,8 @@
 
 Usage: search_faults_timing_child_596.py <ro-delay seconds> <budget scale> <harness arguments...>
 
-The parent harness reads child progress with ``ro_status`` and gives the
+The parent harness reads child progress with ``ro_status`` and ``ro_pending``
+(#597: K3 reads the pending keys) and gives the
 child a ``--max-seconds`` budget. A parent that stalls after a read leaves
 the child time to run on, which the first value models. A faster runner
 leaves a fixed budget larger relative to the work, which the second value
@@ -41,6 +42,16 @@ def scaled_run_child(self: faults.Scenario, role: str, *args: str, **kw: object)
     return _run_child(self, role, *argv, **kw)
 
 
+_ro_pending = faults.ro_pending
+
+
+def slow_ro_pending(directory: Path) -> set[tuple[str, str]]:
+    pending = _ro_pending(directory)
+    time.sleep(ro_delay)
+    return pending
+
+
 faults.ro_status = slow_ro_status
+faults.ro_pending = slow_ro_pending
 faults.Scenario.run_child = scaled_run_child
 raise SystemExit(faults.main(sys.argv[3:]))
