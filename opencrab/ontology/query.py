@@ -958,7 +958,7 @@ class HybridQuery:
         self._neo4j = neo4j
         # The doc store feeds the BM25 leg, the FTS leg and source proofs. Both
         # server contexts (REST _build_context, MCP _assemble_context) pass it
-        # here (#568); without it those three steps are skipped.
+        # here (#568). Without it, query() skips those three steps.
         self._doc_store: Any = doc_store
         # Attached at runtime by _assemble_context() in tools.py
         self._rebac: Any = None

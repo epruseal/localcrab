@@ -2,11 +2,11 @@
 
 Design: docs/issue-568-rest-doc-store.md.
 
-The REST context is built by the real ``apps.api.main._build_context`` and the
-MCP context by the real ``opencrab.mcp.tools._assemble_context``. Only the store
-factories are replaced, so both contexts sit over the same real SQLite stores.
-Queries go through the real handlers ``query_ontology`` (REST) and
-``ontology_query`` (MCP).
+The real ``apps.api.main._build_context`` builds the REST context. The real
+``opencrab.mcp.tools._assemble_context`` builds the MCP context. The test
+replaces only the store factories, so both contexts sit over the same real
+SQLite stores. Queries go through the real handlers ``query_ontology`` (REST)
+and ``ontology_query`` (MCP).
 """
 
 from __future__ import annotations
@@ -154,7 +154,7 @@ def test_rest_and_mcp_choose_the_same_pack_for_auto_pack(world, monkeypatch):
 
 
 def test_rest_response_carries_source_locator_like_mcp(world, monkeypatch):
-    """#545: a cut text gets a locator when the doc store is connected."""
+    """#545: a cut text gets a locator when the query object has a doc store."""
     flow.install_vector_leg(world["vec"], monkeypatch, PACK, [LONG_ID], LONG_TEXT)
     world["docs"].upsert_source(
         LONG_ID, LONG_TEXT, {"pack_id": PACK, "space": "evidence", "node_id": LONG_ID}
@@ -234,7 +234,7 @@ def test_close_context_waits_for_the_bm25_worker_before_closing_stores(
     closer.start()
     try:
         # The default wait elapses, then the unbounded wait begins. The read is
-        # released only after that, so a bounded second wait would be caught.
+        # The test releases the read only after that, so a bounded second wait fails it.
         assert join_entered.wait(WAIT), "_close_context never reached the second wait"
         assert closer.is_alive()
         assert worker_alive_at_close == [], "a store was closed under a live worker"
@@ -247,14 +247,16 @@ def test_close_context_waits_for_the_bm25_worker_before_closing_stores(
 
 
 class _IdleSpyEvent(threading.Event):
-    """A wake event that reports when a thread is blocked in ``wait``."""
+    """A wake event that reports when a thread blocks in ``wait`` with the flag clear."""
 
     def __init__(self) -> None:
         super().__init__()
         self.waiting = threading.Event()
 
     def wait(self, timeout: float | None = None) -> bool:
-        self.waiting.set()
+        # A set flag makes ``wait`` return at once, so it is not an idle wait.
+        if not self.is_set():
+            self.waiting.set()
         try:
             return super().wait(timeout)
         finally:
@@ -273,10 +275,12 @@ def test_close_context_stops_an_idle_bm25_worker(world, monkeypatch):
 
     deadline = time.monotonic() + WAIT
     while time.monotonic() < deadline:
-        if ctx.hybrid._bm25.state is not None and spy.waiting.is_set():
+        if ctx.hybrid._bm25.state is not None and spy.waiting.is_set() and not spy.is_set():
             break
         time.sleep(0.01)
-    assert ctx.hybrid._bm25.state is not None and spy.waiting.is_set(), "worker never went idle"
+    assert (
+        ctx.hybrid._bm25.state is not None and spy.waiting.is_set() and not spy.is_set()
+    ), "worker never went idle"
 
     closer = threading.Thread(target=api._close_context, args=(ctx,), daemon=True)
     closer.start()
