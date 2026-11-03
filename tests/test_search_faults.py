@@ -35,7 +35,7 @@ def _run(args: list[str], tmp_path: Path, script: str) -> subprocess.CompletedPr
 
 
 def _failed_checks(report: dict) -> list[tuple[str, str, str, object]]:
-    """Failed checks per scenario step, so a CI failure names the step that missed its injection."""
+    """Return the failed checks of each scenario step, so a CI failure names the step that missed its injection."""
     return [(sc["id"], st["name"], c["name"], c["detail"])
             for sc in report.get("scenarios", []) for st in sc["steps"] for c in st["checks"] if not c["ok"]]
 

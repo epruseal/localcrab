@@ -6,8 +6,8 @@ The parent harness reads child progress with ``ro_status`` and gives the
 child a ``--max-seconds`` budget. A parent that stalls after a read leaves
 the child time to run on, which the first value models. A faster runner
 leaves a fixed budget larger relative to the work, which the second value
-models. Only the parent process is perturbed. The child processes run at
-their own speed.
+models. The wrapper changes only the parent process. The child processes
+run at their own speed.
 """
 
 from __future__ import annotations
