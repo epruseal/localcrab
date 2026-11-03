@@ -373,10 +373,9 @@ def _assemble_context(graph, vector, docs, sql, billing_sql) -> dict[str, Any]:
     builder = OntologyBuilder(graph, docs, sql, vec=vector)
     rebac = ReBACEngine(graph, sql)
     impact = ImpactEngine(graph, sql)
-    hybrid = HybridQuery(vector, graph)
+    hybrid = HybridQuery(vector, graph, doc_store=docs)
 
-    # Attach Phase 4 dependencies to HybridQuery for BM25 + policy filter
-    hybrid._doc_store = docs
+    # Attach the Phase 4 policy filter dependency to HybridQuery
     hybrid._rebac = rebac
 
     # Phase 5: billing hooks
