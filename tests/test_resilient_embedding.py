@@ -7,6 +7,8 @@ No real network calls — all EFs here are in-process mocks.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from opencrab.config import Settings
@@ -630,3 +632,44 @@ def test_first_attempt_of_a_call_ignores_budget_even_if_time_passes_before_it() 
     ef(["x"])
     assert prim.successes == 1
     assert fb.calls == 0
+
+
+def test_fallback_log_names_budget_exhaustion_only_when_budget_cut_the_call(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger_name = "opencrab.stores.resilient_embedding"
+
+    def fallback_reasons() -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == logger_name and r.getMessage().startswith("임베딩 폴백")
+        ]
+
+    # 앞 둘이 시간 초과로 실패하고 셋째(정상)가 예산에 밀린 호출.
+    ef, clk, led, prims, _ = _build(3, alive=(2,))
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        _call(ef, clk, led, gap=1.0)
+    assert [len(p.attempts) for p in prims] == [1, 1, 0]
+    reasons = fallback_reasons()
+    assert len(reasons) == 1
+    assert "예산" in reasons[0]
+    assert "모든 primary 장애" not in reasons[0]
+
+    # 모든 primary 가 실패한 호출은 종전 문구를 쓴다.
+    ef2, clk2, led2, _, _ = _build(2)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        _call(ef2, clk2, led2, gap=1.0)
+    reasons = fallback_reasons()
+    assert len(reasons) == 1
+    assert "모든 primary 장애" in reasons[0]
+    assert "예산" not in reasons[0]
+
+    # 모든 primary 가 백오프 중인 호출도 종전 문구다.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        _call(ef2, clk2, led2, gap=1.0)
+    reasons = fallback_reasons()
+    assert len(reasons) == 1
+    assert "모든 primary 장애" in reasons[0]

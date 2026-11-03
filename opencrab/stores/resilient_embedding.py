@@ -162,6 +162,7 @@ class ResilientEmbeddingFunction:
         with self._state_lock:
             start = self._resume
         attempted = False
+        budget_exhausted = False
         for k in range(count):
             i = (start + k) % count
             ef = self._primaries[i]
@@ -174,10 +175,7 @@ class ResilientEmbeddingFunction:
             ):
                 with self._state_lock:
                     self._resume = i
-                logger.info(
-                    "임베딩 시도 예산(%.0fs) 소진 → 남은 primary 는 다음 호출에서 시도",
-                    self._attempt_budget,
-                )
+                budget_exhausted = True
                 break
             attempted = True
             try:
@@ -203,7 +201,13 @@ class ResilientEmbeddingFunction:
 
         # 모든 primary 가 unhealthy 이거나 실패 → fallback 경로
         self._fallback_calls += 1
-        logger.info("임베딩 폴백: 로컬 GGUF (모든 primary 장애 또는 unhealthy)")
+        if budget_exhausted:
+            logger.info(
+                "임베딩 폴백: 로컬 GGUF (시도 예산 %.0fs 소진, 남은 primary 미시도)",
+                self._attempt_budget,
+            )
+        else:
+            logger.info("임베딩 폴백: 로컬 GGUF (모든 primary 장애 또는 unhealthy)")
         return self._fallback(input)
 
     @property
