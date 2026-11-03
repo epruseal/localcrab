@@ -221,8 +221,8 @@ root 권한 없이 쓰기 실패를 만드는 수단을 찾아봤다. loop 장�
   - 주입 확인: 신호를 보내기 직전에 자식이 살아 있었고, 회수한 종료 상태가 `-SIGKILL`이며, 종료 뒤 상태가 `backfill`이다.
 - K2 쓰기 프로세스 강제 종료: `ready` 사본에서 자식 `writer`가 새 노드 쓰기, 기존 노드 본문 수정, 노드 삭제를 섞어 반복하고 쓰기마다 `ack`를 낸다. 쓰기 도중의 중단을 보장하려고 자식은 `--pause-at <순번>`으로 정한 쓰기에서 `_node_bm25_sqlite.reindex_key`를 감싼 함수 안에 멈춘다. 그 지점은 `_exec_node_write`의 트랜잭션 안이고 `doc_nodes` 쓰기 뒤, 커밋 전이다. 자식은 멈추기 직전에 `inside` 줄을 낸다. 하네스는 `inside`를 받은 뒤 `SIGKILL`을 보낸다. 다시 연 저장소에서 `ack`한 변경이 모두 원본에 있고, 응답 없는 쓰기가 3.3절의 조건을 지키고, 색인 불변식이 성립하는지 확인한다.
   - 주입 확인: `inside` 줄이 있고, 신호를 보내기 직전에 자식이 살아 있었고, 회수한 종료 상태가 `-SIGKILL`이다.
-- K3 소진 중 강제 종료: `ready` 사본에서 대형 팩 하나의 모든 행을 직접 SQL로 pending에 넣는다. 자식 `search`가 검색을 반복해 소진하는 동안 pending이 줄기 시작하면 `SIGKILL`을 보낸다. 소진이 한 번의 검색에서 끝나 버리면 중간에 끊을 수 없으므로, 자식은 저장소의 소진 상수(묶음 크기와 시간 예산, 운영 값인 클래스 상수)를 작게 바꾸고 검색 사이에 잠시 쉰다. 이 변경은 자식 프로세스 안의 시험 장치이며 제품 코드를 바꾸지 않는다. 다시 연 저장소에서 색인 불변식을 확인하고, `backfill` CLI(상태가 `ready`이면 pending 소진만 한다)로 복구한다.
-  - 주입 확인: 신호를 보내기 직전에 자식이 살아 있었고, 회수한 종료 상태가 `-SIGKILL`이며, 종료 뒤 pending 수가 처음보다 작고 0보다 크다.
+- K3 소진 중 강제 종료: `ready` 사본에서 대형 팩 하나의 모든 행을 직접 SQL로 pending에 넣는다. 자식 `search`가 검색을 반복해 소진한다. 소진이 한 번의 검색에서 끝나 버리면 중간에 끊을 수 없으므로, 자식은 저장소의 소진 상수(묶음 크기와 시간 예산, 운영 값인 클래스 상수)를 작게 바꾸고 검색 사이에 잠시 쉰다. 자식은 `--hold-at-drain 2`로 키를 처리한 둘째 소진 호출이 끝난 직후, 호출자가 커밋하기 전에 멈추고 `held` 줄을 낸다. 첫 소진 트랜잭션은 커밋되어 pending이 줄었고 둘째는 미커밋 쓰기를 쥐고 있다. 하네스는 `held` 줄을 받은 뒤 `SIGKILL`을 보낸다. 신호 시점을 pending 폴링으로 고르지 않는 이유는 `docs/issue-597-k3-flake.md`에 있다. 이 변경은 자식 프로세스 안의 시험 장치이며 제품 코드를 바꾸지 않는다. 다시 연 저장소에서 색인 불변식을 확인하고, `backfill` CLI(상태가 `ready`이면 pending 소진만 한다)로 복구한다.
+  - 주입 확인: `held` 줄이 있고 그 줄이 처리한 키 수가 0보다 크며, 신호를 보내기 직전에 자식이 살아 있었고, 회수한 종료 상태가 `-SIGKILL`이며, 종료 뒤 pending 수가 처음보다 작고 0보다 크다.
 
 ### 4.6 재시작 수렴 (R1, R2, R3)
 
@@ -243,7 +243,7 @@ root 권한 없이 쓰기 실패를 만드는 수단을 찾아봤다. loop 장�
 `scripts/search_faults.py`는 하위 명령 셋을 둔다.
 
 - `run --corpus <코퍼스> --work <적재 디렉터리> --run-root <실행 루트> --out <보고서> [--scenarios <쉼표 목록>]`: 4절의 시나리오를 차례로 돈다. 한 번에 시나리오 하나만 돈다.
-- `actor <역할> --dir <시나리오 디렉터리> [옵션]`: 자식 역할 `backfill`, `verify`, `drop`, `open`, `writer`, `search`. `--fsize-limit`, `--fail-key`, `--batch`, `--max-seconds`, `--count`, `--hold-at-docs`를 받는다.
+- `actor <역할> --dir <시나리오 디렉터리> [옵션]`: 자식 역할 `backfill`, `verify`, `drop`, `open`, `writer`, `search`. `--fsize-limit`, `--fail-key`, `--batch`, `--max-seconds`, `--count`, `--hold-at-docs`, `--hold-at-drain`을 받는다.
 - `selftest`: 판정 함수(3.2절, 3.3절, 3.6절)에 위반과 허용을 하나씩 심은 입력을 주고 기대한 값이 나오는지 확인한다. 파일을 쓰지 않는다.
 
 입력 코퍼스와 적재 디렉터리는 `scripts/search_corpus.py generate`와 `scripts/search_baseline.py load`의 산출물을 그대로 쓴다. 재사용하는 함수는 `search_baseline`의 `check_write_paths`, `corpus_is_smoke`, `Watchdog`, `_open_stores`, `_close`, `_copy_db_files`, `expected_state`, `observed_state`, `_read_corpus`, `_iter_docs`, `judge_bundle`, `doc_rows`, `_principal`, `HashEmbedding`, `NoGraph`, `_atomic_json`이다. 질의 통과의 요청과 FTS, vector 레그 호출은 `search_baseline.cmd_run`의 `request`와 `leg_calls`와 같은 호출 계약(`resolve_packs` 결과의 `effective_pack_ids`, `_profile_for_query`의 요청 크기)으로 새로 쓴다. BM25 레그는 3.2절대로 결합 호출 안의 호출을 기록한다. `cmd_run`의 두 함수는 지연 측정과 감시 슬롯이 얽힌 내부 함수라서, 꺼내 바꾸면 측정 하네스의 동작을 바꾸게 되기 때문이다.
