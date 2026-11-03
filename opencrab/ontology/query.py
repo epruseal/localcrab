@@ -960,7 +960,7 @@ class HybridQuery:
         # server contexts (REST _build_context, MCP _assemble_context) pass it
         # here (#568). Without it, query() skips those three steps.
         self._doc_store: Any = doc_store
-        # Attached at runtime by _assemble_context() in tools.py
+        # _assemble_context() in tools.py sets this at runtime.
         self._rebac: Any = None
         # BM25 index cache — rebuilt off the query hot path by a background
         # worker thread (debounced). Queries serve the (possibly slightly

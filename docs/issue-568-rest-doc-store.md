@@ -98,7 +98,7 @@ REST `/api/query`에서 다음이 바뀐다.
 
 ### 4.1 SQLite 노드 색인 경로의 검색 중 쓰기
 
-SQLite 문서 저장소는 노드 색인이 준비돼 있으면 그 색인으로 BM25를 서비스한다(`HybridQuery._node_index_store`, 킬 스위치 `OPENCRAB_BM25_DB_INDEX=0`). 이 경로의 `LocalSQLDocStore.node_bm25_search`는 먼저 `_node_bm25_try_drain`을 부른다. 대기 중인 키가 있으면 이 함수가 저장소 내부 락을 비차단으로 얻고(`acquire(blocking=False)`) 배치마다 `BEGIN IMMEDIATE`로 색인을 갱신해 커밋한다. `busy_timeout`은 짧게 줄인다. 시간 예산(`_NODE_BM25_DRAIN_SECONDS`)은 배치를 시작하기 전에만 확인한다. `drain` 안에서는 확인하지 않으므로 느린 배치 하나는 예산을 넘겨 쓰기 잠금을 더 오래 잡을 수 있다. 예산은 배치 사이의 상한이고 전체 실행 시간의 엄격한 상한이 아니다. 락이나 DB가 바쁘거나 읽기 전용이면 예외를 삼키고 건너뛴다(디버그 로그). 건너뛰면 색인에 대기 키가 남고 BM25 레그가 `BM25 coverage pending changes` 경고를 낼 수 있다(`docs/issue-541-db-bm25.md`). 이 동작은 MCP 질의가 이미 하는 것이다. REST 연결이 이 경로를 REST 프로세스에서도 열므로 SQLite 쓰기 잠금이 REST 질의 중에 잠깐 잡힐 수 있다. 프로세스 사이 충돌은 SQLite의 잠금과 `busy_timeout`이 처리하고, 진 쪽은 건너뛴다. 시험은 대기 키가 있는 색인에서 REST 질의가 성공하는지 확인한다(5절).
+SQLite 문서 저장소는 노드 색인이 준비돼 있으면 그 색인으로 BM25를 서비스한다(`HybridQuery._node_index_store`, 킬 스위치 `OPENCRAB_BM25_DB_INDEX=0`). 이 경로의 `LocalSQLDocStore.node_bm25_search`는 먼저 `_node_bm25_try_drain`을 부른다. 대기 중인 키가 있으면 이 함수가 저장소 내부 락을 비차단으로 얻고(`acquire(blocking=False)`) 배치마다 `BEGIN IMMEDIATE`로 색인을 갱신해 커밋한다. `busy_timeout`은 짧게 줄인다. 시간 예산(`_NODE_BM25_DRAIN_SECONDS`)은 배치를 시작하기 전에만 확인한다. `drain` 안에서는 확인하지 않으므로 느린 배치 하나는 예산을 넘겨 쓰기 잠금을 더 오래 잡을 수 있다. 예산은 배치 사이의 상한이고 전체 실행 시간의 엄격한 상한이 아니다. 락이나 DB가 바쁘거나 읽기 전용이면 예외를 삼키고 건너뛴다(디버그 로그). 건너뛰면 색인에 대기 키가 남고 BM25 레그가 `BM25 coverage pending changes` 경고를 낼 수 있다(`docs/issue-541-db-bm25.md`). 이 동작은 MCP 질의가 이미 하는 것이다. REST 연결이 이 경로를 REST 프로세스에서도 열므로 SQLite 쓰기 잠금이 REST 질의 중에 잠깐 잡힐 수 있다. 프로세스 사이 충돌은 SQLite의 잠금과 `busy_timeout`이 처리하고, 진 쪽은 건너뛴다. 대기 키가 있는 색인의 검색은 5절이 가리키는 기존 저장소 수준 시험이 덮는다. 이 PR은 REST 경로에서 대기 키를 만들어 시험하지 않는다.
 
 ### 4.2 메모리 영향
 

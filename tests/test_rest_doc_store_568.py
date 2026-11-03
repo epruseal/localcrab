@@ -233,8 +233,8 @@ def test_close_context_waits_for_the_bm25_worker_before_closing_stores(
     closer = threading.Thread(target=api._close_context, args=(ctx,))
     closer.start()
     try:
-        # The default wait elapses, then the unbounded wait begins. The read is
-        # The test releases the read only after that, so a bounded second wait fails it.
+        # The default wait elapses, then the unbounded wait begins. The test
+        # releases the read only after that, so a bounded second wait fails it.
         assert join_entered.wait(WAIT), "_close_context never reached the second wait"
         assert closer.is_alive()
         assert worker_alive_at_close == [], "a store was closed under a live worker"
