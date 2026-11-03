@@ -494,16 +494,18 @@ _UNAVAILABLE_LOG_LOCK = threading.Lock()
 
 
 def _log_auth_unavailable(reason: str) -> None:
-    """One WARNING per reason per interval. Only the fixed reason code is
-    logged: exception text carries SQL and parameters. ``require_auth`` runs in
-    the thread pool, so the table needs the lock."""
-    now = time.monotonic()
+    """Log one WARNING per reason per interval. Log only the fixed reason code:
+    exception text carries SQL and parameters. ``require_auth`` runs in the
+    thread pool. Read the clock, compare, update the table and log inside one
+    lock, so the table order is the log order. A log handler never takes this
+    lock."""
     with _UNAVAILABLE_LOG_LOCK:
+        now = time.monotonic()
         last = _UNAVAILABLE_LOGGED.get(reason)
         if last is not None and now - last < _UNAVAILABLE_LOG_INTERVAL:
             return
         _UNAVAILABLE_LOGGED[reason] = now
-    logger.warning("REST token check unavailable (%s); answering 503", reason)
+        logger.warning("REST token check unavailable (%s); answering 503", reason)
 
 
 def require_auth(
@@ -531,9 +533,9 @@ def require_auth(
         principal = verify_token(ctx.sql, presented) if presented else None
     except Exception as exc:
         # #601: a store that cannot answer right now says nothing about the
-        # token, so it is a 503 and not a 500. Other errors keep leaving this
-        # dependency unchanged. `ctx.sql.available` is not consulted: the store
-        # is built once at startup and the flag is not refreshed afterwards.
+        # token. Answer 503, not 500. Let every other error leave this
+        # dependency as before. Do not read `ctx.sql.available`: the store is
+        # built once at startup and nothing refreshes the flag.
         reason = token_store_unavailable_reason(exc)
         if reason is None:
             raise

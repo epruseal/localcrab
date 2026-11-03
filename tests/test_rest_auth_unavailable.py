@@ -290,3 +290,33 @@ def test_log_limit_is_per_reason_and_expires(env, monkeypatch, caplog):
         _manifest(env, env.headers)  # interval over: logged again
     assert len(lines()) == 3
     assert "store-unavailable" in lines()[-1]
+
+
+def test_log_limit_reads_the_clock_and_logs_inside_its_lock(env, monkeypatch):
+    """The table order must be the log order, so the clock read, the compare,
+    the update and the log call share one lock."""
+    from types import SimpleNamespace
+
+    held_at_clock: list[bool] = []
+    held_at_log: list[bool] = []
+
+    def clock() -> float:
+        held_at_clock.append(api._UNAVAILABLE_LOG_LOCK.locked())
+        return 1000.0
+
+    class _Probe(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            held_at_log.append(api._UNAVAILABLE_LOG_LOCK.locked())
+
+    probe = _Probe(level=logging.WARNING)
+    logger = logging.getLogger("opencrab.api")
+    monkeypatch.setattr(api, "time", SimpleNamespace(monotonic=clock))
+    monkeypatch.setattr(auth_mod, "verify_token", _raiser(_busy_error()))
+    logger.addHandler(probe)
+    try:
+        _assert_unavailable(_manifest(env, env.headers))
+    finally:
+        logger.removeHandler(probe)
+
+    assert held_at_clock == [True]
+    assert held_at_log == [True]
