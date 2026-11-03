@@ -799,15 +799,15 @@ def write_lock(
 
 
 class StoreBootstrapLockTimeoutError(TimeoutError):
-    """A store constructor timed out while it waited for its bootstrap lock (#578).
+    """A SQLite store timed out while it waited for its bootstrap lock (#578).
 
     This class is a subclass of ``TimeoutError``, so existing handlers of
     ``TimeoutError`` still catch it. The message is the ``write_lock`` message.
     It names the lock file and, when the record is readable, the holder.
 
-    A store constructor uses this class to tell a busy lock from other
-    failures. A busy lock must propagate. If the constructor hides it, the
-    MCP context keeps an unavailable store and nothing retries it.
+    A store uses this class to tell a busy lock from other failures. A busy
+    lock must propagate. If the store hides it, the MCP context keeps an
+    unavailable store and nothing retries it.
     """
 
 

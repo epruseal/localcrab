@@ -96,15 +96,20 @@ make_sql_store(settings)
 (`TimeoutError`의 하위 클래스, `opencrab/locking.py`)를 올린다. 스토어를
 `available=False`로 남기지 않는다. 불가용 스토어로 이뤄진 MCP 컨텍스트가 게시되면
 이후 모든 호출이 그 컨텍스트를 재사용한다. 그러면 검색 레그가 경고 없이 빠진 채
-프로세스를 재시작할 때까지 남는다.
+프로세스를 재시작할 때까지 남는다. ChromaStore는 `chroma.lock` 시간 초과를
+`ChromaLockTimeoutError`로 이미 전파한다. 방침은 같고 잠금 파일은 다르다.
 
 컨텍스트 빌드(`opencrab/mcp/tools/__init__.py`의 `_build_context`)는 예외가 나면
 아무것도 게시하지 않고, 다음 호출이 처음부터 다시 만든다. 시작 가드(`serve`의
 stdio 분기, `opencrab.mcp.server.main`, HTTP lifespan)는 이 예외로 기동을
-중단한다. `_optional_store`(`status`, `packs repair-registry`, `packs repair-anchors`)는
-예외를 잡아 `None`을 돌려주므로 해당 명령은 계속 진행한다. 이 방침은 ChromaStore가
-`chroma.lock` 시간 초과를 `ChromaLockTimeoutError`로 전파하는 방침과 같다.
-두 잠금 파일은 다르다.
+중단한다.
+
+`status`, `packs repair-registry`, `packs repair-anchors`는 SQL 스토어를 먼저 만든다.
+그 생성자가 같은 데이터 디렉터리의 `write.lock` 때문에 이 예외를 올리면 세 명령은
+종료 코드 1로 끝난다. 세 명령은 그래프, 벡터, 문서 스토어를 `_optional_store`로
+만든다. `_optional_store`는 그 생성에서 난
+이 예외를 잡아 `None`을 돌려주므로, SQL 스토어가 열린 뒤에는 명령이 계속된다
+(예: 벡터 DB 파일이 하위 디렉터리에 있고 그 디렉터리의 잠금만 점유된 경우).
 
 잠금과 무관한 초기화 실패(손상된 파일, 확장 로드 실패 등)는 종전대로
 `available=False`로 남는다. 재현 명령:
