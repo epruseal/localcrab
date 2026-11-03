@@ -40,6 +40,8 @@ stdio 전송(`opencrab serve`)에는 해당하지 않는다. 자격증명이 아
 
 같은 503이 인증 대기 시한(`_AUTH_DEADLINE_SECONDS`)을 넘긴 요청과 인증 대기열이 가득 찬 때(`_AUTH_QUEUE_LIMIT`)에도 나간다. 자격 증명이 없거나 비 Bearer 헤더이거나 공백뿐인 토큰은 조회가 필요 없으므로 대기열 상태와 무관하게 401이다. 설계와 오류 분류는 [issue-580-auth-unavailable.md](./issue-580-auth-unavailable.md)가 정한다.
 
+REST API(`/api/*`)의 토큰 조회도 같은 분류로 같은 상황에서 같은 503을 낸다. 설계는 [issue-601-rest-auth-unavailable.md](./issue-601-rest-auth-unavailable.md)가 정한다.
+
 ## 로그에 이미 남았을 수 있는 토큰
 
 #427 수정 이전에 쿼리 토큰 허용으로 기동한 서버는 액세스 로그에 토큰 원문을 남겼을 수 있다. 그 토큰의 폐기 여부는 운영자가 판단한다. 로그의 보존 기간과 열람 가능한 범위가 판단 근거다.

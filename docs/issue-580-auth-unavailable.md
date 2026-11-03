@@ -29,6 +29,8 @@ MCP HTTP 인증(`opencrab/mcp/http_app.py`)에서 토큰 조회가 저장소 오
 
 ## 오류 분류(`_lookup`)
 
+분류 함수는 #601에서 `opencrab/auth.py`의 `token_store_unavailable_reason`으로 옮겼고 REST 인증과 공유한다. 아래 조건은 그대로다.
+
 503으로 올리는 경우:
 
 - SQLite 잠금: `sqlalchemy.exc.OperationalError`이고 `orig`가 `sqlite3.OperationalError`이며 `orig.sqlite_errorcode & 0xFF`가 5(`SQLITE_BUSY`) 또는 6(`SQLITE_LOCKED`)이다. 프로젝트가 요구하는 Python 3.11 이상에서 이 속성이 있다.
