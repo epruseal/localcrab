@@ -21,6 +21,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from itertools import chain, zip_longest
 from typing import Any
 
 from opencrab.common.pack_tags import canonicalize_pack_alias
@@ -322,6 +323,10 @@ def _ordered_unique(values: list[str | None], limit: int) -> list[str]:
 # 본문 접기".
 _FOLD_BODIES = "_fold_bodies"
 _FOLDED_MEMBERS = "_folded_members"
+# #571: This constant sets how many hits of each lexical leg (BM25, FTS) the
+# query passes to _reserve_leg_tops as candidates. The contract is in
+# docs/ARCHITECTURE.md, "결합 결과의 레그 상위".
+_LEXICAL_TOP_DEPTH = 2
 _FOLD_METADATA_KEY = "folded_duplicates"
 _PRIVATE_PROVENANCE = "_query_provenance"
 _PRIVATE_PROVENANCE_INVALIDATED = "_query_provenance_invalidated"
@@ -440,17 +445,20 @@ def _reserve_leg_tops(
     warn_ids: list[str],
     window: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Keep the lexical leg top hits inside the returned window (#556).
+    """Keep the lexical leg top hits inside the returned window (#556, #571).
 
     ``items`` is the folded result list in final score order. ``place_ids``
-    are the BM25 and FTS top hits to keep inside the first ``window`` items.
-    This function keeps at most ``window // 2`` groups. ``warn_ids`` are the
-    vector and graph top hits. This function does not move them. The second
+    are the BM25 and FTS candidate hits in priority order. This function
+    walks ``place_ids`` in order and protects the group of each candidate
+    that is in ``items``, until it protects ``window // 2`` groups. It fills
+    the other places of the first ``window`` items in score order, so an
+    unprotected candidate can also be inside. ``warn_ids`` are the vector and
+    graph top hits. This function does not move them. The second
     return value counts the ids of both lists that are in ``items`` but
     outside the new window. The count skips an id that is not in ``items``
     (for example, an id that the policy filter removed). This function
     changes only the order and keeps the same result objects.
-    Contract: docs/ARCHITECTURE.md, "결합 결과의 레그 1위".
+    Contract: docs/ARCHITECTURE.md, "결합 결과의 레그 상위".
     """
     position: dict[str, int] = {}
     for index, item in enumerate(items):
@@ -1127,9 +1135,10 @@ class HybridQuery:
         that only care about results are unaffected. Results with the same
         pack and the same stored bodies can be folded into one. The rules
         and the exceptions are in docs/ARCHITECTURE.md, "질의 결과의 동일
-        본문 접기". The BM25 and FTS top hits are kept in the returned
-        results, and a leg top hit outside them adds a ``fusion:`` warning
-        (docs/ARCHITECTURE.md, "결합 결과의 레그 1위").
+        본문 접기". A later step can reorder the results to keep some BM25
+        and FTS hits in the returned results. That step can also add a
+        ``fusion:`` warning. The rules are in docs/ARCHITECTURE.md, "결합
+        결과의 레그 상위".
         """
         result_lists: list[list[dict[str, Any]]] = []
         include_unpackaged = False
@@ -1320,15 +1329,20 @@ class HybridQuery:
         # Contract: docs/ARCHITECTURE.md, "질의 결과의 동일 본문 접기".
         merged = _fold_identical_bodies(merged)
 
-        # --- Stage 7: Keep leg top hits in the returned window (#556) ---
-        # Contract: docs/ARCHITECTURE.md, "결합 결과의 레그 1위".
+        # --- Stage 7: Keep leg top hits in the returned window (#556, #571) ---
+        # Contract: docs/ARCHITECTURE.md, "결합 결과의 레그 상위".
         if limit >= 1:
             window = limit if rerank_cap is None else min(limit, rerank_cap)
             place_ids: list[str] = []
             warn_ids: list[str] = []
+            # BM25 1st, FTS 1st, BM25 2nd, FTS 2nd: the window cap keeps the
+            # first hits before any second hit.
+            lexical = chain.from_iterable(zip_longest(
+                [h.get("node_id") for h in bm25_hits[:_LEXICAL_TOP_DEPTH]],
+                [h.get("node_id") for h in fts_hits[:_LEXICAL_TOP_DEPTH]],
+            ))
             for hits, target in (
-                ([h.get("node_id") for h in bm25_hits[:1]], place_ids),
-                ([h.get("node_id") for h in fts_hits[:1]], place_ids),
+                (list(lexical), place_ids),
                 ([h.node_id for h in vector_hits[:1]], warn_ids),
                 ([h.node_id for h in graph_results[:1]], warn_ids),
             ):
