@@ -21,6 +21,12 @@ ResilientEmbeddingFunction — 다중 원격(LM Studio 등) ↔ 로컬 GGUF 자�
     해당 primary 만 unhealthy 마킹, 다음 primary 로 계속.
   - 모든 primary 가 unhealthy 이거나 전부 실패 → fallback 호출.
   - health_ttl(기본 15s) 동안 해당 primary 장애 캐시 → 불필요한 재시도 방지.
+    연속 실패하면 건너뜀 간격을 두 배씩 늘려 max_backoff(기본 120s)까지 키운다
+    (15, 30, 60, 120, 120...). 성공하면 연속 실패 횟수가 0으로 돌아간다.
+  - attempt_budget 이 있으면 한 호출에서 첫 시도 이후 경과 시간이 예산 이상일 때
+    남은 primary 를 시도하지 않고 폴백으로 간다(호출당 실패 시도 시간 상한).
+    예산에 걸려 시도하지 못한 첫 primary 는 다음 호출의 첫 후보가 된다(굶김 방지).
+    설계: docs/issue-581-embed-backoff.md
   - 이름(name())은 첫 primary 와 동일 반환 → 컬렉션 재사용 보장(모든
     엔드포인트가 동일 모델 KURE-v1 이라는 전제, name()="kure_v1").
 
@@ -37,7 +43,9 @@ ResilientEmbeddingFunction — 다중 원격(LM Studio 등) ↔ 로컬 GGUF 자�
 
 import logging
 import os
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from opencrab.stores._embedding_utils import l2_normalize
@@ -83,9 +91,20 @@ class ResilientEmbeddingFunction:
     fallback : Any
         모든 primary 장애 시 사용하는 EF. LlamaCppEmbeddingFunction 권장.
     health_ttl : float
-        각 primary 장애 후 재시도 금지 시간(초). 기본 15s. primary 별로
+        각 primary 첫 장애 후 재시도 금지 시간(초). 기본 15s. primary 별로
         독립적으로 추적된다(죽은 1번이 매 호출마다 2번 시도까지 지연시키지
-        않음). 낮추면 빠른 복귀, 높이면 타임아웃 낭비 감소.
+        않음). 낮추면 빠른 복귀, 높이면 타임아웃 낭비 감소. 연속 실패하면
+        두 배씩 늘어난다.
+    max_backoff : float
+        건너뜀 간격의 상한(초). 기본 120s. 실제 상한은 max(max_backoff,
+        health_ttl). health_ttl 과 같게 두면 백오프가 꺼진다.
+    attempt_budget : float | None
+        한 호출에서 첫 시도 이후 경과 시간이 이 값(초) 이상이면 남은 primary
+        를 시도하지 않고 폴백으로 간다. None 이면 상한 없음. 양수여야 한다.
+        호출당 실패 시도 시간은 attempt_budget + (마지막 시도 하나의 소요
+        시간) 미만이다.
+    clock : Callable[[], float]
+        시계. 기본 time.monotonic. 시험이 가상 시계를 넣는다.
     """
 
     def __init__(
@@ -93,15 +112,31 @@ class ResilientEmbeddingFunction:
         primary: Any | list[Any],
         fallback: Any,
         health_ttl: float = 15.0,
+        max_backoff: float = 120.0,
+        attempt_budget: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._primaries: list[Any] = list(primary) if isinstance(primary, list) else [primary]
         if not self._primaries:
             raise ValueError("primary 리스트가 비어있습니다 — 최소 1개 필요")
+        if attempt_budget is not None and attempt_budget <= 0:
+            raise ValueError("attempt_budget 은 양수여야 합니다")
         self._fallback = fallback
         self._health_ttl = health_ttl
+        self._max_backoff = max_backoff
+        self._attempt_budget = attempt_budget
+        self._clock = clock
         # primary 별 독립 unhealthy TTL. 인덱스로 추적(동일 EF 인스턴스
         # 중복 등록 엣지케이스에도 안전).
         self._unhealthy_until: list[float] = [0.0] * len(self._primaries)
+        # primary 별 연속 실패 횟수(성공하면 0). 건너뜀 간격 계산에 쓴다.
+        self._failures: list[int] = [0] * len(self._primaries)
+        # 다음 호출이 스캔을 시작할 위치. 예산에 걸려 시도하지 못한 첫 primary
+        # 의 위치를 기록해 뒤쪽 primary 가 굶지 않게 한다. 평소 0.
+        self._resume = 0
+        # _unhealthy_until/_failures/_resume 의 읽기·쓰기를 보호한다(#577 이후
+        # 도구가 여러 스레드에서 같은 인스턴스를 쓴다). 쥔 채 원격 호출은 하지 않는다.
+        self._state_lock = threading.Lock()
         # 폴백 사용 횟수. 폴백은 설계상 정상 동작이지만 CPU 라 10배 이상 느리다.
         # 2026-08-04 적재에서 primary 가 통째로 오배선돼 전량이 이 경로로 갔는데,
         # WARNING 154줄 외에 집계가 없어 43분이 지나서야 발견됐다. 호출부가
@@ -114,17 +149,39 @@ class ResilientEmbeddingFunction:
     # ------------------------------------------------------------------
 
     def _embed_chain(self, input: list[str]) -> list[list[float]]:
-        """healthy 한 primary 를 순서대로 시도 → 전부 실패/unhealthy 시 fallback."""
+        """시도 대상 primary 를 순서대로 시도 → 전부 실패/건너뜀/예산 소진 시 fallback.
+
+        시도 대상: 한 번도 실패하지 않았거나 건너뜀 기한이 지난 primary.
+        스캔은 _resume 위치부터 시작해 한 바퀴 돈다. 호출의 첫 시도는 예산
+        검사를 받지 않는다."""
         if not input:
             return []
 
-        for i, ef in enumerate(self._primaries):
+        count = len(self._primaries)
+        t0 = self._clock()
+        with self._state_lock:
+            start = self._resume
+        attempted = False
+        for k in range(count):
+            i = (start + k) % count
+            ef = self._primaries[i]
             if not self._is_healthy(i):
                 continue
+            if (
+                attempted
+                and self._attempt_budget is not None
+                and self._clock() - t0 >= self._attempt_budget
+            ):
+                with self._state_lock:
+                    self._resume = i
+                logger.info(
+                    "임베딩 시도 예산(%.0fs) 소진 → 남은 primary 는 다음 호출에서 시도",
+                    self._attempt_budget,
+                )
+                break
+            attempted = True
             try:
                 out = ef(input)
-                self._primary_calls += 1
-                return out
             except Exception as exc:
                 logger.warning(
                     "임베딩 primary 실패 (%s): %s → 다음 엔드포인트 시도",
@@ -132,6 +189,17 @@ class ResilientEmbeddingFunction:
                     exc,
                 )
                 self._mark_unhealthy(i)
+                continue
+            self._primary_calls += 1
+            with self._state_lock:
+                self._failures[i] = 0
+                self._unhealthy_until[i] = 0.0
+                self._resume = 0
+            return out
+        else:
+            # 예산에 걸리지 않고 한 바퀴를 다 돌았다.
+            with self._state_lock:
+                self._resume = 0
 
         # 모든 primary 가 unhealthy 이거나 실패 → fallback 경로
         self._fallback_calls += 1
@@ -191,14 +259,25 @@ class ResilientEmbeddingFunction:
     # ------------------------------------------------------------------
 
     def _is_healthy(self, index: int) -> bool:
-        return time.monotonic() >= self._unhealthy_until[index]
+        """건너뜀 기한이 지났으면(또는 실패한 적이 없으면) True."""
+        with self._state_lock:
+            return self._clock() >= self._unhealthy_until[index]
 
     def _mark_unhealthy(self, index: int) -> None:
-        self._unhealthy_until[index] = time.monotonic() + self._health_ttl
+        """연속 실패 횟수를 올리고 건너뜀 기한을 정한다. 간격은 health_ttl 에서
+        시작해 실패마다 두 배가 되며 max(max_backoff, health_ttl) 에서 멈춘다.
+        지수는 20 에서 자른다(큰 횟수에서 부동소수 넘침 방지)."""
+        with self._state_lock:
+            self._failures[index] += 1
+            failures = self._failures[index]
+            cap = max(self._max_backoff, self._health_ttl)
+            interval = min(self._health_ttl * 2 ** min(failures - 1, 20), cap)
+            self._unhealthy_until[index] = self._clock() + interval
         logger.info(
-            "primary(%s) 를 %.0fs 동안 건너뜀 (health_ttl)",
+            "primary(%s) 를 %.0fs 동안 건너뜀 (연속 실패 %d회)",
             _label(self._primaries[index], index),
-            self._health_ttl,
+            interval,
+            failures,
         )
 
     def force_check(self) -> bool:
@@ -207,7 +286,9 @@ class ResilientEmbeddingFunction:
         any_healthy = False
         for i, ef in enumerate(self._primaries):
             if hasattr(ef, "ping") and ef.ping():
-                self._unhealthy_until[i] = 0.0
+                with self._state_lock:
+                    self._unhealthy_until[i] = 0.0
+                    self._failures[i] = 0
                 any_healthy = True
                 logger.info("primary(%s) 헬스체크 성공 → 폴백 해제", _label(ef, i))
         return any_healthy

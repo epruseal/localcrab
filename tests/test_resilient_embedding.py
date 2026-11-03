@@ -307,3 +307,326 @@ def test_factory_single_base_wires_one_ef() -> None:
     )
     ef = _make_kure_embedding_function(settings)
     assert len(ef._primaries) == 1
+
+
+# ----------------------------------------------------------------------
+# #581: 연속 실패 백오프, 호출당 실패 시도 시간 예산, 예산에 밀린 primary 회전.
+# 가상 시계만 쓴다 — 실제 대기와 네트워크가 없다. 설계: docs/issue-581-embed-backoff.md
+# ----------------------------------------------------------------------
+
+
+class _VClock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+class _Ledger:
+    """호출 하나 동안 실패한 원격 시도가 쓴 가상 시간의 합."""
+
+    def __init__(self) -> None:
+        self.failed = 0.0
+
+
+class _TimedEF:
+    """호출하면 alive 이면 즉시 성공하고, 아니면 가상 시간을 cost 만큼 쓰고 TimeoutError."""
+
+    def __init__(
+        self, clock: _VClock, ledger: _Ledger, label: str, *, cost: float = 8.0, alive: bool = False
+    ) -> None:
+        self.clock = clock
+        self.ledger = ledger
+        self.api_base = f"http://{label}/v1"
+        self.cost = cost
+        self.alive = alive
+        self.attempts: list[float] = []  # 시도 시작 시각
+        self.fail_ends: list[float] = []  # 실패 종료 시각
+        self.successes = 0
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        self.attempts.append(self.clock())
+        if self.alive:
+            self.successes += 1
+            return [[1.0, 0.0] for _ in input]
+        self.clock.advance(self.cost)
+        self.ledger.failed += self.cost
+        self.fail_ends.append(self.clock())
+        raise TimeoutError("timeout")
+
+    def name(self) -> str:
+        return "kure_v1"
+
+    def ping(self) -> bool:
+        return self.alive
+
+
+class _TimedFallback:
+    def __init__(self, clock: _VClock, cost: float = 0.7) -> None:
+        self.clock = clock
+        self.cost = cost
+        self.calls = 0
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        self.calls += 1
+        self.clock.advance(self.cost)
+        return [[0.0, 1.0] for _ in input]
+
+    def name(self) -> str:
+        return "kure_v1_gguf"
+
+
+def _build(
+    n: int,
+    *,
+    cost: float = 8.0,
+    alive: tuple[int, ...] = (),
+    budget: float | None = 16.0,
+    fb_cost: float = 0.7,
+    **kw: float,
+) -> tuple[ResilientEmbeddingFunction, _VClock, _Ledger, list[_TimedEF], _TimedFallback]:
+    clk, led = _VClock(), _Ledger()
+    prims = [_TimedEF(clk, led, f"p{i}", cost=cost, alive=i in alive) for i in range(n)]
+    fb = _TimedFallback(clk, fb_cost)
+    ef = ResilientEmbeddingFunction(
+        primary=list(prims), fallback=fb, attempt_budget=budget, clock=clk, **kw
+    )
+    return ef, clk, led, prims, fb
+
+
+def _call(ef: ResilientEmbeddingFunction, clk: _VClock, led: _Ledger, gap: float) -> float:
+    """호출 하나를 하고 그 호출의 원격 실패 시간을 돌려준다. 이어서 gap 만큼 기다린다."""
+    led.failed = 0.0
+    ef(["x"])
+    failed = led.failed
+    clk.advance(gap)
+    return failed
+
+
+def _drive_until(
+    ef: ResilientEmbeddingFunction,
+    clk: _VClock,
+    led: _Ledger,
+    cond,
+    *,
+    gap: float = 1.0,
+    limit: int = 5000,
+) -> int:
+    for n in range(limit):
+        if cond():
+            return n
+        _call(ef, clk, led, gap=gap)
+    raise AssertionError("조건에 도달하지 못했다")
+
+
+def test_dead_primaries_call_cost_bounded_and_retry_backs_off() -> None:
+    ef, clk, led, prims, _ = _build(2)
+    t_start = clk()
+    costs: list[float] = []
+    while clk() < t_start + 600:
+        costs.append(_call(ef, clk, led, gap=1.0))
+
+    # 호출당 실패 시도 시간: 예산 + 시도 하나(T) 미만.
+    assert max(costs) < 16.0 + 8.0
+    # 같은 primary 의 연속 시도 간격이 k번째에 min(15*2**(k-1), 120) 이상이다.
+    for p in prims:
+        starts = p.attempts
+        assert len(starts) >= 3
+        for k, (a, b) in enumerate(zip(starts, starts[1:], strict=False), start=1):
+            assert b - a >= min(15.0 * 2 ** (k - 1), 120.0)
+    # 대조군: 백오프를 끈 인스턴스(max_backoff == health_ttl)보다 시도가 적다.
+    ef0, clk0, led0, prims0, _ = _build(2, max_backoff=15.0)
+    t0 = clk0()
+    while clk0() < t0 + 600:
+        _call(ef0, clk0, led0, gap=1.0)
+    assert len(prims[0].attempts) < len(prims0[0].attempts)
+
+
+def test_three_dead_primaries_call_cost_bounded_by_budget() -> None:
+    ef, clk, led, prims, _ = _build(3)
+    t_start = clk()
+    costs: list[float] = []
+    while clk() < t_start + 600:
+        costs.append(_call(ef, clk, led, gap=1.0))
+    assert max(costs) < 16.0 + 8.0
+    assert all(p.attempts for p in prims)  # 예산에 밀린 셋째도 시도된다
+
+    # 대조군: 예산이 없으면 첫 호출이 세 시간 초과를 전부 치른다(base 동작).
+    ef0, clk0, led0, _, _ = _build(3, budget=None)
+    assert _call(ef0, clk0, led0, gap=1.0) == 24.0
+
+
+@pytest.mark.parametrize(
+    ("cost", "gap", "fb_cost"),
+    [(8.0, 121.0, 0.7), (8.0, 1.0, 121.0), (17.0, 121.0, 0.7)],
+    ids=["sparse-calls", "slow-fallback", "attempt-longer-than-budget"],
+)
+def test_alive_third_primary_is_not_starved_by_dead_ones(
+    cost: float, gap: float, fb_cost: float
+) -> None:
+    ef, clk, led, prims, _ = _build(3, cost=cost, fb_cost=fb_cost, alive=(2,))
+    served: list[int] = []
+    total = 40
+    for idx in range(total):
+        before = prims[2].successes
+        _call(ef, clk, led, gap=gap)
+        if prims[2].successes > before:
+            served.append(idx)
+    n = 3
+    assert served, "셋째 primary 가 한 번도 처리하지 못했다"
+    assert served[0] < n
+    assert all(b - a <= n for a, b in zip(served, served[1:], strict=False))
+    assert total - 1 - served[-1] < n
+
+
+def test_recovered_primary_is_reused_after_backoff_expires() -> None:
+    ef, clk, led, prims, _ = _build(1)
+    p = prims[0]
+    _drive_until(ef, clk, led, lambda: len(p.fail_ends) >= 8)
+    p.alive = True  # 복구
+    expiry = p.fail_ends[-1] + 120.0  # 마지막 실패 종료 + max_backoff
+    _drive_until(ef, clk, led, lambda: p.successes >= 1)
+    first_success = p.attempts[-1]
+    assert first_success >= p.fail_ends[-1] + 15.0  # 만료 전에는 쓰이지 않는다
+    assert first_success <= expiry + 2.0  # 만료 뒤 첫 호출(호출 주기 안)
+
+
+def test_recovered_last_of_many_instantly_failing_primaries_is_reused() -> None:
+    ef, clk, led, prims, _ = _build(200, cost=0.0)
+    _call(ef, clk, led, gap=1.0)  # 200개가 모두 즉시 실패한다
+    assert all(p.attempts for p in prims)
+    last = prims[-1]
+    last.alive = True
+    _drive_until(ef, clk, led, lambda: last.successes >= 1)
+    # 즉시 실패는 예산을 쓰지 않는다: 만료(첫 실패 15초) 뒤 첫 호출에서 쓰인다.
+    assert last.attempts[-1] - last.attempts[0] <= 15.0 + 2.0
+
+
+def test_success_resets_failure_count_so_next_backoff_starts_at_health_ttl() -> None:
+    ef, clk, led, prims, _ = _build(1)
+    p = prims[0]
+    _drive_until(ef, clk, led, lambda: len(p.fail_ends) >= 8)
+    p.alive = True
+    _drive_until(ef, clk, led, lambda: p.successes >= 1)
+    p.alive = False
+    _call(ef, clk, led, gap=1.0)  # 복구 뒤 첫 실패
+    fail_end = p.fail_ends[-1]
+    n_before = len(p.attempts)
+    _drive_until(ef, clk, led, lambda: len(p.attempts) > n_before)
+    assert 15.0 <= p.attempts[-1] - fail_end < 30.0  # 15초 간격(30초 이상으로 이어지지 않는다)
+
+
+def test_recovered_after_many_slow_dead_primaries_is_reused_within_n_calls() -> None:
+    n = 20
+    ef, clk, led, prims, _ = _build(n)
+    last = prims[-1]
+    _drive_until(ef, clk, led, lambda: len(last.fail_ends) >= 4)
+    last.alive = True
+    expiry = last.fail_ends[-1] + 120.0
+    ordinal = 0
+    for _ in range(5000):
+        if clk() >= expiry:
+            ordinal += 1
+        before = last.successes
+        _call(ef, clk, led, gap=1.0)
+        if last.successes > before:
+            break
+    else:
+        raise AssertionError("복구한 primary 가 다시 쓰이지 않았다")
+    assert ordinal <= n
+
+
+def test_budget_skip_makes_unattempted_primary_first_in_next_call() -> None:
+    ef, clk, led, prims, _ = _build(3)
+    _call(ef, clk, led, gap=121.0)  # p0, p1 이 시간 초과, 셋째는 예산에 밀린다
+    assert [len(p.attempts) for p in prims] == [1, 1, 0]
+    _call(ef, clk, led, gap=121.0)  # 백오프가 모두 만료됐어도 셋째가 맨 앞이다
+    assert len(prims[2].attempts) == 1
+    assert prims[2].attempts[0] < prims[0].attempts[1]
+
+
+def test_one_dead_primary_never_causes_fallback_when_another_is_alive() -> None:
+    ef, clk, led, prims, fb = _build(2, alive=(1,))
+    t_start = clk()
+    while clk() < t_start + 600:
+        _call(ef, clk, led, gap=1.0)
+    assert fb.calls == 0
+    assert ef.fallback_calls == 0
+    assert prims[1].successes == ef.primary_calls
+
+
+def test_instant_failures_do_not_consume_budget() -> None:
+    ef, clk, led, prims, fb = _build(5, cost=0.0, budget=1.0)
+    _call(ef, clk, led, gap=1.0)
+    assert [len(p.attempts) for p in prims] == [1] * 5
+    assert fb.calls == 1
+
+
+def test_force_check_resets_consecutive_failures() -> None:
+    ef, clk, led, prims, _ = _build(1)
+    p = prims[0]
+    _drive_until(ef, clk, led, lambda: len(p.fail_ends) >= 6)
+    p.alive = True  # ping 이 성공하지만 아직 호출은 실패하는 경계: 복구 직후
+    assert ef.force_check() is True
+    p.alive = False
+    _drive_until(ef, clk, led, lambda: len(p.fail_ends) >= 7)
+    # force_check 직후 첫 실패의 건너뜀은 health_ttl(15초)이다.
+    assert ef._unhealthy_until[0] - p.fail_ends[-1] == 15.0
+
+
+def test_without_budget_every_eligible_primary_is_attempted() -> None:
+    ef, clk, led, prims, _ = _build(4, budget=None)
+    assert _call(ef, clk, led, gap=1.0) == 32.0
+    assert [len(p.attempts) for p in prims] == [1] * 4
+
+
+def test_attempt_budget_must_be_positive() -> None:
+    fb = _MockFallback()
+    for bad in (0, -1.0):
+        with pytest.raises(ValueError):
+            ResilientEmbeddingFunction(primary=[_MockEF("p")], fallback=fb, attempt_budget=bad)
+
+
+def test_health_ttl_zero_retries_every_call_and_huge_failure_count_is_safe() -> None:
+    ef, clk, led, prims, _ = _build(1, budget=None, health_ttl=0.0)
+    for _ in range(5):
+        _call(ef, clk, led, gap=0.0)
+    assert len(prims[0].attempts) == 5
+
+    ef2, clk2, led2, prims2, _ = _build(1, budget=None, cost=0.0)
+    for _ in range(3000):
+        _call(ef2, clk2, led2, gap=200.0)  # 매번 백오프가 만료된다
+    assert len(prims2[0].attempts) == 3000
+    assert ef2._unhealthy_until[0] - clk2() <= 120.0  # 간격은 상한을 넘지 않는다
+
+
+def test_factory_sets_attempt_budget_from_openai_timeout() -> None:
+    from opencrab.stores.factory import _make_kure_embedding_function
+
+    settings = Settings(OPENAI_API_BASE="http://a:1234/v1", OPENAI_TIMEOUT="5")
+    assert _make_kure_embedding_function(settings)._attempt_budget == 10.0
+    settings0 = Settings(OPENAI_API_BASE="http://a:1234/v1", OPENAI_TIMEOUT="0")
+    assert _make_kure_embedding_function(settings0)._attempt_budget is None
+
+
+def test_first_attempt_of_a_call_ignores_budget_even_if_time_passes_before_it() -> None:
+    # 시계를 읽을 때마다 가상 시간이 흐른다(잠금 대기와 스케줄링 지연의 모사).
+    # 예산이 지연보다 작아도 호출의 첫 시도는 일어나야 한다.
+    class _TickClock(_VClock):
+        def __call__(self) -> float:
+            self.t += 0.01
+            return self.t
+
+    clk, led = _TickClock(), _Ledger()
+    prim = _TimedEF(clk, led, "p0", alive=True)
+    fb = _TimedFallback(clk)
+    ef = ResilientEmbeddingFunction(
+        primary=[prim], fallback=fb, attempt_budget=0.001, clock=clk
+    )
+    ef(["x"])
+    assert prim.successes == 1
+    assert fb.calls == 0
