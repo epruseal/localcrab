@@ -41,7 +41,7 @@ SOLID 판정: 새 단위는 actor 옵션 하나와 `search` actor 안의 감싸�
 
 - `tests/search_faults_timing_child_596.py`는 부모 쪽 `ro_status`에 더해 `ro_pending`이 읽은 뒤에도 지정한 시간만큼 멈추게 한다. K3는 `ro_pending`으로 진행을 읽는다.
 - `tests/test_search_faults.py::test_signal_injection_does_not_depend_on_runner_speed`에 K3 경우(`parent_stall_drain`)를 더한다. 부모가 소진 전체보다 오래 멈춰도 `COMPLETE`를 요구한다. 수정 전 코드에서는 `not injected: ['K3']`로 실패하고 수정 뒤에는 통과한다.
-- 역변이 둘: (a) K3를 수정 전 형태(`--hold-at-drain`을 넘기지 않는 폴링 후 신호)로 되돌린다. (b) 자식의 `--hold-at-drain` 멈춤을 제거한다. 둘 다 위 경우가 실패해야 한다. (b)는 `held` 줄이 오지 않아 `not_injected`다. 자식이 멈춘 채로 부모만 폴링으로 되돌리는 변이는 자식이 멈춰 있어 판정이 부모 지연에 기대지 않으므로 같은 동작이고 실패하지 않는다.
+- 역변이 둘: (a) K3를 수정 전 형태(`--hold-at-drain`을 넘기지 않는 폴링 후 신호)로 되돌린다. (b) 자식의 `--hold-at-drain` 멈춤을 제거한다. 둘 다 위 경우가 실패해야 한다. (b)는 `not_injected`다. 멈춤 장치를 설치하지 않으면 `held` 줄이 오지 않고, `held` 줄을 낸 뒤 멈춤(`time.sleep`)만 빼면 자식이 살아 있지 않아 신호 직전 확인이 실패한다. 자식이 멈춘 채로 부모만 폴링으로 되돌리는 변이는 자식이 멈춰 있어 판정이 부모 지연에 기대지 않으므로 같은 동작이고 실패하지 않는다.
 - 이 경우의 RED는 부모 지연이 수정 전 소진 전체보다 길다는 전제에 선다. 이 장치에서 수정 전 코드의 소진은 5초보다 짧게 끝난다. 더 느린 러너에서 수정 전 코드는 RED가 흐려질 수 있으나 수정 뒤 코드의 GREEN은 지연 길이에 기대지 않는다.
 
 재현 명령(기준선 코퍼스는 `docs/gate-recipes.md`의 S0 절차로 만든다):

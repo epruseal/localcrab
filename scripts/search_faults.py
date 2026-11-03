@@ -2377,7 +2377,7 @@ def _actor_search(directory: Path, args: argparse.Namespace) -> int:
             return done
 
         nbm.drain = hold_drain
-    rows =json.loads(Path(args.search_file).read_text(encoding="utf-8"))
+    rows = json.loads(Path(args.search_file).read_text(encoding="utf-8"))
     if not args.loop:
         _search_rows(hq, rows)
     else:
