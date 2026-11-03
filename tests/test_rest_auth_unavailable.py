@@ -7,7 +7,7 @@ answer for the same situation. These tests pin the same answer on REST and pin
 what must not change. See ``docs/issue-601-rest-auth-unavailable.md`` for the
 table of tests and the mutations each one must catch.
 
-The app is driven without its lifespan: the context is a hand-built
+The tests run the app without its lifespan. They give it a hand-built
 ``ApiContext`` with a real ``SQLStore`` and doubles for the other stores.
 """
 from __future__ import annotations
@@ -118,7 +118,7 @@ def test_locked_token_file_is_503_then_recovers(env):
 
 
 def test_locked_token_file_is_503_for_an_unverifiable_token_too(env):
-    """With the store locked the token cannot be judged, valid or not."""
+    """A locked store cannot judge any token, valid or not."""
     with _exclusive_lock(env.db_path):
         locked = _manifest(env, {"Authorization": "Bearer not-a-token"})
     _assert_unavailable(locked)
@@ -145,7 +145,7 @@ def test_every_api_route_authenticates_through_require_auth():
     routes = _api_routes()
     assert routes
     # A sync dependency runs in the thread pool, so the wait for a busy store
-    # stays off the event loop. Making it ``async def`` would put that wait on the loop.
+    # stays off the event loop. An ``async def`` dependency would put that wait on the loop.
     assert not inspect.iscoroutinefunction(api.require_auth)
     bypass = [r.path for r in routes if api.require_auth not in set(_calls(r.dependant))]
     assert bypass == []
@@ -229,7 +229,7 @@ def test_unchanged_answers_with_a_healthy_store(env):
 
 
 def test_requests_without_a_usable_credential_stay_401_while_the_store_is_locked(env):
-    """No lookup is needed, so a locked store cannot change the answer."""
+    """These requests need no lookup, so a locked store cannot change the answer."""
     with _exclusive_lock(env.db_path):
         none = _manifest(env)
         basic = _manifest(env, {"Authorization": "Basic Zm9vOmJhcg=="})
@@ -240,8 +240,9 @@ def test_requests_without_a_usable_credential_stay_401_while_the_store_is_locked
 
 
 def test_store_flag_unavailable_does_not_gate_the_lookup(env):
-    """The REST store is built once at startup and its ``available`` flag is not
-    refreshed. A store that was busy at startup but works now still authenticates."""
+    """The REST store is built once at startup, and nothing refreshes its
+    ``available`` flag. A store that was busy at startup but works now still
+    authenticates."""
     env.sql._available = False
     assert _manifest(env, env.headers).status_code == 200
 

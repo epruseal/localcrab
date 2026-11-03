@@ -361,7 +361,7 @@ def verify_token(sql: Any, presented: str) -> Principal | None:
     return Principal(user_id=row[0], is_local=row[1] == 1, disabled=False)
 
 
-# Seconds a client should wait before retrying after a 503 from a token check
+# Seconds a client waits before it retries after a 503 from a token check
 # that could not finish (#580 MCP, #601 REST).
 TOKEN_STORE_RETRY_AFTER = "5"
 
