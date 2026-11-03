@@ -108,7 +108,14 @@ def _make_kure_embedding_function(settings: Settings) -> Any:
         gguf_path=settings.local_gguf_path,
         dim=settings.embed_dim,
     )
-    return ResilientEmbeddingFunction(primary=primary_efs, fallback=fallback_ef)
+    # 호출당 실패한 원격 시도 시간 상한: 시간 초과의 두 배(primary 둘이 모두
+    # 시간 초과까지 가는 최악을 허용). 시간 초과가 양수가 아니면 예산을 끈다
+    # (예산은 양수여야 한다). 근거: docs/issue-581-embed-backoff.md
+    return ResilientEmbeddingFunction(
+        primary=primary_efs,
+        fallback=fallback_ef,
+        attempt_budget=(2 * settings.openai_timeout if settings.openai_timeout > 0 else None),
+    )
 
 
 def make_vector_store(settings: Settings) -> Any:
