@@ -68,7 +68,6 @@ import asyncio
 import contextvars
 import logging
 import queue
-import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -82,9 +81,11 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from opencrab.auth import (
+    TOKEN_STORE_RETRY_AFTER,
     Principal,
     principal_scope,
     refuse_stale_shared_secret_env,
+    token_store_unavailable_reason,
     verify_token,
 )
 from opencrab.common.json_transport import serialize_jsonrpc_response
@@ -321,7 +322,6 @@ def _pool(name: str) -> ThreadPoolExecutor:
 # the deadline first. Both answer 503.
 _AUTH_DEADLINE_SECONDS = 8.0
 _AUTH_QUEUE_LIMIT = 16
-_AUTH_RETRY_AFTER = "5"
 _UNAVAILABLE_LOG_INTERVAL = 10.0
 _UNAVAILABLE_LOGGED: dict[str, float] = {}
 _UNAVAILABLE_LOG_LOCK = threading.Lock()
@@ -347,43 +347,8 @@ def _unavailable(reason: str) -> HTTPException:
     return HTTPException(
         status_code=503,
         detail="Authentication temporarily unavailable",
-        headers={"Retry-After": _AUTH_RETRY_AFTER, **_NO_STORE},
+        headers={"Retry-After": TOKEN_STORE_RETRY_AFTER, **_NO_STORE},
     )
-
-
-# SQLSTATE values of a server-type database that mean "try again": class 08
-# (connection exception), 57P01-57P03 (shutdown, cannot connect now), 53300
-# (too many connections).
-_RETRYABLE_SQLSTATES = frozenset({"57P01", "57P02", "57P03", "53300"})
-
-
-def _unavailable_reason(exc: BaseException) -> str | None:
-    """Reason code when *exc* means the token store could not answer right now,
-    else None (the caller keeps the pre-#580 behavior: 401).
-
-    A SQLite lock is told apart by its result code. Any other SQLite failure
-    (no such table or column, cannot open the file, I/O error) is not
-    something a retry fixes. For a server-type database, a failure before the
-    session exists carries no SQLSTATE and counts as unavailable.
-    """
-    from sqlalchemy.exc import OperationalError
-    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
-
-    if isinstance(exc, PoolTimeoutError):
-        return "store-unavailable"
-    if not isinstance(exc, OperationalError):
-        return None
-    orig = getattr(exc, "orig", None)
-    if isinstance(orig, sqlite3.Error):
-        code = getattr(orig, "sqlite_errorcode", None)
-        # SQLITE_BUSY (5) and SQLITE_LOCKED (6), including extended codes.
-        return "store-busy" if isinstance(code, int) and code & 0xFF in (5, 6) else None
-    if exc.connection_invalidated:
-        return "store-unavailable"
-    sqlstate = getattr(orig, "pgcode", None)
-    if sqlstate is None or sqlstate.startswith("08") or sqlstate in _RETRYABLE_SQLSTATES:
-        return "store-unavailable"
-    return None
 
 
 class _AuthJob:
@@ -639,7 +604,7 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
         try:
             return verify_token(store, presented)
         except Exception as exc:  # noqa: BLE001
-            reason = _unavailable_reason(exc)
+            reason = token_store_unavailable_reason(exc)
             if reason is not None:
                 raise _unavailable(reason) from None
             # No users table yet, or another failure a retry does not fix.

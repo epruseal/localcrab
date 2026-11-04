@@ -33,6 +33,7 @@ import contextvars
 import hashlib
 import os
 import secrets
+import sqlite3
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -358,6 +359,48 @@ def verify_token(sql: Any, presented: str) -> Principal | None:
     # read off the row (contamination tolerance: an is_local value other
     # than exactly 1 must not be treated as local).
     return Principal(user_id=row[0], is_local=row[1] == 1, disabled=False)
+
+
+# Seconds a client waits before it retries after a 503 from a token check
+# that could not finish (#580 MCP, #601 REST).
+TOKEN_STORE_RETRY_AFTER = "5"
+
+# SQLSTATE values of a server-type database that mean "try again": class 08
+# (connection exception), 57P01-57P03 (shutdown, cannot connect now), 53300
+# (too many connections).
+_RETRYABLE_SQLSTATES = frozenset({"57P01", "57P02", "57P03", "53300"})
+
+
+def token_store_unavailable_reason(exc: BaseException) -> str | None:
+    """Reason code when *exc* means the token store could not answer right now,
+    else None (the caller keeps its answer from before #580).
+
+    Shared by the MCP (#580) and REST (#601) token checks, so both surfaces
+    classify a store error the same way.
+
+    A SQLite lock is told apart by its result code. Any other SQLite failure
+    (no such table or column, cannot open the file, I/O error) is not
+    something a retry fixes. For a server-type database, a failure before the
+    session exists carries no SQLSTATE and counts as unavailable.
+    """
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    if isinstance(exc, PoolTimeoutError):
+        return "store-unavailable"
+    if not isinstance(exc, OperationalError):
+        return None
+    orig = getattr(exc, "orig", None)
+    if isinstance(orig, sqlite3.Error):
+        code = getattr(orig, "sqlite_errorcode", None)
+        # SQLITE_BUSY (5) and SQLITE_LOCKED (6), including extended codes.
+        return "store-busy" if isinstance(code, int) and code & 0xFF in (5, 6) else None
+    if exc.connection_invalidated:
+        return "store-unavailable"
+    sqlstate = getattr(orig, "pgcode", None)
+    if sqlstate is None or sqlstate.startswith("08") or sqlstate in _RETRYABLE_SQLSTATES:
+        return "store-unavailable"
+    return None
 
 
 def revoke_token(sql: Any, token_id: str) -> None:

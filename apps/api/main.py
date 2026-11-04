@@ -4,6 +4,8 @@ import asyncio
 import inspect
 import logging
 import os
+import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -486,6 +488,26 @@ def get_context() -> ApiContext:
     return app.state.context
 
 
+_UNAVAILABLE_LOG_INTERVAL = 10.0
+_UNAVAILABLE_LOGGED: dict[str, float] = {}
+_UNAVAILABLE_LOG_LOCK = threading.Lock()
+
+
+def _log_auth_unavailable(reason: str) -> None:
+    """Log one WARNING per reason per interval. Log only the fixed reason code:
+    exception text carries SQL and parameters. ``require_auth`` runs in the
+    thread pool. Read the clock, compare, update the table and log inside one
+    lock, so the table order is the log order. A log handler never takes this
+    lock."""
+    with _UNAVAILABLE_LOG_LOCK:
+        now = time.monotonic()
+        last = _UNAVAILABLE_LOGGED.get(reason)
+        if last is not None and now - last < _UNAVAILABLE_LOG_INTERVAL:
+            return
+        _UNAVAILABLE_LOGGED[reason] = now
+        logger.warning("REST token check unavailable (%s); answering 503", reason)
+
+
 def require_auth(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
     ctx: ApiContext = Depends(get_context),
@@ -500,14 +522,29 @@ def require_auth(
     audit attribution, ``/api/usage`` -- reads this server-derived value
     instead of a client-supplied one.
     """
-    from opencrab.auth import verify_token
+    from opencrab.auth import TOKEN_STORE_RETRY_AFTER, token_store_unavailable_reason, verify_token
 
     presented = (
         credentials.credentials
         if (credentials is not None and credentials.scheme.lower() == "bearer")
         else None
     )
-    principal = verify_token(ctx.sql, presented) if presented else None
+    try:
+        principal = verify_token(ctx.sql, presented) if presented else None
+    except Exception as exc:
+        # #601: a store that cannot answer right now says nothing about the
+        # token. Answer 503, not 500. Let every other error leave this
+        # dependency as before. Do not read `ctx.sql.available`: the store is
+        # built once at startup and nothing refreshes the flag.
+        reason = token_store_unavailable_reason(exc)
+        if reason is None:
+            raise
+        _log_auth_unavailable(reason)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication temporarily unavailable",
+            headers={"Retry-After": TOKEN_STORE_RETRY_AFTER, "Cache-Control": "no-store"},
+        ) from None
     if principal is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
