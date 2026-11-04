@@ -2113,6 +2113,228 @@ class TestHarnessPromotionApply:
             "node_receipts": [], "edge_receipts": [], "errors": [],
         }
 
+    # -- #39 / #40 / #44: edge properties, dry_run edges, BM25 invalidation --
+
+    @pytest.fixture
+    def real_stack(self, tmp_path):
+        """Real builder over a local graph store, to read a stored edge back."""
+        from opencrab.ontology.builder import OntologyBuilder
+        from opencrab.stores.local_graph_store import LocalGraphStore
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+        from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
+
+        sql = SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
+        ensure_test_user(sql, "test-user")
+        graph = LocalGraphStore(str(tmp_path / "graph.db"))
+        docs = LocalSQLDocStore(str(tmp_path / "doc.db"))
+        assert graph.available
+        ctx = _base_ctx(builder=OntologyBuilder(graph, docs, sql), sql=sql, neo4j=graph)
+        yield ctx, graph
+        graph.close()
+        docs.close()
+
+    @staticmethod
+    def _edge_package(from_id, to_id, properties=None):
+        edge = {
+            "from_space": "resource", "from_id": from_id, "relation": "cites",
+            "to_space": "resource", "to_id": to_id,
+        }
+        if properties is not None:
+            edge["properties"] = properties
+        return {
+            "package_id": "pkg-e1", "mission_id": "mis-1", "run_id": "run-1",
+            "nodes": [
+                {"space": "resource", "node_type": "Dataset", "node_id": from_id, "properties": {}},
+                {"space": "resource", "node_type": "Dataset", "node_id": to_id, "properties": {}},
+            ],
+            "edges": [edge],
+        }
+
+    @staticmethod
+    def _stored(graph, from_id, to_id):
+        return graph.get_edge("Dataset", from_id, "cites", "Dataset", to_id)
+
+    def test_normal_edge_properties_persist_in_graph(self, real_stack):
+        ctx, graph = real_stack
+        props = {"confidence": 0.9, "evidence_refs": ["e1", "e2"], "note": {"k": "v"}}
+        with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+            result = harness_promotion_apply(self._edge_package("a1", "a2", props))
+        assert result["errors"] == []
+        stored = self._stored(graph, "a1", "a2")
+        assert {k: stored[k] for k in props} == props
+
+    def test_normal_edge_properties_match_ontology_add_edge(self, real_stack):
+        """Same input, surrogate character included, stores the same
+        properties through the promotion path and through ontology_add_edge."""
+        from opencrab.mcp.tools import ontology_add_edge, ontology_add_node
+
+        ctx, graph = real_stack
+        props = {"confidence": 0.5, "note": "a\ud800b", "nested": {"s": "x\ud800y"}}
+        with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+            promoted = harness_promotion_apply(self._edge_package("b1", "b2", props))
+            ontology_add_node("resource", "Dataset", "c1")
+            ontology_add_node("resource", "Dataset", "c2")
+            direct = ontology_add_edge("resource", "c1", "cites", "resource", "c2", props)
+        assert promoted["errors"] == []
+        assert "error" not in direct
+
+        def own(edge):
+            return {k: v for k, v in edge.items() if k not in ("from_id", "to_id")}
+
+        via_harness = own(self._stored(graph, "b1", "b2"))
+        via_tool = own(self._stored(graph, "c1", "c2"))
+        assert via_harness["note"] == "a?b"
+        assert via_harness == via_tool
+
+    def test_error_edge_reserved_property_is_rejected_by_store_rule(self, real_stack):
+        """The store's property rule applies to a promoted edge too: no
+        second, weaker entry point."""
+        ctx, graph = real_stack
+        with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+            result = harness_promotion_apply(
+                self._edge_package("d1", "d2", {"edge_key": "forged"})
+            )
+        assert result["summary"]["edges_written"] == 0
+        assert [e["edge"] for e in result["errors"]] == ["d1-[cites]->d2"]
+        assert self._stored(graph, "d1", "d2") is None
+
+    def test_normal_edge_without_properties_matches_ontology_add_edge(self, real_stack):
+        """Control: an edge with no properties is stored as before."""
+        from opencrab.mcp.tools import ontology_add_edge, ontology_add_node
+
+        ctx, graph = real_stack
+        with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+            promoted = harness_promotion_apply(self._edge_package("e1", "e2"))
+            ontology_add_node("resource", "Dataset", "f1")
+            ontology_add_node("resource", "Dataset", "f2")
+            ontology_add_edge("resource", "f1", "cites", "resource", "f2")
+        assert promoted["errors"] == []
+        via_harness = self._stored(graph, "e1", "e2")
+        via_tool = self._stored(graph, "f1", "f2")
+        assert set(via_harness) == set(via_tool)
+        assert set(via_harness) == {"pack_id", "from_id", "relation", "to_id"}
+
+    def test_edge_reapply_same_properties_is_idempotent_different_conflicts(self, real_stack):
+        """Upsert meaning is the one ontology_add_edge has: identical
+        properties are idempotent, different properties conflict, and the
+        stored value stays."""
+        ctx, graph = real_stack
+        first = {"confidence": 0.9}
+        with patch("opencrab.mcp.tools._get_context", return_value=ctx):
+            harness_promotion_apply(self._edge_package("g1", "g2", first))
+            same = harness_promotion_apply(self._edge_package("g1", "g2", first))
+            other = harness_promotion_apply(self._edge_package("g1", "g2", {"confidence": 0.1}))
+        assert same["errors"] == []
+        assert [e["edge"] for e in other["errors"]] == ["g1-[cites]->g2"]
+        assert self._stored(graph, "g1", "g2")["confidence"] == 0.9
+
+    def test_normal_add_edge_receives_properties_kwarg(self):
+        from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
+
+        package = self._edge_package("h1", "h2", {"confidence": 0.7})
+        builder = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql)
+            harness_promotion_apply(package)
+        assert builder.add_edge.call_args.kwargs["properties"] == {"confidence": 0.7}
+
+    def test_normal_dry_run_validates_edge_grammar(self):
+        package = self._edge_package("i1", "i2")
+        package["edges"] += [
+            {"from_space": "resource", "from_id": "i1", "relation": "related_to",
+             "to_space": "resource", "to_id": "i2"},
+            # The space pair is directional: claim -> outcome is a defined
+            # meta-edge, outcome -> claim is not.
+            {"from_space": "claim", "from_id": "i3", "relation": "supports",
+             "to_space": "outcome", "to_id": "i4"},
+            {"from_space": "outcome", "from_id": "i4", "relation": "supports",
+             "to_space": "claim", "to_id": "i3"},
+        ]
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            result = harness_promotion_apply(package, dry_run=True)
+        mock_ctx.assert_not_called()
+        assert result["edge_receipts"] == [
+            {"from_id": "i1", "relation": "cites", "to_id": "i2", "status": "dry_run_valid"},
+            {"from_id": "i3", "relation": "supports", "to_id": "i4", "status": "dry_run_valid"},
+        ]
+        assert [e["edge"] for e in result["errors"]] == [
+            "i1-[related_to]->i2", "i4-[supports]->i3",
+        ]
+        assert "related_to" in result["errors"][0]["error"]
+
+    def test_normal_apply_invalidates_bm25_cache_once_per_write_and_dry_run_does_not(self):
+        from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
+
+        package = self._edge_package("j1", "j2")
+        builder = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
+        hybrid = MagicMock()
+        nodes_only = dict(package, edges=[])
+        edges_only = dict(package, nodes=[])
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql, hybrid=hybrid)
+            harness_promotion_apply(package, dry_run=True)
+            hybrid.invalidate_bm25_cache.assert_not_called()
+            harness_promotion_apply(package)
+            hybrid.invalidate_bm25_cache.assert_called_once_with()
+            # Either kind of receipt alone is a write.
+            for only in (nodes_only, edges_only):
+                hybrid.invalidate_bm25_cache.reset_mock()
+                harness_promotion_apply(only)
+                hybrid.invalidate_bm25_cache.assert_called_once_with()
+
+    def test_edge_no_receipts_means_no_bm25_invalidation(self):
+        """An empty package and a package whose every write raised change
+        nothing, so they must not mark the index stale."""
+        from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
+
+        empty = {"package_id": "pkg-e", "mission_id": "mis-e", "run_id": "run-e"}
+        failing = self._edge_package("l1", "l2")
+        builder = MagicMock()
+        builder.add_node.side_effect = RuntimeError("node write failed")
+        builder.add_edge.side_effect = RuntimeError("edge write failed")
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
+        hybrid = MagicMock()
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql, hybrid=hybrid)
+            harness_promotion_apply(empty)
+            result = harness_promotion_apply(failing)
+        assert result["summary"] == {"nodes_written": 0, "edges_written": 0, "errors": 3}
+        hybrid.invalidate_bm25_cache.assert_not_called()
+
+    def test_error_bm25_invalidation_failure_keeps_receipts(self, caplog):
+        import logging
+
+        from opencrab.stores.sql_store import SQLStore
+        from tests._pack_fixtures import ensure_test_user
+
+        package = self._edge_package("k1", "k2")
+        builder = MagicMock()
+        builder.add_node.return_value = {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        builder.add_edge.return_value = {"receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}}
+        sql = SQLStore("sqlite:///:memory:")
+        ensure_test_user(sql, "test-user")
+        hybrid = MagicMock()
+        hybrid.invalidate_bm25_cache.side_effect = RuntimeError("boom")
+        with patch("opencrab.mcp.tools._get_context") as mock_ctx:
+            mock_ctx.return_value = _base_ctx(builder=builder, sql=sql, hybrid=hybrid)
+            with caplog.at_level(logging.WARNING):
+                result = harness_promotion_apply(package)
+        assert result["summary"] == {"nodes_written": 2, "edges_written": 1, "errors": 0}
+        assert any("invalidate_bm25_cache" in rec.message for rec in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # _get_context — the real (unmocked) wiring path

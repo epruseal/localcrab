@@ -75,6 +75,7 @@ def apply_promotion_package(
         from opencrab.locking import write_lock
         from opencrab.ontology.builder import OntologyBuilder, graph_write_failed
         from opencrab.pack.ownership import resolve_write_pack
+        from opencrab.pack.write_gate import reject_boundary_identity
         from opencrab.stores.factory import (
             make_billing_sql_store,
             make_doc_store,
@@ -164,12 +165,17 @@ def apply_promotion_package(
 
         for edge in package.edges:
             try:
+                # #39: edge properties are stored now, so apply the same
+                # reserved identity key check the MCP dispatch applies to
+                # package.edges[*].properties.
+                reject_boundary_identity({"properties": edge.properties})
                 result = builder.add_edge(
                     from_space=edge.from_space,
                     from_id=edge.from_id,
                     relation=edge.relation,
                     to_space=edge.to_space,
                     to_id=edge.to_id,
+                    properties=edge.properties or {},
                     pack_id=target_pack_id,
                 )
                 edge_receipts.append({

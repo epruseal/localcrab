@@ -86,7 +86,7 @@ def harness_promotion_apply(
     except ImportError:
         return {"error": "crabharness package not installed. Run: pip install -e crabharness/"}
 
-    from opencrab.grammar.validator import validate_node, validate_node_properties
+    from opencrab.grammar.validator import validate_edge, validate_node, validate_node_properties
 
     try:
         promo = PromotionPackage.model_validate(package)
@@ -113,6 +113,23 @@ def harness_promotion_apply(
                         "node_type": node.node_type,
                         "status": "dry_run_valid",
                     })
+        # #40: grammar only. Like the node loop above, this reads no store.
+        # The live write checks endpoint existence, property rules and pack
+        # permission; this branch does not.
+        for edge in promo.edges:
+            er = validate_edge(edge.from_space, edge.to_space, edge.relation)
+            if not er.valid:
+                errors.append({
+                    "edge": f"{edge.from_id}-[{edge.relation}]->{edge.to_id}",
+                    "error": er.error,
+                })
+            else:
+                edge_receipts.append({
+                    "from_id": edge.from_id,
+                    "relation": edge.relation,
+                    "to_id": edge.to_id,
+                    "status": "dry_run_valid",
+                })
         return {
             "package_id": promo.package_id,
             "dry_run": True,
@@ -122,7 +139,7 @@ def harness_promotion_apply(
         }
 
     from opencrab.auth import current_principal
-    from opencrab.mcp.tools import _get_context
+    from opencrab.mcp.tools import _clean_meta, _get_context
     from opencrab.ontology.builder import graph_write_failed
     from opencrab.pack.ownership import (
         PackForbiddenError,
@@ -185,6 +202,9 @@ def harness_promotion_apply(
                 relation=edge.relation,
                 to_space=edge.to_space,
                 to_id=edge.to_id,
+                # #39: same properties handling as ontology_add_edge; the
+                # builder and graph store apply the shared validation.
+                properties=_clean_meta(edge.properties or {}),
                 pack_id=target_pack_id,
             )
             edge_receipts.append({
@@ -200,6 +220,19 @@ def harness_promotion_apply(
                 "edge": f"{edge.from_id}-[{edge.relation}]->{edge.to_id}",
                 "error": safe_tool_error("harness_promotion_apply", exc),
             })
+
+    # #44: mark the BM25 index stale after a write, as the other write tools
+    # do. Skipped when no builder call returned a receipt: an empty or fully
+    # rejected package changes nothing, and each invalidation makes the
+    # background rebuild discard its candidate. A failure here must not hide
+    # the receipts of an applied package.
+    if node_receipts or edge_receipts:
+        try:
+            ctx["hybrid"].invalidate_bm25_cache()
+        except Exception as exc:
+            logger.warning(
+                "invalidate_bm25_cache failed after promotion: %s", type(exc).__name__
+            )
 
     # #66 hardening: builder.add_node() never raises for a per-store failure
     # (see builder.py's module docstring) — a node_receipts entry exists even
