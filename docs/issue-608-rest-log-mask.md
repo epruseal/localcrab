@@ -57,7 +57,8 @@
 ## 가정
 
 - REST 진입점의 마스킹은 로거 필터가 `uvicorn.run()`의 `dictConfig`에 지워지지 않는다는 가정에 기대지 않는다. `python -m apps.api.main`은 `__main__` 실행에서 한 번(로그 설정 전), uvicorn이 `apps.api.main:app`을 다시 import할 때 한 번(로그 설정 후) 설치한다. uvicorn CLI로 띄우는 `server.api:app`은 로그 설정 뒤에 import하며 설치한다. 그래서 프로세스 시험(1번)은 이 가정을 검사하지 못한다. `opencrab serve`는 `create_app()`이 `uvicorn.run()` 앞에서 한 번만 설치하므로 가정에 기댄다. 그 경로는 기존 프로세스 시험이 지킨다.
-- uvicorn이 `uvicorn.error`에 쓰는 WebSocket 핸드셰이크 줄의 인자는 `(클라이언트 주소, 경로+질의 문자열)`이다. 시험 1번의 양성 대조(`WebSocket /mcp?token=***`)가 `websockets` 라이브러리가 있을 때 이 형태를 확인한다. 라이브러리가 없는 환경은 핸드셰이크 줄이 없어 이 대조를 건너뛴다.
+- uvicorn이 WebSocket 핸드셰이크를 처리해 앱이 거부(403)하면 `uvicorn.error`에 `(클라이언트 주소, 경로+질의 문자열)` 인자의 핸드셰이크 줄이 기록된다. 시험 1번은 업그레이드 요청의 응답 상태 줄이 403이면 양성 대조(`WebSocket /mcp?token=***`)를 단언한다. 401이면(WebSocket 라이브러리가 없어 uvicorn이 업그레이드를 일반 HTTP로 넘긴 경우) 대조를 건너뛰고 값 부재 단언만 건다. 그 밖의 상태 줄과 수신 실패는 시험 실패다.
+- 시험 1번의 자식 프로세스는 `.env`와 상속 저장소 설정을 읽지 않는다. 환경은 허용 목록(`PATH`와 임시 `HOME`, `LOCAL_DATA_DIR`, `LOCALCRAB_ENV_FILE=/dev/null`, `PORT`, `PYTHONPATH`)이고, 작업 디렉터리는 `.env`가 없는 임시 디렉터리다(Pydantic Settings의 `env_file`은 `LOCALCRAB_ENV_FILE`과 현재 디렉터리 `.env`뿐이다). `apps/api/main.py`의 `load_dotenv` 두 호출은 시험의 실행기가 무력화한다. `tests/conftest.py`의 격리 값은 공유하지 않는다. `LOCALCRAB_ENV_FILE`은 `setdefault`라 호출자가 실제 파일을 지정할 수 있고 `LOCAL_DATA_DIR`은 세션 공용 디렉터리이기 때문이다.
 - 라이브 서비스는 이 변경을 반영하려면 REST 프로세스를 재시작해야 한다. 재시작은 리드가 한다.
 
 ## 받아들임 기준
