@@ -320,32 +320,10 @@ _NULL_ROLE_PACKAGE = {
 
 
 @pytest.fixture
-def crabharness_root():
-    """Same sys.path juggling as tests/test_crabharness_promotion_billing.py's
-    autouse fixture (see its docstring): make the repo root win the top-level
-    `crabharness` name for the duration of the test."""
-    import sys
+def crabharness_root(monkeypatch):
     from pathlib import Path
 
-    repo_root = Path(__file__).resolve().parent.parent
-    conflicting_entry = str(repo_root / "crabharness")
-    removed = {
-        name: sys.modules.pop(name)
-        for name in list(sys.modules)
-        if name == "crabharness" or name.startswith("crabharness.")
-    }
-    old_path = list(sys.path)
-    sys.path[:] = [p for p in sys.path if p != conflicting_entry]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    try:
-        yield
-    finally:
-        sys.path[:] = old_path
-        for name in list(sys.modules):
-            if name == "crabharness" or name.startswith("crabharness."):
-                del sys.modules[name]
-        sys.modules.update(removed)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent.parent / "crabharness"))
 
 
 def test_builder_add_node_rejects_none_before_any_store_write(real_schema_env, tmp_path):
@@ -379,7 +357,7 @@ def test_mcp_harness_dry_run_reports_inner_none(real_schema_env, crabharness_roo
 def test_crabharness_apply_dry_run_reports_inner_none(real_schema_env, crabharness_root, tmp_path):
     import json
 
-    from crabharness.crabharness.apply import apply_promotion_package
+    from crabharness.apply import apply_promotion_package
 
     package_path = tmp_path / "package.json"
     package_path.write_text(json.dumps(_NULL_ROLE_PACKAGE), encoding="utf-8")

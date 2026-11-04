@@ -28,23 +28,16 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _real_crabharness_import_root():
-    """See tests/test_tools_handlers_direct.py's TestHarnessPromotionApply
-    fixture of the same name for the full rationale: crabharness/ has no
-    __init__.py, so whichever sys.path entry is scanned first "wins" the
-    `crabharness` top-level name for the rest of the process. Force the repo
-    root to win here regardless of what already ran earlier in the suite.
-    """
+    """Load the standalone package from this checkout."""
     repo_root = Path(__file__).resolve().parent.parent
-    conflicting_entry = str(repo_root / "crabharness")
+    package_root = str(repo_root / "crabharness")
     removed = {
         name: sys.modules.pop(name)
         for name in list(sys.modules)
         if name == "crabharness" or name.startswith("crabharness.")
     }
     old_path = list(sys.path)
-    sys.path[:] = [p for p in sys.path if p != conflicting_entry]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+    sys.path.insert(0, package_root)
     try:
         yield
     finally:
@@ -149,7 +142,7 @@ class TestApplyPromotionPackageSubjectIdAudit:
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
-            from crabharness.crabharness.apply import apply_promotion_package
+            from crabharness.apply import apply_promotion_package
 
             apply_promotion_package(package_path, dry_run=False, tenant_id="acme", subject_id="u1")
         node_pack_id = builder_instance.add_node.call_args.kwargs["pack_id"]
@@ -184,7 +177,7 @@ class TestApplyPromotionPackageSubjectIdAudit:
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
-            from crabharness.crabharness.apply import apply_promotion_package
+            from crabharness.apply import apply_promotion_package
 
             apply_promotion_package(package_path, dry_run=False)
         assert "subject_id" not in builder_instance.add_node.call_args.kwargs
@@ -213,7 +206,7 @@ class TestApplyPromotionPackageBilling:
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
-            from crabharness.crabharness.apply import apply_promotion_package
+            from crabharness.apply import apply_promotion_package
 
             result = apply_promotion_package(package_path, dry_run=False, tenant_id="acme", subject_id="u1")
         assert result["summary"]["nodes_written"] == 1
@@ -252,7 +245,7 @@ class TestApplyPromotionPackageBilling:
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
-            from crabharness.crabharness.apply import apply_promotion_package
+            from crabharness.apply import apply_promotion_package
 
             with caplog.at_level(logging.WARNING):
                 result = apply_promotion_package(package_path, dry_run=False)
@@ -286,7 +279,7 @@ class TestApplyPromotionPackageBilling:
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
-            from crabharness.crabharness.apply import apply_promotion_package
+            from crabharness.apply import apply_promotion_package
 
             result = apply_promotion_package(package_path, dry_run=False)
         assert len(result["node_receipts"]) == 1  # receipt still recorded, unbilled
@@ -315,7 +308,7 @@ class TestApplyPromotionPackageBilling:
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
-            from crabharness.crabharness.apply import apply_promotion_package
+            from crabharness.apply import apply_promotion_package
 
             apply_promotion_package(package_path, dry_run=False)
         billing_instance.on_harness_apply.assert_not_called()
@@ -324,7 +317,7 @@ class TestApplyPromotionPackageBilling:
         billing_instance = MagicMock()
         package_path = _write_package(tmp_path, _VALID_PACKAGE)
         with patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance):
-            from crabharness.crabharness.apply import apply_promotion_package
+            from crabharness.apply import apply_promotion_package
 
             result = apply_promotion_package(package_path, dry_run=True)
         assert result["dry_run"] is True
@@ -357,7 +350,7 @@ class TestApplyPromotionPackageEdgeProperties:
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
-            from crabharness.crabharness.apply import apply_promotion_package
+            from crabharness.apply import apply_promotion_package
 
             apply_promotion_package(package_path, dry_run=False)
         assert builder_instance.add_edge.call_args.kwargs["properties"] == {
@@ -383,7 +376,7 @@ class TestApplyPromotionPackageEdgeProperties:
             patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
             patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
         ):
-            from crabharness.crabharness.apply import apply_promotion_package
+            from crabharness.apply import apply_promotion_package
 
             result = apply_promotion_package(package_path, dry_run=False)
         builder_instance.add_edge.assert_not_called()

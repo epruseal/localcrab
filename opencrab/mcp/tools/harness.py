@@ -82,7 +82,7 @@ def harness_promotion_apply(
     billed.
     """
     try:
-        from crabharness.crabharness.models import PromotionPackage
+        from crabharness.models import PromotionPackage
     except ImportError:
         return {"error": "crabharness package not installed. Run: pip install -e crabharness/"}
 

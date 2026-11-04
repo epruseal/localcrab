@@ -1725,53 +1725,10 @@ _VALID_PACKAGE = {
 
 class TestHarnessPromotionApply:
     @pytest.fixture(autouse=True)
-    def _real_crabharness_import_root(self):
-        """opencrab.mcp.tools.harness_promotion_apply does
-        ``from crabharness.crabharness.models import PromotionPackage``,
-        which needs the OUTER crabharness/ directory as the top-level
-        ``crabharness`` package. tests/test_common_utils_characterization.py
-        and tests/test_structural_characterization.py deliberately put
-        crabharness/crabharness/ on sys.path instead (so crabharness's own
-        internal ``from crabharness.models import ...`` imports resolve) —
-        once either module has been collected in the same session,
-        sys.modules['crabharness'] is pinned to that other root for the rest
-        of the process, breaking this import. Force-clear the cached entries
-        and prioritise the repo root on sys.path so this class's imports
-        resolve correctly regardless of what already ran earlier in the
-        full-suite ordering (this is a real cross-file environment hazard,
-        not something introduced by these tests — see the two files above).
-
-        Just re-prioritising the repo root on sys.path is NOT enough:
-        crabharness/ has no __init__.py (a PEP 420 namespace portion when
-        found via the repo root), and a namespace-package candidate never
-        wins over a regular package found later in the scan — so as long as
-        crabharness/crabharness/ (a *regular* package, __init__.py present)
-        is anywhere on sys.path, `import crabharness` resolves to it
-        regardless of ordering. The conflicting entry must be removed from
-        sys.path entirely for the duration of this test, not just outranked.
-        """
-        import sys
+    def _real_crabharness_import_root(self, monkeypatch):
         from pathlib import Path
 
-        repo_root = Path(__file__).resolve().parent.parent
-        conflicting_entry = str(repo_root / "crabharness")
-        removed = {
-            name: sys.modules.pop(name)
-            for name in list(sys.modules)
-            if name == "crabharness" or name.startswith("crabharness.")
-        }
-        old_path = list(sys.path)
-        sys.path[:] = [p for p in sys.path if p != conflicting_entry]
-        if str(repo_root) not in sys.path:
-            sys.path.insert(0, str(repo_root))
-        try:
-            yield
-        finally:
-            sys.path[:] = old_path
-            for name in list(sys.modules):
-                if name == "crabharness" or name.startswith("crabharness."):
-                    del sys.modules[name]
-            sys.modules.update(removed)
+        monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent.parent / "crabharness"))
 
     def test_normal_apply_writes_nodes_and_edges(self):
         from opencrab.stores.sql_store import SQLStore
@@ -2071,12 +2028,7 @@ class TestHarnessPromotionApply:
         assert result["errors"][0]["node_id"] == "bad2"
 
     def test_error_crabharness_not_installed(self, monkeypatch):
-        # Python's import machinery looks up sys.modules by the *full* dotted
-        # name first ("crabharness.crabharness.models") — once that submodule
-        # has been cached by an earlier test's successful import, blanking
-        # only the top-level "crabharness" entry has no effect. Block the
-        # exact name the `from ... import` statement resolves.
-        monkeypatch.setitem(sys.modules, "crabharness.crabharness.models", None)
+        monkeypatch.setitem(sys.modules, "crabharness.models", None)
         result = harness_promotion_apply(_VALID_PACKAGE)
         assert result == {
             "error": "crabharness package not installed. Run: pip install -e crabharness/"
