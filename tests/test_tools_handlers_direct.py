@@ -2246,20 +2246,29 @@ class TestHarnessPromotionApply:
 
     def test_normal_dry_run_validates_edge_grammar(self):
         package = self._edge_package("i1", "i2")
-        package["edges"].append({
-            "from_space": "resource", "from_id": "i1", "relation": "related_to",
-            "to_space": "resource", "to_id": "i2",
-        })
+        package["edges"] += [
+            {"from_space": "resource", "from_id": "i1", "relation": "related_to",
+             "to_space": "resource", "to_id": "i2"},
+            # The space pair is directional: claim -> outcome is a defined
+            # meta-edge, outcome -> claim is not.
+            {"from_space": "claim", "from_id": "i3", "relation": "supports",
+             "to_space": "outcome", "to_id": "i4"},
+            {"from_space": "outcome", "from_id": "i4", "relation": "supports",
+             "to_space": "claim", "to_id": "i3"},
+        ]
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             result = harness_promotion_apply(package, dry_run=True)
         mock_ctx.assert_not_called()
         assert result["edge_receipts"] == [
-            {"from_id": "i1", "relation": "cites", "to_id": "i2", "status": "dry_run_valid"}
+            {"from_id": "i1", "relation": "cites", "to_id": "i2", "status": "dry_run_valid"},
+            {"from_id": "i3", "relation": "supports", "to_id": "i4", "status": "dry_run_valid"},
         ]
-        assert [e["edge"] for e in result["errors"]] == ["i1-[related_to]->i2"]
+        assert [e["edge"] for e in result["errors"]] == [
+            "i1-[related_to]->i2", "i4-[supports]->i3",
+        ]
         assert "related_to" in result["errors"][0]["error"]
 
-    def test_normal_apply_invalidates_bm25_cache_once_and_dry_run_does_not(self):
+    def test_normal_apply_invalidates_bm25_cache_once_per_write_and_dry_run_does_not(self):
         from opencrab.stores.sql_store import SQLStore
         from tests._pack_fixtures import ensure_test_user
 
@@ -2270,12 +2279,19 @@ class TestHarnessPromotionApply:
         sql = SQLStore("sqlite:///:memory:")
         ensure_test_user(sql, "test-user")
         hybrid = MagicMock()
+        nodes_only = dict(package, edges=[])
+        edges_only = dict(package, nodes=[])
         with patch("opencrab.mcp.tools._get_context") as mock_ctx:
             mock_ctx.return_value = _base_ctx(builder=builder, sql=sql, hybrid=hybrid)
             harness_promotion_apply(package, dry_run=True)
             hybrid.invalidate_bm25_cache.assert_not_called()
             harness_promotion_apply(package)
-        hybrid.invalidate_bm25_cache.assert_called_once_with()
+            assert hybrid.invalidate_bm25_cache.call_count == 1
+            # Either kind of receipt alone is a write.
+            harness_promotion_apply(nodes_only)
+            assert hybrid.invalidate_bm25_cache.call_count == 2
+            harness_promotion_apply(edges_only)
+            assert hybrid.invalidate_bm25_cache.call_count == 3
 
     def test_edge_no_receipts_means_no_bm25_invalidation(self):
         """An empty package and a package whose every write raised change
