@@ -2,7 +2,8 @@
 
 Channels covered (see docs/mcp-client-auth.md): ``uvicorn.access`` (request
 line), ``uvicorn.asgi`` (TRACE scope dump) and ``uvicorn.error`` (WebSocket
-handshake lines, closed by ``ws="none"`` in ``opencrab serve``).
+handshake lines; ``opencrab serve`` also sets ``ws="none"``). The REST process
+is covered by tests/test_rest_access_log_redaction.py (#608).
 
 The integration tests start the real ``opencrab serve --transport http
 --allow-query-token`` in a subprocess with an isolated HOME and data
@@ -88,7 +89,7 @@ def test_asgi_trace_scope_query_string_is_masked_on_a_copy():
 def test_install_is_idempotent_and_attaches_both_loggers():
     install_access_log_redaction()
     install_access_log_redaction()
-    for name in ("uvicorn.access", "uvicorn.asgi"):
+    for name in ("uvicorn.access", "uvicorn.asgi", "uvicorn.error"):
         filters = [f for f in logging.getLogger(name).filters if isinstance(f, AccessLogTokenRedactor)]
         assert len(filters) == 1
 
