@@ -2286,12 +2286,12 @@ class TestHarnessPromotionApply:
             harness_promotion_apply(package, dry_run=True)
             hybrid.invalidate_bm25_cache.assert_not_called()
             harness_promotion_apply(package)
-            assert hybrid.invalidate_bm25_cache.call_count == 1
+            hybrid.invalidate_bm25_cache.assert_called_once_with()
             # Either kind of receipt alone is a write.
-            harness_promotion_apply(nodes_only)
-            assert hybrid.invalidate_bm25_cache.call_count == 2
-            harness_promotion_apply(edges_only)
-            assert hybrid.invalidate_bm25_cache.call_count == 3
+            for only in (nodes_only, edges_only):
+                hybrid.invalidate_bm25_cache.reset_mock()
+                harness_promotion_apply(only)
+                hybrid.invalidate_bm25_cache.assert_called_once_with()
 
     def test_edge_no_receipts_means_no_bm25_invalidation(self):
         """An empty package and a package whose every write raised change

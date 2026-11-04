@@ -43,14 +43,14 @@
 | 5 | `test_edge_reapply_same_properties_is_idempotent_different_conflicts`: 같은 properties 재적용은 오류가 없고, 다른 properties는 `errors`에 오르며 저장값이 안 바뀐다 | 실패(RED) | M1 |
 | 6 | `test_normal_add_edge_receives_properties_kwarg`: 목 빌더의 `add_edge` kwargs에 `properties`가 있다 | 실패(RED) | M1 |
 | 7 | `test_normal_dry_run_validates_edge_grammar`: dry_run에 문법상 무효한 relation 엣지를 넣으면 `errors`에 오르고 유효 엣지는 `edge_receipts`에 오른다. 방향이 있는 공간 쌍의 정방향은 유효하고 역방향은 무효다. 스토어 컨텍스트는 열지 않는다 | 실패(RED) | M4: 엣지 검증 결과 무시, M10: 공간 인자 교환 |
-| 8 | `test_normal_apply_invalidates_bm25_cache_once_per_write_and_dry_run_does_not`: 실쓰기마다 `invalidate_bm25_cache`가 한 번 불리고(노드만 있는 패키지와 엣지만 있는 패키지도 같다) dry_run에서는 안 불린다 | 실패(RED) | M5: 호출 삭제, M11: 노드 영수증이 있을 때만 호출, M12: 엣지 영수증이 있을 때만 호출 |
-| 9 | `test_edge_no_receipts_means_no_bm25_invalidation`: 빈 패키지와 모든 쓰기가 예외인 패키지는 무효화를 부르지 않는다(대조군) | 통과 | M8: 조건 없이 호출, M11: 노드 영수증만 조건, M12: 엣지 영수증만 조건 |
+| 8 | `test_normal_apply_invalidates_bm25_cache_once_per_write_and_dry_run_does_not`: 실쓰기마다 `invalidate_bm25_cache`가 한 번 불리고(노드만 있는 패키지와 엣지만 있는 패키지도 같다) dry_run에서는 안 불린다 | 실패(RED) | M5: 호출 삭제, M11: 노드 영수증이 있을 때만 호출, M12: 엣지 영수증이 있을 때만 호출, M13: 인자를 붙여 호출 |
+| 9 | `test_edge_no_receipts_means_no_bm25_invalidation`: 빈 패키지와 모든 쓰기가 예외인 패키지는 무효화를 부르지 않는다(대조군) | 통과 | M8: 조건 없이 호출 |
 | 10 | `test_error_bm25_invalidation_failure_keeps_receipts`: `invalidate_bm25_cache`가 예외를 내도 영수증을 반환하고 경고를 남긴다 | 실패(RED) | M6: 가드 제거 |
 | 11 | `tests/test_crabharness_promotion_billing.py::TestApplyPromotionPackageEdgeProperties::test_normal_edge_properties_reach_add_edge`: `apply_promotion_package`가 `add_edge`에 properties를 넘긴다 | 실패(RED) | M7: `apply.py`의 `properties=` 인자 삭제 |
 | 12 | 같은 클래스의 `test_error_reserved_identity_key_in_edge_properties_is_rejected`: 신원 키가 든 엣지는 `add_edge` 앞에서 거부된다 | 실패(RED) | M9: 거부 호출 삭제 |
 | 13 | `tests/test_auth_boundary.py::...::test_dispatch_rejects_and_writes_nothing`의 `harness_promotion_apply` 사례: MCP 디스패치가 승격 패키지의 엣지 신원 키를 거부한다(대조군) | 통과 | 해당 없음(기존 거부 규칙을 승격 도구에 고정) |
 
-변이 M1부터 M12는 대상 파일을 직접 편집해 해당 시험이 실패함을 확인한 뒤 원본으로 되돌린다(`docs/gate-recipes.md` 역변이 절의 `opencrab/pack/` 밖 절차).
+변이 M1부터 M13은 대상 파일을 직접 편집해 해당 시험이 실패함을 확인한 뒤 원본으로 되돌린다(`docs/gate-recipes.md` 역변이 절의 `opencrab/pack/` 밖 절차).
 
 ## 하지 않는 일
 
