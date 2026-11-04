@@ -112,14 +112,17 @@ __all__ = [
 ]
 
 # #427: the ?token= credential travels in the URL when allow_query_token is on,
-# and uvicorn logs the URL. Two uvicorn loggers carry the query string: the
-# access log (request line) and the TRACE-level ASGI message logger (scope
-# dump). The WebSocket handshake lines on uvicorn.error also carry it; that
-# channel is closed by ws="none" in ``opencrab serve``, not filtered here.
+# and uvicorn logs the URL. Three uvicorn loggers carry the query string: the
+# access log (request line), the TRACE-level ASGI message logger (scope dump)
+# and uvicorn.error (WebSocket handshake lines). ``opencrab serve`` also sets
+# ws="none", so no handshake line exists there. #608: a client can send
+# ?token= to any process that mounts ``mcp_router``, even one that rejects the
+# query credential, and the request line is logged before the 401. So
+# ``mcp_router`` installs the filter and it covers the handshake lines too.
 # The mask is total (no prefix): a token prefix still shrinks the search space.
 _TOKEN_PARAM = "token"
 _TOKEN_MASK = "***"
-_REDACTED_LOGGERS = ("uvicorn.access", "uvicorn.asgi")
+_REDACTED_LOGGERS = ("uvicorn.access", "uvicorn.asgi", "uvicorn.error")
 
 
 def _redact_query(query: str) -> str:
@@ -155,7 +158,7 @@ def _scrub_log_arg(arg: Any) -> Any:
 
 
 class AccessLogTokenRedactor(logging.Filter):
-    """Mask ``token`` query values in uvicorn access and TRACE log records.
+    """Mask ``token`` query values in uvicorn access, TRACE and WebSocket log records.
 
     The filter never drops a record and never raises. A record with an
     unexpected args shape passes through unchanged.
@@ -174,8 +177,9 @@ def install_access_log_redaction() -> None:
     """Attach the redactor to the uvicorn loggers once (idempotent).
 
     Logger filters survive the ``dictConfig`` call in ``uvicorn.run()``, but
-    handlers do not. ``create_app()`` runs before that call, so one install
-    from ``create_app()`` is enough.
+    handlers do not. So the install can run before or after uvicorn sets up
+    its logging. ``mcp_router()`` is the only caller (#608): ``create_app()``
+    and ``apps.api.main`` both build their ``/mcp`` routes with it.
     """
     for name in _REDACTED_LOGGERS:
         target = logging.getLogger(name)
@@ -512,7 +516,13 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
     a deployment that does not need URL credentials must not carry their
     exposure. Only ``opencrab serve --transport http --allow-query-token``
     turns it on.
+
+    The router also installs the uvicorn log redaction (#608). Every process
+    that mounts these routes can receive ``?token=`` on any path, whether or
+    not it accepts that credential, and uvicorn logs the request line before
+    the 401.
     """
+    install_access_log_redaction()
     router = APIRouter()
     server = MCPServer()  # constructed once; tool stores lazy-init on first call
     bearer = HTTPBearer(auto_error=False)
@@ -1012,7 +1022,6 @@ async def _startup_registry_check(app: FastAPI) -> Any:
 def create_app(*, allow_query_token: bool = False) -> FastAPI:
     """Lightweight FastAPI app for ``serve --transport http`` — MCP router + healthz."""
     refuse_stale_shared_secret_env()
-    install_access_log_redaction()
     if allow_query_token:
         logger.warning(
             "?token= query-parameter auth is ENABLED. The credential will appear "
