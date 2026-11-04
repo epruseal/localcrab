@@ -329,3 +329,64 @@ class TestApplyPromotionPackageBilling:
             result = apply_promotion_package(package_path, dry_run=True)
         assert result["dry_run"] is True
         billing_instance.on_harness_apply.assert_not_called()
+
+
+class TestApplyPromotionPackageEdgeProperties:
+    """Issue #39: the CLI path dropped PromotionEdge.properties like the MCP
+    tool did. The other add_edge callers that have properties forward them."""
+
+    def test_normal_edge_properties_reach_add_edge(self, tmp_path, monkeypatch):
+        _principal_ctx = _bound_principal(tmp_path, monkeypatch)
+        graph, docs, sql, builder_instance, billing_instance = _patch_factories(
+            {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        )
+        builder_instance.add_edge.return_value = {
+            "receipt_id": "r2", "receipt_ts": "t2", "stores": {"graph": "ok"}
+        }
+        edge = dict(
+            _VALID_PACKAGE_WITH_EDGE["edges"][0],
+            properties={"confidence": 0.9, "evidence_refs": ["e1"]},
+        )
+        package_path = _write_package(tmp_path, dict(_VALID_PACKAGE_WITH_EDGE, edges=[edge]))
+        with (
+            _principal_ctx,
+            patch("opencrab.stores.factory.make_graph_store", return_value=graph),
+            patch("opencrab.stores.factory.make_doc_store", return_value=docs),
+            patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            patch("opencrab.stores.factory.make_billing_sql_store", return_value=sql),
+            patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
+            patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
+        ):
+            from crabharness.crabharness.apply import apply_promotion_package
+
+            apply_promotion_package(package_path, dry_run=False)
+        assert builder_instance.add_edge.call_args.kwargs["properties"] == {
+            "confidence": 0.9, "evidence_refs": ["e1"],
+        }
+
+    def test_error_reserved_identity_key_in_edge_properties_is_rejected(self, tmp_path, monkeypatch):
+        """The MCP dispatch rejects reserved identity keys under
+        package.edges[*].properties. The CLI path stores edge properties now,
+        so it applies the same rule before the write."""
+        _principal_ctx = _bound_principal(tmp_path, monkeypatch)
+        graph, docs, sql, builder_instance, billing_instance = _patch_factories(
+            {"receipt_id": "r1", "receipt_ts": "t1", "stores": {"graph": "ok"}}
+        )
+        edge = dict(_VALID_PACKAGE_WITH_EDGE["edges"][0], properties={"owner_id": "victim"})
+        package_path = _write_package(tmp_path, dict(_VALID_PACKAGE_WITH_EDGE, edges=[edge]))
+        with (
+            _principal_ctx,
+            patch("opencrab.stores.factory.make_graph_store", return_value=graph),
+            patch("opencrab.stores.factory.make_doc_store", return_value=docs),
+            patch("opencrab.stores.factory.make_sql_store", return_value=sql),
+            patch("opencrab.stores.factory.make_billing_sql_store", return_value=sql),
+            patch("opencrab.ontology.builder.OntologyBuilder", return_value=builder_instance),
+            patch("opencrab.billing.hooks.BillingHooks", return_value=billing_instance),
+        ):
+            from crabharness.crabharness.apply import apply_promotion_package
+
+            result = apply_promotion_package(package_path, dry_run=False)
+        builder_instance.add_edge.assert_not_called()
+        assert result["edge_receipts"] == []
+        assert len(result["errors"]) == 1
+        assert "owner_id" in result["errors"][0]["error"]

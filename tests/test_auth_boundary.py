@@ -654,6 +654,26 @@ class TestReservedIdentityKeysInPayloads:
                     "properties": {"owner_id": "victim"},
                 },
             ),
+            (
+                "harness_promotion_apply",
+                {
+                    "package": {
+                        "package_id": "p",
+                        "mission_id": "m",
+                        "run_id": "r",
+                        "edges": [
+                            {
+                                "from_space": "resource",
+                                "from_id": "a",
+                                "relation": "cites",
+                                "to_space": "resource",
+                                "to_id": "b",
+                                "properties": {"owner_id": "victim"},
+                            }
+                        ],
+                    },
+                },
+            ),
         ],
     )
     def test_dispatch_rejects_and_writes_nothing(self, env, tool, arguments):
