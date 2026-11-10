@@ -1402,6 +1402,11 @@ def packs_backfill_pack_id(
     Default mode infers pack_id from any ``/packs/<id>/`` path stored in
     ``properties.source_path`` / ``source_id`` / ``node_id`` / ``id``.
     ``--assume-pack-id X`` fills every still-empty entry with X.
+
+    ``--apply`` holds write.lock from the plan to the end of the write (#630).
+    It waits for another holder up to WRITE_LOCK_TIMEOUT and exits 1 with the
+    holder message on timeout. Other writers wait for this command in turn.
+    A dry run takes no lock.
     """
     from opencrab.config import get_settings
     from opencrab.ontology.pack_provenance import inspect_pack_ids, resolve_backfill_dry_run
@@ -1421,34 +1426,53 @@ def packs_backfill_pack_id(
     # helpers are read-only here; the target store is the only write path.
     from opencrab.ontology.pack_provenance import _backfill_pack_ids_unlocked
 
-    counts = _backfill_pack_ids_unlocked(
-        db_path, assume_pack_id=assume_pack_id, dry_run=True
-    )
-    plan = inspect_pack_ids(db_path, assume_pack_id=assume_pack_id)
+    def read_plan() -> tuple[dict[str, Any], dict[str, Any]]:
+        counts = _backfill_pack_ids_unlocked(
+            db_path, assume_pack_id=assume_pack_id, dry_run=True
+        )
+        return counts, inspect_pack_ids(db_path, assume_pack_id=assume_pack_id)
+
     if effective_dry_run:
+        counts, plan = read_plan()
         summary = {**counts, "dry_run": True, **plan}
     else:
+        from contextlib import ExitStack
         from dataclasses import asdict
 
+        from opencrab.locking import write_lock
         from opencrab.stores.factory import make_graph_store
 
-        graph = make_graph_store(cfg)
-        try:
-            if not graph.available:
-                raise RuntimeError("target graph store is not available")
-            receipt = (
-                graph.backfill_pack_provenance(plan["records"])
-                if plan["records"]
-                else None
-            )
-            summary = {
-                **counts,
-                "dry_run": False,
-                "receipt": asdict(receipt),
-                **plan,
-            }
-        finally:
-            graph.close()
+        # #630: hold write.lock from the plan to the close of the store.
+        # Another writer then cannot change the graph between the plan and
+        # the write, and cannot see this write inside its own hold. The store
+        # bootstrap takes the same lock file again on this thread, which
+        # file_lock allows. Only the acquisition timeout is converted.
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(
+                    write_lock(cfg.local_data_dir, purpose="packs backfill-pack-id")
+                )
+            except TimeoutError as exc:
+                err_console.print(f"[red]{exc}[/red]")
+                raise SystemExit(1) from exc
+            counts, plan = read_plan()
+            graph = make_graph_store(cfg)
+            try:
+                if not graph.available:
+                    raise RuntimeError("target graph store is not available")
+                receipt = (
+                    graph.backfill_pack_provenance(plan["records"])
+                    if plan["records"]
+                    else None
+                )
+                summary = {
+                    **counts,
+                    "dry_run": False,
+                    "receipt": asdict(receipt),
+                    **plan,
+                }
+            finally:
+                graph.close()
 
     console.print_json(json.dumps(summary, ensure_ascii=False))
     if effective_dry_run:
