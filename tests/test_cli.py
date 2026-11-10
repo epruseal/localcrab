@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1045,6 +1046,193 @@ class TestPacksBackfillPackId:
         ).fetchone()
         wrote_pack_id = "pack_id" in json.loads(row[0])
         assert wrote_pack_id is (not expected_dry_run)
+
+
+def _graph_snapshot(db_path: Path) -> list:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return [
+            conn.execute("SELECT node_id, properties FROM graph_nodes ORDER BY node_id").fetchall(),
+            conn.execute(
+                "SELECT from_id, relation, to_id, properties FROM graph_edges "
+                "ORDER BY from_id, relation, to_id"
+            ).fetchall(),
+        ]
+    finally:
+        conn.close()
+
+
+def _node_props(db_path: Path, node_id: str) -> dict:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT properties FROM graph_nodes WHERE node_id=?", (node_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return json.loads(row[0])
+
+
+class TestPacksBackfillPackIdWriteLock:
+    """#630: ``--apply`` holds write.lock from the plan through the write.
+
+    The other holder is a thread of this process. ``file_lock`` blocks other
+    threads of the same process, as in
+    ``tests/test_store_bootstrap_lock_timeout_578.py``.
+    """
+
+    def test_apply_does_not_write_inside_another_holders_lock(
+        self, cli_env, runner, monkeypatch
+    ):
+        """Once the command has its graph store, no other writer can take
+        write.lock until the write is done."""
+        import opencrab.stores.factory as factory
+        from opencrab.locking import file_lock
+
+        db_path = cli_env / "graph.db"
+        _seed_graph(db_path)
+        real_make = factory.make_graph_store
+        decided = threading.Event()
+        cli_done = threading.Event()
+        seen: dict[str, object] = {}
+
+        def contender() -> None:
+            # timeout=0 tries once: a free lock is taken, a held lock is not.
+            try:
+                with file_lock("write.lock", str(cli_env), timeout=0):
+                    seen["before"] = _graph_snapshot(db_path)
+                    seen["first_try"] = "acquired"
+                    decided.set()
+                    cli_done.wait(timeout=30)
+                    seen["after"] = _graph_snapshot(db_path)
+            except TimeoutError:
+                seen["first_try"] = "blocked"
+                decided.set()
+
+        thread = threading.Thread(target=contender, daemon=True)
+
+        def make_then_contend(cfg):
+            store = real_make(cfg)
+            thread.start()
+            assert decided.wait(timeout=10)
+            return store
+
+        monkeypatch.setattr(factory, "make_graph_store", make_then_contend)
+        try:
+            result = runner.invoke(main, ["packs", "backfill-pack-id", "--apply"])
+        finally:
+            cli_done.set()
+            thread.join(timeout=30)
+
+        assert result.exit_code == 0, result.output
+        assert seen["first_try"] == "blocked", (
+            "another writer took write.lock while the command held its graph store; "
+            f"graph changed under that hold: {seen.get('before') != seen.get('after')}"
+        )
+        assert _node_props(db_path, "n-inferable")["pack_id"] == "pack-a"
+
+    def test_apply_waits_and_plans_after_the_holder_releases(
+        self, cli_env, runner, monkeypatch
+    ):
+        """A holder that changes the graph and then releases must not leave
+        the command with a plan made before that change."""
+        import opencrab.locking as locking
+        import opencrab.ontology.pack_provenance as provenance
+        from opencrab.locking import file_lock
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        db_path = cli_env / "graph.db"
+        _seed_graph(db_path)
+        main_thread = threading.get_ident()
+        order: list[str] = []
+        moved = threading.Event()
+        real_inspect = provenance.inspect_pack_ids
+        real_write_lock = locking.write_lock
+
+        def inspect_and_signal(*args, **kwargs):
+            plan = real_inspect(*args, **kwargs)
+            order.append("planned")
+            moved.set()
+            return plan
+
+        def write_lock_and_signal(*args, **kwargs):
+            # Only the command's thread. The holder's own store bootstrap
+            # also calls write_lock.
+            if threading.get_ident() == main_thread:
+                order.append("lock")
+                moved.set()
+            return real_write_lock(*args, **kwargs)
+
+        monkeypatch.setattr(provenance, "inspect_pack_ids", inspect_and_signal)
+        monkeypatch.setattr(locking, "write_lock", write_lock_and_signal)
+        holding = threading.Event()
+        holder_saw_move: list[bool] = []
+
+        def holder() -> None:
+            with file_lock("write.lock", str(cli_env), timeout=30):
+                holding.set()
+                # Change the graph after the command's first step: a plan, or
+                # a request for write.lock.
+                holder_saw_move.append(moved.wait(timeout=30))
+                store = LocalGraphStore(db_path=str(db_path))
+                store.upsert_node("Agent", "n-late", {"source_path": "/data/packs/pack-b/z.md"})
+                store.close()
+
+        thread = threading.Thread(target=holder, daemon=True)
+        thread.start()
+        assert holding.wait(timeout=10)
+        try:
+            result = runner.invoke(main, ["packs", "backfill-pack-id", "--apply"])
+        finally:
+            thread.join(timeout=30)
+
+        assert holder_saw_move == [True]
+        assert order[0] == "lock", order
+        assert result.exit_code == 0, result.output
+        assert _node_props(db_path, "n-late")["pack_id"] == "pack-b"
+        assert _node_props(db_path, "n-inferable")["pack_id"] == "pack-a"
+
+    def test_apply_times_out_with_an_operator_message(self, cli_env, runner, monkeypatch):
+        from opencrab.config import get_settings
+        from tests.test_store_bootstrap_lock_timeout_578 import _Holder
+
+        db_path = cli_env / "graph.db"
+        _seed_graph(db_path)
+        before = _graph_snapshot(db_path)
+        monkeypatch.setenv("WRITE_LOCK_TIMEOUT", "0.3")
+        get_settings.cache_clear()
+
+        with _Holder(str(cli_env)) as holder:
+            result = runner.invoke(main, ["packs", "backfill-pack-id", "--apply"])
+            holder_alive = holder.alive()
+
+        assert holder_alive
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        # Rich folds a long path across lines. Join the lines before matching.
+        unfolded = result.output.replace("\n", "")
+        assert "write.lock" in unfolded
+        assert "timed out after" in " ".join(result.output.split())
+        assert _graph_snapshot(db_path) == before
+
+    def test_dry_run_does_not_wait_for_write_lock(self, cli_env, runner, monkeypatch):
+        from opencrab.config import get_settings
+        from tests.test_store_bootstrap_lock_timeout_578 import _Holder
+
+        db_path = cli_env / "graph.db"
+        _seed_graph(db_path)
+        free = runner.invoke(main, ["packs", "backfill-pack-id"])
+        assert free.exit_code == 0, free.output
+        monkeypatch.setenv("WRITE_LOCK_TIMEOUT", "0.3")
+        get_settings.cache_clear()
+
+        with _Holder(str(cli_env)) as holder:
+            held = runner.invoke(main, ["packs", "backfill-pack-id"])
+            holder_alive = holder.alive()
+
+        assert holder_alive
+        assert held.exit_code == 0, held.output
+        assert _parse_leading_json(held.output) == _parse_leading_json(free.output)
 
 
 # ---------------------------------------------------------------------------
