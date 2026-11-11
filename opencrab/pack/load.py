@@ -3239,6 +3239,15 @@ def incremental_finalize(
     `PackNotFoundError`/`PackForbiddenError` 로 아무것도 지우지 않고 끝난다. 청크 축
     `load_chunks_incremental` 과 같은 호출당 1회 검사이며 같은 의도한 모서리(적재 도중
     소유권 변경)를 갖는다. 호출자는 증분 적재에 넘긴 것과 같은 등록부 `SQLStore` 를 넘긴다.
+
+    삭제 순서(#636): 후보 노드의 doc 행을 먼저 지우고, 그 뒤 그래프 노드를 지운다. 한
+    노드의 doc 행을 지우다 예외가 나면 그 노드는 이번 실행에서 그래프에 남기고 건수를 경고로
+    남긴다(`node_del` 은 실제로 지운 수 그대로다). 그래서 doc 삭제 실패나 중단 뒤에도
+    `live_pack_state` 가 이 팩의 비앵커 doc 행으로 읽는 행은 그래프 노드 없이 남지 않는다.
+    이 팩 태그가 없는 doc 행은 이 단계가 보지 못한다. 중단하면 doc 행 없는 그래프 노드가 남을 수
+    있고, 같은 입력의 다음 실행이 후보로 다시 잡아 지운다. 노드 벡터는 종전대로 마지막 벡터
+    고아 단계에서 지운다(그래프 노드 삭제 뒤의 벡터 창은 #640). 계약 서술:
+    `docs/pack-contract-layer.md` 의 6-1절.
     """
     require_live_data("incremental_finalize")
     principal = _require_bound_principal()
@@ -3311,11 +3320,37 @@ def incremental_finalize(
                 "--force-delete 로 강행하십시오."
             )
 
-    # ── 노드 삭제 ────────────────────────────────────────────────────
-    # doc 삭제는 여기서 하지 않는다 — 아래 doc 축 정리(doc_del_candidates)가
-    # 이 node_id 의 모든 space 를 한 번에 지운다. 예전엔 여기서 live_nodes 의
-    # space_id 하나만 지워서 다른 space 의 행을 놓쳤다(F4-d, 2026-08-11 설계 지적).
+    # ── doc 축 정리: 후보 노드의 모든 space 행을 그래프 노드보다 먼저 지운다(#636) ──
+    # load_nodes_incremental 의 F4-c 가 매 증분 실시간으로 대부분 정리하지만,
+    # 그 경로를 안 거치는 자리(아래 노드 삭제 경로 등)의 doc 삭제도 여기서 합류한다.
+    # 순서가 계약이다. 예전에는 그래프 노드를 먼저 지웠다. 그래서 doc 삭제가 실패하거나
+    # 두 단계 사이에서 멈추면 그래프 노드 없이 doc 행만 남았고, 그 행은 노드 BM25 결과로
+    # 나와 canonical 이 node_not_found 를 냈다. 지금은 행 하나라도 예외로 못 지운 노드를
+    # `doc_failed` 에 모으고, 아래 노드 삭제가 그 노드를 건너뛴다. 반환 False 는 지울 행이
+    # 없었다는 뜻이라 실패가 아니다. 이 순서에서 멈추면 doc 행 없는 그래프 노드가 남을 수
+    # 있다. 그 노드는 다음 증분의 live_pack_state 가 다시 읽어 같은 입력이면 다시 후보로
+    # 잡는다. 저널은 두지 않는다. 후보를 매 실행 입력과 라이브의 차이로 다시 정하기 때문이다.
+    doc_failed: set[str] = set()
+    for node_id in doc_del_candidates:
+        for space in doc_node_spaces[node_id]:
+            try:
+                ok_del = docs.delete_node_doc(space, node_id)
+            except Exception as exc:
+                doc_failed.add(node_id)
+                log.warning("doc 고아 삭제 오류(%s) %s space=%s: %s", pack_name, node_id, space, exc)
+                continue
+            if ok_del:
+                doc_orphan_del += 1
+
+    # ── 노드 삭제: doc 행을 다 지운 노드만 ─────────────────────────────────
+    # doc 삭제는 여기서 하지 않는다. 위 doc 축 정리(doc_del_candidates)가 이 node_id 의
+    # 모든 space 를 한 번에 지운다. 예전엔 여기서 live_nodes 의 space_id 하나만 지워서
+    # 다른 space 의 행을 놓쳤다(F4-d, 2026-08-11 설계 지적).
+    node_deferred = 0
     for node_id in node_del_candidates:
+        if node_id in doc_failed:
+            node_deferred += 1
+            continue
         node_type, _space_id, _props = live_nodes[node_id]
         try:
             deleted = graph.delete_node(node_type, node_id)
@@ -3324,19 +3359,10 @@ def incremental_finalize(
             continue
         if deleted:
             node_del += 1
-
-    # ── doc 축 정리: 후보 노드의 모든 space 행을 지운다 ─────────────────────
-    # load_nodes_incremental 의 F4-c 가 매 증분 실시간으로 대부분 정리하지만,
-    # 그 경로를 안 거치는 자리(위 노드 삭제 경로 등)의 doc 삭제도 여기서 합류한다.
-    for node_id in doc_del_candidates:
-        for space in doc_node_spaces[node_id]:
-            try:
-                ok_del = docs.delete_node_doc(space, node_id)
-            except Exception as exc:
-                log.warning("doc 고아 삭제 오류(%s) %s space=%s: %s", pack_name, node_id, space, exc)
-                continue
-            if ok_del:
-                doc_orphan_del += 1
+    if node_deferred:
+        log.warning(
+            "그래프 노드 삭제 보류(%s): %d건. doc 행 삭제가 실패한 노드는 그래프에 남기고 "
+            "다음 증분이 다시 시도한다(#636)", pack_name, node_deferred)
 
     # ── 청크 삭제 (delete_pack과 동일 배치 패턴) ────────────────────────
     chunk_del_list = list(chunk_del_candidates)
