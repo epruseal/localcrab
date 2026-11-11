@@ -382,6 +382,11 @@ def test_write_lock_purpose_lands_in_the_record(tmp_path):
     assert record["purpose"] == "mcp tool: pack_ingest"
 
 
+# #627: dispatch_tool은 write.lock 앞에서 인자 이름을 inputSchema와 대조한다.
+# 실제 dispatch로 잠금까지 가는 아래 시험들은 스키마의 필수 인자를 채운다.
+_ADD_NODE_ARGUMENTS = {"space": "subject", "node_type": "User", "node_id": "u1"}
+
+
 def test_dispatch_tool_write_purpose_reaches_the_record(tmp_path, monkeypatch, bind_test_principal):
     """정상(2b): `dispatch_tool()`을 실제로 통과시켜 purpose가
     `f"mcp tool: {name}"`으로 락 파일까지 이어짐을 증명한다 -- `_write_lock()`이나
@@ -413,7 +418,9 @@ def test_dispatch_tool_write_purpose_reaches_the_record(tmp_path, monkeypatch, b
         # visible to dispatch_tool() running on a plain new thread. Copy the
         # current context explicitly so the worker sees the same principal.
         ctx = contextvars.copy_context()
-        worker = threading.Thread(target=ctx.run, args=(dispatch_tool, name, {}))
+        worker = threading.Thread(
+            target=ctx.run, args=(dispatch_tool, name, _ADD_NODE_ARGUMENTS)
+        )
         worker.start()
         try:
             assert entered.wait(timeout=5), "쓰기 도구 본문에 들어가지 않았다"
@@ -510,7 +517,9 @@ def test_dispatch_timeout_error_excludes_holder_info_at_modern_boundary(
     server = MCPServer()
     with _Holder("write.lock", str(tmp_path)):
         with caplog.at_level("WARNING"):
-            response = server._modern_tools_call({"name": "ontology_add_node", "arguments": {}})
+            response = server._modern_tools_call(
+                {"name": "ontology_add_node", "arguments": _ADD_NODE_ARGUMENTS}
+            )
     text = response["content"][0]["text"]
     assert json.loads(text) == {"error": "ontology_add_node failed (TimeoutError)"}
     assert "pid=" not in text
@@ -529,7 +538,9 @@ def test_dispatch_timeout_error_excludes_holder_info_at_legacy_boundary(
     server = MCPServer()
     with _Holder("write.lock", str(tmp_path)):
         with caplog.at_level("WARNING"):
-            response = server._handle_tools_call({"name": "ontology_add_node", "arguments": {}})
+            response = server._handle_tools_call(
+                {"name": "ontology_add_node", "arguments": _ADD_NODE_ARGUMENTS}
+            )
     text = response["content"][0]["text"]
     assert json.loads(text) == {"error": "ontology_add_node failed (TimeoutError)"}
     assert "pid=" not in text

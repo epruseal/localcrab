@@ -10,8 +10,11 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
+import sys
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,15 +91,37 @@ def _bearer():
     return {"Authorization": f"Bearer {secret}"}
 
 
+@contextmanager
 def _app(which):
-    """MCP 인스턴스(``opencrab serve --transport http``)와 REST 프로세스의 앱."""
+    """MCP 인스턴스(``opencrab serve --transport http``)와 REST 프로세스의 앱.
+
+    REST 앱은 새로 import한다. ``apps.api.main``은 import할 때 ``mcp_router()``를
+    한 번 붙이고, 그 라우터는 처음 성공한 인증 저장소를 캐시한다. 앞선 시험이 다른
+    ``LOCAL_DATA_DIR``로 이 모듈을 먼저 썼으면 이 시험의 토큰은 401이 된다. 끝나면
+    ``sys.modules``와 패키지 속성을 원래대로 돌린다(``tests/test_http_app_modern.py``의
+    import 시험과 같은 방식).
+    """
     if which == "serve":
         from opencrab.mcp.http_app import create_app
 
-        return create_app()
-    import apps.api.main as api_main
+        yield create_app()
+        return
+    import apps.api as api_pkg
 
-    return api_main.app
+    name = "apps.api.main"
+    original_module = sys.modules.pop(name, None)
+    had_attr = hasattr(api_pkg, "main")
+    original_attr = getattr(api_pkg, "main", None)
+    try:
+        yield importlib.import_module(name).app
+    finally:
+        sys.modules.pop(name, None)
+        if original_module is not None:
+            sys.modules[name] = original_module
+        if had_attr:
+            api_pkg.main = original_attr
+        elif hasattr(api_pkg, "main"):
+            delattr(api_pkg, "main")
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +201,12 @@ class TestError:
         """MCP 인스턴스 둘이 쓰는 앱과 REST 프로세스의 ``/mcp``가 같은 결과를 낸다."""
         caplog.set_level(logging.WARNING)
         headers = _bearer()
-        client = TestClient(_app(which))
-        resp = client.post(
-            "/mcp",
-            json=_call("ontology_list_edges", {"from_type": "Concept", "to_type": "Concept"}),
-            headers=headers,
-        )
+        with _app(which) as app:
+            resp = TestClient(app).post(
+                "/mcp",
+                json=_call("ontology_list_edges", {"from_type": "Concept", "to_type": "Concept"}),
+                headers=headers,
+            )
         assert resp.status_code == 200
         payload, _ = _payload(resp.json())
         assert "from_type" in payload["error"]
