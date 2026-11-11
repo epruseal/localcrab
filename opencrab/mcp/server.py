@@ -28,6 +28,7 @@ from opencrab.mcp import protocol
 from opencrab.mcp.protocol import ProtocolValidationError
 from opencrab.mcp.tools import (
     ForbiddenArgumentError,
+    ToolArgumentError,
     UnknownToolError,
     dispatch_tool,
     safe_tool_error,
@@ -369,13 +370,18 @@ class MCPServer:
             result = dispatch_tool(name, arguments)
         except UnknownToolError:
             raise
-        except ForbiddenArgumentError as exc:
+        except (ForbiddenArgumentError, ToolArgumentError) as exc:
             # #168: a narrow catch of dispatch_tool's own curated exception
             # type (see its docstring) -- its message names only the
             # CLIENT'S OWN rejected argument (e.g. "subject_id"), never a
             # backend value, a path, or an internal repr. Kept unchanged
             # per design's principle that a narrow catch of a specific,
             # already-reviewed exception type may keep its own message.
+            # #627: ToolArgumentError는 인자 이름이 inputSchema와 맞지 않을 때
+            # dispatch_tool이 도구 함수를 부르기 전에 던진다. 메시지는 도구
+            # 이름, 거부된 인자 이름, 스키마 밖 이름이 있으면 그 도구가 받는
+            # 인자 이름을 담는다. TypeError 전체를 받지 않으므로 도구 본문이
+            # 던진 TypeError는 아래 일반 처리로 간다.
             result = {"error": str(exc)}
         except LookupError as exc:
             if type(exc) is LookupError:
@@ -522,11 +528,12 @@ class MCPServer:
             # the generic envelope below instead of being misreported as
             # "method not found".
             raise
-        except ForbiddenArgumentError as exc:
+        except (ForbiddenArgumentError, ToolArgumentError) as exc:
             # #168: same rationale as `_modern_tools_call`'s equivalent
             # catch -- a narrow catch of dispatch_tool's own curated
             # exception type, whose message names only the client's own
-            # rejected argument. Kept unchanged.
+            # rejected argument. Kept unchanged. #627: ToolArgumentError도
+            # 같은 이유로 여기서 받는다(`_modern_tools_call`의 같은 catch 참고).
             result = {"error": str(exc)}
         except LookupError as exc:
             if type(exc) is LookupError:

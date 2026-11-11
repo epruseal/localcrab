@@ -36,6 +36,16 @@ era 의 단일 출처는 **요청 바디**다. HTTP 헤더는 era 판정에 쓰�
 
 **`tools/call` 형상 검증(#251)**: legacy 도 modern 과 **같은** 공유 검증기(`validate_tools_call_params`)를 dispatch 이전에 통과한다 — 비문자열 `name`, truthy 비객체 `arguments`, 비객체 `params` 는 -32602 다. 전에는 이 형상들이 dispatch 안에서 터져 내부 TypeError 가 JSON-RPC **성공 봉투**에 실려 나가거나(-32601 로 갈리거나) -32603 이 됐다. 도구를 실행시키던 입력은 하나도 바뀌지 않았다. 남은 era 차이는 정확히 하나: legacy 는 present + **falsy** 비객체 `arguments`(`null`/`[]`/`0`/`0.0`/`false`/`""`)를 종전대로 `{}` 로 정규화해 **도구를 실행한다**(modern 은 -32602). 그 형상은 오늘 성공하는 호출이므로 D절 제거 시점까지 유지한다 — `docs/mcp-legacy-transition.md` §3.
 
+## tools/call 인자 이름 검증 (#627)
+
+두 세대 모두 `dispatch_tool`이 도구 함수를 부르기 전에 인자 이름을 그 도구의 `inputSchema`와 대조한다. 이 대조는 권한 확인과 `tenant_id`/`subject_id` 거부 뒤, write.lock 획득 앞에서 한다. `properties`에 없는 이름이나 `required`에 있는데 빠진 이름이 있으면 도구 함수를 부르지 않는다.
+
+`id`가 있는 요청의 응답은 거부된 이름을 담은 최상위 `{"error": ...}` 도구 결과다. 스키마 밖 이름이 있으면 그 도구가 받는 이름도 함께 담는다. JSON-RPC 오류가 아니며, modern에서는 위 규칙대로 `isError`가 true다. 거부 기록은 WARNING 수준이고 호출자가 보낸 키 이름을 싣지 않으며 ERROR와 Traceback을 남기지 않는다.
+
+값의 타입과 중첩 객체 안의 키는 대조하지 않는다. 도구 본문이 던진 예외는 종전대로 ERROR와 Traceback으로 기록한다. 대조의 전제인 스키마와 함수 시그니처의 일치는 레지스트리 계약 시험이 고정한다.
+
+재현: `pytest tests/test_issue627_tool_argument_validation.py tests/test_tool_registry_contract.py::TestInputSchemaMatchesHandlerSignature`.
+
 ## pack_ingest partial 결과의 retryable 표
 
 `pack_ingest`의 partial 결과는 content에 `retryable`(불리언)을 싣는다. `isError`는 이 규칙과 무관하게 모든 partial에서 true다. 이 표가 `retryable`과 `reject_codes`를 정하는 유일한 문서이며, 다른 문서와 코드 주석은 이 표를 가리킨다.

@@ -172,6 +172,21 @@ class ForbiddenArgumentError(ValueError):
     believe it had taken effect."""
 
 
+class ToolArgumentError(TypeError):
+    """호출 인자 이름이 도구의 ``inputSchema``와 맞지 않을 때 dispatch_tool()이 던진다(#627).
+
+    스키마의 ``properties``에 없는 이름과 ``required``에 있는데 빠진 이름이
+    대상이다. 도구 함수를 부르기 전에 거르므로 호출자의 실수가 함수 바인딩의
+    TypeError와 ERROR, Traceback 기록으로 바뀌지 않는다. 메시지는 도구 이름과
+    거부된 인자 이름을 담고, 스키마 밖 이름이 있으면 그 도구가 받는 인자 이름도
+    담는다. 받는 인자 이름은 이 호출자에게 tools/list로 이미 보이는 스키마
+    이름이다.
+
+    같은 실수를 파이썬 직접 호출은 TypeError로 보고하므로 TypeError 하위형으로
+    둔다. dispatch_tool을 직접 부르며 TypeError를 잡던 호출자는 그대로 잡는다.
+    """
+
+
 def allowed_access_tiers(principal: Principal) -> frozenset[AccessTier]:
     """Access tiers *principal* may see (tools/list) and call (dispatch_tool).
 
@@ -309,6 +324,49 @@ _FORBIDDEN_ARGS = ("tenant_id", "subject_id")
 _reserved_identity_violations = boundary_identity_violations
 
 
+def _tool_argument_error(
+    name: str, input_schema: dict[str, Any], arguments: dict[str, Any]
+) -> ToolArgumentError | None:
+    """인자 이름이 스키마와 맞지 않으면 던질 예외를 만들어 돌려준다(#627).
+
+    돌려주기 전에 WARNING 수준 기록을 한 번 부른다.
+
+    최상위 인자 이름만 본다. 값의 타입과 중첩 객체 안의 키는 보지 않는다. 스키마
+    밖 이름은 호출자가 보낸 순서를, 빠진 필수 이름은 스키마의 순서를 따른다.
+    이름이 모두 맞으면 None을 돌려준다.
+
+    로그에는 도구 이름, 스키마 밖 이름의 개수, 빠진 필수 이름만 싣는다. 빠진
+    이름은 스키마가 정한 서버 쪽 이름이다. 호출자가 보낸 키 이름은 입력 원문이라
+    싣지 않는다(docs/observability-rules.md). 예외를 로그 호출보다 먼저 만들고
+    로그 호출의 Exception 계열 실패를 버리므로, 기록 경로의 예외가 이 입력 오류를
+    대신하지 않는다(safe_tool_error의 로그 보호와 같은 방식).
+    """
+    properties = input_schema.get("properties", {})
+    unexpected = [key for key in arguments if key not in properties]
+    missing = [key for key in input_schema.get("required", []) if key not in arguments]
+    if not unexpected and not missing:
+        return None
+    problems = []
+    if unexpected:
+        accepted = list(properties)
+        problems.append(
+            f"unexpected argument(s) {unexpected} -- not in this tool's inputSchema; "
+            f"accepted arguments: {accepted}"
+        )
+    if missing:
+        problems.append(f"missing required argument(s) {missing}")
+    error = ToolArgumentError(f"tool {name!r}: " + "; ".join(problems))
+    try:
+        logger.warning(
+            "tool %r: rejected call arguments before the handler ran "
+            "(unexpected=%d, missing=%s)",
+            name, len(unexpected), missing,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return error
+
+
 def safe_tool_error(source: str, exc: Exception) -> str:
     """Caller-facing message for an exception a broad `except` caught.
 
@@ -387,7 +445,9 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
                                    the SAME UnknownToolError, computed from
                                    the SAME tools_for_principal(principal)
                                    "Available" list
-        3. client-argument validation -- _FORBIDDEN_ARGS / reserved-identity
+        3. client-argument validation -- _FORBIDDEN_ARGS / reserved-identity,
+                                   이어서 인자 이름과 inputSchema 대조
+                                   (ToolArgumentError, #627)
         4. handler execution
 
     Step 2 running before step 3 is the fix: the earlier ordering validated
@@ -478,6 +538,13 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
             "authenticated identity. Rejected rather than overwritten so the "
             "caller does not believe its value was stored."
         )
+
+    # #627: 인자 이름을 inputSchema와 대조한다. 권한 확인 뒤에 두므로 숨긴
+    # 도구의 스키마 이름은 메시지로 새지 않는다. 실행(write.lock 획득 포함)
+    # 앞에 두므로 거부된 호출은 도구 함수에 닿지 않는다.
+    argument_error = _tool_argument_error(name, spec.schema.get("inputSchema", {}), arguments)
+    if argument_error is not None:
+        raise argument_error
 
     # Step 4: execute.
     with principal_scope(principal):
