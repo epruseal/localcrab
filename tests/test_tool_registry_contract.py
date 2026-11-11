@@ -86,6 +86,34 @@ class TestToolSchemaShape:
             )
 
 
+class TestInputSchemaMatchesHandlerSignature:
+    """#627: ``dispatch_tool``은 인자 이름을 ``inputSchema``와 대조해 거른다.
+
+    스키마와 도구 함수 시그니처가 어긋나면 두 결함 가운데 하나가 생긴다.
+    스키마가 좁으면 함수가 받는 정상 호출을 검증이 거부한다. 스키마가 넓으면
+    검증을 통과한 호출이 함수 바인딩에서 TypeError가 되어 ERROR와 Traceback으로
+    돌아간다. 이 시험이 두 집합의 일치를 고정한다.
+    """
+
+    @pytest.mark.parametrize("name", GOLDEN_TOOL_NAMES)
+    def test_properties_and_required_match_handler_parameters(self, name):
+        import inspect
+
+        from opencrab.mcp.tools._registry import _REGISTRY
+
+        spec = _REGISTRY[name]
+        schema = spec.schema["inputSchema"]
+        params = list(inspect.signature(spec.fn).parameters.values())
+        kinds = {p.kind for p in params}
+        assert inspect.Parameter.VAR_KEYWORD not in kinds, name
+        assert inspect.Parameter.VAR_POSITIONAL not in kinds, name
+        assert inspect.Parameter.POSITIONAL_ONLY not in kinds, name
+        assert set(schema["properties"]) == {p.name for p in params}, name
+        assert set(schema["required"]) == {
+            p.name for p in params if p.default is inspect.Parameter.empty
+        }, name
+
+
 class TestDispatchContract:
     def test_dispatch_known_tool_ontology_manifest(self):
         # ontology_manifest() takes no ctx/store dependencies — safe to call
