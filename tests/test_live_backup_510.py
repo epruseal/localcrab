@@ -172,8 +172,8 @@ class _StepWriter:
     Give it to ``backup_sqlite`` as the ``_on_step`` hook. The hook runs between two
     steps, so each commit occurs before the next step starts. A copy that holds no
     read snapshot must then start again at page 1. A pinned copy continues to read
-    its snapshot. Thus the order of steps and commits decides the result, and the
-    speed of the machine does not.
+    its snapshot. The order of steps and commits decides the result. The speed of
+    the machine does not change the result.
     """
 
     def __init__(self, path: Path) -> None:
@@ -182,7 +182,7 @@ class _StepWriter:
         self._conn.execute("PRAGMA synchronous=OFF")
         # The fixtures use ids 0 to 299 and ids from 10_000_000.
         self._next_id = 5_000_000
-        #: ``(status, pages done)`` after each step, in step order.
+        #: The hook adds one ``(status, pages done)`` pair after each step.
         self.steps: list[tuple[int, int]] = []
 
     def __call__(self, status: int, remaining: int, total: int) -> None:
@@ -222,7 +222,7 @@ class TestPinnedSnapshot:
             bk.backup_data_dir(live_dir, settings=_Settings(), lock_timeout=5.0)
         assert "rows" in pinned, "graph.db was not copied from a pinned snapshot"
         done = [pages for _status, pages in writer.steps]
-        # A commit came between each two steps ...
+        # A commit came after each step and before the next step ...
         assert len(done) >= 2 and marks["after"] > marks["before"], (
             "the writer did not run during the copy"
         )
@@ -262,7 +262,7 @@ class TestPinnedSnapshot:
     def test_control_without_the_pin_the_same_copy_cannot_finish(
         self, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Remove the pin: each commit of the same writer sends the copy back to page 1."""
+        """Remove the pin: each commit of the same writer makes the copy start again at page 1."""
         live_dir = big_live_dir
         real_open = bk._SnapshotPins.open_snapshot
 
@@ -284,8 +284,8 @@ class TestPinnedSnapshot:
             monkeypatch.setattr(bk, "backup_sqlite", spy)
             with pytest.raises(TimeoutError, match=r"graph\.db exceeded its deadline"):
                 bk.backup_data_dir(live_dir, settings=_Settings(), lock_timeout=1.5)
-        # The deadline only ends the run. The steps show the cause: a commit came
-        # between each two steps, and each step stopped where the first step stopped.
+        # The deadline only ends the run. The steps show the cause. A commit came after
+        # each step and before the next step. Each step stopped where the first step stopped.
         assert len(writer.steps) >= 2, writer.steps
         statuses = {status for status, _pages in writer.steps}
         assert statuses == {sqlite3.SQLITE_OK}, f"a step ended the copy or was busy: {statuses}"
