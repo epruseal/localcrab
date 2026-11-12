@@ -482,10 +482,9 @@ class TestSourceWriterOrigin:
 # "one caller" a stable, checkable contract instead of one this design's own
 # orchestrator would immediately violate.
 #
-# `opencrab/pack/fork.py` (the orchestrator) has not landed yet in this
-# unit, so the true file count is 0 today. "At most one" pins the ceiling
-# now; the orchestrator commit tightens this to "exactly one" (asserting the
-# single file IS opencrab/pack/fork.py) once that module exists.
+# `opencrab/pack/fork.py` (the orchestrator) landed with #201. The tests
+# below therefore pin the exact list of caller files instead of "at most
+# one". The only file that passes fork_copy=True is opencrab/pack/fork.py.
 #
 # #74 adds a SECOND, structurally different caller of `write_vector=False`:
 # `source_writer._graph_leg` passes it on every `write_source` call (fork or

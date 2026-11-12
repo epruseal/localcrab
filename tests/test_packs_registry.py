@@ -598,3 +598,23 @@ class TestPackPublish:
                     "pack_publish", {"pack_id": "no-such-pack", "visibility": "public-read"}
                 )
         assert result == {"error": "pack not found", "pack_id": "no-such-pack"}
+
+
+class TestPackPublishDescription:
+    """#532: a client reads this description through tools/list."""
+
+    def test_description_points_at_the_listed_pack_fork(self):
+        # tools/list returns tools_for_principal() as is (opencrab/mcp/server.py).
+        # A remote principal sees both tools: both are WRITE tier.
+        from opencrab.auth import current_principal
+        from opencrab.mcp.tools import tools_for_principal
+
+        remote = Principal(user_id="remote-1", is_local=False, disabled=False)
+        with principal_scope(remote):
+            listed = {t["name"]: t for t in tools_for_principal(current_principal())}
+        description = listed["pack_publish"]["description"]
+
+        assert "pack_fork" in listed
+        assert "pack_fork" in description
+        for stale in ("not available", "#148", "grants nothing"):
+            assert stale not in description

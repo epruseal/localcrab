@@ -165,8 +165,9 @@ def harness_promotion_apply(
     except PackNotFoundError:
         return {"error": "pack not found; use pack_create first", "pack_id": target_pack_id}
     except PackForbiddenError:
-        # No fork tool exists yet (see pack.py's pack_ingest/pack_publish) --
-        # naming one here would send callers into an unknown-tool error.
+        # This hint matches pack_ingest's hint (see its comment in pack.py).
+        # pack_fork (#201) writes only into a new pack that the caller owns.
+        # It cannot make this pack writable, so the hint does not name it.
         return {
             "error": "PACK_NOT_WRITABLE: not the pack owner",
             "pack_id": target_pack_id,

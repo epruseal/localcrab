@@ -1992,10 +1992,10 @@ def pack_ingest(
             "Set a content pack's visibility. Owner-only. `visibility` is one of: "
             "private (default — only the owner can see or use it), "
             "public-read (anyone can read/query it), or "
-            "public-fork (same read access as public-read today; it additionally "
-            "RECORDS that you permit forking. The fork tool itself is not "
-            "available yet -- it is planned in issue #148, so until then this "
-            "value expresses intent and grants nothing beyond public-read)."
+            "public-fork (same read access as public-read; other users can "
+            "also fork it with pack_fork into a new private pack that they "
+            "own). Other users can fork only a public-fork pack. The owner "
+            "can fork their own pack at any visibility."
         ),
         "inputSchema": {
             "type": "object",
