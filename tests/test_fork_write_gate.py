@@ -483,8 +483,8 @@ class TestSourceWriterOrigin:
 # orchestrator would immediately violate.
 #
 # `opencrab/pack/fork.py` (the orchestrator) landed with #201. The tests
-# below therefore pin the exact caller file list instead of "at most one":
-# the only fork_copy=True caller file is opencrab/pack/fork.py.
+# below therefore pin the exact list of caller files instead of "at most
+# one". The only file that passes fork_copy=True is opencrab/pack/fork.py.
 #
 # #74 adds a SECOND, structurally different caller of `write_vector=False`:
 # `source_writer._graph_leg` passes it on every `write_source` call (fork or
