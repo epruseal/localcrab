@@ -194,8 +194,9 @@ def ontology_add_node(
     except PackForbiddenError:
         # A visible (public) pack owned by someone else -- existence is
         # already observable, so this can safely say more than "not found".
-        # No fork tool exists yet (see pack.py's pack_ingest/pack_publish) --
-        # naming one here would send callers into an unknown-tool error.
+        # This hint matches pack_ingest's hint (see its comment in pack.py).
+        # pack_fork (#201) writes only into a new pack that the caller owns.
+        # It cannot make this pack writable, so the hint does not name it.
         return {
             "error": "PACK_NOT_WRITABLE: not the pack owner",
             "pack_id": target_pack_id,
@@ -331,8 +332,9 @@ def ontology_add_edge(
     except PackForbiddenError:
         # A visible (public) pack owned by someone else -- existence is
         # already observable, so this can safely say more than "not found".
-        # No fork tool exists yet (see pack.py's pack_ingest/pack_publish) --
-        # naming one here would send callers into an unknown-tool error.
+        # This hint matches pack_ingest's hint (see its comment in pack.py).
+        # pack_fork (#201) writes only into a new pack that the caller owns.
+        # It cannot make this pack writable, so the hint does not name it.
         return {
             "error": "PACK_NOT_WRITABLE: not the pack owner",
             "pack_id": target_pack_id,

@@ -858,7 +858,7 @@ def test_dispatch_tool_holds_the_write_lock_around_pack_ingest():
 # 23. No user-facing pack string may name a tool that is not registered.
 #
 # Round 7 of review found `hint: "use pack_fork to copy this pack into your
-# own"` on two error paths -- there is no pack_fork handler, so every caller
+# own"` on two error paths -- no pack_fork handler existed then, so every caller
 # who followed the advertised recovery path got an unknown-tool error. A
 # hand-fixed string can regress the same way, so pin the invariant instead of
 # the wording: every `<name>_<name>`-shaped tool reference appearing in
