@@ -166,31 +166,69 @@ def _assert_copy_equals_pin(expected: set[tuple[int, str]], copy: Path) -> None:
     assert _rows(copy) == expected, "the copy differs from the rows visible at the pin"
 
 
+class _StepWriter:
+    """A writer that commits one row to ``path`` after each step of a copy (#647).
+
+    Give it to ``backup_sqlite`` as the ``_on_step`` hook. The hook runs between two
+    steps, so each commit occurs before the next step starts. A copy that holds no
+    read snapshot must then start again at page 1. A pinned copy continues to read
+    its snapshot. Thus the order of steps and commits decides the result, and the
+    speed of the machine does not.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._conn = sqlite3.connect(str(path), isolation_level=None)
+        # The commits must change the source. They do not have to be durable.
+        self._conn.execute("PRAGMA synchronous=OFF")
+        # The fixtures use ids 0 to 299 and ids from 10_000_000.
+        self._next_id = 5_000_000
+        #: ``(status, pages done)`` after each step, in step order.
+        self.steps: list[tuple[int, int]] = []
+
+    def __call__(self, status: int, remaining: int, total: int) -> None:
+        self.steps.append((status, total - remaining))
+        self._next_id += 1
+        self._conn.execute("INSERT INTO t (id, v) VALUES (?, 'w')", (self._next_id,))
+
+    def close(self) -> None:
+        self._conn.close()
+
+
 class TestPinnedSnapshot:
     def test_copy_completes_and_matches_the_pin_while_a_writer_keeps_committing(
-        self, tmp_path: Path, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         live_dir = big_live_dir
         marks: dict[str, int] = {}
         pinned: dict[str, set[tuple[int, str]]] = {}
         real = bk.backup_sqlite
+        with contextlib.closing(_StepWriter(live_dir / "graph.db")) as writer:
 
-        def spy(src: Path, dst: Path, **kw: Any) -> None:
-            if kw.get("src_conn") is not None and src.name == "graph.db":
-                # Read on the pinned connection itself: this is the pin-time row set.
-                pinned["rows"] = _rows(kw["src_conn"])
+            def spy(src: Path, dst: Path, **kw: Any) -> None:
+                if src.name != "graph.db":
+                    real(src, dst, **kw)
+                    return
+                if kw.get("src_conn") is not None:
+                    # Read on the pinned connection itself: this is the pin-time row set.
+                    pinned["rows"] = _rows(kw["src_conn"])
                 marks["before"] = _count(src, "t")
-                kw["_on_step"] = lambda *_a: time.sleep(0.004)
+                # The writer runs whether or not the copy is pinned. An unpinned copy
+                # then cannot finish, and the backup fails with TimeoutError.
+                kw["_on_step"] = writer
                 real(src, dst, **kw)
                 marks["after"] = _count(src, "t")
-                return
-            real(src, dst, **kw)
 
-        monkeypatch.setattr(bk, "backup_sqlite", spy)
-        with _writer(tmp_path, live_dir, "unlocked"):
+            monkeypatch.setattr(bk, "backup_sqlite", spy)
             bk.backup_data_dir(live_dir, settings=_Settings(), lock_timeout=5.0)
+        assert "rows" in pinned, "graph.db was not copied from a pinned snapshot"
+        done = [pages for _status, pages in writer.steps]
+        # A commit came between each two steps ...
+        assert len(done) >= 2 and marks["after"] > marks["before"], (
+            "the writer did not run during the copy"
+        )
+        # ... and each step continued the copy: the copy never started again.
+        assert done == sorted(set(done)), f"the pinned copy started again: {done}"
         copy = _set_dir(live_dir) / "graph.db"
-        assert marks["after"] > marks["before"], "the writer did not run during the copy"
         _assert_copy_equals_pin(pinned["rows"], copy)
         # A set made while the service was writing passes the existing verifier.
         assert "graph.db" in bk.verify_backup_set(_set_dir(live_dir))["sqlite_integrity_checked"]
@@ -222,9 +260,9 @@ class TestPinnedSnapshot:
             _assert_copy_equals_pin(expected, copy)
 
     def test_control_without_the_pin_the_same_copy_cannot_finish(
-        self, tmp_path: Path, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Remove the pin and the writer restarts the copy until the deadline."""
+        """Remove the pin: each commit of the same writer sends the copy back to page 1."""
         live_dir = big_live_dir
         real_open = bk._SnapshotPins.open_snapshot
 
@@ -236,14 +274,26 @@ class TestPinnedSnapshot:
 
         monkeypatch.setattr(bk._SnapshotPins, "open_snapshot", never_pin)
         real = bk.backup_sqlite
+        with contextlib.closing(_StepWriter(live_dir / "graph.db")) as writer:
 
-        def slow(src: Path, dst: Path, **kw: Any) -> None:
-            kw["_on_step"] = lambda *_a: time.sleep(0.004)
-            real(src, dst, **kw)
+            def spy(src: Path, dst: Path, **kw: Any) -> None:
+                if src.name == "graph.db":
+                    kw["_on_step"] = writer
+                real(src, dst, **kw)
 
-        monkeypatch.setattr(bk, "backup_sqlite", slow)
-        with _writer(tmp_path, live_dir, "unlocked"), pytest.raises(TimeoutError):
-            bk.backup_data_dir(live_dir, settings=_Settings(), lock_timeout=1.5)
+            monkeypatch.setattr(bk, "backup_sqlite", spy)
+            with pytest.raises(TimeoutError, match=r"graph\.db exceeded its deadline"):
+                bk.backup_data_dir(live_dir, settings=_Settings(), lock_timeout=1.5)
+        # The deadline only ends the run. The steps show the cause: a commit came
+        # between each two steps, and each step stopped where the first step stopped.
+        assert len(writer.steps) >= 2, writer.steps
+        statuses = {status for status, _pages in writer.steps}
+        assert statuses == {sqlite3.SQLITE_OK}, f"a step ended the copy or was busy: {statuses}"
+        first = writer.steps[0][1]
+        assert first > 0, writer.steps[0]
+        assert {pages for _status, pages in writer.steps} == {first}, (
+            "a step got past the first chunk, so the copy did not start again"
+        )
 
     def test_a_snapshot_copy_may_outlast_the_lock_timeout(
         self, big_live_dir: Path, monkeypatch: pytest.MonkeyPatch
