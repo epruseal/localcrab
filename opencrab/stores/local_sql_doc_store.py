@@ -51,6 +51,7 @@ from typing import Any
 
 from opencrab.locking import StoreBootstrapLockTimeoutError
 from opencrab.stores import _node_bm25_sqlite as _nbm
+from opencrab.stores import _source_fts_sqlite as _sfts
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 from opencrab.stores._sqlite_base import _SqliteConnMixin
@@ -148,6 +149,11 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                             "source_id UNINDEXED, text, "
                             "tokenize='unicode61 remove_diacritics 0')"
                         )
+                        # #642: source_id lookup index on the FTS5 content table.
+                        # CREATE INDEX is DDL, so it commits on its own and stays
+                        # if a later statement of this block fails.
+                        _sfts.require_layout(cur)
+                        cur.execute(_sfts.INDEX_DDL)
                         # 최초 1회 마이그레이션(idempotent): FTS 비었고 본문이 있으면 일괄 색인.
                         n_fts = cur.execute("SELECT count(*) FROM doc_sources_fts").fetchone()[0]
                         n_src = cur.execute("SELECT count(*) FROM doc_sources").fetchone()[0]
@@ -409,7 +415,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         if self._fts_ok:
             statements.extend(
                 [
-                    ("DELETE FROM doc_sources_fts WHERE source_id=:source_id", {"source_id": source_id}),
+                    (_sfts.delete_sql("= :source_id"), {"source_id": source_id}),
                     (
                         "INSERT INTO doc_sources_fts(source_id, text) VALUES (:source_id, :text)",
                         {"source_id": source_id, "text": text},
@@ -447,11 +453,26 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             ),
         ]
         if self._fts_ok:
-            statements.append((
-                f"DELETE FROM doc_sources_fts WHERE source_id IN ({placeholders})",
-                params,
-            ))
+            statements.append((_sfts.delete_sql(f"IN ({placeholders})"), params))
         return self._exec_write_many(statements)[0]
+
+    def source_fts_report(self) -> dict[str, Any]:
+        """#642: counts of the source FTS rows from one read snapshot."""
+        self._require_available()
+        return _sfts.report(self._conn)
+
+    def prune_orphan_source_fts(self) -> dict[str, Any]:
+        """#642: delete the FTS rows that have no doc_sources row.
+
+        One write transaction finds and deletes the rows. Only the operator
+        command ``packs source-fts-orphans --apply`` calls this method, under
+        write.lock.
+        """
+        self._require_available()
+        if not self._fts_ok:
+            raise RuntimeError("the source FTS index is not available")
+        with self._tx(immediate=True) as conn:
+            return _sfts.prune_orphans(conn)
 
     def keyword_search(
         self,

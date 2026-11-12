@@ -61,6 +61,7 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from opencrab.stores import _source_fts_sqlite as _sfts
 from opencrab.stores._graph_common import decode_properties
 from opencrab.stores._json import dump_props
 from opencrab.stores._source_integrity import (
@@ -858,7 +859,7 @@ class _SqlDocStoreBase(abc.ABC):
             conn.execute(self._source_upsert_sql(), source_params)
             conn.execute(self._source_integrity_upsert_sql(), integrity_params)
             if getattr(self, "_fts_ok", False):
-                conn.execute("DELETE FROM doc_sources_fts WHERE source_id=:source_id", {"source_id": source_id})
+                conn.execute(_sfts.delete_sql("= :source_id"), {"source_id": source_id})
                 conn.execute(
                     "INSERT INTO doc_sources_fts(source_id, text) VALUES (:source_id, :text)",
                     {"source_id": source_id, "text": current.text},

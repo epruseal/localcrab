@@ -203,7 +203,10 @@ ctx["hybrid"].invalidate_bm25_cache()  # → epoch를 올려 재빌드 후 atomi
 > 벡터·BM25·그래프에 더해 **키워드 레그**(`_fts_search`)를 추가한다 — doc store가
 > `supports_keyword` capability를 노출할 때만 `keyword_search(...)`를 호출(미지원 시 폴백).
 > `LocalSQLDocStore`는 `doc_sources` 본문을 SQLite **FTS5**(`doc_sources_fts`,
-> `unicode61` 한+영)로 색인한다. 다른 백엔드(Mongo/pgvector)는 동일 capability로 구현.
+> `unicode61` 한+영)로 색인한다. 원문을 다시 쓰거나 지울 때는 FTS5 content 표의 `source_id`
+> 색인(`idx_doc_sources_fts_source_id`)으로 FTS 행을 찾아 rowid로 지운다. 원문이 없는 FTS 행은
+> `opencrab packs source-fts-orphans`가 보고하고 `--apply`가 지운다(#642,
+> `docs/issue-642-source-fts-lookup.md`). 다른 백엔드(Mongo/pgvector)는 동일 capability로 구현.
 > 구현은 `opencrab/stores/local_sql_doc_store.py`와 `opencrab/stores/pg_doc_store.py`를 참고한다.
 
 이 경로에서 JSON 파일 백엔드는 매 쿼리마다 `nodes.json` 전체를 파싱한다. 데이터가
