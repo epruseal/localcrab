@@ -1779,6 +1779,80 @@ def packs_bm25_index_drop(yes: bool) -> None:
     console.print_json(json.dumps({"dropped": True}))
 
 
+@packs.command("source-fts-orphans")
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Delete the orphan rows. Without this flag the command only reports.",
+)
+def packs_source_fts_orphans(apply_changes: bool) -> None:
+    """Report or delete source FTS rows without a doc_sources row (#642).
+
+    Without ``--apply`` the command opens doc_store.db read-only, takes no
+    lock and changes nothing. ``--apply`` holds write.lock from the first
+    report to the last one, as ``backfill-pack-id`` does (#630). It waits for
+    another holder up to WRITE_LOCK_TIMEOUT and exits 1 on timeout. The JSON
+    output holds flags, counts, rowid ranges and the plan of the delete
+    statement. It holds no body text and no source_id values. A dry run
+    prints one hint line after the JSON. Exit code 3 means that the
+    store cannot use its FTS index, or that the final report is not
+    consistent. See docs/issue-642-source-fts-lookup.md.
+    """
+    from contextlib import ExitStack
+
+    from opencrab.config import get_settings
+    from opencrab.stores import _source_fts_sqlite as sfts
+
+    cfg = get_settings()
+    if not cfg.is_local:
+        console.print("[red]source-fts-orphans supports the local SQLite doc store only.[/red]")
+        raise SystemExit(1)
+    db_path = Path(cfg.local_data_dir) / "doc_store.db"
+    if not db_path.exists():
+        console.print(f"[red]doc_store.db not found: {db_path}[/red]")
+        raise SystemExit(1)
+
+    if not apply_changes:
+        console.print_json(json.dumps({"dry_run": True, **sfts.read_only_report(str(db_path))}))
+        console.print("[dim]Dry-run only. Re-run with --apply to delete the orphan rows.[/dim]")
+        return
+
+    from opencrab.locking import write_lock
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    # #630 pattern: take write.lock first. The store bootstrap takes the same
+    # lock file again on this thread, which file_lock allows. Only the
+    # acquisition timeout is converted.
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(
+                write_lock(cfg.local_data_dir, purpose="packs source-fts-orphans")
+            )
+        except TimeoutError as exc:
+            err_console.print(f"[red]{exc}[/red]")
+            raise SystemExit(1) from exc
+        docs = LocalSQLDocStore(str(db_path))
+        try:
+            if not docs.supports_keyword:
+                console.print_json(json.dumps(
+                    {"dry_run": False, "error": "the source FTS index is not available"}
+                ))
+                raise SystemExit(3)
+            before = docs.source_fts_report()
+            deleted = docs.prune_orphan_source_fts()
+            after = docs.source_fts_report()
+        finally:
+            docs.close()
+
+    console.print_json(json.dumps(
+        {"dry_run": False, "before": before, "deleted": deleted, "after": after}
+    ))
+    if not sfts.report_consistent(after):
+        raise SystemExit(3)
+
+
 # ---------------------------------------------------------------------------
 # user group (#144)
 # ---------------------------------------------------------------------------
