@@ -1272,9 +1272,8 @@ class TestDoneJournalDriftRecheck:
         정확히 한 번만 읽어야 한다. 위 드리프트 탐침이 한 번 읽고
         `_delete_pack_vectors` 가 내부에서 다시 읽으면, 상태를 가진 property 의
         두 번째 접근이 던지는 예외가 vectors 축이 저널에 기록되기 전에
-        `delete_pack` 밖으로 새 나간다 — 앞 세 축(node_twin_loop/
-        doc_node_extra_and_sources/graph_nodes)은 이미 커밋됐어도 vectors 축
-        자체는 시도됐다는 기록조차 없이 유실된다.
+        `delete_pack` 밖으로 새 나간다. 앞선 축(#640 순서에서는 node_twin_loop)은
+        이미 커밋됐어도 vectors 축 자체는 시도됐다는 기록조차 없이 유실된다.
 
         역변이: `_delete_pack_vectors` 가 caller 가 넘긴 값 대신
         `vec.available` 을 다시 읽거나, 드리프트 탐침이 값을 캐시하지 않고
@@ -1494,7 +1493,7 @@ class TestDocAxisStickyFailureFlag:
 
 
 # ---------------------------------------------------------------------------
-# 6. 여러 중단 지점 — 첫 축(doc) 직후, 두 번째 축(graph) 직후는 실 SIGKILL.
+# 6. 여러 중단 지점: doc 축 커밋 직후, graph 축(#640 순서의 마지막 축) 커밋 직후는 실 SIGKILL.
 #    두 지점 모두: 재실행(무플래그) → 보고만 하고 멈춘다 → resume=True → 완주.
 # ---------------------------------------------------------------------------
 
@@ -1522,7 +1521,8 @@ class TestMultipleCrashPoints:
         """1번째 훅 위치: doc 축(node_twin_loop + doc_node_extra_and_sources)의
         마지막 커밋 직후·graph 축 진입 이전에 실 SIGKILL. [리드 재정의 핵심 계약]
         재개는 두 단계다 — 플래그 없이 재실행하면 보고만 하고 멈추며(무쓰기),
-        `resume=True` 를 줘야만 graph·vectors를 마저 끝낸다.
+        `resume=True` 를 줘야만 graph 축을 마저 끝낸다. vectors 축은 #640 순서에서
+        doc 축보다 먼저 끝나므로 이 지점에서는 이미 done 이다.
 
         역변이: 크래시 훅을 없애 doc 축 커밋과 저널 갱신을 분리하지 않으면(둘을
         하나의 "죽지 않는" 단계로 합치면) 이 크래시 지점 자체가 재현 불가능해져
@@ -1625,9 +1625,10 @@ class TestMultipleCrashPoints:
     ):
         """2번째 훅 위치: graph 축 완료 직후. [리드 재정의 핵심 계약] 무플래그
         재실행은 보고만 하고 멈추며(doc 축은 다시 불리지 않는다 — 이미 done),
-        `resume=True` 를 줘야만 vectors만 마저 실행한다 — doc/graph를 다시
-        실행하지 않는다는 점에서 위 테스트와 검증 축이 다르다(이 테스트는
-        "이미 done인 축은 건드리지 않는다"를 두 단계 모두에서 고정한다).
+        `resume=True` 재개도 doc/graph를 다시 실행하지 않는다는 점에서 위 테스트와
+        검증 축이 다르다(이 테스트는 "이미 done인 축은 건드리지 않는다"를 두 단계
+        모두에서 고정한다). #640 순서에서 graph 축은 마지막 축이라 이 지점에서는
+        vectors 축도 이미 done 이다.
 
         역변이: 재개가 이미 done인 축까지 무조건 다시 도는(멱등성에 기대 "그냥
         다 재실행"으로 단순화한) 구현이면, 최종 상태로는 못 잡을 수 있다(멱등이라
