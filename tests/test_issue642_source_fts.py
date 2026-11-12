@@ -28,6 +28,21 @@ PACKS = ["p", "q"]
 QUERIES = ["alpha", "beta", "gamma", "delta", "alpha beta", "orphanword"]
 
 
+def _fts5_available() -> bool:
+    """Probe FTS5 without the store, so a store defect cannot look like a skip."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+_FTS5_AVAILABLE = _fts5_available()
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -36,10 +51,11 @@ QUERIES = ["alpha", "beta", "gamma", "delta", "alpha beta", "orphanword"]
 def _open(path: Path):
     from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
-    store = LocalSQLDocStore(str(path))
-    if not store._fts_ok:
-        store.close()
+    if not _FTS5_AVAILABLE:
         pytest.skip("SQLite FTS5 is not available in this build")
+    store = LocalSQLDocStore(str(path))
+    # FTS5 works here, so a false _fts_ok is a bootstrap defect.
+    assert store._fts_ok, "the store bootstrap turned the FTS index off"
     return store
 
 
@@ -574,15 +590,20 @@ def test_c3f_apply_fails_when_the_final_report_is_inconsistent(cli_env, runner):
     assert summary["after"]["duplicate_source_ids"] == 1
 
 
-def test_apply_refuses_a_non_local_doc_store(cli_env, runner, monkeypatch):
+@pytest.mark.parametrize("mode", ["dry_run", "apply"])
+def test_refuses_a_non_local_doc_store(cli_env, runner, monkeypatch, mode):
     from opencrab.config import get_settings
 
-    _legacy_orphan_db(cli_env)
+    path, _normal, _orphans = _legacy_orphan_db(cli_env)
+    sha = _sha256(path)
     monkeypatch.setenv("STORAGE_MODE", "pg")
     get_settings.cache_clear()
-    for args in (["packs", "source-fts-orphans"], ["packs", "source-fts-orphans", "--apply"]):
-        result = runner.invoke(main, args)
-        assert result.exit_code == 1, result.output
+    args = ["packs", "source-fts-orphans"] + (["--apply"] if mode == "apply" else [])
+
+    result = runner.invoke(main, args)
+
+    assert result.exit_code == 1, result.output
+    assert _sha256(path) == sha
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +683,8 @@ def test_d2_duplicate_fts_rows_are_all_replaced_and_deleted(tmp_path):
 def test_d3_other_fts_layout_disables_fts_without_index(tmp_path):
     from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
+    if not _FTS5_AVAILABLE:
+        pytest.skip("SQLite FTS5 is not available in this build")
     path = tmp_path / "doc_store.db"
     conn = sqlite3.connect(str(path))
     conn.execute("CREATE VIRTUAL TABLE doc_sources_fts USING fts5(text, source_id UNINDEXED)")
