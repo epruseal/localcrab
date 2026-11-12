@@ -129,10 +129,13 @@ NOT EXISTS (SELECT 1 FROM doc_sources s WHERE s.source_id = c.c0)
 - 문서 저장소 백엔드가 로컬 SQLite가 아니면(`settings.is_local`이 거짓) 아무것도 하지 않고 종료
   코드 1로 끝난다. `LOCAL_DATA_DIR/doc_store.db`가 없어도 종료 코드 1이다.
 - 옵션 없이 실행하면 dry-run이다. DB를 `mode=ro`로 연다. write.lock을 잡지 않는다. 저장소를 만들지
-  않으므로 부트스트랩도 색인 생성도 실행하지 않는다. 출력은 JSON 객체 하나다. 항목은 배치 검사
-  결과, 색인 유무, `doc_sources` 행 수, FTS 행 수, 고아 행 수, 고아 행 rowid의 최솟값과 최댓값, FTS
-  행이 없는 원문 수, FTS 행이 둘 이상인 source_id 수다. 본문 텍스트와 source_id 값은 출력하지
-  않는다.
+  않으므로 부트스트랩도 색인 생성도 실행하지 않는다. 표준 출력은 JSON 객체 하나와 그 뒤의 안내 한
+  줄이다(`backfill-pack-id`의 dry-run과 같은 형태). JSON 항목은 `dry_run`, 배치 검사 결과
+  (`layout_ok`), 색인 유무(`index_present`), `doc_sources` 행 수, FTS 행 수, 고아 행 수, 고아 행
+  rowid의 최솟값과 최댓값, FTS 행이 없는 원문 수, FTS 행이 둘 이상인 source_id 수, D1 삭제 문장의
+  질의 계획(`delete_plan`, 자리표시자만 담은 계획 문자열)이다. 배치 검사가 실패하면 JSON 항목은
+  `dry_run`, `layout_ok`, `index_present`, `doc_sources` 행 수뿐이다. 본문 텍스트와 source_id 값은
+  출력하지 않는다.
 - 보고 하나의 항목은 모두 한 읽기 트랜잭션(`BEGIN`부터 `COMMIT`까지)의 스냅샷에서 계산한다. 그래서
   한 보고 안의 수들은 같은 시점을 나타낸다. 서로 다른 보고(dry-run, 사전 보고, 사후 보고)는 다른
   시점이며, 그 사이에 다른 작성자가 원문을 더하거나 지울 수 있다.
@@ -140,7 +143,7 @@ NOT EXISTS (SELECT 1 FROM doc_sources s WHERE s.source_id = c.c0)
   write.lock을 용도 이름과 함께 잡는다. 획득 시간 초과는 잠금 보유자 메시지와 종료 코드 1로 바꾼다.
   잠금 안에서 `LocalSQLDocStore`를 연다. 부트스트랩은 같은 스레드에서 같은 잠금 파일을 다시 잡으므로
   기다리지 않는다. 저장소가 키워드 검색을 쓸 수 없으면(`supports_keyword`가 거짓) 아무것도 지우지
-  않고 종료 코드 3으로 끝난다.
+  않고 `dry_run`과 `error` 항목만 담은 JSON 객체 하나를 낸 뒤 종료 코드 3으로 끝난다.
 - 잠금 안의 순서는 사전 보고, 고아 행 삭제, 사후 보고다. 고아 행 삭제는 한 `BEGIN IMMEDIATE`
   트랜잭션이다. 그 트랜잭션 안에서 D6 조건으로 고아 행의 수와 rowid 구간을 읽고, 같은 조건의
   rowid로 FTS 행을 지운다. 삭제 대상은 이 트랜잭션이 정하며, 사전 보고나 dry-run의 값을 쓰지 않는다.
@@ -176,6 +179,8 @@ RED 시험은 이 변경이 새로 만드는 동작을 확인하며, 수정 전 
 | 4. 원문 쓰기와 FTS 동기화가 한 트랜잭션이다 | RED | 세 지점에서 D1의 삭제 문장(`WHERE rowid IN (SELECT id FROM doc_sources_fts_content`)만 실패시킨다. 예외가 나고 원문, 무결성 상태, FTS 행이 그대로여야 한다. 수정 전에는 그 문장이 실행되지 않아 예외가 나지 않으므로 실패한다 | FTS 삭제를 원문 쓰기와 다른 트랜잭션으로 옮기면 원문 상태가 진입 전과 달라 실패한다 |
 | D2. 중복 FTS 행을 모두 지운다 | 계약 | 한 source_id에 FTS 행 둘을 둔다. 재기록 뒤 FTS 행이 하나이고 삭제 뒤 없어야 한다 | `IN`을 스칼라 `=`로 바꾸면 행이 남아 실패한다 |
 | D3. 배치가 다른 FTS 표 | RED | 열 순서가 다른 FTS 표가 있는 DB를 연다. 색인이 생기지 않고 `_fts_ok`가 거짓이어야 한다 | 배치 검사를 빼면 실패한다 |
+| D7. 보고가 FTS 없는 원문과 중복을 센다 | RED | 원문 둘 가운데 하나는 FTS 행이 없고 다른 하나는 FTS 행이 둘인 DB에서 dry-run이 FTS 없는 원문 1, 중복 1을 보고해야 한다 | FTS 없는 원문 수를 늘 0으로 바꾸면 실패한다 |
+| D7. FTS를 쓸 수 없는 저장소의 `--apply` | RED | 다른 배치의 FTS 표가 있는 DB에서 `--apply`가 종료 코드 3과 `error` 항목을 내고 FTS 행과 색인 유무가 그대로여야 한다 | `supports_keyword` 검사를 빼면 삭제 단계의 예외로 종료 코드가 1이 되어 실패한다 |
 | D7. 로컬 SQLite가 아닌 문서 저장소 | RED | dry-run과 `--apply`를 각각 다른 시험 ID로 실행한다. 둘 다 종료 코드 1로 끝나고 DB 파일이 바뀌지 않아야 한다 | `settings.is_local` 검사를 빼면 두 시험 ID가 모두 실패한다 |
 
 FTS5 지원 여부는 저장소를 거치지 않고 표준 `sqlite3`로 따로 판정한다. 모든 시험은 FTS5가 없는

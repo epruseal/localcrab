@@ -62,7 +62,7 @@ def delete_sql(source_id_condition: str) -> str:
 def report(conn: sqlite3.Connection) -> dict[str, Any]:
     """Counts of the source FTS rows. All values come from one read snapshot.
 
-    The report holds counts, rowid bounds and plan text only. It holds no
+    The report holds flags, counts, rowid bounds and plan text. It holds no
     body text and no source_id values.
     """
     own = not conn.in_transaction

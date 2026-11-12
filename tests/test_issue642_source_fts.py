@@ -590,6 +590,51 @@ def test_c3f_apply_fails_when_the_final_report_is_inconsistent(cli_env, runner):
     assert summary["after"]["duplicate_source_ids"] == 1
 
 
+def test_report_counts_sources_without_fts_and_duplicates(cli_env, runner):
+    store = _open(cli_env / "doc_store.db")
+    conn = store._conn
+    _raw_source(conn, "src-a", "alpha beta")  # no FTS row
+    _raw_source(conn, "src-b", "alpha gamma")
+    _raw_fts(conn, "src-b", "alpha gamma")
+    _raw_fts(conn, "src-b", "alpha gamma")  # duplicate FTS row
+    conn.commit()
+    store.close()
+
+    result = runner.invoke(main, ["packs", "source-fts-orphans"])
+
+    assert result.exit_code == 0, result.output
+    report = _parse_leading_json(result.output)
+    assert report["sources_without_fts"] == 1
+    assert report["duplicate_source_ids"] == 1
+    assert report["orphan_rows"] == 0
+
+
+def test_apply_refuses_when_fts_is_unavailable(cli_env, runner):
+    if not _FTS5_AVAILABLE:
+        pytest.skip("SQLite FTS5 is not available in this build")
+    path = cli_env / "doc_store.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE VIRTUAL TABLE doc_sources_fts USING fts5(text, source_id UNINDEXED)")
+    conn.execute("INSERT INTO doc_sources_fts(text, source_id) VALUES ('alpha', 'x')")
+    conn.commit()
+    conn.close()
+
+    result = runner.invoke(main, ["packs", "source-fts-orphans", "--apply"])
+
+    assert result.exit_code == 3, result.output
+    assert _parse_leading_json(result.output) == {
+        "dry_run": False, "error": "the source FTS index is not available",
+    }
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute("SELECT text, source_id FROM doc_sources_fts").fetchall() == [
+            ("alpha", "x")
+        ]
+        assert not _index_present(conn)
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("mode", ["dry_run", "apply"])
 def test_refuses_a_non_local_doc_store(cli_env, runner, monkeypatch, mode):
     from opencrab.config import get_settings

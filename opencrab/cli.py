@@ -1793,8 +1793,10 @@ def packs_source_fts_orphans(apply_changes: bool) -> None:
     Without ``--apply`` the command opens doc_store.db read-only, takes no
     lock and changes nothing. ``--apply`` holds write.lock from the first
     report to the last one, as ``backfill-pack-id`` does (#630). It waits for
-    another holder up to WRITE_LOCK_TIMEOUT and exits 1 on timeout. The
-    output holds counts and rowid ranges only. Exit code 3 means that the
+    another holder up to WRITE_LOCK_TIMEOUT and exits 1 on timeout. The JSON
+    output holds flags, counts, rowid ranges and the plan of the delete
+    statement. It holds no body text and no source_id values. A dry run
+    prints one hint line after the JSON. Exit code 3 means that the
     store cannot use its FTS index, or that the final report is not
     consistent. See docs/issue-642-source-fts-lookup.md.
     """
