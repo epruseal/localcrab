@@ -108,6 +108,29 @@ class _ShapeHostile:
         raise RuntimeError("vector store unavailable")
 
 
+class _AvailableFailsOnce:
+    """첫 가용성 읽기는 실패하고 뒤 읽기는 거짓을 내는 더블이다.
+
+    상태 열거 다음 마감 읽기에서 예외가 나는 갈래를 시험한다. 실 백엔드의 `available` 은
+    단순 속성이므로 현재 그 예외를 낸다는 주장은 아니다.
+    """
+
+    def __init__(self):
+        self.reads = 0
+        self.delete_calls: list[list[str]] = []
+
+    @property
+    def available(self):
+        self.reads += 1
+        if self.reads == 1:
+            raise RuntimeError("available read failed")
+        return False
+
+    def delete(self, ids):
+        self.delete_calls.append(list(ids))
+        raise AssertionError("delete must not be reached")
+
+
 class _VecScenario(_Scenario):
     """r20 시나리오에 벡터 DELETE 주입 지점을 더한다. `shared=True` 면 공유 id 행을 더한다."""
 
@@ -309,12 +332,13 @@ def test_finalize_interruption_at_every_mutation_point_leaves_no_ownerless_vecto
     assert window_seen, "순회가 벡터 삭제 뒤 그래프 노드 삭제 전 지점을 거치지 않았다"
 
 
-@pytest.mark.parametrize("backend", ["shaped-unavailable", "shape-probe-fails"])
+@pytest.mark.parametrize(
+    "backend", ["shaped-unavailable", "shape-probe-fails", "available-read-fails"])
 def test_finalize_unconfirmed_backend_defers_node_and_chunk_deletion(env, caplog, backend):
     """받아들임 기준 1, 2. 벡터 삭제를 확인할 수 없는 백엔드면 그래프 노드와 원본을 남긴다.
 
-    `shaped-unavailable` 은 모양은 있는데 `available` 이 거짓이다. `shape-probe-fails` 는 모양
-    판별이 예외로 끝난다. 두 경우 모두 `live_pack_state` 는 벡터 id 를 빈 집합으로 접는다.
+    앞의 두 사례에서는 `live_pack_state` 가 벡터 id 를 빈 집합으로 접는다. 세 번째 사례는
+    정상 백엔드로 상태를 읽은 뒤 마감의 가용성 읽기에서 예외를 주입한다.
     """
     sc = _VecScenario(env / "t")
     try:
@@ -322,10 +346,16 @@ def test_finalize_unconfirmed_backend_defers_node_and_chunk_deletion(env, caplog
         if backend == "shaped-unavailable":
             sc.vec.available = False
             vec = sc.vec
-        else:
+        elif backend == "shape-probe-fails":
             vec = _ShapeHostile()
-        state = pack_load.live_pack_state(PACK, sc.graph, sc.docs, vec)
-        assert state["vec_ids"] == set(), "전제: 벡터 id 를 열거하지 못한다"
+        else:
+            vec = _AvailableFailsOnce()
+        state_reader = sc.vec if backend == "available-read-fails" else vec
+        state = pack_load.live_pack_state(PACK, sc.graph, sc.docs, state_reader)
+        if backend == "available-read-fails":
+            assert {"s1", "s2", STALE_CHUNK} <= state["vec_ids"], "전제: 벡터 id 를 열거했다"
+        else:
+            assert state["vec_ids"] == set(), "전제: 벡터 id 를 열거하지 못한다"
         with caplog.at_level(logging.WARNING, logger="opencrab.pack.load"):
             res = pack_load.incremental_finalize(
                 PACK, sc.graph, sc.docs, vec, state, set(KEEP_NODES), set(KEEP_CHUNKS),
@@ -336,6 +366,9 @@ def test_finalize_unconfirmed_backend_defers_node_and_chunk_deletion(env, caplog
         assert STALE_CHUNK in sc.source_ids(), "확인할 수 없는 백엔드인데 원본을 지웠다"
         assert res["node_del"] == 0 and res["chunk_del"] == 0 and res["vec_orphan_del"] == 0, res
         assert _warned(caplog, "벡터 백엔드 상태 미확인"), "사유가 경고로 보이지 않는다"
+        if backend == "available-read-fails":
+            assert _warned(caplog, "available-unknown"), "가용성 읽기 실패 사유가 보이지 않는다"
+            assert vec.delete_calls == [], "가용성을 확인하지 못했는데 벡터 삭제를 불렀다"
         assert sc.control() == before
 
         sc.vec.available = True

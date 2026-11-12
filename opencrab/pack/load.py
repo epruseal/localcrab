@@ -1158,7 +1158,8 @@ def _delete_pack_vectors(
          "확인 불가"(rowcount 미확인, chroma 재조회 판독 불가) 신호가 하나라도
          뜨면 `vec_confirmed=False`. chroma 재조회가 요청한 id 의 생존을 확인해도
          `vec_confirmed=False` 다(#640). 그래서 `vec_confirmed` 가 참이면 이번
-         시도에서 모르는 것이 없었고 확인된 생존 벡터도 없었다.
+         시도에서 모르는 것이 없었고 확인된 생존 벡터도 없었다(열거를 못 하는 가용
+         백엔드는 지우지 않고 참을 돌려준다. 계약 문서 6-2절 1번).
          `delete_pack` 은 이 값을 doc_sources 삭제와 graph_nodes 축의 문으로 쓴다.
 
     갈래 0, 1, 2 와 3 의 진입 판정은 `_vec_mode()` 하나로 한다(#640,
