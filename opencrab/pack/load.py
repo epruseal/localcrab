@@ -472,6 +472,38 @@ def _vec_backend(vec):
     return _vec_shape(vec)
 
 
+def _vec_mode(vec, available: bool | None) -> str:
+    """벡터 삭제 단계가 이 백엔드를 어떻게 다룰지 정한다(#640).
+
+    `available` 은 호출자가 이미 읽은 값이다. 이 함수는 `available` 을 다시 읽지
+    않는다(`delete_pack` 의 호출당 한 번 읽기, #327 리뷰 P2). `None` 은 그 읽기가
+    예외로 끝났다는 뜻이다.
+
+    반환:
+      - `"ready"`: `available` 이 참이다. 삭제를 시도한다.
+      - `"absent"`: 가용하지 않고 백엔드 모양도 없다(`_NoVec` 류). 벡터 저장소가
+        없으므로 기다릴 것이 없다.
+      - `"unavailable"`: 모양은 있는데 가용하지 않다(연결, 초기화 실패).
+      - `"available-unknown"`: `available` 읽기가 실패했다.
+      - `"shape-unknown"`: 가용하지 않고 모양 판별 자체가 예외로 끝났다.
+
+    뒤의 세 값은 "벡터 삭제를 확인할 수 없다"는 뜻이다. 모양 판별 실패를 모양
+    없음으로 접으면 재시도할 상태가 구조적 미지원으로 굳는다(#327 P2). 실
+    `SqliteVecStore` 는 확장 적재에 실패하면 `_conn` property 가 판별 중에 같은
+    예외를 다시 던진다. `incremental_finalize` 와 `_delete_pack_vectors` 가 이 판정
+    하나를 공유한다. 두 벌로 두면 한쪽만 고쳐진다(`_vec_backend` 와 같은 교훈).
+    """
+    if available is None:
+        return "available-unknown"
+    if available:
+        return "ready"
+    try:
+        has_shape = _vec_shape(vec)[0] is not None
+    except Exception:
+        return "shape-unknown"
+    return "unavailable" if has_shape else "absent"
+
+
 # `_vec_backend()`가 실제로 내는 kind 전체(`None` 제외) — 새 백엔드가 추가되면
 # 이 목록과, kind 를 분기하는 모든 소비자(`_live_vec_ids`/`pack_live_counts`/
 # `delete_pack`/`_vec_meta_update`)를 함께 갱신해야 한다. 한쪽만 고치면 그 kind가
@@ -1092,7 +1124,7 @@ def _delete_pack_vectors(
     함수 안에서 `vec.available` 을 다시 읽지 않는다(#327 리뷰 P2 실증: 호출자의
     드리프트 탐침이 먼저 한 번 읽고 이 함수가 내부에서 또 읽으면, 상태를 가진
     property 의 두 번째 접근이 던지는 예외가 vectors 축이 저널에 커밋되기
-    **전에** `delete_pack` 밖으로 새 나간다 — 앞선 세 축은 이미 커밋됐어도
+    **전에** `delete_pack` 밖으로 새 나간다. 앞선 축은 이미 커밋됐어도
     vectors 축 자체는 시도됐다는 기록조차 없이 유실된다). `available` 은
     `delete_pack` 호출당 정확히 한 곳(드리프트 탐침)에서만 읽는다.
 
@@ -1124,37 +1156,45 @@ def _delete_pack_vectors(
          기회가 영구히 사라진다.
       3. `available=True` → 기존 kind 기반 삭제를 그대로 실행한다. 조회·삭제 도중
          "확인 불가"(rowcount 미확인, chroma 재조회 판독 불가) 신호가 하나라도
-         뜨면 `vec_confirmed=False`.
+         뜨면 `vec_confirmed=False`. chroma 재조회가 요청한 id 의 생존을 확인해도
+         `vec_confirmed=False` 다(#640). 그래서 `vec_confirmed` 가 참이면 이번
+         시도에서 모르는 것이 없었고 확인된 생존 벡터도 없었다(열거를 못 하는 가용
+         백엔드는 지우지 않고 참을 돌려준다. 계약 문서 6-2절 1번).
+         `delete_pack` 은 이 값을 doc_sources 삭제와 graph_nodes 축의 문으로 쓴다.
+
+    갈래 0, 1, 2 와 3 의 진입 판정은 `_vec_mode()` 하나로 한다(#640,
+    `incremental_finalize` 와 공유).
     """
     chunk_vec_del: int | None = 0
     kind = None
     chroma_unreadable = ""
+    chroma_left = 0
     vec_confirmed = True
-    if vec_available is None:
-        vec_confirmed = False            # 갈래 0 — 가용성 확인 자체가 실패, 재시도 대상
+    # 갈래 판정은 `incremental_finalize` 와 같은 `_vec_mode` 하나로 한다(#640).
+    mode = _vec_mode(vec, vec_available)
+    if mode == "available-unknown":
+        # 갈래 0: 가용성 확인 자체가 실패했다. 재시도 대상이다.
         log.warning(
             "벡터 백엔드 가용성 확인 실패(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
             _safe_type_name(vec), pack_name)
-        return chunk_vec_del, kind, vec_confirmed
-    if not vec_available:
-        try:
-            has_shape = _vec_shape(vec)[0] is not None
-        except Exception:
-            # [#327 리뷰 P2] 모양 판별 자체가 실패했다는 사실을 "모양이 없다"
-            # (구조적 미지원, 갈래 1)와 뭉개면 안 된다 — 위 `vec_available is
-            # None` 과 같은 "구조적 미지원 vs 확인 불가" 구분을 여기도 적용한다.
-            # 뭉개서 `has_shape = False` 로 두면 done=True 로 즉시 확정돼
-            # 재시도 기회가 영구히 사라진다.
-            log.warning(
-                "벡터 백엔드 모양 판별 실패(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
-                _safe_type_name(vec), pack_name)
-            return chunk_vec_del, kind, False
-        if has_shape:
-            vec_confirmed = False        # 갈래 2 — 연결·초기화 실패, 재시도 대상
-            log.warning(
-                "벡터 백엔드 연결 미가용(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
-                _safe_type_name(vec), pack_name)
-        # has_shape=False면 갈래 1 — vec_confirmed=True 유지(대기할 것이 없다).
+        return chunk_vec_del, kind, False
+    if mode == "shape-unknown":
+        # [#327 리뷰 P2] 모양 판별 자체가 실패했다는 사실을 "모양이 없다"
+        # (구조적 미지원, 갈래 1)와 뭉개면 안 된다. 위 갈래 0 과 같은
+        # "구조적 미지원과 확인 불가" 구분을 여기도 적용한다. 뭉개면
+        # done=True 로 즉시 확정돼 재시도 기회가 영구히 사라진다.
+        log.warning(
+            "벡터 백엔드 모양 판별 실패(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
+            _safe_type_name(vec), pack_name)
+        return chunk_vec_del, kind, False
+    if mode == "unavailable":
+        # 갈래 2: 연결이나 초기화가 실패했다. 재시도 대상이다.
+        log.warning(
+            "벡터 백엔드 연결 미가용(%s) — 팩 %s 의 벡터 축을 재시도 대상으로 남긴다",
+            _safe_type_name(vec), pack_name)
+        return chunk_vec_del, kind, False
+    if mode == "absent":
+        # 갈래 1: vec_confirmed=True 를 유지한다(대기할 것이 없다).
         return chunk_vec_del, kind, vec_confirmed
 
     try:
@@ -1205,7 +1245,17 @@ def _delete_pack_vectors(
                         chroma_unreadable = "삭제 후 재조회를 판독할 수 없다 — 삭제 수 미확인"
                         vec_confirmed = False
                     else:
-                        chunk_vec_del = len(requested) - len(requested & survivors)  # R2
+                        chroma_left = len(requested & survivors)
+                        chunk_vec_del = len(requested) - chroma_left  # R2
+                        if chroma_left:
+                            # 요청한 id 가 삭제 뒤에도 남았다(예외 없는 부분 삭제).
+                            # 이 축을 done 으로 두면 그래프 노드와 doc_sources 축이
+                            # 진행해 주인 없는 벡터가 남는다(#640). 재시도 대상이다.
+                            vec_confirmed = False
+            if chroma_left:
+                # 락 밖에서 건수만 남긴다(아래 판독 불가 경고와 같은 이유).
+                log.warning("벡터 삭제 뒤 생존(%s, 팩 %s): %d건. 벡터 축을 재시도 "
+                            "대상으로 남긴다", kind, pack_name, chroma_left)
             if chroma_unreadable:
                 # 락은 위 `with` 가 이미 풀었다 — 락을 쥔 채 로깅하지 않으면서도
                 # 인자 평가가 `try` 안이라, 적대적 `vec` 이 여기서 던져도 흡수된다.
@@ -1304,13 +1354,21 @@ def delete_pack(
     막는다(ops 로더의 `chroma.lock`).
 
     **재개 저널(#327).** 이 함수 전체를
-    `file_lock(delete_journal.lock_filename(pack_name))` 로 감싼다. 4축(`node_twin_loop`
-    → `doc_node_extra_and_sources` → `graph_nodes` → `vectors`) 각각을 `{done, ...}`
-    으로 저널에 원자 기록하고, `done` 하나로만 재실행 여부를 정한다(`count`/`clean` 이
-    있어도 그것만으로 건너뛰지 않는다). `node_twin_loop` 이 `done` 이 아니면
-    `graph_nodes` 축에 진입하지 않는다(doc 트윈 삭제가 개별 실패를 삼키고 진행하므로
-    graph 삭제가 먼저 나가면 doc 없이 고아가 될 수 있다) — `vectors` 는 독립이라
-    이 게이팅과 무관하게 실행된다.
+    `file_lock(delete_journal.lock_filename(pack_name))` 로 감싼다. 4축을 `node_twin_loop`,
+    `vectors`, `doc_node_extra_and_sources`, `graph_nodes` 순서로 실행하고 각각을
+    `{done, ...}` 으로 저널에 원자 기록하고, `done` 하나로만 재실행 여부를 정한다
+    (`count`/`clean` 이 있어도 그것만으로 건너뛰지 않는다). `node_twin_loop` 이 `done`
+    이 아니면 `graph_nodes` 축에 진입하지 않는다(doc 트윈 삭제가 개별 실패를 삼키고
+    진행하므로 graph 삭제가 먼저 나가면 doc 없이 고아가 될 수 있다).
+
+    **벡터는 소유 행보다 먼저 지운다(#640).** `vectors` 축 자신은 다른 축을 기다리지
+    않는다. 대신 `vectors` 가 `done` 이 아니면 doc_sources 삭제와 `graph_nodes` 축이
+    기다린다. 종전 순서(그래프와 doc_sources 먼저)는 중단이나 벡터 실패 뒤 그래프 노드
+    없는 노드 벡터와 원본 없는 청크 벡터를 남겼고, 하이브리드 질의의 벡터 레그가 그
+    행을 canonical `node_not_found` 결과로 냈다. `doc_node_extra_and_sources` 축의
+    doc_nodes 일괄 삭제는 벡터의 소유 행이 아니므로 기다리지 않는다. 그 축의 `done` 은
+    doc_sources 삭제까지 실행했을 때만 참이다. 계약 서술:
+    `docs/pack-contract-layer.md` 의 6-2절.
 
     **완료(`done=True`) 축도 무조건 스킵하지는 않는다(PR #360 리뷰 지적 1/2).**
     `done` 플래그를 영구 신뢰하면, 완료 이후 새로 들어온 `doc_nodes`/`doc_sources`
@@ -1484,7 +1542,7 @@ def delete_pack(
         # 리뷰 P2 실증 — 상태를 가진 property 가 여기서 한 번, 아래
         # `_delete_pack_vectors` 내부에서 다시 한 번 읽히면, 두 번째 접근이
         # 던지는 예외가 vectors 축이 저널에 커밋되기 전에 `delete_pack` 밖으로
-        # 새 나간다. 앞선 세 축은 이미 커밋됐어도 vectors 축 자체는 시도됐다는
+        # 새 나간다. 앞선 축은 이미 커밋됐어도 vectors 축 자체는 시도됐다는
         # 기록조차 없이 유실된다). 캐시한 값을 `_delete_pack_vectors` 에 그대로
         # 넘기고, 그 함수는 더 이상 `vec.available` 을 읽지 않는다. 아래 peek
         # 블록도 같은 이유로 캐시된 모양(`backend=`)을 넘겨 `_live_vec_ids` 가
@@ -1590,7 +1648,36 @@ def delete_pack(
                 {"done": not any_doc_failed, "clean": not any_doc_failed},
             )
 
-        # ── 2. doc_node_extra_and_sources: 고아 doc_nodes 와 doc_sources 행(청크, helper, FTS)을 삭제한다.
+        # ── 2. vectors: 소유 행(그래프 노드, doc_sources)보다 먼저 지운다(#640) ──
+        # 이 축 자신은 다른 축을 기다리지 않는다. 갈래는 `_vec_mode()` 가 정한다
+        # (구조적 미지원/연결 실패/확인 불가/삭제 실행). 아래 doc_sources 삭제와
+        # graph_nodes 축이 이 축의 done 을 기다린다. 종전에는 이 축이 마지막이라
+        # 앞 축을 커밋한 뒤 멈추거나 이 축이 실패하면 주인 없는 벡터가 남았다.
+        if not _axis_done("vectors") or vectors_drift:
+            vec_skipped = False
+            chunk_vec_del, kind, vec_confirmed = _delete_pack_vectors(
+                pack_name, vec, vec_available
+            )
+            _commit_axis(
+                "vectors",
+                {"done": vec_confirmed, "clean": vec_confirmed, "count": chunk_vec_del},
+            )
+        else:
+            # 이미 done 인 축은 벡터스토어에 어떤 파괴적 호출도 하지 않으므로 이번
+            # 실행의 확인 건수는 0이다(과거 count 를 재사용하면 §1 계약 위반,
+            # #327 로컬 지적). 저널은 `kind`/`vec_available` 을 저장하지 않으므로
+            # (축 항목 형태는 {done, clean, count} 뿐) 원래 갈래를 복원할 수 없다 —
+            # 추측 대신 `vec_skipped` 로 중립 라벨("이전 완료")을 낸다(아래
+            # `vec_backend` 조립 참고). `kind`/`vec_available` 자체는 이 분기에서
+            # 더 이상 만들지 않는다.
+            vec_skipped = True
+            chunk_vec_del = 0
+        vectors_done = _axis_done("vectors")
+
+        # ── 3. doc_node_extra_and_sources: 고아 doc_nodes 와 doc_sources 행(청크, helper, FTS)을 삭제한다.
+        # doc_nodes 일괄 삭제는 벡터를 기다리지 않는다(벡터의 소유 행이 아니다).
+        # doc_sources 는 청크 벡터의 소유 행이므로 vectors 가 done 일 때만 지운다
+        # (#640). 축의 done 은 doc_sources 삭제까지 실행했을 때만 참이다.
         if not _axis_done("doc_node_extra_and_sources") or live_docs or doc_nodes_live:
             # (예: backfill이 생성한 dataset: 앵커 — graph_nodes cascade에서 누락됨)
             # 위 조회와 동일하게 `pack_id` 단일 소유 키만 본다(위 주석의
@@ -1604,34 +1691,36 @@ def delete_pack(
                 {"pack": pack_name},
             )
 
-            # metadata.pack_id == pack_name 이 소유 정본이고, metadata.source 는
-            # pack_id 가 없을 때만 폴백으로 본다(레거시 source-만 문서 지원).
-            # 무조건 OR 이면 혼합 태그 문서(pack_id="B", source="A")가 A 삭제에
-            # 함께 지워진다(r13 #142 재리뷰) — `_doc_owner_pred` 참고.
-            src_pred = _doc_owner_pred(docs._dialect)
-            src_rows = docs._fetch_all(
-                f"SELECT source_id FROM {docs._table('doc_sources')} WHERE {src_pred}",
-                {"pack": pack_name},
-            )
-            src_ids = [docs._row_get(r, "source_id") for r in src_rows]
-
             chunk_sql_del = 0
-            for batch in _batched(src_ids):
-                # 삭제 경계의 예외는 이 함수 밖으로 전파된다.
-                delete_sources = getattr(docs, "delete_sources_with_state", None)
-                if not callable(delete_sources):
-                    raise RuntimeError("doc store lacks source-state delete boundary")
-                deleted = delete_sources(batch)
-                chunk_sql_del += deleted
+            if vectors_done:
+                # metadata.pack_id == pack_name 이 소유 정본이고, metadata.source 는
+                # pack_id 가 없을 때만 폴백으로 본다(레거시 source-만 문서 지원).
+                # 무조건 OR 이면 혼합 태그 문서(pack_id="B", source="A")가 A 삭제에
+                # 함께 지워진다(r13 #142 재리뷰) — `_doc_owner_pred` 참고.
+                src_pred = _doc_owner_pred(docs._dialect)
+                src_rows = docs._fetch_all(
+                    f"SELECT source_id FROM {docs._table('doc_sources')} WHERE {src_pred}",
+                    {"pack": pack_name},
+                )
+                src_ids = [docs._row_get(r, "source_id") for r in src_rows]
+
+                for batch in _batched(src_ids):
+                    # 삭제 경계의 예외는 이 함수 밖으로 전파된다.
+                    delete_sources = getattr(docs, "delete_sources_with_state", None)
+                    if not callable(delete_sources):
+                        raise RuntimeError("doc store lacks source-state delete boundary")
+                    deleted = delete_sources(batch)
+                    chunk_sql_del += deleted
             _commit_axis(
                 "doc_node_extra_and_sources",
-                {"done": True, "count": doc_node_extra_del + chunk_sql_del},
+                {"done": vectors_done, "count": doc_node_extra_del + chunk_sql_del},
             )
         else:
             doc_node_extra_del = 0
             chunk_sql_del = 0
 
-        # ── 3. 게이팅: node_twin_loop 이 done 이어야만 graph_nodes 축에 진입한다 ──
+        # ── 4. 게이팅: node_twin_loop 과 vectors 가 done 이어야만 graph_nodes 축에 진입한다 ──
+        # vectors: 노드 벡터가 남은 채 그래프 노드를 지우면 주인 없는 벡터가 된다(#640).
         # `or rows`: 위 node_twin_loop 축과 동일한 이유(#327 재리뷰 P1, id
         # 3947844473) — 신규 노드가 있으면 graph_nodes 축이 이미 done 이어도
         # 재진입해 삭제를 시도한다. 정상 가용 상태에서 이미 지워진 노드에 대한
@@ -1641,7 +1730,11 @@ def delete_pack(
         # codex 가 AGREE 한 설계 그대로이며, 구현 커밋(`2999bd8`)에서
         # 누락됐던 것을 채운다.
         node_del = doc_node_extra_del
-        if _axis_done("node_twin_loop") and (not _axis_done("graph_nodes") or rows):
+        if (
+            _axis_done("node_twin_loop")
+            and vectors_done
+            and (not _axis_done("graph_nodes") or rows)
+        ):
             any_graph_failed = False
             graph_deleted = 0
             for node_type, node_id, _space in rows:
@@ -1664,31 +1757,15 @@ def delete_pack(
         # 노드도 지우지 않았으므로 node_del 에 아무것도 더하지 않는다 — 저널의
         # 과거 count 를 이번 실행 확인 건수로 재사용하면 "재개 실행은 이번 실행
         # 확인 건수만 낸다"(§1) 계약을 어긴다(#327 로컬 지적, codex 1라운드 반례).
-        # node_twin_loop 이 done 이 아니면 graph_nodes 진입 없이 그냥 지나간다 —
-        # 남은 노드는 다음 resume=True 실행이 처리한다. 저널 생성 시점에 이미 4축
-        # 전부 자리표시자(`{"done": False}`)로 채워 놓았으므로(위 journal 초기화 참고)
-        # 여기서 다시 쓰지 않아도 `journal["axes"]["graph_nodes"]` 구독은 안전하다.
-
-        # ── 4. vectors: 독립(ungated) — 세 갈래(구조적 미지원/연결 실패/조회 실패) ──
-        if not _axis_done("vectors") or vectors_drift:
-            vec_skipped = False
-            chunk_vec_del, kind, vec_confirmed = _delete_pack_vectors(
-                pack_name, vec, vec_available
-            )
-            _commit_axis(
-                "vectors",
-                {"done": vec_confirmed, "clean": vec_confirmed, "count": chunk_vec_del},
-            )
-        else:
-            # 이미 done 인 축은 벡터스토어에 어떤 파괴적 호출도 하지 않으므로 이번
-            # 실행의 확인 건수는 0이다(과거 count 를 재사용하면 §1 계약 위반,
-            # #327 로컬 지적). 저널은 `kind`/`vec_available` 을 저장하지 않으므로
-            # (축 항목 형태는 {done, clean, count} 뿐) 원래 갈래를 복원할 수 없다 —
-            # 추측 대신 `vec_skipped` 로 중립 라벨("이전 완료")을 낸다(아래
-            # `vec_backend` 조립 참고). `kind`/`vec_available` 자체는 이 분기에서
-            # 더 이상 만들지 않는다.
-            vec_skipped = True
-            chunk_vec_del = 0
+        # node_twin_loop 이나 vectors 가 done 이 아니면 graph_nodes 진입 없이 그냥
+        # 지나간다. 남은 노드는 다음 resume=True 실행이 처리한다. 저널 생성 시점에
+        # 이미 4축 전부 자리표시자(`{"done": False}`)로 채워 놓았으므로(위 journal
+        # 초기화 참고) 여기서 다시 쓰지 않아도 `journal["axes"]["graph_nodes"]` 구독은
+        # 안전하다.
+        if not vectors_done and (rows or live_docs):
+            log.warning(
+                "벡터 축 미완(%s): 그래프 노드와 doc_sources 삭제를 보류했다. 벡터 "
+                "백엔드를 확인한 뒤 resume=True 로 다시 실행해라(#640)", pack_name)
 
         # 저널은 여기서 자동으로 치우지 않는다. `clear_journal` 자신의 docstring이
         # 명시하듯 "호출자가 부른다" — 이 함수가 그 호출자가 되어 완료 직후 스스로
@@ -3245,9 +3322,16 @@ def incremental_finalize(
     남긴다(`node_del` 은 실제로 지운 수 그대로다). 그래서 doc 삭제 실패나 중단 뒤에도
     `live_pack_state` 가 이 팩의 비앵커 doc 행으로 읽는 행은 그래프 노드 없이 남지 않는다.
     이 팩 태그가 없는 doc 행은 이 단계가 보지 못한다. 중단하면 doc 행 없는 그래프 노드가 남을 수
-    있고, 같은 입력의 다음 실행이 후보로 다시 잡아 지운다. 노드 벡터는 종전대로 마지막 벡터
-    고아 단계에서 지운다(그래프 노드 삭제 뒤의 벡터 창은 #640). 계약 서술:
+    있고, 같은 입력의 다음 실행이 후보로 다시 잡아 지운다. 계약 서술:
     `docs/pack-contract-layer.md` 의 6-1절.
+
+    벡터는 소유 행보다 먼저 지운다(#640). doc 축 다음, 그래프 노드 삭제 앞에 벡터 단계가
+    있다. 벡터 고아 정리와 청크 벡터 삭제가 여기서 돈다. 벡터 삭제가 예외로 끝난 id 의
+    그래프 노드와 청크 원본은 이번 실행에서 남긴다. 벡터 백엔드의 가용성이나 모양을 확인할
+    수 없으면(`_vec_mode()` 의 미확인 세 갈래) 이번 실행은 그래프 노드와 청크 원본을 하나도
+    지우지 않는다. 그래서 중단이나 벡터 실패 뒤에도 이 팩 벡터 가운데 그래프 노드 id 도 청크
+    원본 id 도 아닌 행이 새로 생기지 않는다. 벗어나는 조건과 회수 경로는
+    `docs/pack-contract-layer.md` 의 6-2절에 있다.
     """
     require_live_data("incremental_finalize")
     principal = _require_bound_principal()
@@ -3342,14 +3426,65 @@ def incremental_finalize(
             if ok_del:
                 doc_orphan_del += 1
 
-    # ── 노드 삭제: doc 행을 다 지운 노드만 ─────────────────────────────────
+    # ── 벡터 정리: 그래프 노드와 청크 원본보다 먼저 지운다(#640) ─────────────
+    # 예전에는 이 두 호출이 그래프 노드와 청크 원본 삭제 뒤에 있었다. 그래서 그 사이에서
+    # 멈추거나 벡터 삭제가 예외로 끝나면 소유 행 없는 벡터가 남았고, 하이브리드 질의의
+    # 벡터 레그가 그 행을 canonical node_not_found 결과로 냈다. 지금은 벡터를 먼저 지우고,
+    # 벡터 삭제가 예외로 끝난 id 를 `vec_failed` 에 모아 아래 두 삭제가 건너뛴다. 벡터
+    # 백엔드의 가용성이나 모양을 확인할 수 없으면 벡터를 부르지 않고 소유 행을 모두 남긴다.
+    try:
+        vec_available: bool | None = bool(getattr(vec, "available", False))
+    except Exception:
+        vec_available = None
+    vec_mode = _vec_mode(vec, vec_available)
+    keep_owners = vec_mode in ("unavailable", "available-unknown", "shape-unknown")
+    vec_failed: set[str] = set()
+    if keep_owners:
+        log.warning(
+            "벡터 백엔드 상태 미확인(%s, %s): 벡터 삭제를 확인할 수 없어 이번 실행은 그래프 "
+            "노드와 청크 원본을 지우지 않는다(#640)", pack_name, vec_mode)
+    elif vec_mode == "ready":
+        # 벡터 고아 정리: live vec_ids 가운데 이번 적재의 노드와 청크 어느 쪽 id 도 아닌 것.
+        # 앵커는 노드 삭제와 동일하게 보호 — 현재 앵커 벡터 0건이나 향후 생겨도 오삭제 방지
+        vec_orphans = [
+            i for i in live_vecids - (bypack_node_ids | bypack_chunk_ids) if not _is_anchor(i)
+        ]
+        for batch in _batched(vec_orphans):
+            try:
+                # vec.delete는 요청 개수만 안다(실제 삭제 건수를 돌려주지 않는다) —
+                # 아래 카운트는 "요청 수"이지 확인된 삭제 수가 아니다.
+                # **이 자리는 #161(적재 완료 판정 계약)이 소유한다.** `delete_pack` 의 같은
+                # 결함은 #165 에서 재조회 확인으로 닫혔지만, 여기(와 아래 청크 벡터 삭제)는
+                # 원장과 처분 계약과 함께 바뀌어야 해서 그대로 남겨 뒀다. 고칠 때는 #165 가
+                # 세운 어휘를 쓴다: 확인된 수만 숫자로 내고 미확인은 `None`.
+                vec.delete(batch)
+                vec_orphan_del += len(batch)
+            except Exception as exc:
+                vec_failed.update(batch)
+                log.warning("벡터 고아 삭제 오류(%s): %s", pack_name, exc)
+        # 청크 벡터: evidence 노드 id == 청크 id 공유 팩에서 청크만 사라지고 노드가 남는
+        # id의 벡터는 보존한다(노드 벡터 겸용, 오삭제 방지, 2026-07-22). 한 번에 부른다.
+        # 이 호출이 실패하면 이번 실행의 청크 원본 삭제를 그 대상 전부에 대해 미룬다.
+        vec_del_ids = [i for i in chunk_del_candidates if i not in bypack_node_ids]
+        try:
+            if vec_del_ids:
+                vec.delete(vec_del_ids)
+        except Exception as exc:
+            vec_failed.update(vec_del_ids)
+            log.warning("청크 벡터 삭제 오류(%s): %s", pack_name, exc)
+    # vec_mode == "absent": 벡터 저장소가 없다. 지울 벡터가 없으므로 부르지 않는다.
+
+    # ── 노드 삭제: doc 행과 벡터를 다 지운 노드만 ───────────────────────────
     # doc 삭제는 여기서 하지 않는다. 위 doc 축 정리(doc_del_candidates)가 이 node_id 의
     # 모든 space 를 한 번에 지운다. 예전엔 여기서 live_nodes 의 space_id 하나만 지워서
     # 다른 space 의 행을 놓쳤다(F4-d, 2026-08-11 설계 지적).
-    node_deferred = 0
+    node_deferred = node_vec_deferred = 0
     for node_id in node_del_candidates:
         if node_id in doc_failed:
             node_deferred += 1
+            continue
+        if keep_owners or node_id in vec_failed:
+            node_vec_deferred += 1
             continue
         node_type, _space_id, _props = live_nodes[node_id]
         try:
@@ -3364,8 +3499,11 @@ def incremental_finalize(
             "그래프 노드 삭제 보류(%s): %d건. doc 행 삭제가 실패한 노드는 그래프에 남기고 "
             "다음 증분이 다시 시도한다(#636)", pack_name, node_deferred)
 
-    # ── 청크 삭제 (delete_pack과 동일 배치 패턴) ────────────────────────
-    chunk_del_list = list(chunk_del_candidates)
+    # ── 청크 삭제 (delete_pack과 동일 배치 패턴): 벡터를 다 지운 청크만 ──────
+    chunk_del_list = [
+        i for i in chunk_del_candidates if not (keep_owners or i in vec_failed)
+    ]
+    chunk_vec_deferred = len(chunk_del_candidates) - len(chunk_del_list)
     for batch in _batched(chunk_del_list):
         try:
             # 삭제 경계의 예외는 경고로 남기고 계속한다.
@@ -3375,15 +3513,11 @@ def incremental_finalize(
             chunk_del += delete_sources(batch)
         except Exception as exc:
             log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
-    if chunk_del_list:
-        # evidence 노드 id == 청크 id 공유 팩: 청크만 사라지고 노드가 남는 id의
-        # 벡터는 보존(노드 벡터 겸용 — 오삭제 방지, 2026-07-22)
-        vec_del_ids = [i for i in chunk_del_list if i not in bypack_node_ids]
-        try:
-            if vec_del_ids:
-                vec.delete(vec_del_ids)
-        except Exception as exc:
-            log.warning("청크 벡터 삭제 오류(%s): %s", pack_name, exc)
+    if node_vec_deferred or chunk_vec_deferred:
+        log.warning(
+            "벡터 삭제 미확인 보류(%s): 그래프 노드 %d건, 청크 원본 %d건. 벡터를 먼저 "
+            "지우지 못한 행은 남기고 다음 증분이 다시 시도한다(#640)",
+            pack_name, node_vec_deferred, chunk_vec_deferred)
 
     # ── 엣지 정리 (live에 있으나 이번 적재에서 재확인되지 않은 엣지) ──────
     # 안전핀: applied가 통째로 비었는데 live 엣지가 있으면 edges.jsonl 누락/전건
@@ -3407,24 +3541,6 @@ def incremental_finalize(
             edge_del += int(graph.delete_edge(f_id, r, t_id, owner_pack_id=pack_name))
         except Exception as exc:
             log.warning("엣지 삭제 오류(%s) %s-%s->%s: %s", pack_name, f_id[:8], r, t_id[:8], exc)
-
-    # ── 벡터 고아 정리 (live vec_ids 중 이번 적재의 노드·청크 어느 쪽도 아닌 것) ──
-    # 앵커는 노드 삭제와 동일하게 보호 — 현재 앵커 벡터 0건이나 향후 생겨도 오삭제 방지
-    vec_orphans = [
-        i for i in live_vecids - (bypack_node_ids | bypack_chunk_ids) if not _is_anchor(i)
-    ]
-    for batch in _batched(vec_orphans):
-        try:
-            # vec.delete는 요청 개수만 안다(실제 삭제 건수를 돌려주지 않는다) —
-            # 아래 카운트는 "요청 수"이지 확인된 삭제 수가 아니다.
-            # **이 자리는 #161(적재 완료 판정 계약)이 소유한다.** `delete_pack` 의 같은
-            # 결함은 #165 에서 재조회 확인으로 닫혔지만, 여기(와 위 청크 벡터 삭제)는
-            # 원장·처분 계약과 함께 바뀌어야 해서 그대로 남겨 뒀다. 고칠 때는 #165 가
-            # 세운 어휘를 쓴다: 확인된 수만 숫자로 내고 미확인은 `None`.
-            vec.delete(batch)
-            vec_orphan_del += len(batch)
-        except Exception as exc:
-            log.warning("벡터 고아 삭제 오류(%s): %s", pack_name, exc)
 
     # ── 3원 대사 출력 (assert 아님 — 숫자 보고) ────────────────────────────
     counts = pack_live_counts(pack_name, graph, docs, vec)
