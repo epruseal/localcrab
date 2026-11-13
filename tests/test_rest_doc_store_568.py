@@ -35,6 +35,19 @@ LONG_TEXT = ("lorem ipsum " * 400).strip() + f" {RARE}"
 WAIT = 30
 
 
+@pytest.mark.parametrize("limit", [0, -1, 26])
+def test_rest_query_limit_rejects_outside_range(limit):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        api.QueryRequest(question="q", limit=limit)
+
+
+@pytest.mark.parametrize("limit", [1, 25])
+def test_rest_query_limit_accepts_boundaries(limit):
+    assert api.QueryRequest(question="q", limit=limit).limit == limit
+
+
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     from opencrab.stores.local_graph_store import LocalGraphStore

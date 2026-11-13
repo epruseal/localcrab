@@ -87,6 +87,41 @@ def _outcome(pack_id: str | None = "pack-a") -> QueryOutcome:
     return QueryOutcome(results=[_make_result(pack_id)], warnings=[])
 
 
+@pytest.mark.parametrize("limit", [0, -1, True, False, 1.5, "1", None, float("nan"), float("inf"), -float("inf")])
+def test_query_limit_rejected_before_context(limit):
+    from opencrab.mcp import tools
+
+    with patch.object(tools, "_get_context") as context:
+        response = tools.dispatch_tool("ontology_query", {"question": "q", "limit": limit})
+
+    assert response == {"error": "limit must be an integer >= 1"}
+    context.assert_not_called()
+
+
+def test_query_limit_schema_has_minimum():
+    from opencrab.mcp.tools import TOOLS
+
+    schema = next(tool["inputSchema"] for tool in TOOLS if tool["name"] == "ontology_query")
+    assert schema["properties"]["limit"]["minimum"] == 1
+    assert "maximum" not in schema["properties"]["limit"]
+
+
+@pytest.mark.parametrize("limit", [1, 1.0, 26])
+def test_query_positive_limit_passes_integer_to_hybrid_and_slice(limit):
+    from opencrab.mcp import tools
+
+    hybrid = MagicMock()
+    hybrid.query.return_value = _outcome("pack-a")
+    ctx = _stub_context(hybrid, sql=_real_sql_with_owned_pack("pack-a"))
+    with patch.object(tools, "_get_context", return_value=ctx):
+        response = tools.ontology_query(question="alpha", pack_ids=["pack-a"], limit=limit)
+
+    assert response["total"] == 1
+    passed = hybrid.query.call_args.kwargs["limit"]
+    assert type(passed) is int
+    assert passed == limit
+
+
 def test_t10_ontology_query_includes_envelope_fields():
     from opencrab.mcp import tools
 
