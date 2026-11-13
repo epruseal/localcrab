@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
                 },
                 "limit": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "Maximum number of results (default 10).",
                     "default": 10,
                 },
@@ -208,6 +209,11 @@ def ontology_query(
     from opencrab.mcp.tools import _current_read_scope, _get_context
     from opencrab.services.canonical_ids import enrich as enrich_canonical
     from opencrab.services.pack_selection import mcp_warning_text, resolve_packs
+
+    if isinstance(limit, float) and limit.is_integer():
+        limit = int(limit)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        return {"error": "limit must be an integer >= 1"}
 
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         raise ValueError("offset must be an integer >= 0")

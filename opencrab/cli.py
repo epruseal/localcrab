@@ -864,7 +864,7 @@ def extract(
 @main.command()
 @click.argument("question")
 @click.option("--spaces", "-s", default=None, help="Comma-separated space IDs to filter.")
-@click.option("--limit", "-n", default=10, show_default=True)
+@click.option("--limit", "-n", type=click.IntRange(min=1), default=10, show_default=True)
 @click.option("--offset", type=click.IntRange(min=0), default=0, show_default=True)
 @click.option("--json-output", is_flag=True, default=False, help="Output raw JSON (legacy list format).")
 @click.option(

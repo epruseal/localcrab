@@ -738,6 +738,31 @@ class TestQuery:
         assert flow.find_reserved(envelope) == []
         assert size <= result_caps.QUERY_RESPONSE_CHAR_BUDGET
 
+    @pytest.mark.parametrize("limit", ["0", "-1", "1.0", "abc"])
+    def test_invalid_limit_is_rejected_before_stores(
+        self, bootstrapped, cli_env, runner, monkeypatch, limit
+    ):
+        from opencrab import cli
+
+        stores = MagicMock()
+        monkeypatch.setattr(cli, "_make_stores", stores)
+        result = runner.invoke(main, ["query", "q", "--limit", limit])
+        assert result.exit_code == 2
+        assert "Invalid value for '--limit'" in result.output
+        stores.assert_not_called()
+
+    @pytest.mark.parametrize("limit", [1, 26])
+    def test_positive_limit_reaches_hybrid(
+        self, bootstrapped, cli_env, runner, mock_vector_store, monkeypatch, limit
+    ):
+        from opencrab.ontology.query import HybridQuery, QueryOutcome
+
+        hybrid_query = MagicMock(return_value=QueryOutcome([], []))
+        monkeypatch.setattr(HybridQuery, "query", hybrid_query)
+        result = runner.invoke(main, ["query", "q", "--limit", str(limit)])
+        assert result.exit_code == 0, result.output
+        assert hybrid_query.call_args.kwargs["limit"] == limit
+
     def test_negative_offset_is_rejected(self, bootstrapped, cli_env, runner, mock_vector_store):
         result = runner.invoke(main, ["query", "zzz", "--offset", "-1"])
         assert result.exit_code == 2

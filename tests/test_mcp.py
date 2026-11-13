@@ -1038,6 +1038,19 @@ class TestMCPServer:
             "source_locator", "offset_bytes", "length_bytes",
         ]
 
+    @pytest.mark.parametrize("modern", [False, True])
+    def test_query_invalid_limit_error_envelope(self, server, modern):
+        from opencrab.mcp import tools
+
+        params = {"name": "ontology_query", "arguments": {"question": "q", "limit": 0}}
+        with patch.object(tools, "_get_context") as context:
+            result = server._modern_tools_call(params) if modern else server._handle_tools_call(params)
+        assert json.loads(result["content"][0]["text"]) == {
+            "error": "limit must be an integer >= 1"
+        }
+        assert result.get("isError", False) is modern
+        context.assert_not_called()
+
     def test_handle_tools_call_manifest(self, server):
         request = json.dumps({
             "jsonrpc": "2.0",
