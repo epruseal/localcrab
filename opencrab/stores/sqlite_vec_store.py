@@ -525,13 +525,22 @@ class SqliteVecStore(_SqliteConnMixin):
         return ids
 
     def _slot_owners(self, conn, ids: list[str]) -> dict[str, str]:
-        """``node_id`` -> owning ``pack_id`` for the ids that already have a row.
+        """기존 슬롯의 node_id와 pack_id를 조회한다."""
+        try:
+            point_lookup = bool(ids) and all(type(_id) is str and _id.encode("utf-8") is not None for _id in ids)
+        except UnicodeEncodeError:
+            point_lookup = False
+        if point_lookup:
+            owners = {}
+            for _id in dict.fromkeys(ids):
+                row = conn.execute(
+                    f"SELECT node_id, pack_id FROM {self._table} WHERE node_id = ?",  # noqa: S608
+                    (_id,),
+                ).fetchone()
+                if row is not None:
+                    owners[row["node_id"]] = row["pack_id"]
+            return owners
 
-        One array-bound query, not one bind per id: a batch is caller-sized and
-        can exceed SQLite's variable limit (the same reason
-        ``_sql_dialect.in_string_array`` exists). Ids with no row are simply
-        absent from the result, which is what the gate reads as "new slot".
-        """
         id_frag, id_transform = SQLITE.in_string_array("node_id", "?")
         rows = conn.execute(
             f"SELECT node_id, pack_id FROM {self._table} WHERE {id_frag}",  # noqa: S608
