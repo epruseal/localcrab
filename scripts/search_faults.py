@@ -188,6 +188,17 @@ def selftest_cases() -> list[tuple[str, Any, Any]]:
         ("missing query", True, bool(surface_violations({"q": ref()}, {}, {}, rows_unchanged=True))),
     ]
 
+    hit = {"node_id": "n", "space": "s", "node_type": "t", "score": 1.0, "pack_id": "p",
+           "text": "x", "properties": {}}
+    pending = f"{sb.COVERAGE_PREFIX} pending changes: 1"
+    slow = "BM25 latency over budget: 600 ms against 500 ms"
+    cases += [
+        ("oracle match with only a latency warning", True, _db_matches_oracle(([hit], [slow]), [hit])),
+        ("oracle match with a coverage warning", False, _db_matches_oracle(([hit], [pending, slow]), [hit])),
+        ("oracle match with other hits", False, _db_matches_oracle(([hit], []), [{**hit, "node_id": "m"}])),
+        ("oracle match without a result", False, _db_matches_oracle(None, [hit])),
+    ]
+
     def chk(cat: str, ok: bool) -> dict[str, Any]:
         return {"cat": cat, "ok": ok}
 
@@ -629,6 +640,12 @@ def _shape(hits: list[dict[str, Any]]) -> list[tuple]:
              json.dumps(h["properties"], sort_keys=True, ensure_ascii=False)) for h in hits]
 
 
+def _db_matches_oracle(got: Any, want: list[dict[str, Any]]) -> bool:
+    """The DB result has no coverage warning and the oracle's hits. Other warnings, such as the
+    latency warning of #569, leave the hits unchanged and do not count as a mismatch."""
+    return got is not None and not sb._coverage(got[1]) and _shape(got[0]) == _shape(want)
+
+
 class Svc:
     """The harness's own service-role stores and HybridQuery for one copy."""
 
@@ -924,7 +941,7 @@ class Scenario:
             limit = _profile(q).bm25_limit
             got = svc.docs.node_bm25_search(q["text"], pack_ids=eff, spaces=q["spaces"], limit=limit)
             want = index.search(q["text"], spaces=q["spaces"], limit=limit, pack_ids=eff)
-            if got is None or got[1] or _shape(got[0]) != _shape(want):
+            if not _db_matches_oracle(got, want):
                 mismatch.append(q["qid"])
         self.check(st, "recovery", "db results equal the oracle", not mismatch, mismatch)
         status = ro_status(self.dir)
@@ -2075,7 +2092,7 @@ def build_reference(ctx: Ctx) -> list[str]:
             limit = _profile(q).bm25_limit
             got = svc.docs.node_bm25_search(q["text"], pack_ids=eff, spaces=q["spaces"], limit=limit)
             want = index.search(q["text"], spaces=q["spaces"], limit=limit, pack_ids=eff)
-            if got is None or got[1] or _shape(got[0]) != _shape(want):
+            if not _db_matches_oracle(got, want):
                 problems.append(f"reference DB result differs from the oracle: {q['qid']}")
             if observed[q["qid"]]["bm25_cov"]:
                 problems.append(f"reference has a coverage warning: {q['qid']}")

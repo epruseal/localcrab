@@ -37,7 +37,7 @@ MCP `ontology_query`에는 질의 시간 제한과 취소 장치가 없다(`open
 하네스는 시작할 때 적재 디렉터리를 복사한 기준 사본에서 두 가지를 잰다.
 
 - 기준 분류: 질의 세트 전부를 한 번씩 돌려 `search_baseline.judge_bundle`로 질의별 레그별 분류, 놓친 정답 집합, 자동 선택 판정을 얻는다. 질의마다 결합 결과의 대표 `node_id` 순서도 기준 결합 결과로 남긴다.
-- 오라클 일치: 질의마다 BM25 레그의 요청(질의문, `spaces`, `_profile_for_query`의 `bm25_limit`, 기준 선택의 `effective_pack_ids`)으로 DB 색인 결과와 `BM25Index.build(전량)` 결과를 비교한다. 비교는 항목의 `node_id`, `space`, `node_type`, `score`, `pack_id`, `text`, `properties`와 순서다.
+- 오라클 일치: 질의마다 BM25 레그의 요청(질의문, `spaces`, `_profile_for_query`의 `bm25_limit`, 기준 선택의 `effective_pack_ids`)으로 DB 색인 결과와 `BM25Index.build(전량)` 결과를 비교한다. 비교는 항목의 `node_id`, `space`, `node_type`, `score`, `pack_id`, `text`, `properties`와 순서다. 경고는 `BM25 coverage` 접두인 것만 불일치로 센다(`_db_matches_oracle`).
 
 기준 사본이 `ready`가 아니거나, pending이 남았거나, `verify`가 불일치거나, 오라클과 다른 질의가 하나라도 있으면 실행은 `INCOMPLETE`다. 기준 분류에 있는 `partial_silent`는 #550이며 장애의 결과로 세지 않는다.
 
@@ -91,7 +91,7 @@ C2는 메모리 경로라 색인에 쓰지 않으므로 시점마다 3.4절의 b
 
 - 상태가 `ready`이고 pending이 0이다.
 - `verify` CLI가 종료 코드 0이다.
-- 질의마다 DB 색인 결과가 그 시점 원본 전량의 오라클과 같다.
+- 질의마다 DB 색인 결과가 그 시점 원본 전량의 오라클과 같다(`BM25 coverage` 접두가 아닌 경고는 불일치로 세지 않는다).
 - 질의 통과의 분류가 기준 분류와 같다.
 
 보고서는 장애마다 실제로 실행한 복구 명령 목록을 남긴다.

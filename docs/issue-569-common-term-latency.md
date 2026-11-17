@@ -54,7 +54,7 @@
 
 ### 5.3 선택 경로
 
-호출자 둘이 이 목록을 응답에 싣는다. BM25 레그는 `_node_index_search`가 응답 경고에 더한다. 팩 선택은 `pack_selection.resolve_packs`가 탐침 경고를 선택 경고 코드로 바꾼다. 이전 코드는 탐침 경고가 하나라도 있으면 `auto_pack_probe_coverage`를 달았다. 지연 경고가 그 코드로 나가면 응답이 색인이 불완전하다고 잘못 말하고, 장애 주입 하네스(`scripts/search_faults.py`)는 그 코드가 있으면 `wrong_pack`을 면책한다. 그래서 `BM25 latency over budget` 접두 경고(`PROBE_LATENCY_PREFIX`)는 새 코드 `auto_pack_probe_slow`로 따로 낸다. 나머지 탐침 경고는 기존대로 coverage 코드를 쓴다. 새 코드의 문구는 `_MCP_WARNINGS`와 `_CLI_WARNINGS` 두 표에 둔다. `search_faults.py`는 바꾸지 않는다. 새 코드는 면책 대상이 아니다. `pack_registry._choose_by_content_with_warnings`의 docstring은 탐침 경고가 두 종류임을 적는다.
+이 목록을 응답에 싣는 경로는 둘이다. 장애 주입 하네스는 이 목록을 응답에 싣지 않고 오라클과 대조한다(7절과 8절). BM25 레그는 `_node_index_search`가 응답 경고에 더한다. 팩 선택은 `pack_selection.resolve_packs`가 탐침 경고를 선택 경고 코드로 바꾼다. 이전 코드는 탐침 경고가 하나라도 있으면 `auto_pack_probe_coverage`를 달았다. 지연 경고가 그 코드로 나가면 응답이 색인이 불완전하다고 잘못 말하고, 장애 주입 하네스(`scripts/search_faults.py`)는 그 코드가 있으면 `wrong_pack`을 면책한다. 그래서 `BM25 latency over budget` 접두 경고(`PROBE_LATENCY_PREFIX`)는 새 코드 `auto_pack_probe_slow`로 따로 낸다. 나머지 탐침 경고는 기존대로 coverage 코드를 쓴다. 새 코드의 문구는 `_MCP_WARNINGS`와 `_CLI_WARNINGS` 두 표에 둔다. `wrong_pack` 면책은 바꾸지 않으며 새 코드는 면책 대상이 아니다. `search_faults.py`의 오라클 대조 두 자리는 `_db_matches_oracle`로 coverage 접두 경고만 불일치로 센다. `pack_registry._choose_by_content_with_warnings`의 docstring은 탐침 경고가 두 종류임을 적는다.
 
 ## 6. 정확성
 
@@ -62,13 +62,13 @@
 
 ## 7. 호출자와 형제 경로
 
-진입점은 `_node_bm25_sqlite.search` 하나다. BM25 레그, 팩별 탐침, `ontology_query` 경로가 모두 이 함수를 부른다. 메모리 경로, PG, MongoDB, `verify`, `backfill_step`, `drain`, `reindex_key`는 바꾸지 않는다. 하네스(`scripts/search_baseline.py`)는 `BM25 coverage` 접두로 coverage 경고를 가르므로 새 경고가 분류를 바꾸지 않는다. 팩 선택은 5.3절의 새 코드를 쓴다.
+진입점은 `_node_bm25_sqlite.search` 하나다. BM25 레그, 팩별 탐침, `ontology_query` 경로가 모두 이 함수를 부른다. 메모리 경로, PG, MongoDB, `verify`, `backfill_step`, `drain`, `reindex_key`는 바꾸지 않는다. 하네스(`scripts/search_baseline.py`와 `scripts/search_faults.py`)는 `BM25 coverage` 접두로 coverage 경고를 가르므로 새 경고가 분류를 바꾸지 않는다. `search_faults.py`는 `node_bm25_search`를 직접 불러 DB 결과를 오라클과 대조하는 자리가 둘(복구 확인과 기준 사본 측정) 있고, 이 두 자리는 경고 목록이 비었는지를 봤다. 새 경고가 결과는 같은데 이 대조를 실패로 만들었으므로 두 자리를 `_db_matches_oracle`로 모았다. 팩 선택은 5.3절의 새 코드를 쓴다.
 
 ## 8. SOLID 판정
 
 - 단일 책임: 경고 계산은 `search` 안의 짧은 래퍼가 맡고 검색 본문(`_search`)은 그대로다. 호출자 한 집단(`search`를 부르는 곳)을 나누지 않는다.
 - 개방 폐쇄: 새 분기는 경고 접두 하나를 가르는 조건이다. 등록표는 만들지 않는다.
-- 리스코프 치환: `search`의 반환 형태, 항목, 점수, 순서는 같다. 경고 목록에 문자열 하나가 더 붙을 수 있다. 호출자 둘이 이 목록을 쓴다. 레그 경로는 그대로 전달하고, 팩 선택 경로는 "탐침 경고는 coverage 경고"를 기대하므로 5.3절대로 가른다.
+- 리스코프 치환: `search`의 반환 형태, 항목, 점수, 순서는 같다. 경고 목록에 문자열 하나가 더 붙을 수 있다. 호출자 셋이 이 목록을 쓴다. 레그 경로는 그대로 전달한다. 팩 선택 경로는 "탐침 경고는 coverage 경고"를 기대하므로 5.3절대로 가른다. 장애 주입 하네스의 오라클 대조 두 자리는 "경고가 없다"를 기대했으므로 coverage 접두 경고만 세도록 `_db_matches_oracle`로 바꾼다.
 - 인터페이스 분리와 의존 역전: 새 인자와 새 타입이 없다.
 
 ## 9. 색인 형식, 쓰기 비용, 라이브 적용
@@ -79,15 +79,16 @@
 
 ## 10. 시험 전략
 
-새 시험은 `tests/test_node_bm25_latency_warning.py`에 둔다.
+새 시험은 두 곳에 둔다. 검색과 팩 선택의 시험은 `tests/test_node_bm25_latency_warning.py`에 둔다. 오라클 대조의 시험은 하네스 판정 함수의 관례대로 `scripts/search_faults.py`의 `selftest_cases`에 심은 입력으로 두고 `tests/test_search_faults.py`의 기존 시험이 돌린다.
 
 - 경고: 예산을 넘기면 경고가 붙고 결과는 같다. 흔한 용어가 없으면 경고가 없다. 팩별 모드는 탐침 예산을 읽는다. 시험은 예산을 고정한다.
 - 팩 선택: 지연 경고는 `auto_pack_probe_slow`로, coverage 경고는 기존 코드로 나간다. 둘이 같이 오면 둘 다 나간다. `SLOW_WARNING`이 `PROBE_LATENCY_PREFIX`로 시작하고 coverage 경고는 시작하지 않는다.
+- 오라클 대조: 지연 경고만 있고 결과가 같으면 일치로 센다. coverage 경고가 함께 있거나 결과가 다르거나 결과가 없으면 불일치로 센다.
 - 기존 시험 `tests/test_node_bm25_prune.py`와 `tests/test_node_bm25_index.py`는 바꾸지 않는다.
 
 ## 11. 문서 반영
 
-`docs/issue-567-bm25-prune.md` 12절의 "잔여" 서술에 이 설계가 후속임을 한 줄 더한다. `docs/issue-542-fault-injection.md`의 `wrong_pack` 면책 서술에 새 코드가 면책 대상이 아님을 한 줄 더한다. 수치는 날짜 기록에만 둔다.
+`docs/issue-567-bm25-prune.md` 12절의 "잔여" 서술에 이 설계가 후속임을 한 줄 더한다. `docs/issue-542-fault-injection.md`의 `wrong_pack` 면책 서술에 새 코드가 면책 대상이 아님을 한 줄 더하고 오라클 대조 서술(3.1절과 3.5절)에 coverage 경고만 불일치로 센다는 말을 더한다. 수치는 날짜 기록에만 둔다.
 
 ## 12. 범위 밖
 
