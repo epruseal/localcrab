@@ -51,7 +51,7 @@ def test_utf8_byte_roundtrip_from_actual_query(stack, case, mode):
         source_id, node_id = "src:other", "src:real"
         text = "other zzrt " + BIG
         _node(stack, node_id, BIG)
-        _write(stack, text, source_id, node_id=node_id)
+        _write(stack, text, source_id, origin="server", node_id=node_id)
     else:
         source_id = node_id = "src:multi"
         text = "multi zzrt " + "한글🙂 " * 4000

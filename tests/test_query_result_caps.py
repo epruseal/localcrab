@@ -798,12 +798,17 @@ def stack(tmp_path):
         sql._engine.dispose()
 
 
-def _write(stack, text: str, source_id: str, **meta: Any) -> dict[str, Any]:
+def _write(
+    stack, text: str, source_id: str, *, origin: str = "client", **meta: Any
+) -> dict[str, Any]:
+    """Write one source. A display id that differs from ``source_id`` is only
+    accepted from a server replay (#544), so those callers pass ``origin="server"``."""
     from opencrab.pack.source_writer import write_source
 
     return write_source(
         stack["sql"], stack["hybrid"], stack["docs"], stack["vec"], graph=stack["graph"],
         text=text, source_id=source_id, metadata={"space": "evidence", **meta}, pack_id=PACK,
+        origin=origin,
     )
 
 
@@ -956,7 +961,7 @@ class TestRealStores:
     def test_display_id_mismatch_reads_exact_source(self, stack):
         _node(stack, "src:real", BIG)  # graph node only: no vector, no source row
         other = "other zzother " + BIG
-        _write(stack, other, "src:other", node_id="src:real")
+        _write(stack, other, "src:other", origin="server", node_id="src:real")
         response = _ask(stack, "zzother", use_bm25=False, use_fts=False)
         item = _by_id(response, "src:real")
         locator = item["truncation"]["source_locator"]
@@ -1021,13 +1026,13 @@ class TestRealStores:
         assert _by_id(response, long_id)["truncation"]["fields"]
         assert _get(stack, long_id)["found"] is False
         # metadata.node_id naming an id that does not exist.
-        _write(stack, "ghost zzghost " + BIG, "src:ghost", node_id="ghost:id")
+        _write(stack, "ghost zzghost " + BIG, "src:ghost", origin="server", node_id="ghost:id")
         response = _ask(stack, "zzghost", use_bm25=False)
         assert _by_id(response, "ghost:id")["truncation"]["fields"]
         assert _get(stack, "ghost:id")["found"] is False
         # metadata.node_id naming another existing node: found, but not this body.
         _write(stack, BIG, "src:real")
-        _write(stack, "other zzother " + BIG, "src:other", node_id="src:real")
+        _write(stack, "other zzother " + BIG, "src:other", origin="server", node_id="src:real")
         response = _ask(stack, "zzother", use_bm25=False)
         item = _by_id(response, "src:real")
         node = _get(stack, item["node_id"])

@@ -3215,3 +3215,157 @@ def test_484_same_id_failed_then_landed_in_one_request_does_not_defer(stack):
     assert result["status"] == "partial" and result["retryable"] is True, result
     assert result["evidence_node"] == sid + _DERIVED and result["text_ingested"] is True, result
     assert stack["graph"].get_node("LogEntry", sid) is not None
+
+
+# ---------------------------------------------------------------------------
+# #544: 저장 키(source_id)와 표시 node_id(metadata.node_id)의 관계
+# ---------------------------------------------------------------------------
+#
+# 검색 결과의 node_id 는 `metadata.node_id` 를 저장 id 보다 먼저 쓴다. 그래서
+# 호출자가 준 다른 값이 그대로 표시 id 가 되면 그 id 는 없는 노드이거나 다른
+# 노드를 가리킨다. 클라이언트 쓰기는 이 키를 비우거나 source_id 와 같게 둬야
+# 하고, 서버가 되풀이해 쓰는 사본(origin="server": fork 가 복사하는 청크 행)만
+# 소유 노드를 가리키는 별도 값을 가질 수 있다.
+
+
+def _displayed_ids(stack, question: str, pack_id: str = "pack-a") -> tuple[set, set]:
+    """검색이 보여 주는 node_id: 벡터 leg 와 FTS leg."""
+    h = stack["hybrid"]
+    vec = {hit.node_id for hit in h._vector_search(question, None, 10, pack_ids=[pack_id])}
+    fts = {hit.get("node_id") for hit in h._fts_search(question, None, 10, pack_ids=[pack_id])}
+    return vec, fts
+
+
+def _no_source_rows(stack, source_id: str) -> None:
+    assert stack["docs"].get_source(source_id) is None
+    assert stack["vector"].get_by_id(source_id) is None
+    assert stack["graph"].get_nodes_by_id(source_id) == []
+
+
+def test_544_a_display_id_equal_to_the_source_id_is_shown_and_resolves(stack):
+    receipt = _write(stack, text="quokka544 본문", source_id="src-544-eq",
+                     metadata={"node_id": "src-544-eq"})
+    assert receipt["stores"]["graph"] == "ok", receipt["stores"]
+
+    vec, fts = _displayed_ids(stack, "quokka544")
+    assert "src-544-eq" in vec and fts == {"src-544-eq"}, (vec, fts)
+    assert stack["graph"].get_node_by_id_scoped("src-544-eq", ["pack-a"]) is not None
+
+
+def test_544_an_absent_display_id_falls_back_to_the_source_id(stack):
+    _write(stack, text="wombat544 본문", source_id="src-544-none")
+
+    _vec, fts = _displayed_ids(stack, "wombat544")
+    assert fts == {"src-544-none"}, fts
+    assert "node_id" not in stack["docs"].get_source("src-544-none")["metadata"]
+
+
+@pytest.mark.parametrize("claimed", ["no-such-node-544", "other-node-544", "foreign-node-544", 7])
+def test_544_a_separate_display_id_is_refused_before_any_write(stack, claimed):
+    """없는 id, 같은 팩의 다른 노드, 남의 팩 노드, 문자열이 아닌 참 값 모두 같다.
+
+    갈린 값은 검색 결과에서 없는 노드나 다른 노드를 원문처럼 가리키므로, 쓰기
+    전에 거절하고 어느 스토어에도 행을 남기지 않는다. 다른 노드는 그대로다.
+    """
+    _seed_node(stack, "TextUnit", "other-node-544", text="다른 노드")
+    _seed_node(stack, "TextUnit", "foreign-node-544", pack_id="pack-b", principal=BOB,
+               text="남의 노드")
+    others = [_snapshot(stack, "TextUnit", n) for n in ("other-node-544", "foreign-node-544")]
+    assert all(all(part is not None for part in snap) for snap in others)
+
+    with pytest.raises(ValueError, match="node_id"):
+        _write(stack, text="본문", source_id="src-544-bad", metadata={"node_id": claimed})
+
+    _no_source_rows(stack, "src-544-bad")
+    assert [_snapshot(stack, "TextUnit", n) for n in ("other-node-544", "foreign-node-544")] == others
+
+
+@pytest.mark.parametrize("empty", [None, ""])
+def test_544_an_empty_display_id_is_harmless_and_accepted(stack, empty):
+    """표시 id 결정은 `metadata.node_id or 저장 id` 라서 거짓 값은 표시를 바꾸지 못한다."""
+    _write(stack, text="numbat544 본문", source_id="src-544-empty", metadata={"node_id": empty})
+
+    _vec, fts = _displayed_ids(stack, "numbat544")
+    assert fts == {"src-544-empty"}, fts
+
+
+def test_544_a_refused_rewrite_leaves_the_stored_source_untouched(stack):
+    _write(stack, text="처음 본문", source_id="src-544-keep")
+    before = stack["docs"].get_source("src-544-keep")
+    vec_before = stack["vector"].get_by_id("src-544-keep")
+
+    with pytest.raises(ValueError, match="node_id"):
+        _write(stack, text="바뀐 본문", source_id="src-544-keep",
+               metadata={"node_id": "no-such-node-544"})
+
+    assert stack["docs"].get_source("src-544-keep") == before
+    assert stack["vector"].get_by_id("src-544-keep") == vec_before
+    assert _node(stack, "src-544-keep")["text"] == "처음 본문"
+
+
+def test_544_a_server_replay_keeps_the_separate_owner_mapping(stack):
+    """origin="server" 사본(fork 의 청크 행)은 소유 노드를 가리키는 값을 가진다."""
+    _seed_node(stack, "Topic", "owner-544", space="concept")
+
+    _write(stack, text="chunk544 본문", source_id="chunk-544",
+           metadata={"node_id": "owner-544"}, origin="server")
+
+    assert stack["docs"].get_source("chunk-544")["metadata"]["node_id"] == "owner-544"
+    assert stack["vector"].get_by_id("chunk-544")["metadata"]["node_id"] == "owner-544"
+
+
+def test_544_fork_copies_a_source_whose_display_id_names_its_owner_node(stack):
+    _seed_node(stack, "Topic", "owner-544f", space="concept")
+    _write(stack, text="chunk544f 본문", source_id="chunk-544f",
+           metadata={"node_id": "owner-544f"}, origin="server")
+
+    result = _fork(stack, principal=ALICE, src_pack_id="pack-a")
+
+    assert result.get("status") == "ok", result
+    # The copy keeps pointing at the owner node, remapped into the fork.
+    hits = stack["docs"].keyword_search("chunk544f", pack_ids=[result["pack_id"]])
+    assert len(hits) == 1, hits
+    copied_id, shown = hits[0]["source_id"], hits[0]["node_id"]
+    assert copied_id != "chunk-544f" and shown.startswith("owner-544f"), hits
+    assert shown != copied_id and shown != "owner-544f", hits
+
+
+def test_544_the_internal_legacy_ingest_branch_refuses_a_separate_display_id(stack):
+    """공개 `pack_ingest` 도구에는 metadata 인자가 없다. 내부 분기가 write_source 를 부른다."""
+    result = _ingest468(stack, text="본문", source_id="src-544-mcp",
+                        metadata={"node_id": "no-such-node-544"}, text_as_node=False)
+
+    assert result["text_ingested"] is False, result
+    assert any("node_id" in e for e in result["node_errors"]), result
+    _no_source_rows(stack, "src-544-mcp")
+
+
+def test_544_the_internal_legacy_ingest_branch_accepts_an_equal_display_id(stack):
+    result = _ingest468(stack, text="본문", source_id="src-544-mcp-eq",
+                        metadata={"node_id": "src-544-mcp-eq"}, text_as_node=False)
+
+    assert result["text_ingested"] is True and result["node_errors"] == [], result
+    assert stack["docs"].get_source("src-544-mcp-eq") is not None
+
+
+def test_544_rest_ingest_refuses_a_separate_display_id(rest_client, rest_module, rest_auth):
+    resp = rest_client.post(
+        "/api/ingest",
+        json={"text": "REST 본문", "source_id": "src-544-rest",
+              "metadata": {"node_id": "no-such-node-544"}},
+        headers=rest_auth,
+    )
+
+    assert resp.status_code == 422, resp.text
+    ctx = rest_module.app.state.context
+    assert ctx.docs.get_source("src-544-rest") is None
+    assert ctx.vector.get_by_id("src-544-rest") is None
+    assert ctx.graph.get_nodes_by_id("src-544-rest") == []
+
+    ok = rest_client.post(
+        "/api/ingest",
+        json={"text": "REST 본문", "source_id": "src-544-rest",
+              "metadata": {"node_id": "src-544-rest"}},
+        headers=rest_auth,
+    )
+    assert ok.status_code == 200, ok.text
