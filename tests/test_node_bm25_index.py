@@ -476,6 +476,116 @@ def test_verify_detects_swapped_term_frequencies(tmp_path):
         c.execute(f"INSERT INTO {nbm.FTS}(rowid, tokens) VALUES (?, ?)", (keys["d2"], " ".join(t1)))
     report = store.node_bm25_verify()
     assert report["ok"] is False and report["mismatched_terms"] == 2
+    assert report["vocab_orphans"] == 0 and report["docsize_mismatch"] == 0
+
+
+def _verify_store(tmp_path) -> LocalSQLDocStore:
+    store = _store(tmp_path)
+    for i in range(3):
+        store.upsert_node_doc("evidence", "Note", f"d{i}", {"text": f"alpha beta{i}", "pack_id": "a"})
+    assert store.node_bm25_verify()["ok"] is True
+    return store
+
+
+def _doc_key(store, node_id: str) -> int:
+    return int(store._conn.execute(
+        f"SELECT doc_key FROM {nbm.DOCS} WHERE node_id=?", (node_id,)).fetchone()[0])
+
+
+def _inject_vocabulary_only_id(store) -> None:
+    """A new rowid with terms but no DOCS row and no docsize row (#637 B4 shape)."""
+    rowid = int(store._conn.execute(f"SELECT MAX(doc_key) FROM {nbm.DOCS}").fetchone()[0]) + 1000
+    with store._tx() as conn:
+        conn.execute(f"INSERT INTO {nbm.FTS}(rowid, tokens) VALUES (?, 'alpha ghost')", (rowid,))
+        conn.execute(f"DELETE FROM {nbm.FTS}_docsize WHERE id=?", (rowid,))
+
+
+def _inject_missing_docsize(store) -> None:
+    """The docsize row of an indexed document is gone; its terms stay (issue recipe)."""
+    with store._tx() as conn:
+        conn.execute(f"DELETE FROM {nbm.FTS}_docsize WHERE id=?", (_doc_key(store, "d1"),))
+
+
+def _inject_consistent_removal(store) -> None:
+    """The DOCS row, the node and the stats share are gone; the FTS rows stay."""
+    key = _doc_key(store, "d1")
+    with store._tx() as conn:
+        dl = conn.execute(f"SELECT dl FROM {nbm.DOCS} WHERE doc_key=?", (key,)).fetchone()[0]
+        conn.execute(f"DELETE FROM {nbm.DOCS} WHERE doc_key=?", (key,))
+        conn.execute(f"UPDATE {nbm.STATS} SET doc_count=doc_count-1, total_len=total_len-? WHERE id=1", (dl,))
+        conn.execute("DELETE FROM doc_nodes WHERE node_id='d1'")
+        conn.execute(f"DELETE FROM {nbm.PENDING}")
+
+
+@pytest.mark.parametrize(
+    ("inject", "vocab_orphans", "docsize_mismatch"),
+    [
+        (_inject_vocabulary_only_id, 1, 0),
+        (_inject_missing_docsize, 0, 1),
+        (_inject_consistent_removal, 1, 1),
+    ],
+)
+def test_verify_reports_fts_vocabulary_and_docsize_orphans(tmp_path, inject, vocab_orphans, docsize_mismatch):
+    store = _verify_store(tmp_path)
+    inject(store)
+    report = store.node_bm25_verify()
+    assert report["ok"] is False
+    assert report["vocab_orphans"] == vocab_orphans
+    assert report["docsize_mismatch"] == docsize_mismatch
+    assert report["missing"] == report["orphans"] == 0
+    assert report["mismatched_meta"] == report["mismatched_terms"] == 0
+    assert report["stats_ok"] is True
+
+
+def test_verify_stays_clean_across_normal_index_changes(tmp_path):
+    store = _verify_store(tmp_path)
+
+    def clean() -> None:
+        report = store.node_bm25_verify()
+        assert report["ok"] is True
+        assert report["vocab_orphans"] == 0 and report["docsize_mismatch"] == 0
+
+    for i in range(3):  # several commits that replace the terms of one document
+        store.upsert_node_doc("evidence", "Note", "d0", {"text": f"gamma{i}", "pack_id": "a"})
+        clean()
+    # a node whose text, id and type give no token still has a docsize row
+    store.upsert_node_doc("evidence", "---", "--", {"text": ""})
+    empty_key = _doc_key(store, "--")
+    assert store._conn.execute(f"SELECT dl FROM {nbm.DOCS} WHERE doc_key=?", (empty_key,)).fetchone()[0] == 0
+    assert store._conn.execute(
+        f"SELECT 1 FROM {nbm.FTS}_docsize WHERE id=?", (empty_key,)).fetchone() is not None
+    clean()
+    # delete the document with the largest key, then reuse that key
+    assert store.delete_node_doc("evidence", "--")
+    store.node_bm25_sync_pending()
+    clean()
+    store.upsert_node_doc("evidence", "Note", "d9", {"text": "delta", "pack_id": "a"})
+    assert _doc_key(store, "d9") == empty_key
+    clean()
+    # an outside write leaves a pending key whose DOCS row still exists
+    _raw(str(tmp_path / "doc.db"), "UPDATE doc_nodes SET properties=? WHERE node_id='d1'",
+         ('{"text": "epsilon", "pack_id": "a"}',))
+    assert store.node_bm25_status()["pending"] == 1
+    clean()
+    store.node_bm25_sync_pending()
+    clean()
+
+
+def test_cli_verify_fails_on_vocabulary_orphan(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from opencrab import cli as cli_mod
+
+    store = _verify_store(tmp_path)
+    _inject_vocabulary_only_id(store)
+
+    class _Stores:
+        doc = store
+
+    monkeypatch.setattr(cli_mod, "_make_stores", lambda *a, **k: _Stores())
+    result = CliRunner().invoke(cli_mod.main, ["packs", "bm25-index", "verify"])
+    assert result.exit_code == 1, result.output
+    assert '"vocab_orphans": 1' in result.output
 
 
 def test_trigger_forms_record_keys_without_failing(tmp_path):
