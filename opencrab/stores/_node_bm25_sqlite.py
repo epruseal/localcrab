@@ -553,7 +553,7 @@ def _search(
             pruned = _prune.select(
                 conn, row_to_node,
                 names={"fts": FTS, "vinst": VINST, "docs": DOCS},
-                q_terms=q_terms, idf=idf, df=dfs, cf=cfs, avgdl=avgdl, n_docs=n_docs,
+                q_terms=q_terms, idf=idf, df=dfs, cf=cfs, avgdl=avgdl,
                 pack_set=pack_set, spaces=spaces, limit=limit, per_pack=per_pack,
                 max_text_chars=_decode_chars(_meta(conn).get("max_text_chars")),
                 node_terms=node_terms, node_columns=_NODE_COLUMNS,
