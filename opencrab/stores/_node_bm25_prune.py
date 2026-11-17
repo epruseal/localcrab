@@ -293,11 +293,11 @@ def select(
         open_packs = [p for p in pack_set if not closed[pack_index[p]]]
         read = None
         # A posting scan reads one row per occurrence and a ``MATCH`` join one row per document.
-        # The scan pays off only when it is needed anyway: no group is closed, so the new
-        # documents number at least ``df`` minus the known ones, and re-tokenising them
-        # costs more than the scan.
+        # The scan pays off only when it is needed anyway. Without per-pack groups the one
+        # group is open here, so the new documents number at least ``df`` minus the known
+        # ones, and re-tokenising them costs more than the scan.
         known = cand.keys.size + cand.dead.size
-        if (SCAN_US * cf[term] >= DENSE_SCAN_US and not per_pack and not closed.any()
+        if (SCAN_US * cf[term] >= DENSE_SCAN_US and not per_pack
                 and RETOK_BASE_US * max(df[term] - known, 0) >= SCAN_US * cf[term]):
             # Dense term: take the matching documents from the postings and one read of the
             # ``docs`` columns instead of a ``MATCH`` join. The scan is then not repeated.
