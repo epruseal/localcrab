@@ -194,6 +194,7 @@ def select(
     df: dict[str, int],
     cf: dict[str, int],
     avgdl: float,
+    n_docs: int,
     pack_set: list[str],
     spaces: list[str] | None,
     limit: int,
@@ -292,17 +293,16 @@ def select(
         term = pending.pop(0)
         open_packs = [p for p in pack_set if not closed[pack_index[p]]]
         read = None
-        # A posting scan reads one row per occurrence and a ``MATCH`` join one row per document.
-        # The scan pays off only when it is needed anyway. Without per-pack groups the one
-        # group is open here, so the new documents number at least ``df`` minus the known
-        # ones, and re-tokenising them costs more than the scan.
-        known = cand.keys.size + cand.dead.size
-        if (SCAN_US * cf[term] >= DENSE_SCAN_US and not per_pack
-                and RETOK_BASE_US * max(df[term] - known, 0) >= SCAN_US * cf[term]):
-            # Dense term: take the matching documents from the postings and one read of the
-            # ``docs`` columns instead of a ``MATCH`` join. The scan is then not repeated.
+        dense = False
+        if SCAN_US * cf[term] >= DENSE_SCAN_US and not per_pack and 2 * df[term] > n_docs:
+            # The first common term reads the ``docs`` columns once for the later terms too.
             if not columns:
                 columns.append(_doc_columns(conn, docs, open_packs, spaces))
+            dense = _scan_needed(columns[0][0].size, df[term], n_docs,
+                                 cand.keys.size + cand.dead.size, cf[term])
+        if dense:
+            # Dense term: take the matching documents from the postings and one read of the
+            # ``docs`` columns instead of a ``MATCH`` join. The scan is then not repeated.
             p_keys, p_tf = _postings(conn, vinst, term)
             log["postings"] += 1
             # The posting set must be the vocabulary's document set.
@@ -429,6 +429,19 @@ def _match_docs(
         if np.any(np.diff(keys) == 0):
             raise PruneFallbackError("match duplicate")
     return keys, dl, grp
+
+
+def _scan_needed(m_docs: int, df_term: int, n_docs: int, known: int, cf_term: int) -> bool:
+    """True when re-tokenising the new documents of the term cannot beat its posting scan.
+
+    A posting scan reads one row per occurrence and a ``MATCH`` join one row per document,
+    so the scan pays off only when it is needed anyway. ``m_docs`` documents are inside the
+    packs and spaces, so at most ``n_docs - m_docs`` matching documents are outside. The new
+    documents number at least ``df`` minus those and minus the ``known`` ones. Re-tokenising
+    costs at least ``RETOK_BASE_US`` for each of them.
+    """
+    outside = max(n_docs - m_docs, 0)
+    return RETOK_BASE_US * max(df_term - outside - known, 0) >= SCAN_US * cf_term
 
 
 def _doc_columns(

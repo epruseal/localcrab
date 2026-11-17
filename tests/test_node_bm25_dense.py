@@ -143,6 +143,50 @@ def test_per_pack_search_keeps_the_match_join(tmp_path, dense):
     assert dense["match"] >= 1
 
 
+def test_scan_needed_rule():
+    need = prune._scan_needed
+    # All documents inside, many new documents: re-tokenising loses to the scan.
+    assert need(m_docs=1000, df_term=1000, n_docs=1000, known=0, cf_term=5000)
+    # The packs hold few documents: most matches lie outside, so few new documents remain.
+    assert not need(m_docs=10, df_term=1000, n_docs=1000, known=0, cf_term=5000)
+    # Known documents are not new.
+    assert not need(m_docs=1000, df_term=1000, n_docs=1000, known=990, cf_term=5000)
+    # The bound is exact at the edge: 50 us per new document against 0.25 us per occurrence.
+    edge = int(prune.SCAN_US * 5000 / prune.RETOK_BASE_US)
+    assert need(m_docs=1000, df_term=edge, n_docs=1000, known=0, cf_term=5000)
+    assert not need(m_docs=1000, df_term=edge - 1, n_docs=1000, known=0, cf_term=5000)
+
+
+def test_the_dense_path_follows_the_rule(tmp_path, monkeypatch, dense):
+    store = _store(tmp_path)
+    rng = random.Random(7)
+    for i in range(400):
+        pack = "pa" if i < 4 else "pb"
+        store.upsert_node_doc("evidence", "Note", f"n{i:04d}", {
+            "text": "alpha beta " * rng.randint(1, 6) + "gamma " * rng.randint(0, 3),
+            "pack_id": pack})
+    assert store.node_bm25_sync_pending() == 0
+    q = "alpha beta gamma"
+    # Most matches lie outside the one small pack: the join route serves it.
+    small, _ = _search(store, q, ["pa"], limit=10)
+    assert dense["match"] >= 1
+    full, _ = _full(store, monkeypatch, q, ["pa"], limit=10)
+    assert _shape(small) == _shape(full)
+    # Re-tokenising never looks cheap: the dense route serves the large pack.
+    before = dict(dense)
+    monkeypatch.setattr(prune, "RETOK_BASE_US", 1e12)
+    big, _ = _search(store, q, ["pb"], limit=10)
+    assert dense["match"] == before["match"]
+    assert dense["columns"] > before["columns"]
+    assert _shape(big) == _shape(_full(store, monkeypatch, q, ["pb"], limit=10)[0])
+    # Re-tokenising looks free: the join route serves it again.
+    before = dict(dense)
+    monkeypatch.setattr(prune, "RETOK_BASE_US", 0.0)
+    free, _ = _search(store, q, ["pb"], limit=10)
+    assert dense["match"] > before["match"]
+    assert _shape(free) == _shape(_full(store, monkeypatch, q, ["pb"], limit=10)[0])
+
+
 def test_the_default_threshold_keeps_small_terms_on_the_match_join(tmp_path, monkeypatch):
     monkeypatch.setattr(prune, "FULL_SCAN_CF_MAX", -1)
     calls = {"columns": 0}
