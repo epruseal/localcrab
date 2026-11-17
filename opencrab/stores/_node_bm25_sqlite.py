@@ -54,13 +54,15 @@ UNAVAILABLE_WARNING = "BM25 coverage unavailable: node index query failed"
 
 # #569: the response says so when a search with common query terms runs past
 # the latency requirement of docs/issue-542-search-baseline.md section 4.3. The
-# per-pack probe shares the budget of the auto-selection request it serves. The
-# prefix is not "BM25 coverage", so coverage classification ignores this warning.
+# per-pack probe gets the auto-selection request budget (2500 ms) minus the
+# budget of the BM25 leg of the query that follows it (500 ms). The prefix is
+# not "BM25 coverage", so coverage classification ignores this warning, and
+# ``pack_selection.PROBE_LATENCY_PREFIX`` routes it to its own warning code.
 LEG_BUDGET_MS = 500.0
-PROBE_BUDGET_MS = 2500.0
+PROBE_BUDGET_MS = 2000.0
 SLOW_WARNING = (
     "BM25 latency over budget: {ms} ms against {budget} ms; "
-    "{common} of {terms} query terms occur in more than half of the indexed documents"
+    "{common} of {terms} indexed query terms occur in more than half of the indexed documents"
 )
 
 

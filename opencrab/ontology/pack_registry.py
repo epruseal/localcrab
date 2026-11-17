@@ -541,8 +541,9 @@ def _choose_by_content_with_warnings(
     ``(candidates, truncated_packs)``: ``truncated_packs``는 히트 수가
     ``PER_PACK_PROBE_LIMIT``에 닿아 그 팩의 실제 매치가 더 있을 수 있음을
     관측용으로 알리는 목록이다(§7 항목9, 선택 결과 자체에는 영향 없음).
-    셋째 값은 BM25 탐침이 낸 coverage 경고다(#541). 호출자는 이 값으로
-    선택이 불완전한 색인에서 나왔음을 응답에 남긴다.
+    셋째 값은 BM25 탐침이 낸 경고다. ``BM25 coverage`` 접두 경고는 색인이 불완전하다는
+    뜻이고(#541), ``BM25 latency over budget`` 접두 경고는 탐침이 예산을 넘었다는
+    뜻이다(#569). 호출자는 두 종류를 가려 응답에 남긴다.
 
     선택 기준은 (겹친 고유 토큰 수, 누적 BM25/FTS 점수, pack_id) 내림차순 --
     더 많은 서로 다른 질의어를 커버하는 팩을 우선하고, 동점이면 결정론적으로

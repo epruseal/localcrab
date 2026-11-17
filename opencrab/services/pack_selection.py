@@ -38,6 +38,12 @@ PACK_IDS_OUT_OF_SCOPE = "pack_ids_out_of_scope"
 # #541: the auto_pack content probe ran on a BM25 index that reported a
 # coverage gap (pending changes, unavailable index, or a partial memory window).
 AUTO_PACK_PROBE_COVERAGE = "auto_pack_probe_coverage"
+# #569: the probe ran past its latency budget with common query terms. This code
+# is separate from the coverage code: the index was complete, and
+# ``scripts/search_faults.py`` excuses a wrong pack only for incomplete coverage.
+AUTO_PACK_PROBE_SLOW = "auto_pack_probe_slow"
+# The warning text of ``_node_bm25_sqlite.SLOW_WARNING`` starts with this prefix.
+PROBE_LATENCY_PREFIX = "BM25 latency over budget"
 
 
 @dataclass(frozen=True)
@@ -189,8 +195,10 @@ def resolve_packs(
                     candidates, truncated_packs, probe_warnings = (
                         _choose_by_content_with_warnings(question, registry, hybrid, spaces)
                     )
-                    if probe_warnings:
+                    if any(not w.startswith(PROBE_LATENCY_PREFIX) for w in probe_warnings):
                         warnings.append(PackWarning(AUTO_PACK_PROBE_COVERAGE))
+                    if any(w.startswith(PROBE_LATENCY_PREFIX) for w in probe_warnings):
+                        warnings.append(PackWarning(AUTO_PACK_PROBE_SLOW))
                     if truncated_packs:
                         logger.info(
                             "auto_pack content fallback: probe limit reached for %s",
@@ -256,6 +264,10 @@ _MCP_WARNINGS = {
         "auto_pack chose from a keyword index that reported incomplete coverage; "
         "the choice may differ once the index catches up"
     ),
+    AUTO_PACK_PROBE_SLOW: (
+        "auto_pack content probe ran past its latency budget because the query "
+        "has very common terms; the response may be slower than the documented limit"
+    ),
 }
 
 _CLI_WARNINGS = {
@@ -272,6 +284,11 @@ _CLI_WARNINGS = {
     AUTO_PACK_PROBE_COVERAGE: (
         "warning: --auto-pack chose from a keyword index that reported incomplete "
         "coverage; the choice may differ once the index catches up."
+    ),
+    AUTO_PACK_PROBE_SLOW: (
+        "warning: --auto-pack content probe ran past its latency budget because "
+        "the query has very common terms; the response may be slower than the "
+        "documented limit."
     ),
 }
 

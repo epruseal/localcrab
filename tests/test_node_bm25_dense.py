@@ -34,13 +34,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture
-def dense(monkeypatch):
+@pytest.fixture(params=[0.0, 100.0], ids=["all-dense", "mixed"])
+def dense(monkeypatch, request):
+    """Force the pruned path. 0 sends every term to the dense path. 100 sends only the
+    common terms there (``SCAN_US * cf >= 100``) and keeps the rare ones on ``MATCH``."""
     monkeypatch.setattr(prune, "FULL_SCAN_CF_MAX", -1)
-    monkeypatch.setattr(prune, "DENSE_SCAN_US", 0.0)
+    monkeypatch.setattr(prune, "DENSE_SCAN_US", request.param)
     monkeypatch.delenv("OPENCRAB_BM25_PRUNE", raising=False)
-    calls = {"columns": 0, "match": 0, "postings": 0}
+    calls = {"columns": 0, "match": 0, "postings": 0, "stats": []}
     real_columns, real_match, real_postings = prune._doc_columns, prune._match_docs, prune._postings
+    real_select = prune.select
+
+    def select(*a, **k):
+        k["stats"] = {}
+        calls["stats"].append(k["stats"])
+        return real_select(*a, **k)
+
+    monkeypatch.setattr(prune, "select", select)
 
     def columns(*a, **k):
         calls["columns"] += 1
@@ -83,6 +93,33 @@ def test_dense_admission_equals_full_scan_and_oracle(tmp_path, monkeypatch, dens
                     {p: _shape(h) for p, h in per_full.items()}, (q, scope, limit)
     assert dense["columns"] > 0
     assert FALLBACK not in caplog.text
+
+
+def test_dense_admission_takes_the_same_candidates_as_the_match_join(tmp_path, monkeypatch, dense):
+    """Equal hits cannot show a wrong candidate set: a wrongly admitted or missed document
+    can lose by score anyway. ``admitted`` and ``chosen`` count the candidates."""
+    monkeypatch.setenv("OPENCRAB_BM25_MAX_NODE_CHARS", "4000")
+    store = _store(tmp_path)
+    _zipf_corpus(store, random.Random(3))
+    scopes = [["pa"], ["pb", "pc"], ["pa", "pb", "pc", "7"]]
+    runs = []
+    for q in _QUESTIONS:
+        for scope in scopes:
+            for per_pack in (False, True):
+                runs.append((q, scope, per_pack))
+    with_dense = []
+    for q, scope, per_pack in runs:
+        dense["stats"].clear()
+        _search(store, q, scope, None, 10, per_pack=per_pack)
+        with_dense.append([(s.get("admitted"), s.get("chosen")) for s in dense["stats"]])
+    with monkeypatch.context() as m:
+        m.setattr(prune, "DENSE_SCAN_US", 1e18)
+        without = []
+        for q, scope, per_pack in runs:
+            dense["stats"].clear()
+            _search(store, q, scope, None, 10, per_pack=per_pack)
+            without.append([(s.get("admitted"), s.get("chosen")) for s in dense["stats"]])
+    assert with_dense == without
 
 
 def test_dense_terms_skip_the_match_join(tmp_path, dense):
@@ -184,7 +221,7 @@ def test_slow_search_with_common_terms_names_the_latency(tmp_path, monkeypatch):
     hits, warnings = _search(store, common, ["pa"], limit=10)
     assert len(warnings) == 1
     assert warnings[0].startswith("BM25 latency over budget:")
-    assert "3 of 3 query terms occur in more than half" in warnings[0]
+    assert "3 of 3 indexed query terms occur in more than half" in warnings[0]
     assert not warnings[0].startswith("BM25 coverage")
     # The hits equal the hits of a search that is fast enough.
     monkeypatch.setattr(nbm, "LEG_BUDGET_MS", 10**9)
@@ -198,3 +235,44 @@ def test_slow_search_with_common_terms_names_the_latency(tmp_path, monkeypatch):
     assert _search(store, common, ["pa"], limit=10, per_pack=True)[1] == []
     monkeypatch.setattr(nbm, "PROBE_BUDGET_MS", -1.0)
     assert len(_search(store, common, ["pa"], limit=10, per_pack=True)[1]) == 1
+
+
+def test_probe_latency_warning_has_its_own_selection_code(monkeypatch):
+    """A slow probe over a complete index must not read as incomplete coverage: the fault
+    harness excuses a wrong pack only for the coverage code."""
+    from unittest.mock import MagicMock
+
+    from opencrab.services import pack_selection as ps
+    from opencrab.stores import _node_bm25_sqlite as nbm
+
+    assert nbm.SLOW_WARNING.startswith(ps.PROBE_LATENCY_PREFIX)
+    assert not nbm.PENDING_WARNING.startswith(ps.PROBE_LATENCY_PREFIX)
+    assert ps.mcp_warning_text(ps.PackWarning(ps.AUTO_PACK_PROBE_SLOW))
+    assert ps.cli_warning_text(ps.PackWarning(ps.AUTO_PACK_PROBE_SLOW))
+    slow = nbm.SLOW_WARNING.format(ms=3000, budget=2000, common=2, terms=3)
+    coverage = nbm.PENDING_WARNING.format(n=1)
+    monkeypatch.setattr(
+        "opencrab.pack.ownership.list_packs_for",
+        lambda sql, principal: [{"pack_id": "pack-a", "title": "x", "description": "y"}],
+    )
+
+    def codes(probe_warnings):
+        class Hybrid:
+            def _bm25_search_per_pack_with_warnings(self, question, spaces, limit, *, pack_ids):
+                return ({"pack-a": [{"pack_id": "pack-a", "text": "zzword", "score": 3.5}]},
+                        probe_warnings)
+
+            def _fts_search(self, question, spaces, limit, *, pack_ids):
+                return []
+
+        sel = ps.resolve_packs(
+            "zzword", None, True, False, "/tmp", scope=frozenset({"pack-a"}),
+            raise_on_error=False, sql=MagicMock(), principal=MagicMock(), hybrid=Hybrid(),
+            spaces=None)
+        assert sel.effective_pack_ids == ["pack-a"]
+        return [w.code for w in sel.warnings]
+
+    assert codes([]) == []
+    assert codes([slow]) == [ps.AUTO_PACK_PROBE_SLOW]
+    assert codes([coverage]) == [ps.AUTO_PACK_PROBE_COVERAGE]
+    assert codes([coverage, slow]) == [ps.AUTO_PACK_PROBE_COVERAGE, ps.AUTO_PACK_PROBE_SLOW]

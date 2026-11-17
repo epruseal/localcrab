@@ -40,7 +40,6 @@ SEED_MAX = 400
 # postings and a column read of ``docs`` instead of a ``MATCH`` join. Re-tokenising
 # the few new documents cannot beat such a scan (design 6.2 of #569).
 DENSE_SCAN_US = 20_000.0
-DENSE_RETOK_RATIO = 100.0
 
 _SQL_CHUNK = 500
 
@@ -292,7 +291,7 @@ def select(
             continue
         term = pending.pop(0)
         open_packs = [p for p in pack_set if not closed[pack_index[p]]]
-        if SCAN_US * cf[term] >= DENSE_SCAN_US and RETOK_BASE_US >= DENSE_RETOK_RATIO * SCAN_US:
+        if SCAN_US * cf[term] >= DENSE_SCAN_US:
             if not columns:
                 columns.append(_doc_columns(conn, docs, open_packs, pack_index, spaces, per_pack))
             p_keys, p_tf = _postings(conn, vinst, term)
