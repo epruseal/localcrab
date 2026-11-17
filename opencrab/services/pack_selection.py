@@ -265,8 +265,8 @@ _MCP_WARNINGS = {
         "the choice may differ once the index catches up"
     ),
     AUTO_PACK_PROBE_SLOW: (
-        "auto_pack content probe ran past its latency budget because the query "
-        "has very common terms; the response may be slower than the documented limit"
+        "auto_pack content probe ran past its latency budget on a query with very "
+        "common terms; the response may be slower than the documented limit"
     ),
 }
 
@@ -286,9 +286,9 @@ _CLI_WARNINGS = {
         "coverage; the choice may differ once the index catches up."
     ),
     AUTO_PACK_PROBE_SLOW: (
-        "warning: --auto-pack content probe ran past its latency budget because "
-        "the query has very common terms; the response may be slower than the "
-        "documented limit."
+        "warning: --auto-pack content probe ran past its latency budget on a query "
+        "with very common terms; the response may be slower than the documented "
+        "limit."
     ),
 }
 
