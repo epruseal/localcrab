@@ -17,6 +17,7 @@ import hashlib
 import logging
 import os
 import sqlite3
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -50,6 +51,17 @@ _SCAN_BATCH = 1000
 
 PENDING_WARNING = "BM25 coverage pending changes: {n} node rows are not indexed yet"
 UNAVAILABLE_WARNING = "BM25 coverage unavailable: node index query failed"
+
+# #569: the response says so when a search with common query terms runs past
+# the latency requirement of docs/issue-542-search-baseline.md section 4.3. The
+# per-pack probe shares the budget of the auto-selection request it serves. The
+# prefix is not "BM25 coverage", so coverage classification ignores this warning.
+LEG_BUDGET_MS = 500.0
+PROBE_BUDGET_MS = 2500.0
+SLOW_WARNING = (
+    "BM25 latency over budget: {ms} ms against {budget} ms; "
+    "{common} of {terms} query terms occur in more than half of the indexed documents"
+)
 
 
 class IndexFormatMismatchError(RuntimeError):
@@ -366,8 +378,34 @@ def search(
 
     Returns ``(hits, warnings)``. ``hits`` is a list, or a dict of lists keyed
     by pack when ``per_pack``. Raises ``NotReadyError`` when the snapshot is not a
-    ready index of this format.
+    ready index of this format. The hits do not depend on the elapsed time.
     """
+    started = time.perf_counter()
+    terms: dict[str, int] = {}
+    hits, warnings = _search(
+        conn, row_to_node, question, pack_ids=pack_ids, spaces=spaces, limit=limit,
+        per_pack=per_pack, terms=terms,
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    budget = PROBE_BUDGET_MS if per_pack else LEG_BUDGET_MS
+    if elapsed_ms > budget and terms.get("common"):
+        warnings = [*warnings, SLOW_WARNING.format(
+            ms=int(elapsed_ms), budget=int(budget), common=terms["common"], terms=terms["all"])]
+    return hits, warnings
+
+
+def _search(
+    conn: sqlite3.Connection,
+    row_to_node: RowToNode,
+    question: str,
+    *,
+    pack_ids: list[str],
+    spaces: list[str] | None,
+    limit: int,
+    per_pack: bool,
+    terms: dict[str, int],
+) -> tuple[Any, list[str]]:
+    """``search`` without the latency warning; ``terms`` receives the term counts."""
     from opencrab.ontology.bm25 import _node_text, bm25_idf, bm25_score
     from opencrab.ontology.pack_provenance import scope_pack_id
     from opencrab.ontology.text_cues import tokenize
@@ -406,6 +444,8 @@ def search(
             idf[term] = bm25_idf(n_docs, int(df))
             dfs[term] = int(df)
             cfs[term] = int(cnt)
+    terms["all"] = len(dfs)
+    terms["common"] = sum(1 for df in dfs.values() if 2 * df > n_docs)
 
     def full_scored() -> list[tuple]:
         space_sql = ""

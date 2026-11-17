@@ -36,6 +36,11 @@ RETOK_BASE_US = 50.0     # re-tokenising one document
 RETOK_TOKEN_US = 1.0     # plus one stored token
 SEED_BUDGET_US = 30_000.0
 SEED_MAX = 400
+# #569: a term whose posting scan costs at least this much is admitted from its
+# postings and a column read of ``docs`` instead of a ``MATCH`` join. Re-tokenising
+# the few new documents cannot beat such a scan (design 6.2 of #569).
+DENSE_SCAN_US = 20_000.0
+DENSE_RETOK_RATIO = 100.0
 
 _SQL_CHUNK = 500
 
@@ -97,6 +102,15 @@ def _contrib(tf: np.ndarray, dl: np.ndarray, idf_t: float, mult_t: int, avgdl: f
     )
 
 
+def _by_group(grp: np.ndarray, groups: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(order, start, end): ``order[start[g]:end[g]]`` are the indices of group ``g``."""
+    small = grp.astype(np.int16) if groups < 2**15 else grp
+    order = np.argsort(small, kind="stable")
+    sorted_grp = grp[order]
+    ids = np.arange(groups)
+    return order, np.searchsorted(sorted_grp, ids, "left"), np.searchsorted(sorted_grp, ids, "right")
+
+
 def _kth(values: np.ndarray, grp: np.ndarray, groups: int, k: int) -> np.ndarray:
     """k-th largest value per group; -inf for a group with fewer than k values."""
     theta = np.full(groups, -np.inf)
@@ -106,13 +120,10 @@ def _kth(values: np.ndarray, grp: np.ndarray, groups: int, k: int) -> np.ndarray
         if values.size >= k:
             theta[0] = np.partition(values, values.size - k)[values.size - k]
         return theta
-    order = np.lexsort((-values, grp))
-    sorted_grp = grp[order]
-    ids = np.arange(groups)
-    start = np.searchsorted(sorted_grp, ids, "left")
-    count = np.searchsorted(sorted_grp, ids, "right") - start
-    full = count >= k
-    theta[full] = values[order[start[full] + k - 1]]
+    order, start, end = _by_group(grp, groups)
+    for g in np.flatnonzero(end - start >= k):
+        seg = values[order[start[g]:end[g]]]
+        theta[g] = np.partition(seg, seg.size - k)[seg.size - k]
     return theta
 
 
@@ -122,10 +133,14 @@ def _topk_index(values: np.ndarray, grp: np.ndarray, groups: int, k: int) -> np.
         if values.size <= k:
             return np.arange(values.size)
         return np.argpartition(values, values.size - k)[values.size - k:]
-    order = np.lexsort((-values, grp))
-    sorted_grp = grp[order]
-    rank = np.arange(sorted_grp.size) - np.searchsorted(sorted_grp, sorted_grp, "left")
-    return order[rank < k]
+    order, start, end = _by_group(grp, groups)
+    picked = []
+    for g in np.flatnonzero(end > start):
+        idx = order[start[g]:end[g]]
+        if idx.size > k:
+            idx = idx[np.argpartition(values[idx], idx.size - k)[idx.size - k:]]
+        picked.append(idx)
+    return np.concatenate(picked) if picked else np.zeros(0, dtype=np.int64)
 
 
 def _retok_cost(dls: np.ndarray) -> float:
@@ -211,6 +226,7 @@ def select(
     closed = np.zeros(groups, dtype=bool)
     log = stats if stats is not None else {}
     log.update({"postings": 0, "retokenised": 0, "admitted": 0, "terms": len(pending)})
+    columns: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
     def retokenise(idx: np.ndarray, must_hold: str | None = None, first_new: int = -1) -> None:
         keys = [int(x) for x in cand.keys[idx]]
@@ -276,6 +292,31 @@ def select(
             continue
         term = pending.pop(0)
         open_packs = [p for p in pack_set if not closed[pack_index[p]]]
+        if SCAN_US * cf[term] >= DENSE_SCAN_US and RETOK_BASE_US >= DENSE_RETOK_RATIO * SCAN_US:
+            if not columns:
+                columns.append(_doc_columns(conn, docs, open_packs, pack_index, spaces, per_pack))
+            p_keys, p_tf = _postings(conn, vinst, term)
+            log["postings"] += 1
+            # The posting set must be the vocabulary's document set.
+            if p_keys.size != df[term]:
+                raise PruneFallbackError("posting count")
+            c_keys, c_dl, c_grp = columns[0]
+            at = np.minimum(np.searchsorted(c_keys, p_keys), max(c_keys.size - 1, 0))
+            take = np.zeros(p_keys.size, dtype=bool)
+            if c_keys.size:
+                take = (c_keys[at] == p_keys) & ~closed[c_grp[at]]
+            at = at[take]
+            new = np.ones(at.size, dtype=bool)
+            if cand.keys.size:
+                new &= ~np.isin(p_keys[take], cand.keys)
+            if cand.dead.size:
+                new &= ~np.isin(p_keys[take], cand.dead)
+            log["admitted"] += int(new.sum())
+            tf_old = _lookup(p_keys, p_tf, cand.keys)
+            cand.add(c_keys[at][new], c_grp[at][new], c_dl[at][new])
+            scanned.add(term)
+            add_tf(term, np.concatenate((tf_old, p_tf[take][new])))
+            continue
         a_keys, a_dl, a_grp = _match_docs(conn, fts, docs, term, open_packs, pack_index,
                                           spaces, per_pack, df[term])
         new = np.ones(a_keys.size, dtype=bool)
@@ -384,4 +425,44 @@ def _match_docs(
         keys, dl, grp = keys[order], dl[order], grp[order]
         if np.any(np.diff(keys) == 0):
             raise PruneFallbackError("match duplicate")
+    return keys, dl, grp
+
+
+def _doc_columns(
+    conn: sqlite3.Connection,
+    docs: str,
+    open_packs: list[str],
+    pack_index: dict[str, int],
+    spaces: list[str] | None,
+    per_pack: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(doc keys ascending, dl, group) of every document in the open packs and spaces."""
+    cond = f"d.pack_id IN ({','.join('?' * len(open_packs))})"
+    params: list[Any] = list(open_packs)
+    if spaces:
+        cond += f" AND d.space IN ({','.join('?' * len(spaces))})"
+        params += list(spaces)
+    pack_col = ", group_concat(d.pack_id, char(31))" if per_pack else ""
+    row = conn.execute(
+        f"SELECT count(*), group_concat(d.doc_key, ' '), group_concat(d.dl, ' '){pack_col} "
+        f"FROM {docs} d WHERE {cond}",
+        params,
+    ).fetchone()
+    n = int(row[0])
+    if per_pack and n:
+        packs = row[3].split("\x1f")
+        if len(packs) != n:
+            raise PruneFallbackError("pack text")
+        grp = np.fromiter((pack_index[p] for p in packs), dtype=np.int64, count=n)
+    else:
+        grp = np.zeros(n, dtype=np.int64)
+    keys = _ints(row[1])
+    dl = _ints(row[2])
+    if keys.size != n or dl.size != n:
+        raise PruneFallbackError("column text")
+    if n > 1 and np.any(np.diff(keys) <= 0):
+        order = np.argsort(keys, kind="stable")
+        keys, dl, grp = keys[order], dl[order], grp[order]
+        if np.any(np.diff(keys) == 0):
+            raise PruneFallbackError("column duplicate")
     return keys, dl, grp
