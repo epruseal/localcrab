@@ -19,6 +19,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_budgets_follow_the_latency_requirement():
+    """docs/issue-542-search-baseline.md 4.3: BM25 leg 500 ms. The auto request gets 2500 ms
+    and the probe leaves the leg budget of the query that follows it."""
+    assert nbm.LEG_BUDGET_MS == 500.0
+    assert nbm.PROBE_BUDGET_MS + nbm.LEG_BUDGET_MS == 2500.0
+
+
 def test_slow_search_with_common_terms_names_the_latency(tmp_path, monkeypatch):
     store = _store(tmp_path)
     _skewed(store)
