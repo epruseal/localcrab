@@ -16,6 +16,7 @@ import sqlite3
 import pytest
 
 from opencrab.stores import _node_bm25_prune as prune
+from opencrab.stores import _node_bm25_sqlite as nbm
 from tests.test_node_bm25_prune import (
     _QUESTIONS,
     FALLBACK,
@@ -41,6 +42,9 @@ def dense(monkeypatch, request):
     monkeypatch.setattr(prune, "FULL_SCAN_CF_MAX", -1)
     monkeypatch.setattr(prune, "DENSE_SCAN_US", request.param)
     monkeypatch.delenv("OPENCRAB_BM25_PRUNE", raising=False)
+    # The latency warning depends on the wall clock. Keep it out of these equality tests.
+    monkeypatch.setattr(nbm, "LEG_BUDGET_MS", 1e9)
+    monkeypatch.setattr(nbm, "PROBE_BUDGET_MS", 1e9)
     calls = {"columns": 0, "match": 0, "postings": 0, "stats": []}
     real_columns, real_match, real_postings = prune._doc_columns, prune._match_docs, prune._postings
     real_select = prune.select
@@ -131,6 +135,14 @@ def test_dense_terms_skip_the_match_join(tmp_path, dense):
     assert dense["postings"] >= 1
 
 
+def test_per_pack_search_keeps_the_match_join(tmp_path, dense):
+    store = _store(tmp_path)
+    _skewed(store)
+    _search(store, "alpha beta gamma", ["pa"], limit=10, per_pack=True)
+    assert dense["columns"] == 0
+    assert dense["match"] >= 1
+
+
 def test_the_default_threshold_keeps_small_terms_on_the_match_join(tmp_path, monkeypatch):
     monkeypatch.setattr(prune, "FULL_SCAN_CF_MAX", -1)
     calls = {"columns": 0}
@@ -208,12 +220,11 @@ def test_dense_columns_honour_pack_and_space_filters(tmp_path, monkeypatch, dens
 
 
 def test_slow_search_with_common_terms_names_the_latency(tmp_path, monkeypatch):
-    from opencrab.stores import _node_bm25_sqlite as nbm
-
     store = _store(tmp_path)
     _skewed(store)
     common, rare = "alpha beta gamma", "qxrare"
-    # The default budget leaves a fast search without a latency warning.
+    # A search inside the budget has no latency warning.
+    monkeypatch.setattr(nbm, "LEG_BUDGET_MS", 1e9)
     _hits, warnings = _search(store, common, ["pa"], limit=10)
     assert warnings == []
     monkeypatch.setattr(nbm, "LEG_BUDGET_MS", -1.0)
@@ -243,7 +254,6 @@ def test_probe_latency_warning_has_its_own_selection_code(monkeypatch):
     from unittest.mock import MagicMock
 
     from opencrab.services import pack_selection as ps
-    from opencrab.stores import _node_bm25_sqlite as nbm
 
     assert nbm.SLOW_WARNING.startswith(ps.PROBE_LATENCY_PREFIX)
     assert not nbm.PENDING_WARNING.startswith(ps.PROBE_LATENCY_PREFIX)

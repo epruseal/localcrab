@@ -37,8 +37,8 @@ RETOK_TOKEN_US = 1.0     # plus one stored token
 SEED_BUDGET_US = 30_000.0
 SEED_MAX = 400
 # #569: a term whose posting scan costs at least this much is admitted from its
-# postings and a column read of ``docs`` instead of a ``MATCH`` join. Re-tokenising
-# the few new documents cannot beat such a scan (design 6.2 of #569).
+# postings and a column read of ``docs`` instead of a ``MATCH`` join, when the scan is
+# needed anyway (design 5.1 of #569).
 DENSE_SCAN_US = 20_000.0
 
 _SQL_CHUNK = 500
@@ -291,9 +291,18 @@ def select(
             continue
         term = pending.pop(0)
         open_packs = [p for p in pack_set if not closed[pack_index[p]]]
-        if SCAN_US * cf[term] >= DENSE_SCAN_US:
+        read = None
+        # A posting scan reads one row per occurrence and a ``MATCH`` join one row per document.
+        # The scan pays off only when it is needed anyway: no group is closed, so the new
+        # documents number at least ``df`` minus the known ones, and re-tokenising them
+        # costs more than the scan.
+        known = cand.keys.size + cand.dead.size
+        if (SCAN_US * cf[term] >= DENSE_SCAN_US and not per_pack and not closed.any()
+                and RETOK_BASE_US * max(df[term] - known, 0) >= SCAN_US * cf[term]):
+            # Dense term: take the matching documents from the postings and one read of the
+            # ``docs`` columns instead of a ``MATCH`` join. The scan is then not repeated.
             if not columns:
-                columns.append(_doc_columns(conn, docs, open_packs, pack_index, spaces, per_pack))
+                columns.append(_doc_columns(conn, docs, open_packs, spaces))
             p_keys, p_tf = _postings(conn, vinst, term)
             log["postings"] += 1
             # The posting set must be the vocabulary's document set.
@@ -303,21 +312,13 @@ def select(
             at = np.minimum(np.searchsorted(c_keys, p_keys), max(c_keys.size - 1, 0))
             take = np.zeros(p_keys.size, dtype=bool)
             if c_keys.size:
-                take = (c_keys[at] == p_keys) & ~closed[c_grp[at]]
+                take = c_keys[at] == p_keys
             at = at[take]
-            new = np.ones(at.size, dtype=bool)
-            if cand.keys.size:
-                new &= ~np.isin(p_keys[take], cand.keys)
-            if cand.dead.size:
-                new &= ~np.isin(p_keys[take], cand.dead)
-            log["admitted"] += int(new.sum())
-            tf_old = _lookup(p_keys, p_tf, cand.keys)
-            cand.add(c_keys[at][new], c_grp[at][new], c_dl[at][new])
-            scanned.add(term)
-            add_tf(term, np.concatenate((tf_old, p_tf[take][new])))
-            continue
-        a_keys, a_dl, a_grp = _match_docs(conn, fts, docs, term, open_packs, pack_index,
-                                          spaces, per_pack, df[term])
+            a_keys, a_dl, a_grp = p_keys[take], c_dl[at], c_grp[at]
+            read = (p_keys, p_tf)
+        else:
+            a_keys, a_dl, a_grp = _match_docs(conn, fts, docs, term, open_packs, pack_index,
+                                              spaces, per_pack, df[term])
         new = np.ones(a_keys.size, dtype=bool)
         if cand.keys.size:
             new &= ~np.isin(a_keys, cand.keys)
@@ -333,8 +334,11 @@ def select(
             # Documents taken later cannot hold this term (design 6.4, 1).
             cand.tfs[term] = np.zeros(cand.keys.size, dtype=np.int64)
             continue
-        p_keys, p_tf = _postings(conn, vinst, term)
-        log["postings"] += 1
+        if read is None:
+            p_keys, p_tf = _postings(conn, vinst, term)
+            log["postings"] += 1
+        else:
+            p_keys, p_tf = read
         tf_old = _lookup(p_keys, p_tf, cand.keys)
         new_keys = a_keys[new]
         tf_new = _lookup(p_keys, p_tf, new_keys)
@@ -431,37 +435,31 @@ def _doc_columns(
     conn: sqlite3.Connection,
     docs: str,
     open_packs: list[str],
-    pack_index: dict[str, int],
     spaces: list[str] | None,
-    per_pack: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(doc keys ascending, dl, group) of every document in the open packs and spaces."""
+    """(doc keys ascending, dl, group 0) of every document in the open packs and spaces.
+
+    The dense rule runs only without per-pack groups, so every document is in group 0.
+    """
     cond = f"d.pack_id IN ({','.join('?' * len(open_packs))})"
     params: list[Any] = list(open_packs)
     if spaces:
         cond += f" AND d.space IN ({','.join('?' * len(spaces))})"
         params += list(spaces)
-    pack_col = ", group_concat(d.pack_id, char(31))" if per_pack else ""
     row = conn.execute(
-        f"SELECT count(*), group_concat(d.doc_key, ' '), group_concat(d.dl, ' '){pack_col} "
+        f"SELECT count(*), group_concat(d.doc_key, ' '), group_concat(d.dl, ' ') "
         f"FROM {docs} d WHERE {cond}",
         params,
     ).fetchone()
     n = int(row[0])
-    if per_pack and n:
-        packs = row[3].split("\x1f")
-        if len(packs) != n:
-            raise PruneFallbackError("pack text")
-        grp = np.fromiter((pack_index[p] for p in packs), dtype=np.int64, count=n)
-    else:
-        grp = np.zeros(n, dtype=np.int64)
+    grp = np.zeros(n, dtype=np.int64)
     keys = _ints(row[1])
     dl = _ints(row[2])
     if keys.size != n or dl.size != n:
         raise PruneFallbackError("column text")
     if n > 1 and np.any(np.diff(keys) <= 0):
         order = np.argsort(keys, kind="stable")
-        keys, dl, grp = keys[order], dl[order], grp[order]
+        keys, dl = keys[order], dl[order]
         if np.any(np.diff(keys) == 0):
             raise PruneFallbackError("column duplicate")
     return keys, dl, grp

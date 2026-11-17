@@ -211,6 +211,8 @@ def test_each_finish_path_matches_the_full_scan(tmp_path, monkeypatch, forced, c
     # Re-tokenising everything: posting scans never look cheaper.
     with monkeypatch.context() as m:
         m.setattr(prune, "SCAN_US", 1e12)
+        # #569: a dense term reads its postings in place of the MATCH join. Keep the join.
+        m.setattr(prune, "DENSE_SCAN_US", float("inf"))
         before = dict(forced)
         got, _ = _search(store, q, ["pa"], limit=10)
         assert _shape(got) == _shape(full)
