@@ -84,6 +84,31 @@ _GRAPH_SKIPPED_LONG_ID = "skipped (id exceeds the node id limit after fork remap
 _SKIPPED_GRAPH_FAILED = SKIPPED_GRAPH_WRITE_FAILED
 
 
+def _check_display_node_id(
+    meta: Mapping[str, Any], *, source_id: str, origin: str
+) -> None:
+    """Refuse a client-supplied ``metadata.node_id`` that is not this source's id (#544).
+
+    Search shows ``metadata.node_id or source_id`` as a hit's node id. A client
+    value that differs therefore points the hit at a node that does not exist,
+    or at another node, and a follow-up graph read returns the wrong object.
+    This module writes the source's own node under ``source_id`` (#74), so a
+    client has nothing else to name. The check is not an existence probe: it
+    reads no store, so it cannot reveal another pack's nodes.
+
+    A falsy value (``None``, ``""``) already falls back to ``source_id`` at
+    display time, so it is not refused. ``origin="server"`` is a replay of a row
+    this server wrote, and ``pack_fork`` copies chunk rows whose ``node_id``
+    legitimately names their owning node.
+    """
+    claimed = meta.get("node_id")
+    if origin == "client" and claimed and claimed != source_id:
+        raise ValueError(
+            f"{source_id}: metadata.node_id must equal the source id "
+            "(the source is stored as the graph node of that id)"
+        )
+
+
 def _docs_available(docs: Any) -> bool:
     return bool(getattr(docs, "available", False))
 
@@ -183,6 +208,11 @@ def write_source(
     forker's own values -- ``origin="client"`` (the default) would reject
     that as forged identity. ``pack_fork`` is the only intended caller.
 
+    ``metadata["node_id"]`` (#544): under ``origin="client"`` it must be absent,
+    falsy or equal to ``source_id``; any other value raises ``ValueError`` before
+    anything is written. Only ``origin="server"`` replays may carry a separate
+    value (a copied chunk row names its owning node).
+
     ``fork_copy`` (design v7 §4-C-2) routes authorization through
     ``write_gate.authorize_fork_copy`` instead of ``authorize``, widening the
     allowed status to a pack's own fork-reserved ``creating`` window -- see
@@ -253,6 +283,7 @@ def write_source(
         origin=origin,
     )
     meta.setdefault("space", _DEFAULT_SPACE)
+    _check_display_node_id(meta, source_id=source_id, origin=origin)
 
     # #171 ownership-tag invariant, checked BEFORE the first write. `pack` is
     # not a reserved boundary key, so a client can still send it; leaving the
