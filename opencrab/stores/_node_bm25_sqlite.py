@@ -653,7 +653,16 @@ def verify(conn: sqlite3.Connection, row_to_node: RowToNode) -> dict[str, Any]:
         total_dl += entry[2]
     stats = conn.execute(f"SELECT doc_count, total_len FROM {STATS} WHERE id=1").fetchone()
     stats_ok = stats is not None and int(stats[0]) == len(indexed) and int(stats[1]) == total_dl
-    ok = not (missing or orphans or mismatched_meta or mismatched_terms) and stats_ok
+    # #638: compare the FTS side with the DOCS keys too. A document id that only the
+    # vocabulary holds, or a docsize table that differs from DOCS, is an index fault.
+    # Use ``.keys()`` only: ``index_print`` is a defaultdict.
+    doc_keys = {entry[0] for entry in indexed.values()}
+    docsize_ids = {int(r[0]) for r in conn.execute(f"SELECT id FROM {FTS}_docsize")}
+    vocab_orphans = len(index_print.keys() - doc_keys)
+    docsize_mismatch = len(docsize_ids ^ doc_keys)
+    ok = not (
+        missing or orphans or mismatched_meta or mismatched_terms or vocab_orphans or docsize_mismatch
+    ) and stats_ok
     return {
         "ok": ok,
         "state": meta.get("state"),
@@ -663,5 +672,7 @@ def verify(conn: sqlite3.Connection, row_to_node: RowToNode) -> dict[str, Any]:
         "orphans": orphans,
         "mismatched_meta": mismatched_meta,
         "mismatched_terms": mismatched_terms,
+        "vocab_orphans": vocab_orphans,
+        "docsize_mismatch": docsize_mismatch,
         "stats_ok": stats_ok,
     }
