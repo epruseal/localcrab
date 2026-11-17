@@ -175,7 +175,7 @@ MCP 도구 `ontology_query`는 결과 항목의 본문(`text`)과 `metadata`, `g
 
 `truncation.full_text_tool`은 `ontology_get_node(node_id)`를 가리킨다. 이 도구가 원문을 돌려주는 조건은 항목의 `node_id`가 읽기 범위 안의 그래프 노드 id이고 그 노드의 속성이 원문을 담는 것이다. 이 조건이 성립하면 응답의 `properties`가 노드 속성 전체를 담는다. 조건이 성립하지 않는 경우는 다음과 같다.
 
-- `write_source`가 소스마다 `evidence/TextUnit` 노드를 `source_id`로 만들고 그 `text` 속성에 원문을 담는다(#74). 벡터와 FTS leg는 메타데이터의 `node_id`를 저장 id보다 먼저 쓴다. 클라이언트 쓰기(`origin="client"`)에서 `write_source`는 `source_id`와 다른 `metadata.node_id`를 쓰기 전에 거부한다(#544). 서버 사본(`origin="server"`, `pack_fork`가 복사하는 청크 행)과 그 이전에 저장된 행은 다른 값을 가질 수 있고, 그런 소스의 항목은 다른 노드를 가리킨다. 이때 `ontology_get_node`는 id가 없으면 `found=false`를 돌려주고, id가 읽기 범위 안의 다른 노드이면 그 노드를 돌려준다(`found=true`이고 원문이 아니다).
+- `write_source`가 소스마다 `evidence/TextUnit` 노드를 `source_id`로 만들고 그 `text` 속성에 원문을 담는다(#74). 벡터와 FTS leg는 메타데이터의 `node_id`를 저장 id보다 먼저 쓴다. 클라이언트 쓰기(`origin="client"`)에서 `write_source`는 값이 있으면서 `source_id`와 다른 `metadata.node_id`를 쓰기 전에 거부한다(#544). 값이 없거나 빈 문자열이면 표시 id가 `source_id`로 되돌아가므로 받아들인다. 서버 사본(`origin="server"`, `pack_fork`가 복사하는 청크 행)과 그 이전에 저장된 행은 다른 값을 가질 수 있고, 그런 소스의 항목은 다른 노드를 가리킨다. 이때 `ontology_get_node`는 id가 없으면 `found=false`를 돌려주고, id가 읽기 범위 안의 다른 노드이면 그 노드를 돌려준다(`found=true`이고 원문이 아니다).
 - 소스 id가 `SOURCE_NODE_ID_BUDGET`을 넘고 같은 id의 그래프 행이 하나도 없으면 `write_source`는 그래프 노드를 만들지 않고 문서와 벡터만 쓴다(기존 시험이 이 경로를 고정한다). 이 소스는 검색에 걸려도 `ontology_get_node`가 `found=false`로 답한다. 같은 id의 그래프 노드가 이미 있으면 갱신 경로를 타므로 이 예외에 들지 않는다.
 - BM25 leg와 일반 노드 벡터의 `text`는 합성 문자열이다. 원래 값은 `properties`에서 읽는다.
 - 그래프 leg 항목은 이웃 노드의 `node_id`로 위와 같은 조건이다.
