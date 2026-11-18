@@ -58,6 +58,7 @@ class _SqliteConnMixin:
     _conns_lock: threading.Lock
     _all_conns: list[Any]
     _lock: threading.Lock
+    _shared: Any = None  # #671: 공유 파일 객체(기본 없음)
 
     # 이슈 #94: SQLite 의 자동 체크포인트(PASSIVE)는 임계를 넘긴 커밋마다 다시
     # 시도되지만, 성공해도 WAL 파일을 0으로 되감지(TRUNCATE) 않는다 — 프레임
@@ -71,9 +72,22 @@ class _SqliteConnMixin:
     # 가능하도록 클래스 상수로 둔다(테스트에서 monkeypatch).
     _WAL_CHECKPOINT_THRESHOLD_BYTES: int = 4 * 1024 * 1024
 
-    def _init_conn_state(self, db_path: str) -> None:
-        """스레드-로컬 커넥션 + 쓰기 직렬화 락 초기화. __init__에서 1회 호출."""
+    @property
+    def shared_file(self) -> Any:
+        """이 저장소가 연결과 쓰기 락을 나눠 쓰는 ``SharedSqliteFile`` (없으면 ``None``).
+
+        #671 시제품: 기본은 ``None``이며 그때 이 믹스인은 종전과 같다.
+        """
+        return self._shared
+
+    def _init_conn_state(self, db_path: str, shared: Any = None) -> None:
+        """스레드-로컬 커넥션 + 쓰기 직렬화 락 초기화. __init__에서 1회 호출.
+
+        ``shared``(``opencrab.stores._single_file.SharedSqliteFile``)가 있으면 스레드별 연결과
+        쓰기 락과 연결 목록을 그 객체의 것으로 바꿔 같은 파일을 쓰는 저장소들이 나눠 쓴다.
+        """
         self._db_path = db_path
+        self._shared = shared
         # 쓰기 직렬화 락: 스레드별 커넥션이 같은 WAL 파일에 동시에 쓰면 SQLITE_BUSY가
         # 나므로, 프로세스 내에서는 한 번에 한 writer만 쓰도록 직렬화한다.
         self._lock = threading.Lock()
@@ -87,6 +101,13 @@ class _SqliteConnMixin:
         self._graph_tx_state = threading.local()
         self._conns_lock = threading.Lock()
         self._all_conns = []
+        if shared is not None:
+            self._local = shared.local
+            self._lock = shared.lock
+            self._conns_lock = shared.conns_lock
+            self._all_conns = shared.all_conns
+            overridden = type(self)._configure_connection is not _SqliteConnMixin._configure_connection
+            shared.acquire(self, self._configure_connection if overridden else None)
 
     def _configure_connection(self, conn: sqlite3.Connection) -> None:
         """Hook for subclasses needing extra per-connection setup (e.g.
@@ -101,6 +122,9 @@ class _SqliteConnMixin:
         백업 경로는 온라인 백업 API로 WAL을 통과해 읽으므로 이 사이드카 파일들을
         백업에 함께 복사해서는 안 된다. 자세한 내용은 opencrab/stores/backup.py 참고.
         """
+        if self._shared is not None:
+            # 공유 파일: 연결 생성과 모든 저장소의 설정 훅 적용을 공유 객체가 맡는다.
+            return self._shared.new_conn()
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -147,6 +171,17 @@ class _SqliteConnMixin:
         ``except BaseException`` 이 가로채 이미 성공한 commit 에 대해 잘못된
         rollback 을 시도하고, 호출자에게는 쓰기 자체가 실패한 것처럼 보인다.
         """
+        shared = self._shared
+        if shared is not None and shared.in_unit_of_work:
+            # #671: ``unit_of_work()`` 안이면 이미 쓰기 락과 BEGIN IMMEDIATE를 쥐고 있다.
+            # 합류 구간(SAVEPOINT)으로 감싸 안쪽 실패만 되돌리고, commit과 체크포인트는 바깥 구간이 맡는다.
+            if immediate and exclusive:
+                raise ValueError("immediate and exclusive transactions are mutually exclusive")
+            if exclusive:
+                raise RuntimeError("an exclusive transaction cannot join a unit of work")
+            with shared.joined_tx() as joined_conn:
+                yield joined_conn
+            return
         with self._lock:
             conn = self._conn
             try:
@@ -292,6 +327,10 @@ class _SqliteConnMixin:
                 self._all_conns.remove(conn)
 
     def close(self) -> None:
+        if self._shared is not None:
+            # 연결은 같은 파일을 쓰는 다른 저장소와 나눠 쓴다. 마지막 저장소가 닫을 때만 닫힌다.
+            self._shared.release(self)
+            return
         with self._conns_lock:
             for conn in self._all_conns:
                 try:

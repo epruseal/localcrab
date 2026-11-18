@@ -76,6 +76,7 @@ from opencrab.pack.normalize import (
     with_chunk_space,
 )
 from opencrab.pack.write_gate import authorize, authorize_delete
+from opencrab.stores._single_file import is_single_file, unit_of_work_for
 from opencrab.stores._sql_dialect import SQLITE, SqlDialect, json_valid_expr
 from opencrab.stores._vector_base import slot_owner
 
@@ -2960,6 +2961,9 @@ def load_chunks(
         return 0, 0
 
     ok = err = 0
+    # #671: 벡터와 doc 저장소가 같은 SharedSqliteFile을 나눠 쓰면 한 트랜잭션으로 쓴다.
+    # 아니면(기본) 아래 기존 경로가 한 줄도 달라지지 않는다.
+    atomic = is_single_file(vec, docs)
     seen_ids: set[str]  = set()   # 중복 청크 ID dedup
     b_texts: list[str]  = []
     b_ids:   list[str]  = []
@@ -2975,6 +2979,18 @@ def load_chunks(
         청크는 doc_sources 기준선이 안 움직이므로 다음 증분이 재시도한다.
         """
         nonlocal ok, err
+        if atomic:
+            # #671: 한 건의 벡터와 doc을 한 트랜잭션에 넣는다. 실패하면 둘 다 남지 않는다.
+            try:
+                with unit_of_work_for(vec, docs):
+                    vec.upsert_texts(texts=[txt], ids=[sid], metadatas=[meta])
+                    docs.upsert_source(sid, txt, meta)
+            except Exception as exc_unit:
+                err += 1
+                log.warning("청크 개별 오류(%s) %s: %s", pack_name, sid[:8], exc_unit)
+                return False
+            ok += 1
+            return True
         try:
             vec.upsert_texts(texts=[txt], ids=[sid], metadatas=[meta])
         except Exception as exc2:
@@ -2994,25 +3010,41 @@ def load_chunks(
         nonlocal ok, err
         if not b_texts:
             return
-        try:
-            vec.upsert_texts(texts=b_texts, ids=b_ids, metadatas=b_metas)
-        except Exception as exc:
-            # 배치 실패 시 건별 재시도 (1건 결함이 배치 전체를 날리지 않게)
-            log.warning("청크 배치 오류(%s), 건별 재시도: %s", pack_name, exc)
-            for sid, txt, meta in zip(b_ids, b_texts, b_metas):
-                flush_single(sid, txt, meta)
+        if atomic:
+            # #671: 벡터와 doc이 한 파일을 나눠 쓴다. 배치 전체를 한 트랜잭션에 넣고 예외를
+            # 삼키지 않는다. 어느 한 쓰기라도 실패하면 배치 전체가 롤백된다(고아 행 없음).
+            # 그다음 건별 재시도로 내려가 문제 건만 err로 센다.
+            try:
+                with unit_of_work_for(vec, docs):
+                    vec.upsert_texts(texts=b_texts, ids=b_ids, metadatas=b_metas)
+                    for sid, txt, meta in zip(b_ids, b_texts, b_metas):
+                        docs.upsert_source(sid, txt, meta)
+            except Exception as exc:
+                log.warning("청크 배치 롤백(%s), 건별 재시도: %s", pack_name, exc)
+                for sid, txt, meta in zip(b_ids, b_texts, b_metas):
+                    flush_single(sid, txt, meta)
+            else:
+                ok += len(b_texts)
         else:
-            # [Δ r11 P2] doc 쓰기 실패를 더 이상 삼키지 않는다 — flush_single 과
-            # 같은 계약(벡터 성공 + doc 성공이어야 ok).
-            doc_failed = 0
-            for sid, txt, meta in zip(b_ids, b_texts, b_metas):
-                try:
-                    docs.upsert_source(sid, txt, meta)
-                except Exception as exc3:
-                    doc_failed += 1
-                    err += 1
-                    log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
-            ok += len(b_texts) - doc_failed
+            try:
+                vec.upsert_texts(texts=b_texts, ids=b_ids, metadatas=b_metas)
+            except Exception as exc:
+                # 배치 실패 시 건별 재시도 (1건 결함이 배치 전체를 날리지 않게)
+                log.warning("청크 배치 오류(%s), 건별 재시도: %s", pack_name, exc)
+                for sid, txt, meta in zip(b_ids, b_texts, b_metas):
+                    flush_single(sid, txt, meta)
+            else:
+                # [Δ r11 P2] doc 쓰기 실패를 더 이상 삼키지 않는다 — flush_single 과
+                # 같은 계약(벡터 성공 + doc 성공이어야 ok).
+                doc_failed = 0
+                for sid, txt, meta in zip(b_ids, b_texts, b_metas):
+                    try:
+                        docs.upsert_source(sid, txt, meta)
+                    except Exception as exc3:
+                        doc_failed += 1
+                        err += 1
+                        log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
+                ok += len(b_texts) - doc_failed
         b_texts.clear()
         b_ids.clear()
         b_metas.clear()
