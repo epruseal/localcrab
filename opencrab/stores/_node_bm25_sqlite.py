@@ -62,7 +62,8 @@ LEG_BUDGET_MS = 500.0
 PROBE_BUDGET_MS = 2000.0
 SLOW_WARNING = (
     "BM25 latency over budget: {ms} ms against {budget} ms; "
-    "{common} of {terms} indexed query terms occur in more than half of the indexed documents"
+    "{common} of {terms} indexed query terms are common: they occur in more than half of the "
+    "indexed documents or more than {cf_max} times"
 )
 
 
@@ -392,7 +393,8 @@ def search(
     budget = PROBE_BUDGET_MS if per_pack else LEG_BUDGET_MS
     if elapsed_ms > budget and terms.get("common"):
         warnings = [*warnings, SLOW_WARNING.format(
-            ms=int(elapsed_ms), budget=int(budget), common=terms["common"], terms=terms["all"])]
+            ms=int(elapsed_ms), budget=int(budget), common=terms["common"], terms=terms["all"],
+            cf_max=_prune.FULL_SCAN_CF_MAX)]
     return hits, warnings
 
 
@@ -447,7 +449,12 @@ def _search(
             dfs[term] = int(df)
             cfs[term] = int(cnt)
     terms["all"] = len(dfs)
-    terms["common"] = sum(1 for df in dfs.values() if 2 * df > n_docs)
+    # #667: a term is common when it is in more than half of the documents or has more
+    # occurrences than the pruner's full-scan bound. The query cost follows both.
+    terms["common"] = sum(
+        1 for term, df in dfs.items()
+        if 2 * df > n_docs or cfs[term] > _prune.FULL_SCAN_CF_MAX
+    )
 
     def full_scored() -> list[tuple]:
         space_sql = ""
