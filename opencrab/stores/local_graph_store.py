@@ -54,11 +54,11 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
 
     _dialect = SQLITE
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, shared: Any = None) -> None:
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
         self._available = False
         self._schema_state = "unconfigured"
-        self._init_conn_state(db_path)
+        self._init_conn_state(db_path, shared)
         self._init_db()
 
     def _configure_connection(self, conn: sqlite3.Connection) -> None:

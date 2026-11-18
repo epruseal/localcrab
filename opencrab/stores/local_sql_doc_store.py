@@ -74,7 +74,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
 
     _dialect = SQLITE
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, shared: Any = None) -> None:
         """
         Replaces: LocalDocStore.__init__(data_dir) / MongoStore.__init__(uri, db_name)
         WHY: receive a file path rather than a directory so the caller controls
@@ -92,7 +92,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         # off or the node index is unsupported. The switch is read once, here.
         self._bm25_cache: _ncache.PostingCache | None = None
         self._bm25_token: _ncache.TokenSource | None = None
-        self._init_conn_state(db_path)
+        self._init_conn_state(db_path, shared)
         self._init_db()
         if self.supports_node_bm25 and _ncache.enabled():
             # Opened now, not at the first query, so that a replaced database file is seen.
@@ -313,6 +313,10 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
 
     def _node_bm25_try_drain(self) -> None:
         """Drain pending keys without waiting for locks (design 4.6)."""
+        if self._shared is not None and self._shared.in_unit_of_work:
+            # #671: inside a unit of work this thread already holds the writer lock and an open
+            # transaction. A drain here would BEGIN a nested transaction and roll the unit back.
+            return
         conn = self._conn
         try:
             if not _nbm.has_pending(conn):

@@ -201,6 +201,8 @@ class SqliteVecStore(_SqliteConnMixin):
         collection_name: str = "vectors_kure",
         ann: str = "",
         ann_coarse_k: int = 512,
+        *,
+        shared: Any = None,
     ) -> None:
         """
         Parameters
@@ -250,7 +252,7 @@ class SqliteVecStore(_SqliteConnMixin):
         self._ann_cache_lock = threading.Lock()
         self._conn_dv: dict[int, int] = {}
         self._available = False
-        self._init_conn_state(db_path)
+        self._init_conn_state(db_path, shared)
         self._init_db()
 
     # ------------------------------------------------------------------
