@@ -494,10 +494,12 @@ def preflight_source_write(
       ``GraphPropertyValidationError`` (REST status 422). This function does not
       read incident edges. On Neo4j, the write can therefore refuse after the
       pack row exists.
-    - Three sources of residue are not deterministic. This function and the
-      write read the digest in two separate reads. The CLI uses two separate
-      lock sections. A writer outside ``write_lock`` can create the default pack
-      between the check and the insert.
+    - Some outcomes are not deterministic. This function and the write read
+      the stores in separate reads, so a transient read failure in the write
+      can refuse after the pack row exists. The CLI uses two separate lock
+      sections. A writer outside ``write_lock`` can change a slot or create the
+      default pack between the check and the insert. Then the check can also
+      refuse a request that the write accepts.
     - The CLI also writes the anchor row of the new pack before ``write_source``
       runs. A rejection that only the write finds leaves that row too.
     - The graph store checks that it can write before it runs ``prepare_node``
@@ -505,7 +507,8 @@ def preflight_source_write(
       pack gets an error receipt. This function raises for an invalid body or
       an existing node row.
     - On Neo4j, a stored node whose properties cannot give a digest (including
-      a node with no ``node_type`` value) makes the write raise ``GraphPropertyValidationError``. This function raises
+      a node with no ``node_type`` value) makes the write raise
+      ``GraphPropertyValidationError``. This function raises
       ``NodeIdentityConflict``. Both map to status 422.
     - The message of the ``pack`` alias rule names ``pack_id``. This function
       names the throwaway id.

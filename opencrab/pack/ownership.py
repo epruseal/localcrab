@@ -488,7 +488,8 @@ def new_default_pack_id() -> str:
 def find_default_pack(sql: Any, owner_id: str) -> str | None:
     """``owner_id``'s default pack_id, or ``None`` when it has none yet.
 
-    This function reads like ``ensure_default_pack`` and never inserts.
+    This function runs the same SELECT as ``ensure_default_pack`` and never
+    inserts.
     ``None`` means ``ensure_default_pack`` will create the row.
     """
     from sqlalchemy import text
@@ -590,8 +591,8 @@ def resolve_write_pack(
     When the caller has no default pack, ``admit`` runs first with a random id
     of the shape the new pack will get (no client value can equal it). If
     ``admit`` raises, the function creates nothing. The function does not call
-    ``admit`` when ``requested`` is given or when the default pack exists,
-    because neither case creates a row. ``admit`` must not write.
+    ``admit`` when the caller passes ``requested`` or when the default pack
+    exists, because neither case creates a row. ``admit`` must not write.
     """
     if requested:
         return requested

@@ -657,8 +657,9 @@ def ingest_text(
             # in the caller's default pack (unlike /api/nodes /api/edges, which
             # accept an explicit one). #661: this call creates the registry row
             # of a caller with no default pack, so `admit` checks the request
-            # first. A rejection from `admit` is the client error that
-            # write_source raises below. It creates no row.
+            # first. A rejection from `admit` is a client error of the same
+            # kind, and the handler below maps it to status 422. It creates no
+            # row.
             target_pack_id = resolve_write_pack(
                 ctx.sql, auth.principal, None,
                 admit=lambda new_pack_id: preflight_source_write(

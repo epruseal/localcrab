@@ -606,9 +606,11 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
             # instead of leaving a file unpacked.
             effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
             # #661: this call creates the registry row of a principal with no
-            # default pack. The check runs first, so a source write that
-            # write_source rejects leaves no row. The lock stops another writer
-            # from creating that pack between the check and the insert.
+            # default pack. The check runs first, so a request that the check
+            # rejects leaves no row. The docstring of preflight_source_write
+            # lists the rejections that only the write finds. In the CLI, such a
+            # rejection also leaves the anchor row. Other writers that take
+            # write.lock cannot create that pack between the check and the insert.
             if effective_pack:
                 target_pack_id = effective_pack
             else:

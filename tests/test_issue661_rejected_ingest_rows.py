@@ -402,7 +402,9 @@ def test_a_failing_digest_read_is_judged_like_the_write_does(rest, data_dir, mon
 
 
 def test_the_preflight_does_not_reject_when_no_graph_can_be_read():
-    """그래프가 없으면 쓰기는 영수증으로 답하고 거부하지 않는다. 사전 검사도 거부하지 않는다."""
+    """그래프가 없거나 사용할 수 없으면 쓰기는 영수증으로 답하고 거부하지 않는다. 사전 검사도 거부하지 않는다."""
+    from types import SimpleNamespace
+
     from opencrab.auth import Principal
     from opencrab.pack.source_writer import preflight_source_write
 
@@ -412,9 +414,16 @@ def test_the_preflight_does_not_reject_when_no_graph_can_be_read():
         None, None, None, text="본문", source_id="src-661", metadata=None,
         principal=principal, pack_id="default-new-661",
     ) is None
-    # 본문이 무효여도 그래프가 없으면 add_node는 속성 검사를 하지 않고 영수증을 돌려준다.
+    # 본문이 무효여도 그래프가 없으면 add_node는 그래프 저장소의 속성 정규화(prepare_node)를
+    # 거치지 않고 영수증을 돌려준다.
     assert preflight_source_write(
         None, None, None, text="본문", source_id="src-661",
+        metadata={"title": float("nan")},
+        principal=principal, pack_id="default-new-661",
+    ) is None
+    # 저장소 객체가 있어도 사용할 수 없으면(available=False) 같은 답이다.
+    assert preflight_source_write(
+        None, None, SimpleNamespace(available=False), text="본문", source_id="src-661",
         metadata={"title": float("nan")},
         principal=principal, pack_id="default-new-661",
     ) is None
