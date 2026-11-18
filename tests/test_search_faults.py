@@ -24,6 +24,30 @@ def test_judge_detects_every_planted_case():
     assert [(name, actual) for name, expected, actual in results if expected != actual] == []
 
 
+def _hit(node_id: str, score: float) -> dict:
+    return {"node_id": node_id, "space": "evidence", "node_type": "Note", "score": score,
+            "pack_id": "a", "text": node_id, "properties": {"pack_id": "a"}}
+
+
+@pytest.mark.parametrize("name,got,expected", [
+    ("same hits and order", ([_hit("x", 2.0), _hit("y", 1.0)], []), True),
+    ("latency warning leaves the hits",
+     ([_hit("x", 2.0), _hit("y", 1.0)], ["BM25 latency over budget: 9 ms"]), True),
+    ("no hits", ([], []), False),
+    ("no result", None, False),
+    ("coverage warning", ([_hit("x", 2.0), _hit("y", 1.0)], ["BM25 coverage pending changes: 1"]), False),
+    ("coverage among other warnings",
+     ([_hit("x", 2.0), _hit("y", 1.0)], ["BM25 latency over budget: 9 ms", "BM25 coverage x"]), False),
+    ("other order", ([_hit("y", 1.0), _hit("x", 2.0)], []), False),
+    ("other score", ([_hit("x", 2.5), _hit("y", 1.0)], []), False),
+    ("missing hit", ([_hit("x", 2.0)], []), False),
+    ("extra hit", ([_hit("x", 2.0), _hit("y", 1.0), _hit("z", 0.5)], []), False),
+])
+def test_db_matches_oracle_judges_hits_and_coverage(name, got, expected):
+    want = [_hit("x", 2.0), _hit("y", 1.0)]
+    assert faults._db_matches_oracle(got, want) is expected, name
+
+
 def _run(args: list[str], tmp_path: Path, script: str) -> subprocess.CompletedProcess:
     tmp = tmp_path / "tmp"
     tmp.mkdir(exist_ok=True)

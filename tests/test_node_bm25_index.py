@@ -24,6 +24,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_latency_warning(monkeypatch):
+    """Keep wall-clock time out of the `warnings == []` assertions of this file."""
+    monkeypatch.setattr(nbm, "LEG_BUDGET_MS", 1e9)
+    monkeypatch.setattr(nbm, "PROBE_BUDGET_MS", 1e9)
+
+
 class _NoGraph:
     available = False
 
