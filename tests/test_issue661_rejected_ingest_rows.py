@@ -174,7 +174,7 @@ def test_a_rejected_ingest_from_a_user_without_a_default_pack_changes_no_row(
 def test_a_body_the_graph_write_refuses_leaves_no_row_and_gets_the_same_answer(
     rest, data_dir, raw_body,
 ):
-    """`GraphPropertyValidationError`는 그래프 쓰기가 첫 줄에서 던진다. 사전 검사가 따라야 한다."""
+    """`GraphPropertyValidationError`는 그래프 쓰기가 저장소를 읽기 전에 던진다. 사전 검사가 따라야 한다."""
     client, ctx = rest
     member_id, member_headers = _user(ctx.sql, "member")
     legacy_id, legacy_headers = _legacy_user(ctx.sql, "legacy")
@@ -287,6 +287,145 @@ def test_a_foreign_graph_node_with_the_same_id_is_rejected_without_creating_a_de
     assert _FOREIGN_NODE_DETAIL in resp.json()["detail"], resp.text
     assert _packs_of(ctx.sql, legacy_id) == []
     assert _changed(before, _all_rows(data_dir)) == []
+
+
+def test_a_foreign_doc_nodes_row_alone_rejects_an_id_inside_the_budget(rest, data_dir):
+    """노드 슬롯 탐침의 doc 쪽만 걸리는 경우. source 슬롯과 그래프에는 남의 행이 없다."""
+    client, ctx = rest
+    ctx.docs.upsert_node_doc("evidence", "TextUnit", "src-661", {"pack_id": "pack-b", "text": "남의 것"})
+    legacy_id, headers = _legacy_user(ctx.sql, "legacy")
+    before = _all_rows(data_dir)
+
+    resp = _ingest(client, headers)
+
+    assert resp.status_code == 422, resp.text
+    assert _FOREIGN_NODE_DETAIL in resp.json()["detail"], resp.text
+    assert _packs_of(ctx.sql, legacy_id) == []
+    assert _changed(before, _all_rows(data_dir)) == []
+
+
+def test_a_foreign_graph_node_rejects_an_id_past_the_node_budget(rest, data_dir):
+    """예산을 넘는 id라도 그래프에 노드가 이미 있으면 쓰기는 노드 단계를 건너뛰지 않는다."""
+    client, ctx = rest
+    over = "G" * (SOURCE_NODE_ID_BUDGET + 1)
+    owner_id, _owner_headers = _user(ctx.sql, "owner")
+    create_pack(ctx.sql, owner_id, "pack-owner-661")
+    ctx.graph.upsert_node(
+        node_type="TextUnit", node_id=over,
+        properties={"pack_id": "pack-owner-661", "text": "남의 노드"}, space_id="evidence",
+    )
+    legacy_id, headers = _legacy_user(ctx.sql, "legacy")
+    before = _all_rows(data_dir)
+
+    resp = _ingest(client, headers, source_id=over)
+
+    assert resp.status_code == 422, resp.text
+    assert _packs_of(ctx.sql, legacy_id) == []
+    assert _changed(before, _all_rows(data_dir)) == []
+
+
+def test_an_untagged_node_of_another_type_rejects_without_creating_a_default_pack(rest, data_dir):
+    """같은 id를 다른 타입의 무태그 노드가 가진다. 저장소의 일반 삽입 경로가 거부하는 경우다."""
+    client, ctx = rest
+    ctx.graph.upsert_node(
+        node_type="Entity", node_id="src-661", properties={"text": "무태그 노드"}, space_id="concept",
+    )
+    legacy_id, headers = _legacy_user(ctx.sql, "legacy")
+    _member_id, member_headers = _user(ctx.sql, "member")
+    expected = _ingest(client, member_headers)
+    before = _all_rows(data_dir)
+
+    resp = _ingest(client, headers)
+
+    assert expected.status_code == 422, expected.text
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == expected.json()
+    assert _packs_of(ctx.sql, legacy_id) == []
+    assert _changed(before, _all_rows(data_dir)) == []
+
+
+def test_a_text_unit_row_whose_digest_cannot_be_read_rejects_without_creating_a_default_pack(
+    rest, data_dir,
+):
+    """space가 문자열이 아닌 직접 쓴 행. digest를 못 읽으면 쓰기는 일반 삽입 경로로 가서 거부된다."""
+    client, ctx = rest
+    graph_db = data_dir / "graph.db"
+    con = sqlite3.connect(graph_db)
+    try:
+        table = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%graph_nodes'"
+        ).fetchone()[0]
+        con.execute(
+            f'INSERT INTO "{table}" (node_type, node_id, space_id, properties) VALUES (?, ?, NULL, ?)',  # noqa: S608
+            ("TextUnit", "src-661", '{"text": "직접 쓴 행", "space": 5}'),
+        )
+        con.commit()
+    finally:
+        con.close()
+    legacy_id, headers = _legacy_user(ctx.sql, "legacy")
+    _member_id, member_headers = _user(ctx.sql, "member")
+    expected = _ingest(client, member_headers)
+    before = _all_rows(data_dir)
+
+    resp = _ingest(client, headers)
+
+    assert expected.status_code == 422, expected.text
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == expected.json()
+    assert _packs_of(ctx.sql, legacy_id) == []
+    assert _changed(before, _all_rows(data_dir)) == []
+
+
+def test_a_failing_digest_read_is_judged_like_the_write_does(rest, data_dir, monkeypatch):
+    """CAS 토큰을 못 읽으면(읽기 예외) 쓰기는 일반 삽입 경로로 가서 거부된다. 사전 검사도 같다."""
+    client, ctx = rest
+    ctx.graph.upsert_node(
+        node_type="TextUnit", node_id="src-661", properties={"text": "무태그 옛 노드"}, space_id="evidence",
+    )
+
+    def _raiser(self, *args, **kwargs):  # noqa: ARG001
+        raise RuntimeError("digest read failed")
+
+    monkeypatch.setattr(type(ctx.graph), "get_node_digest", _raiser)
+    legacy_id, headers = _legacy_user(ctx.sql, "legacy")
+    _member_id, member_headers = _user(ctx.sql, "member")
+    expected = _ingest(client, member_headers)
+    before = _all_rows(data_dir)
+
+    resp = _ingest(client, headers)
+
+    assert expected.status_code == 422, expected.text
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == expected.json()
+    assert _packs_of(ctx.sql, legacy_id) == []
+    assert _changed(before, _all_rows(data_dir)) == []
+
+
+def test_the_preflight_does_not_reject_when_no_graph_can_be_read():
+    """그래프가 없으면 쓰기는 영수증으로 답하고 거부하지 않는다. 사전 검사도 거부하지 않는다."""
+    from opencrab.auth import Principal
+    from opencrab.pack.source_writer import preflight_source_write
+
+    principal = Principal(user_id="user_x_661", is_local=False, disabled=False)
+
+    assert preflight_source_write(
+        None, None, None, text="본문", source_id="src-661", metadata=None,
+        principal=principal, pack_id="default-new-661",
+    ) is None
+
+
+def test_an_untagged_text_unit_row_with_a_healthy_digest_is_still_accepted(rest, data_dir):
+    """대조군: 같은 타입의 무태그 행은 CAS 경로로 이어받는다. 새 거부가 이것을 막으면 안 된다."""
+    client, ctx = rest
+    ctx.graph.upsert_node(
+        node_type="TextUnit", node_id="src-661", properties={"text": "무태그 옛 노드"}, space_id="evidence",
+    )
+    legacy_id, headers = _legacy_user(ctx.sql, "legacy")
+
+    resp = _ingest(client, headers)
+
+    assert resp.status_code == 200, resp.text
+    assert len(_packs_of(ctx.sql, legacy_id)) == 1
 
 
 def test_an_id_past_the_node_budget_is_not_over_rejected_by_the_admission(rest, data_dir):

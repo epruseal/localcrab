@@ -45,6 +45,7 @@ from typing import Any, Literal
 from opencrab.common.graph_identity import (
     GraphSchemaMigrationRequired,
     GraphWriteUnavailable,
+    NodeIdentityConflict,
     prepare_node,
 )
 from opencrab.common.pack_tags import canonicalize_pack_alias
@@ -210,14 +211,29 @@ def _existing_node_rows(graph: Any, source_id: str) -> list[dict[str, Any]] | No
     return rows if isinstance(rows, list) else None
 
 
-def _node_digest(graph: Any, source_id: str) -> str | None:
+def _node_digest(
+    graph: Any, source_id: str, rows: list[dict[str, Any]] | None
+) -> str | None:
     """CAS token for an existing ``TextUnit`` row, or ``None``.
 
     ``None`` sends ``add_node`` down its plain-insert path, where the store's
     own digest comparison rejects a mismatch. That is the correct disposition
     for every ``None`` case here: no row, a row of another type, a backend
     without the method, or a read that failed.
+
+    The token is read only for an existing row of THIS type. All three
+    backends filter ``get_node_digest`` on node_type, so ``if rows`` would
+    behave the same today. The check keeps the shape the design states, so a
+    future backend without that filter cannot send the digest of another type
+    into the update path. ``_graph_leg`` and ``preflight_source_write`` both
+    call this function, so they cannot disagree about the path the write takes.
     """
+    if not (
+        rows is not None
+        and len(rows) == 1
+        and rows[0].get("node_type") == _SOURCE_NODE_TYPE
+    ):
+        return None
     getter = getattr(graph, "get_node_digest", None)
     if getter is None:
         return None
@@ -436,37 +452,52 @@ def preflight_source_write(
     principal: Any,
     pack_id: str,
 ) -> None:
-    """Raise what ``write_source`` would raise for this request, writing nothing (#661).
+    """Raise what ``write_source`` raises for this request. Write nothing (#661).
 
-    ``pack_id`` is the id of a default pack that does not exist yet. It comes
-    from ``resolve_write_pack(admit=...)``, which calls this BEFORE it inserts
-    the pack's registry row, so a rejected request leaves no row behind. The new
-    pack is owned by the caller and ready by construction, so ``authorize`` is
-    not repeated here. ``principal`` is a parameter because the caller has not
-    entered ``principal_scope`` yet. The checks and their order follow
+    ``pack_id`` is the id of a default pack that does not exist yet.
+    ``resolve_write_pack(admit=...)`` calls this function BEFORE it inserts the
+    registry row of that pack. A rejected request then leaves no row. The new
+    pack belongs to the caller and has the ready status, so this function does
+    not repeat ``authorize``. The caller has not entered ``principal_scope``
+    yet, so ``principal`` is a parameter. The checks follow the order of
     ``write_source``:
 
     1. the source slot of another pack (``source_identity_conflict``),
     2. the checks that read no store (``validate_source_input``),
     3. the checks of ``add_node`` that read no store (``validate_node_input``),
     4. the node slot of another pack (``node_identity_conflict``),
-    5. the property normalisation that the graph write runs first
-       (``prepare_node``), only when the graph is available.
+    5. the property normalisation that the graph store runs at the start of its
+       own write (``prepare_node``), when the graph is available,
+    6. the refusal of the graph store for an existing node row, when the write
+       cannot use the CAS path (see below).
 
-    Steps 3 to 5 are skipped for the over-budget id that the graph leg skips.
-    No row can carry the new pack id, so every identity check judges the same
-    way for this id as for the id that ``ensure_default_pack`` stores.
+    Steps 3 to 6 do not run for the over-budget id that the graph leg skips.
+    No row can carry the new pack id. Every identity check therefore gives the
+    same answer for this id as for the id that ``ensure_default_pack`` stores.
+
+    Step 6: the properties of this request carry a pack id that no stored row
+    has, so their digest never equals the digest of a stored row. When a node
+    row exists and ``_node_digest`` returns no CAS token, the write takes the
+    plain insert path. The store then always raises ``NodeIdentityConflict``
+    with the text that this function uses. A user with a pack gets the same
+    answer from the same path.
 
     Known differences from the write:
 
-    - A ``NodeIdentityConflict`` that only the graph store raises inside its own
-      write (same id held by a node of another type without a pack tag) is not
-      mirrored. A caller without a default pack can still leave the row then.
-    - ``prepare_node`` is not the first call of a graph write. The store checks
-      first that it can write at all. In that degraded state a user with a pack
-      gets an error receipt, and this check raises for an invalid body.
-    - The message of the ``pack`` alias rule names ``pack_id``, which is the
-      throwaway id here.
+    - The Neo4j store compares a cached ``node_digest`` property on the CAS
+      path. The property can be stale or absent. This function does not read
+      it, so the write can still refuse after the pack row exists.
+    - The CAS path can raise a ``RuntimeError`` subclass for a damaged edge.
+      REST answers 500 for it, for a user with a pack as well.
+    - The graph store checks that it can write before it runs ``prepare_node``
+      and before it compares a node row. In that degraded state a user with a
+      pack gets an error receipt. This function raises for an invalid body or
+      an existing node row.
+    - On Neo4j, a stored node whose properties cannot give a digest makes the
+      write raise ``GraphPropertyValidationError``. This function raises
+      ``NodeIdentityConflict``. Both map to status 422.
+    - The message of the ``pack`` alias rule names ``pack_id``. This function
+      names the throwaway id.
     """
     reason = source_identity_conflict(docs, vector, source_id=source_id, pack_id=pack_id)
     if reason:
@@ -474,7 +505,8 @@ def preflight_source_write(
     meta = validate_source_input(
         metadata, source_id=source_id, principal=principal, pack_id=pack_id,
     )
-    if _node_leg_skipped(source_id, _existing_node_rows(graph, source_id)):
+    rows = _existing_node_rows(graph, source_id)
+    if _node_leg_skipped(source_id, rows):
         return
     props = validate_node_input(
         _source_node_props(text, meta, pack_id),
@@ -489,6 +521,8 @@ def preflight_source_write(
         raise ValueError(identity_reject_message("node", source_id, reason))
     if graph is not None and getattr(graph, "available", False):
         prepare_node(_SOURCE_NODE_TYPE, source_id, props, _SOURCE_NODE_SPACE)
+    if rows and _node_digest(graph, source_id, rows) is None:
+        raise NodeIdentityConflict(f"node identity conflict: {source_id}")
 
 
 def _graph_leg(
@@ -573,18 +607,8 @@ def _graph_leg(
             # text_as_node=True branch makes the mirror-image call for the same
             # reason.
             write_vector=False,
-            # Read the CAS token only for an existing row of THIS type. All
-            # three backends filter `get_node_digest` on node_type, so `if
-            # rows` happens to behave the same today -- narrowed to the shape
-            # the design states so a future backend without that filter cannot
-            # quietly send another type's digest into the update path.
-            _expected_current_digest=(
-                _node_digest(graph, source_id)
-                if rows is not None
-                and len(rows) == 1
-                and rows[0].get("node_type") == _SOURCE_NODE_TYPE
-                else None
-            ),
+            # The CAS token of an existing row of this type (see `_node_digest`).
+            _expected_current_digest=_node_digest(graph, source_id, rows),
         )
     except (GraphSchemaMigrationRequired, GraphWriteUnavailable) as exc:
         # Operational failure of the system of record -- reported, not raised,
