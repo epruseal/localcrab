@@ -457,6 +457,11 @@ class TestResponseBudget:
                 [{"node_id": "a", "metadata": parts}, {"node_id": "b", "text": "ok"}]
             ),
             "n0_warnings": _response([], spaces_filter_warnings=["w" * 600_000]),
+            # #667: the new key carries the same list as the old key.
+            "n0_warnings_new_key": _response([], warnings=["w" * 600_000]),
+            "n0_warnings_both_keys": _response(
+                [], spaces_filter_warnings=["w" * 300_000], warnings=["w" * 300_000]
+            ),
             "outside_fields": _response(
                 [{"node_id": "a", "text": "ok"}],
                 selected_packs=[{"pack_id": "p" * 600_000, "score": 1, "matched": []}],
@@ -464,7 +469,9 @@ class TestResponseBudget:
         }
 
     @pytest.mark.parametrize(
-        "name", ["n1_identifier", "n2_first_result_too_big", "n0_warnings", "outside_fields"]
+        "name",
+        ["n1_identifier", "n2_first_result_too_big", "n0_warnings", "n0_warnings_new_key",
+         "n0_warnings_both_keys", "outside_fields"],
     )
     def test_row_c_returns_the_fixed_error(self, name):
         response = self._row_c_cases()[name]

@@ -322,8 +322,11 @@ def ontology_query(
         # 드러낸다(호출자가 "결과 없음"과 "필터 적용 불가"를 구분할 수 있도록).
         # outcome.warnings 는 query() 호출마다 새로 만들어지는 지역 반환값이라
         # 동시 요청 간 공유 상태 경합이 없다(QueryOutcome 참조).
+        # #667: 경고는 spaces 필터 밖의 것(BM25 커버리지, 지연)도 싣는다. 내용에 맞는
+        # 이름은 `warnings`이고, 기존 소비자를 위해 옛 키도 같은 목록으로 남긴다.
         if outcome.warnings:
             response["spaces_filter_warnings"] = list(outcome.warnings)
+            response["warnings"] = list(outcome.warnings)
         if include_pack_provenance:
             response["selected_packs"] = [
                 result_caps.cap_selected_pack(
