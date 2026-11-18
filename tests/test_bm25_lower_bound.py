@@ -13,9 +13,17 @@ from collections import Counter
 import pytest
 
 from opencrab.ontology.bm25 import _B, _DELTA, _K1, BM25Index, bm25_idf, bm25_score
+from opencrab.stores import _node_bm25_sqlite as nbm
 from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
 FTS5_DELETE_OK = sqlite3.sqlite_version_info >= (3, 43, 0)
+
+
+@pytest.fixture(autouse=True)
+def _no_latency_warning(monkeypatch):
+    """Keep wall-clock time out of the `warnings == []` assertion of this file."""
+    monkeypatch.setattr(nbm, "LEG_BUDGET_MS", 1e9)
+    monkeypatch.setattr(nbm, "PROBE_BUDGET_MS", 1e9)
 
 
 def _node(nid: str, text: str, pack: str = "A") -> dict:

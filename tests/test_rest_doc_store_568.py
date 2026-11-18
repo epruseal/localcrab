@@ -179,6 +179,23 @@ def test_rest_and_mcp_auto_pack_probe_honors_the_spaces_filter(world, monkeypatc
     assert rest["pack_filter"]["pack_ids"] == mcp["pack_filter"]["pack_ids"]
 
 
+def test_rest_and_mcp_carry_the_outcome_warnings_under_both_keys(world, monkeypatch):
+    """#667: `warnings` is the accurate name, `spaces_filter_warnings` stays for old clients."""
+    from opencrab.ontology.query import QueryOutcome
+
+    ctx = _rest_ctx(world, monkeypatch)
+    mcp_ctx = _mcp_ctx(world, monkeypatch)
+    warned = ["BM25 latency over budget: 9 ms against 5 ms; 1 of 1 indexed query terms are common"]
+    for hybrid in (ctx.hybrid, mcp_ctx["hybrid"]):
+        monkeypatch.setattr(hybrid, "query", lambda *a, **k: QueryOutcome(results=[], warnings=list(warned)))
+    rest = _rest_ask(ctx, world, RARE, pack_ids=[PACK])
+    mcp = _mcp_ask(mcp_ctx, world, RARE, pack_ids=[PACK])
+    for response in (rest, mcp):
+        assert response["warnings"] == response["spaces_filter_warnings"] == warned
+    monkeypatch.setattr(ctx.hybrid, "query", lambda *a, **k: QueryOutcome(results=[], warnings=[]))
+    assert "warnings" not in _rest_ask(ctx, world, RARE, pack_ids=[PACK])
+
+
 def test_rest_response_carries_source_locator_like_mcp(world, monkeypatch):
     """#545: a cut text gets a locator when the query object has a doc store."""
     flow.install_vector_leg(world["vec"], monkeypatch, PACK, [LONG_ID], LONG_TEXT)

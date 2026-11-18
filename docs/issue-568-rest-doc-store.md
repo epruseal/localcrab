@@ -92,7 +92,7 @@ REST `/api/query`에서 다음이 바뀐다.
 - BM25 레그와 FTS 레그가 결과를 낸다. MCP와 같은 질의에서 같은 레그 구성이 된다.
 - 잘린 본문의 결과 항목이 `truncation.source_locator`를 받을 수 있다. 조건은 MCP와 같다(`docs/ARCHITECTURE.md` 11절). 종전에는 `full_text_unavailable`만 받았다.
 - `auto_pack` 요청의 팩 선택이 MCP와 같아진다(3.2절).
-- BM25 커버리지 경고가 응답의 `spaces_filter_warnings`에 실릴 수 있다. 이 필드는 `outcome.warnings`를 그대로 싣는다.
+- BM25 커버리지 경고가 응답의 `spaces_filter_warnings`에 실릴 수 있다. 이 필드는 `outcome.warnings`를 그대로 싣는다. #667부터 같은 목록이 새 키 `warnings`에도 실린다.
 
 바뀌지 않는 것: 응답 형상, 바이트 예산 계약(`result_caps.apply_response_budget`), 인증, 읽기 범위. 코드가 `write.lock`을 잡는 경로도 없다.
 

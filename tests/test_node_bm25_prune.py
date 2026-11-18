@@ -27,10 +27,20 @@ pytestmark = pytest.mark.skipif(
 FALLBACK = "pruned search fell back"
 
 
+@pytest.fixture(autouse=True)
+def _no_latency_warning(monkeypatch):
+    """Keep wall-clock time out of the `warnings == []` assertions of this file."""
+    monkeypatch.setattr(nbm, "LEG_BUDGET_MS", 1e9)
+    monkeypatch.setattr(nbm, "PROBE_BUDGET_MS", 1e9)
+
+
 @pytest.fixture
 def forced(monkeypatch):
     monkeypatch.setattr(prune, "FULL_SCAN_CF_MAX", -1)
     monkeypatch.delenv("OPENCRAB_BM25_PRUNE", raising=False)
+    # #667: the counts below assume every posting read goes to SQLite. The cache has its own
+    # tests (tests/test_node_bm25_cache.py).
+    monkeypatch.setenv("OPENCRAB_BM25_CACHE", "0")
     calls = {"select": 0, "postings": 0, "retok": 0, "stats": {}}
     real_select, real_postings, real_terms = prune.select, prune._postings, nbm.node_terms
 
@@ -191,6 +201,39 @@ def test_pruning_takes_only_the_rare_term_documents(tmp_path, monkeypatch, force
     # The group closes after the rare term: the 400 common documents never enter.
     assert stats["admitted"] == 60, stats
     assert stats["chosen"] < 60, stats
+    assert FALLBACK not in caplog.text
+
+
+def test_a_pruned_document_is_not_admitted_again_by_a_later_term(tmp_path, monkeypatch, forced, caplog):
+    """A document dropped as too weak stays out when a later term matches it again. The
+    result does not show a second admission, so the check reads the `admitted` count."""
+    # Taking every term through the match join and a full re-read makes each candidate
+    # exact, so the weak ones drop while terms are still pending.
+    monkeypatch.setattr(prune, "SCAN_US", 1e9)
+    store = _store(tmp_path)
+    for i in range(300):
+        store.upsert_node_doc("evidence", "Note", f"f{i:03d}", {"text": "filler", "pack_id": "pa"})
+    for i in range(10):
+        store.upsert_node_doc("evidence", "Note", f"z{i:02d}",
+                              {"text": "zrare " + "pad " * 40, "pack_id": "pa"})
+    for i in range(2):
+        store.upsert_node_doc("evidence", "Note", f"s{i:02d}",
+                              {"text": "xrare xrare xrare", "pack_id": "pa"})
+    for i in range(20):
+        store.upsert_node_doc("evidence", "Note", f"w{i:02d}",
+                              {"text": "xrare yrare " + "pad " * 40, "pack_id": "pa"})
+    for i in range(10):
+        store.upsert_node_doc("evidence", "Note", f"y{i:02d}", {"text": "yrare", "pack_id": "pa"})
+    assert store.node_bm25_sync_pending() == 0
+    caplog.set_level(logging.WARNING)
+    q = "zrare xrare yrare"
+    got, _ = _search(store, q, ["pa"], limit=2)
+    full, _ = _full(store, monkeypatch, q, ["pa"], limit=2)
+    assert _shape(got) == _shape(full) == _shape(_oracle(store, q, ["pa"], limit=2))
+    stats = forced["stats"]
+    # 10 z documents, 22 x documents and 10 y-only documents. The 20 documents that hold x
+    # and y dropped after the x step and do not count a second time at the y step.
+    assert stats["admitted"] == 10 + 22 + 10, stats
     assert FALLBACK not in caplog.text
 
 

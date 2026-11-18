@@ -22,6 +22,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from opencrab.stores import _node_bm25_cache as _cache
 from opencrab.stores import _node_bm25_prune as _prune
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,8 @@ LEG_BUDGET_MS = 500.0
 PROBE_BUDGET_MS = 2000.0
 SLOW_WARNING = (
     "BM25 latency over budget: {ms} ms against {budget} ms; "
-    "{common} of {terms} indexed query terms occur in more than half of the indexed documents"
+    "{common} of {terms} indexed query terms are common: they occur in more than half of the "
+    "indexed documents or more than {cf_max} times"
 )
 
 
@@ -375,6 +377,7 @@ def search(
     spaces: list[str] | None,
     limit: int,
     per_pack: bool,
+    cache_scope: Any | None = None,
 ) -> tuple[Any, list[str]]:
     """Search inside the caller's read snapshot.
 
@@ -386,13 +389,14 @@ def search(
     terms: dict[str, int] = {}
     hits, warnings = _search(
         conn, row_to_node, question, pack_ids=pack_ids, spaces=spaces, limit=limit,
-        per_pack=per_pack, terms=terms,
+        per_pack=per_pack, terms=terms, cache_scope=cache_scope,
     )
     elapsed_ms = (time.perf_counter() - started) * 1000
     budget = PROBE_BUDGET_MS if per_pack else LEG_BUDGET_MS
     if elapsed_ms > budget and terms.get("common"):
         warnings = [*warnings, SLOW_WARNING.format(
-            ms=int(elapsed_ms), budget=int(budget), common=terms["common"], terms=terms["all"])]
+            ms=int(elapsed_ms), budget=int(budget), common=terms["common"], terms=terms["all"],
+            cf_max=_prune.FULL_SCAN_CF_MAX)]
     return hits, warnings
 
 
@@ -406,6 +410,7 @@ def _search(
     limit: int,
     per_pack: bool,
     terms: dict[str, int],
+    cache_scope: Any | None = None,
 ) -> tuple[Any, list[str]]:
     """``search`` without the latency warning; ``terms`` receives the term counts."""
     from opencrab.ontology.bm25 import _node_text, bm25_idf, bm25_score
@@ -421,6 +426,9 @@ def _search(
         raise NotReadyError
     if not is_ready(conn):
         raise NotReadyError
+    # #667: the reads above pinned the snapshot. The scope compares the version token with
+    # the one read before BEGIN and gives a cache session only when no commit came between.
+    session = cache_scope.open() if cache_scope is not None else None
     warnings: list[str] = []
     n_pending = pending_count(conn)
     if n_pending:
@@ -439,15 +447,31 @@ def _search(
     idf: dict[str, float] = {}
     dfs: dict[str, int] = {}
     cfs: dict[str, int] = {}
-    for term, df, cnt in conn.execute(
-        f"SELECT term, doc, cnt FROM {VROW} WHERE term IN ({_placeholders(len(uniq))})", uniq
-    ):
-        if df:
-            idf[term] = bm25_idf(n_docs, int(df))
-            dfs[term] = int(df)
-            cfs[term] = int(cnt)
+    # #667: heavy terms come from the cache. The vocabulary read costs time in proportion to
+    # the term's occurrences, so only the terms the cache does not hold are read.
+    cached, missing = _cache.cached_stats(session, uniq)
+    for term, (df, cnt) in cached.items():
+        idf[term] = bm25_idf(n_docs, df)
+        dfs[term] = df
+        cfs[term] = cnt
+    if missing:
+        for term, df, cnt in conn.execute(
+            f"SELECT term, doc, cnt FROM {VROW} WHERE term IN ({_placeholders(len(missing))})",
+            missing,
+        ):
+            if df:
+                idf[term] = bm25_idf(n_docs, int(df))
+                dfs[term] = int(df)
+                cfs[term] = int(cnt)
+                if session is not None and int(cnt) > _prune.FULL_SCAN_CF_MAX:
+                    session.stats_put(term, int(df), int(cnt))
     terms["all"] = len(dfs)
-    terms["common"] = sum(1 for df in dfs.values() if 2 * df > n_docs)
+    # #667: a term is common when it is in more than half of the documents or has more
+    # occurrences than the pruner's full-scan bound. The query cost follows both.
+    terms["common"] = sum(
+        1 for term, df in dfs.items()
+        if 2 * df > n_docs or cfs[term] > _prune.FULL_SCAN_CF_MAX
+    )
 
     def full_scored() -> list[tuple]:
         space_sql = ""
@@ -556,7 +580,7 @@ def _search(
                 q_terms=q_terms, idf=idf, df=dfs, cf=cfs, avgdl=avgdl,
                 pack_set=pack_set, spaces=spaces, limit=limit, per_pack=per_pack,
                 max_text_chars=_decode_chars(_meta(conn).get("max_text_chars")),
-                node_terms=node_terms, node_columns=_NODE_COLUMNS,
+                node_terms=node_terms, node_columns=_NODE_COLUMNS, cache=session,
             )
             return render(pruned, strict=True), warnings
         except _prune.PruneFallbackError as exc:

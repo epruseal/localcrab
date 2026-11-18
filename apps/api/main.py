@@ -808,8 +808,10 @@ def query_ontology(
     # #51: spaces 필터의 과도기 경고를 MCP(response["spaces_filter_warnings"])와
     # 동일하게 노출한다. outcome.warnings 는 query() 반환값(지역 변수)이라
     # 스레드풀에서 동시 요청이 몰려도 서로의 경고를 훔쳐보지 않는다.
+    # #667: MCP와 같은 이유로 새 키 `warnings`를 옛 키와 같은 목록으로 싣는다.
     if outcome.warnings:
         response["spaces_filter_warnings"] = list(outcome.warnings)
+        response["warnings"] = list(outcome.warnings)
     response = result_caps.apply_response_budget(
         response,
         offset=payload.offset,

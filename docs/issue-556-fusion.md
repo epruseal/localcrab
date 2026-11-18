@@ -138,7 +138,7 @@ RRF(Cormack, Clarke, Buettcher, SIGIR 2009)는 목록마다 순위의 역수를 
 
 ## 6. 호출자와 형제 경로
 
-`HybridQuery.query`를 부르는 곳은 MCP `ontology_query`(`opencrab/mcp/tools/query.py`), REST 질의(`apps/api/main.py`), CLI 질의(`opencrab/cli.py`), #542 하네스(`scripts/search_baseline.py`), 장애 주입 하네스(`scripts/search_faults.py`)다. 모두 같은 함수를 거치므로 한 곳의 변경이 모두에 걸린다. MCP, REST, CLI는 `outcome.results[offset:limit]`을 쓴다. 반환 결과 수는 바뀌지 않는다. 새 경고는 다른 `QueryOutcome.warnings`와 같은 길로 나간다. MCP와 REST는 기존 키 `spaces_filter_warnings`에 `outcome.warnings` 전체를 싣고, CLI는 `warning:` 줄로 출력한다. 이 키 이름은 바꾸지 않는다.
+`HybridQuery.query`를 부르는 곳은 MCP `ontology_query`(`opencrab/mcp/tools/query.py`), REST 질의(`apps/api/main.py`), CLI 질의(`opencrab/cli.py`), #542 하네스(`scripts/search_baseline.py`), 장애 주입 하네스(`scripts/search_faults.py`)다. 모두 같은 함수를 거치므로 한 곳의 변경이 모두에 걸린다. MCP, REST, CLI는 `outcome.results[offset:limit]`을 쓴다. 반환 결과 수는 바뀌지 않는다. 새 경고는 다른 `QueryOutcome.warnings`와 같은 길로 나간다. MCP와 REST는 기존 키 `spaces_filter_warnings`에 `outcome.warnings` 전체를 싣고(#667부터 같은 목록이 새 키 `warnings`에도 실린다), CLI는 `warning:` 줄로 출력한다. 옛 키 이름은 바꾸지 않는다.
 
 - rerank 경로(기본): 이 이슈의 대상이다.
 - 평면 병합(`use_rerank=False`): 같은 단계를 거친다. probe(날짜 기록 2절)에서 평면 병합은 어휘 레그 1위인 정답을 창 밖에 둔 질의가 셋 있었다(`auto-content-0`, `auto-content-2`, `explicit-mixed-1`). 원인은 평면 병합의 중복 규칙이다. 같은 `node_id`가 여러 레그에 나오면 첫 레그(vector)의 정규화 점수만 남긴다(`query.py` 평면 병합 주석의 규칙 (2)). 그래서 BM25 1위의 정규화 점수 1.0이 vector의 낮은 점수로 바뀐다. 이것은 이 이슈와 같은 결함(한 레그 1위가 다른 레그 때문에 창 밖으로 밀림)이다. 공유 지점 하나로 두 경로를 함께 고친다. 중복 규칙 자체는 기존 시험(`tests/test_query_characterization.py`의 `test_duplicate_node_id_across_legs_keeps_first_leg_value`)이 고정한 규칙이므로 바꾸지 않는다.

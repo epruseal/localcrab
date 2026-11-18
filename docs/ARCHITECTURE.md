@@ -664,7 +664,7 @@ BM25 인덱스는 최근 노드만 전역 순서로 담는다. 오래된 팩의 
 - legacy store가 전체 행 수를 제공하지 않으면 `BM25 coverage total unknown`을
   반환한다.
 
-MCP 응답은 기존 `spaces_filter_warnings`에 이 경고를 담는다. BM25 미커버 노드는
+MCP 응답은 기존 `spaces_filter_warnings`와 같은 목록의 새 키 `warnings`에 이 경고를 담는다(#667). BM25 미커버 노드는
 벡터 검색과 FTS에서 여전히 후보가 될 수 있다.
 
 ### 조정 방법

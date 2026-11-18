@@ -216,3 +216,4 @@ def test_t10_ontology_query_exposes_bm25_coverage_warning():
         response = tools.ontology_query(question="alpha", pack_ids=["pack-a"])
 
     assert response["spaces_filter_warnings"] == ["BM25 coverage total unknown"]
+    assert response["warnings"] == response["spaces_filter_warnings"]
