@@ -222,8 +222,8 @@ def _node_digest(
     without the method, or a read that failed.
 
     The token is read only for an existing row of THIS type. All three
-    backends filter ``get_node_digest`` on node_type, so ``if rows`` would
-    behave the same today. The check keeps the shape the design states, so a
+    backends filter ``get_node_digest`` on node_type, so ``if rows`` has the
+    same result today. The check keeps the shape the design states, so a
     future backend without that filter cannot send the digest of another type
     into the update path. ``_graph_leg`` and ``preflight_source_write`` both
     call this function, so they cannot disagree about the path the write takes.
@@ -458,7 +458,7 @@ def preflight_source_write(
     ``resolve_write_pack(admit=...)`` calls this function BEFORE it inserts the
     registry row of that pack. A rejected request then leaves no row. The new
     pack belongs to the caller and has the ready status, so this function does
-    not repeat ``authorize``. The caller has not entered ``principal_scope``
+    not repeat ``authorize``. The caller did not enter ``principal_scope``
     yet, so ``principal`` is a parameter. The checks follow the order of
     ``write_source``:
 
@@ -480,21 +480,32 @@ def preflight_source_write(
     row exists and ``_node_digest`` returns no CAS token, the write takes the
     plain insert path. The store then always raises ``NodeIdentityConflict``
     with the text that this function uses. A user with a pack gets the same
-    answer from the same path.
+    answer for a row that the caller does not own. The plain insert accepts a
+    row of the caller with equal content.
 
     Known differences from the write:
 
     - The Neo4j store compares a cached ``node_digest`` property on the CAS
       path. The property can be stale or absent. This function does not read
       it, so the write can still refuse after the pack row exists.
-    - The CAS path can raise a ``RuntimeError`` subclass for a damaged edge.
-      REST answers 500 for it, for a user with a pack as well.
+    - On the CAS path, a damaged incident edge fails the write. The SQL store
+      raises ``GraphMigrationConflict``, and ``add_node`` records it in the
+      receipt (REST status 200). The Neo4j store raises
+      ``GraphPropertyValidationError`` (REST status 422). This function does not
+      read incident edges. On Neo4j, the write can therefore refuse after the
+      pack row exists.
+    - Three sources of residue are not deterministic. This function and the
+      write read the digest in two separate reads. The CLI uses two separate
+      lock sections. A writer outside ``write_lock`` can create the default pack
+      between the check and the insert.
+    - The CLI also writes the anchor row of the new pack before ``write_source``
+      runs. A rejection that only the write finds leaves that row too.
     - The graph store checks that it can write before it runs ``prepare_node``
       and before it compares a node row. In that degraded state a user with a
       pack gets an error receipt. This function raises for an invalid body or
       an existing node row.
-    - On Neo4j, a stored node whose properties cannot give a digest makes the
-      write raise ``GraphPropertyValidationError``. This function raises
+    - On Neo4j, a stored node whose properties cannot give a digest (including
+      a node with no ``node_type`` value) makes the write raise ``GraphPropertyValidationError``. This function raises
       ``NodeIdentityConflict``. Both map to status 422.
     - The message of the ``pack`` alias rule names ``pack_id``. This function
       names the throwaway id.

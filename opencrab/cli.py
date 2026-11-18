@@ -605,10 +605,10 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
             # pack like before, and fall back to the principal's default pack
             # instead of leaving a file unpacked.
             effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
-            # #661: a principal with no default pack gets its registry row here, so
-            # a source write that write_source would reject is refused before the row.
-            # The lock keeps another writer from creating that pack between the
-            # check and the insert, which would make the check judge a stale id.
+            # #661: this call creates the registry row of a principal with no
+            # default pack. The check runs first, so a source write that
+            # write_source rejects leaves no row. The lock stops another writer
+            # from creating that pack between the check and the insert.
             if effective_pack:
                 target_pack_id = effective_pack
             else:

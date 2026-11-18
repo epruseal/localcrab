@@ -412,6 +412,38 @@ def test_the_preflight_does_not_reject_when_no_graph_can_be_read():
         None, None, None, text="본문", source_id="src-661", metadata=None,
         principal=principal, pack_id="default-new-661",
     ) is None
+    # 본문이 무효여도 그래프가 없으면 add_node는 속성 검사를 하지 않고 영수증을 돌려준다.
+    assert preflight_source_write(
+        None, None, None, text="본문", source_id="src-661",
+        metadata={"title": float("nan")},
+        principal=principal, pack_id="default-new-661",
+    ) is None
+
+
+@pytest.mark.parametrize("probe", ["get_source", "get_node_doc"])
+def test_an_unverifiable_ownership_probe_rejects_without_creating_a_default_pack(
+    rest, data_dir, monkeypatch, probe,
+):
+    """소유를 확인할 수 없으면(탐침 예외) 쓰기는 422로 거부한다. 사전 검사도 같은 답을 내고 행을 남기지 않는다."""
+    client, ctx = rest
+
+    def _raiser(self, *args, **kwargs):  # noqa: ARG001
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(type(ctx.docs), probe, _raiser)
+    legacy_id, headers = _legacy_user(ctx.sql, "legacy")
+    _member_id, member_headers = _user(ctx.sql, "member")
+    expected = _ingest(client, member_headers)
+    before = _all_rows(data_dir)
+
+    resp = _ingest(client, headers)
+
+    assert expected.status_code == 422, expected.text
+    assert "cannot verify existing ownership" in expected.json()["detail"]
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == expected.json()
+    assert _packs_of(ctx.sql, legacy_id) == []
+    assert _changed(before, _all_rows(data_dir)) == []
 
 
 def test_an_untagged_text_unit_row_with_a_healthy_digest_is_still_accepted(rest, data_dir):
@@ -498,7 +530,7 @@ def test_a_rejected_cli_ingest_for_a_local_user_without_a_default_pack_changes_n
     result = CliRunner().invoke(_cli_main, ["ingest", str(src)])
 
     assert result.exit_code != 0, result.output
-    # rich은 긴 경로 뒤에서 줄을 바꾼다. 공백을 정리한 뒤 비교한다.
+    # rich는 긴 경로 뒤에서 줄을 바꾼다. 공백을 정리한 뒤 비교한다.
     assert _FOREIGN_SOURCE_DETAIL in " ".join(result.output.split()), result.output
     assert _packs_of(sql, user_id) == []
     assert _changed(before, _all_rows(data_dir)) == []

@@ -655,10 +655,10 @@ def ingest_text(
         try:
             # IngestRequest carries no pack_id field, so every REST ingest lands
             # in the caller's default pack (unlike /api/nodes /api/edges, which
-            # accept an explicit one). #661: a caller with no default pack gets
-            # its registry row created here, so the request is checked first.
-            # A rejection raised by `admit` is the same client error that
-            # write_source raises below, and creates no row.
+            # accept an explicit one). #661: this call creates the registry row
+            # of a caller with no default pack, so `admit` checks the request
+            # first. A rejection from `admit` is the client error that
+            # write_source raises below. It creates no row.
             target_pack_id = resolve_write_pack(
                 ctx.sql, auth.principal, None,
                 admit=lambda new_pack_id: preflight_source_write(

@@ -111,7 +111,8 @@ def validate_pack_id_format(
 _DEFAULT_PACK_ID_PREFIX = "default-"
 
 # One owner's default-pack lookup, shared by ``find_default_pack`` and
-# ``_ensure_default_pack_on`` so the read-only twin cannot drift from the writer.
+# ``_ensure_default_pack_on``. Both read the same statement, so the check and the
+# writer use one query.
 _SELECT_DEFAULT_PACK = (
     "SELECT pack_id FROM packs WHERE owner_id = :oid AND is_default = :is_default"
 )
@@ -487,8 +488,8 @@ def new_default_pack_id() -> str:
 def find_default_pack(sql: Any, owner_id: str) -> str | None:
     """``owner_id``'s default pack_id, or ``None`` when it has none yet.
 
-    Read-only twin of ``ensure_default_pack``: it never inserts. ``None`` means
-    ``ensure_default_pack`` would create the row.
+    This function reads like ``ensure_default_pack`` and never inserts.
+    ``None`` means ``ensure_default_pack`` will create the row.
     """
     from sqlalchemy import text
 
@@ -584,13 +585,13 @@ def resolve_write_pack(
     않는다").
 
     ``admit`` (#661) is the caller's read-only check of the write it is about
-    to make. Resolving a default pack that does not exist yet INSERTS its
-    registry row, so a write rejected afterwards would leave that row behind.
+    to make. This function INSERTS the registry row of a default pack that
+    does not exist yet, so a write that fails afterwards leaves that row.
     When the caller has no default pack, ``admit`` runs first with a random id
-    of the shape the new pack will get (no client value can equal it); if it
-    raises, nothing has been created. ``admit`` is not called when ``requested``
-    is given or when the default pack already exists, since neither creates a
-    row. ``admit`` must not write.
+    of the shape the new pack will get (no client value can equal it). If
+    ``admit`` raises, the function creates nothing. The function does not call
+    ``admit`` when ``requested`` is given or when the default pack exists,
+    because neither case creates a row. ``admit`` must not write.
     """
     if requested:
         return requested
