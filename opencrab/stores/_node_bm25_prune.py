@@ -188,12 +188,16 @@ def select(
     node_terms: Callable[[dict[str, Any], int | None], list[str]],
     node_columns: str,
     stats: dict[str, Any] | None = None,
+    cache: Any | None = None,
 ) -> list[tuple[float, str, str, str, str]]:
     """Return ``(score, updated_at, space, node_id, pack_id)`` in search order.
 
     ``names`` maps "fts", "vinst" and "docs" to the index table names. The list
     holds every document of each group's exact top ``limit`` and the boundary
     ties (design 6.4). Raises ``PruneFallbackError`` when a consistency check fails.
+    ``cache`` is a ``_node_bm25_cache.Session`` or ``None``. With a session, a heavy
+    term's posting arrays come from the cache and a scan of such a term costs nothing
+    (#667 design 5.3). The cost changes the path only, never the result.
     """
     fts, vinst, docs = names["fts"], names["vinst"], names["docs"]
     groups = len(pack_set) if per_pack else 1
@@ -210,7 +214,23 @@ def select(
     cand = _Candidates()
     closed = np.zeros(groups, dtype=bool)
     log = stats if stats is not None else {}
-    log.update({"postings": 0, "retokenised": 0, "admitted": 0, "terms": len(pending)})
+    log.update({"postings": 0, "retokenised": 0, "admitted": 0, "terms": len(pending),
+                "cache_hits": 0, "cache_stores": 0})
+
+    def scan_cf(term: str) -> int:
+        """Occurrences that a scan of ``term`` reads. None when its arrays are cached."""
+        return 0 if cache is not None and cache.has_postings(term) else cf[term]
+
+    def postings(term: str) -> tuple[np.ndarray, np.ndarray]:
+        if cache is not None:
+            hit = cache.postings_get(term)
+            if hit is not None:
+                log["cache_hits"] += 1
+                return hit
+        found = _postings(conn, vinst, term)
+        if cache is not None and cf[term] > FULL_SCAN_CF_MAX and cache.postings_put(term, *found):
+            log["cache_stores"] += 1
+        return found
 
     def retokenise(idx: np.ndarray, must_hold: str | None = None, first_new: int = -1) -> None:
         keys = [int(x) for x in cand.keys[idx]]
@@ -262,14 +282,14 @@ def select(
             closed |= theta * (1 - rho) > rest * (1 + rho)
         nonexact = np.flatnonzero(~cand.has_exact)
         if closed.all():
-            scan_cost = SCAN_US * sum(cf[t] for t in pending)
+            scan_cost = SCAN_US * sum(scan_cf(t) for t in pending)
             if _retok_cost(cand.dls[nonexact]) <= scan_cost:
                 if nonexact.size:
                     retokenise(nonexact)
                 break
-            term = max(pending, key=lambda t: (ub[t] / max(cf[t], 1), t))
+            term = max(pending, key=lambda t: (ub[t] / max(scan_cf(t), 1), t))
             pending.remove(term)
-            p_keys, p_tf = _postings(conn, vinst, term)
+            p_keys, p_tf = postings(term)
             log["postings"] += 1
             scanned.add(term)
             add_tf(term, _lookup(p_keys, p_tf, cand.keys))
@@ -284,7 +304,7 @@ def select(
         if cand.dead.size:
             new &= ~np.isin(a_keys, cand.dead)
         log["admitted"] += int(new.sum())
-        if _retok_cost(a_dl[new]) + _retok_cost(cand.dls[nonexact]) < SCAN_US * cf[term]:
+        if _retok_cost(a_dl[new]) + _retok_cost(cand.dls[nonexact]) < SCAN_US * scan_cf(term):
             start = cand.keys.size
             cand.add(a_keys[new], a_grp[new], a_dl[new])
             idx = np.concatenate((nonexact, np.arange(start, cand.keys.size)))
@@ -293,7 +313,7 @@ def select(
             # Documents taken later cannot hold this term (design 6.4, 1).
             cand.tfs[term] = np.zeros(cand.keys.size, dtype=np.int64)
             continue
-        p_keys, p_tf = _postings(conn, vinst, term)
+        p_keys, p_tf = postings(term)
         log["postings"] += 1
         tf_old = _lookup(p_keys, p_tf, cand.keys)
         new_keys = a_keys[new]

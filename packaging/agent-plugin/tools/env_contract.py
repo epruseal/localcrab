@@ -101,6 +101,9 @@ ENV_CONTRACT: dict[str, str] = {
     # #567: "0" turns off the exact top-k pruning and keeps the full DB index
     # scan (rollback switch, docs/issue-567-bm25-prune.md 6.7).
     "OPENCRAB_BM25_PRUNE": "튜너블",
+    # #667: "0" turns off the in-process posting cache of the node BM25 search (rollback
+    # switch, docs/issue-667-bm25-posting-cache.md). The store reads it when it is made.
+    "OPENCRAB_BM25_CACHE": "튜너블",
     "OPENCRAB_AUTO_PACK_MIN_SCORE": "튜너블",
     # opencrab/pack/jsonl_io.py 전용. opencrab/mcp/tools/pack.py 는 이 모듈을
     # 임포트하지 않는다(위 재현 명령으로 확인) -- 팩 CLI 저작 경로에서만 읽힌다.

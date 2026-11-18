@@ -50,6 +50,7 @@ import time
 from typing import Any
 
 from opencrab.locking import StoreBootstrapLockTimeoutError
+from opencrab.stores import _node_bm25_cache as _ncache
 from opencrab.stores import _node_bm25_sqlite as _nbm
 from opencrab.stores import _source_fts_sqlite as _sfts
 from opencrab.stores._sql_dialect import SQLITE
@@ -87,8 +88,24 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         self._available = False
         self._fts_ok = False  # SQLite FTS5 키워드 색인 가용 여부(capability)
         self._node_bm25_ok = False  # #541 node BM25 index objects exist
+        # #667: the posting cache and its version token. Both stay None when the cache is
+        # off or the node index is unsupported. The switch is read once, here.
+        self._bm25_cache: _ncache.PostingCache | None = None
+        self._bm25_token: _ncache.TokenSource | None = None
         self._init_conn_state(db_path)
         self._init_db()
+        if self.supports_node_bm25 and _ncache.enabled():
+            # Opened now, not at the first query, so that a replaced database file is seen.
+            self._bm25_token = _ncache.TokenSource(self._db_path, self._new_conn)
+            self._bm25_cache = _ncache.PostingCache()
+
+    def close(self) -> None:
+        # #667: ``close`` also runs from inside ``_init_db`` (bootstrap lock timeout), before
+        # the token source exists.
+        token = getattr(self, "_bm25_token", None)
+        if token is not None:
+            token.close()
+        super().close()
 
     def _init_db(self) -> None:
         """
@@ -346,12 +363,18 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         self._node_bm25_try_drain()
         conn = self._conn
         own = not conn.in_transaction
+        # #667: read the version token before BEGIN. A caller that already holds a
+        # transaction has a snapshot of unknown age, so it gets no cache.
+        scope = None
+        if own and self._bm25_cache is not None and self._bm25_token is not None:
+            scope = _ncache.Scope.before_begin(self._bm25_cache, self._bm25_token)
         if own:
             conn.execute("BEGIN")
         try:
             return _nbm.search(
                 conn, self._row_to_node, query,
                 pack_ids=pack_ids, spaces=spaces, limit=limit, per_pack=per_pack,
+                cache_scope=scope,
             )
         except _nbm.NotReadyError:
             return None

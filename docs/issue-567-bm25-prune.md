@@ -68,7 +68,7 @@ WHERE v.term = ? AND d.pack_id IN (...) GROUP BY v.doc
 | 팩 필터를 스캔 앞단으로 당기기 | 부분 채택 | `MATCH`를 `docs`와 문서 단위로 조인하면서 팩과 space 조건을 거는 것은 형식 변경 없이 된다. 이 조인이 새 문서의 `dl`과 그룹을 준다. 출현 목록 자체를 팩으로 자르려면 `doc_key`가 팩별로 모여 있거나 `docs(pack_id)` 색인이 있어야 한다. 둘 다 스키마나 쓰기 경로를 바꾼다. |
 | 자동 선택 탐침의 비용 상한 | 채택 안 함 | 상한에 걸리면 팩 선택이 달라질 수 있어 근사가 된다. 정확한 경로로 자연어 팩별 탐침이 요구치 안에 든다(날짜 기록 4절). 이슈 코멘트의 `probe limit reached`는 탐침을 건너뛴 팩이 아니다. `pack_selection.py`의 원문은 `logger.info("auto_pack content fallback: probe limit reached for %s", truncated_packs)`이고, `truncated_packs`는 `pack_registry._choose_by_content_with_warnings`가 "히트 수가 `PER_PACK_PROBE_LIMIT`에 닿아 그 팩의 실제 매치가 더 있을 수 있음을 관측용으로 알리는 목록"이다. 모든 팩을 탐침했다. |
 | FTS5 `bm25()`로 순위 | 채택 안 함 | k1과 b가 FTS5 안에 고정되어 있고 idf 식이 다르다. probe에서 문서당 비용도 출현 목록 순회보다 컸다. |
-| 메모리 캐시(문서별 `dl`과 팩, 흔한 용어의 출현 목록) | 채택 안 함 | 정확한 무효화 표지가 없다. `doc_key`는 최댓값 행이 지워지면 재사용되므로 행 수, 최댓값, 통계로는 팩 이동을 놓칠 수 있다. 연결별 `PRAGMA data_version`과 `total_changes`를 쓰면 스레드별 연결마다 캐시가 생긴다. 채택안만으로 관측 형태 대부분이 요구치 안에 든다. |
+| 메모리 캐시(문서별 `dl`과 팩, 흔한 용어의 출현 목록) | 채택 안 함 | 정확한 무효화 표지가 없다. `doc_key`는 최댓값 행이 지워지면 재사용되므로 행 수, 최댓값, 통계로는 팩 이동을 놓칠 수 있다. 연결별 `PRAGMA data_version`과 `total_changes`를 쓰면 스레드별 연결마다 캐시가 생긴다. 채택안만으로 관측 형태 대부분이 요구치 안에 든다. #667이 파일별 `data_version` 표지와 읽기 전후 비교로 이 표지를 정의하고 흔한 용어의 출현 목록 캐시를 채택했다(`docs/issue-667-bm25-posting-cache.md`). |
 | 색인 형식 변경(용어별 최대 tf, 블록 최대값, 팩별 rowid) | 채택 안 함 | 라이브 재색인과 쓰기 비용(#565)이 늘어난다. 형식을 바꾸지 않는 채택안을 먼저 적용한다. |
 
 단순성 사다리: 새 의존성이 없다. numpy는 이미 `pyproject.toml`의 직접 의존성(`numpy>=2.0`)이다. 새 저장 구조, 캐시, 스레드가 없다. 운영 되돌리기 스위치 하나를 둔다(6.7절).
