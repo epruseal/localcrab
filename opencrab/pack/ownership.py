@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import re
 import secrets
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
 from opencrab.pack.fork_remap import NODE_ID_COLUMN_LIMIT
@@ -109,6 +109,12 @@ def validate_pack_id_format(
 # design was rejected: it exposes user_id, couples the pack_id format to the
 # user_id format, and can't stop a second process from racing to the same id).
 _DEFAULT_PACK_ID_PREFIX = "default-"
+
+# One owner's default-pack lookup, shared by ``find_default_pack`` and
+# ``_ensure_default_pack_on`` so the read-only twin cannot drift from the writer.
+_SELECT_DEFAULT_PACK = (
+    "SELECT pack_id FROM packs WHERE owner_id = :oid AND is_default = :is_default"
+)
 
 # On a pack_id collision, create_pack retries this many random-suffixed
 # candidates before giving up (see create_pack).
@@ -473,14 +479,32 @@ def ensure_default_pack(sql: Any, owner_id: str, *, conn: Any = None) -> str:
         return _ensure_default_pack_on(sql, owner_id, owned_conn)
 
 
+def new_default_pack_id() -> str:
+    """A fresh random default-pack id (``default-`` + 16 hex digits)."""
+    return f"{_DEFAULT_PACK_ID_PREFIX}{secrets.token_hex(8)}"
+
+
+def find_default_pack(sql: Any, owner_id: str) -> str | None:
+    """``owner_id``'s default pack_id, or ``None`` when it has none yet.
+
+    Read-only twin of ``ensure_default_pack``: it never inserts. ``None`` means
+    ``ensure_default_pack`` would create the row.
+    """
+    from sqlalchemy import text
+
+    with sql._engine.connect() as conn:
+        row = conn.execute(
+            text(_SELECT_DEFAULT_PACK), {"oid": owner_id, "is_default": True}
+        ).fetchone()
+    return row[0] if row is not None else None
+
+
 def _ensure_default_pack_on(sql: Any, owner_id: str, conn: Any) -> str:
     """``ensure_default_pack``'s body, given an already-open ``conn``."""
     from sqlalchemy import text
     from sqlalchemy.exc import IntegrityError
 
-    select_existing = text(
-        "SELECT pack_id FROM packs WHERE owner_id = :oid AND is_default = :is_default"
-    )
+    select_existing = text(_SELECT_DEFAULT_PACK)
     # A Python bool binds correctly on both drivers here: pysqlite treats
     # bool as an int subclass (True -> 1) against the INTEGER column, and
     # psycopg binds it to a real boolean -- no per-dialect branch needed for
@@ -511,7 +535,7 @@ def _ensure_default_pack_on(sql: Any, owner_id: str, conn: Any) -> str:
         )
 
     for _ in range(_MAX_RANDOM_ATTEMPTS):
-        candidate = f"{_DEFAULT_PACK_ID_PREFIX}{secrets.token_hex(8)}"
+        candidate = new_default_pack_id()
         try:
             # Measured (#148 round-5 verification): a pack_id PK collision on
             # this INSERT surfaces as an IntegrityError, NOT rowcount 0 --
@@ -541,7 +565,13 @@ def _ensure_default_pack_on(sql: Any, owner_id: str, conn: Any) -> str:
     raise RuntimeError(f"could not allocate a unique default pack_id for owner {owner_id!r}")
 
 
-def resolve_write_pack(sql: Any, principal: Principal, requested: str | None) -> str:
+def resolve_write_pack(
+    sql: Any,
+    principal: Principal,
+    requested: str | None,
+    *,
+    admit: Callable[[str], None] | None = None,
+) -> str:
     """The pack_id a write should target: ``requested`` if the caller named
     one, else ``principal``'s default pack.
 
@@ -552,9 +582,20 @@ def resolve_write_pack(sql: Any, principal: Principal, requested: str | None) ->
     write path can leave ``pack_id`` unset: every write lands in a pack, one
     way or another (see module docstring / #143 "팩 없는 쓰기 경로를 남기지
     않는다").
+
+    ``admit`` (#661) is the caller's read-only check of the write it is about
+    to make. Resolving a default pack that does not exist yet INSERTS its
+    registry row, so a write rejected afterwards would leave that row behind.
+    When the caller has no default pack, ``admit`` runs first with a random id
+    of the shape the new pack will get (no client value can equal it); if it
+    raises, nothing has been created. ``admit`` is not called when ``requested``
+    is given or when the default pack already exists, since neither creates a
+    row. ``admit`` must not write.
     """
     if requested:
         return requested
+    if admit is not None and find_default_pack(sql, principal.user_id) is None:
+        admit(new_default_pack_id())
     return ensure_default_pack(sql, principal.user_id)
 
 

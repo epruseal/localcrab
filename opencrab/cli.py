@@ -558,7 +558,7 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
     from opencrab.ontology.pack_provenance import infer_pack_id_from_path
     from opencrab.ontology.query import HybridQuery
     from opencrab.pack.ownership import resolve_write_pack
-    from opencrab.pack.source_writer import write_source
+    from opencrab.pack.source_writer import preflight_source_write, write_source
 
     # #145: a CLI write is attributed to the local user, and resolving the
     # principal happens BEFORE any store is opened or written -- a missing
@@ -605,7 +605,22 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
             # pack like before, and fall back to the principal's default pack
             # instead of leaving a file unpacked.
             effective_pack = pack_id or infer_pack_id_from_path(file.resolve())
-            target_pack_id = effective_pack or resolve_write_pack(stores.sql, principal, None)
+            # #661: a principal with no default pack gets its registry row here, so
+            # a source write that write_source would reject is refused before the row.
+            # The lock keeps another writer from creating that pack between the
+            # check and the insert, which would make the check judge a stale id.
+            if effective_pack:
+                target_pack_id = effective_pack
+            else:
+                with write_lock():
+                    target_pack_id = resolve_write_pack(
+                        stores.sql, principal, None,
+                        admit=lambda new_pack_id: preflight_source_write(
+                            mongo, chroma, neo4j,
+                            text=text, source_id=source_id, metadata=meta,
+                            principal=principal, pack_id=new_pack_id,
+                        ),
+                    )
 
             with principal_scope(principal), write_lock():
                 # #194: ensure anchor for ready packs that have lost it (best-effort)

@@ -644,7 +644,7 @@ def ingest_text(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     from opencrab.auth import principal_scope
     from opencrab.pack.ownership import resolve_write_pack
-    from opencrab.pack.source_writer import write_source
+    from opencrab.pack.source_writer import preflight_source_write, write_source
 
     source_id = payload.source_id or f"{auth.user_id}-{uuid4().hex[:12]}"
     metadata = dict(payload.metadata)
@@ -652,11 +652,21 @@ def ingest_text(
 
     with write_lock():
         _enforce_ingest_limits(ctx, auth, source_id)
-        # IngestRequest carries no pack_id field, so every REST ingest lands
-        # in the caller's default pack (unlike /api/nodes /api/edges, which
-        # accept an explicit one).
-        target_pack_id = resolve_write_pack(ctx.sql, auth.principal, None)
         try:
+            # IngestRequest carries no pack_id field, so every REST ingest lands
+            # in the caller's default pack (unlike /api/nodes /api/edges, which
+            # accept an explicit one). #661: a caller with no default pack gets
+            # its registry row created here, so the request is checked first.
+            # A rejection raised by `admit` is the same client error that
+            # write_source raises below, and creates no row.
+            target_pack_id = resolve_write_pack(
+                ctx.sql, auth.principal, None,
+                admit=lambda new_pack_id: preflight_source_write(
+                    ctx.docs, ctx.vector, ctx.graph,
+                    text=payload.text, source_id=source_id, metadata=metadata,
+                    principal=auth.principal, pack_id=new_pack_id,
+                ),
+            )
             with principal_scope(auth.principal):
                 receipt = write_source(
                     ctx.sql, ctx.hybrid, ctx.docs, ctx.vector,

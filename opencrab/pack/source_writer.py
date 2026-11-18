@@ -45,15 +45,17 @@ from typing import Any, Literal
 from opencrab.common.graph_identity import (
     GraphSchemaMigrationRequired,
     GraphWriteUnavailable,
+    prepare_node,
 )
 from opencrab.common.pack_tags import canonicalize_pack_alias
-from opencrab.ontology.builder import SKIPPED_GRAPH_WRITE_FAILED
+from opencrab.ontology.builder import SKIPPED_GRAPH_WRITE_FAILED, validate_node_input
 from opencrab.pack.fork_remap import SOURCE_NODE_ID_BUDGET
 from opencrab.pack.write_gate import (
     SOURCE_STAMPED,
     authorize,
     authorize_fork_copy,
     identity_reject_message,
+    node_identity_conflict,
     source_identity_conflict,
     stamp,
 )
@@ -107,6 +109,69 @@ def _check_display_node_id(
             f"{source_id}: metadata.node_id must equal the source id "
             "(the source is stored as the graph node of that id)"
         )
+
+
+def validate_source_input(
+    metadata: Mapping[str, Any] | None,
+    *,
+    source_id: str,
+    principal: Any,
+    pack_id: str,
+    origin: str = "client",
+) -> dict[str, Any]:
+    """The checks of ``write_source`` that read no store, and the stamped metadata.
+
+    Stamps the server-owned identity keys, fills the default space, refuses a
+    separate display ``node_id`` (#544) and a ``pack`` alias that disagrees
+    with ``pack_id`` (#171). Raises ``ValueError`` and writes nothing.
+    ``write_source`` and ``preflight_source_write`` both run this one function,
+    so the two cannot disagree on what a request must look like.
+    """
+    meta = stamp(
+        metadata, principal=principal, pack_id=pack_id, keys=SOURCE_STAMPED,
+        origin=origin,
+    )
+    meta.setdefault("space", _DEFAULT_SPACE)
+    _check_display_node_id(meta, source_id=source_id, origin=origin)
+
+    # #171 ownership-tag invariant, checked BEFORE the first write. `pack` is
+    # not a reserved boundary key, so a client can still send it; leaving the
+    # check to the vector leg means the doc row is already committed when it
+    # fires.
+    canonicalize_pack_alias(meta)
+    return meta
+
+
+def _node_leg_skipped(source_id: str, rows: list[dict[str, Any]] | None) -> bool:
+    """True when the graph leg creates no node for this id (the long-id carve-out).
+
+    An id past the budget cannot survive as a node id through a fork remap, and
+    tests/test_pack_fork.py's T77 pins that a source-only id of that length must
+    NOT make a pack unforkable. So do not CREATE a node for it.
+
+    The ``rows == []`` half is not decoration. The carve-out is "do not
+    create", not "do not look": a node for a long id can already exist
+    (pack_ingest's text_as_node=True has no length check, and a fork of a
+    budget-length source produces one). Skipping the update there would leave
+    the graph on the old text while the doc row moved to the new one -- the
+    divergence this whole leg exists to prevent. ``_existing_node_rows``
+    returns None for "cannot tell", and ``None == []`` is False, so every
+    uncertain answer falls through to the normal path and fails closed there.
+    """
+    return len(source_id) > SOURCE_NODE_ID_BUDGET and rows == []
+
+
+def _source_node_props(text: str, meta: Mapping[str, Any], pack_id: str) -> dict[str, Any]:
+    """The properties of the ``TextUnit`` node that mirrors a source.
+
+    ``_graph_leg`` and ``preflight_source_write`` both call this, so the
+    preflight judges the same properties that the graph write receives.
+    """
+    node_props: dict[str, Any] = {"pack_id": pack_id, "text": text}
+    for key in ("title", "source"):
+        if meta.get(key):
+            node_props[key] = meta[key]
+    return node_props
 
 
 def _docs_available(docs: Any) -> bool:
@@ -278,18 +343,10 @@ def write_source(
     if reason:
         raise ValueError(identity_reject_message("source", source_id, reason))
 
-    meta = stamp(
-        metadata, principal=principal, pack_id=pack_id, keys=SOURCE_STAMPED,
+    meta = validate_source_input(
+        metadata, source_id=source_id, principal=principal, pack_id=pack_id,
         origin=origin,
     )
-    meta.setdefault("space", _DEFAULT_SPACE)
-    _check_display_node_id(meta, source_id=source_id, origin=origin)
-
-    # #171 ownership-tag invariant, checked BEFORE the first write. `pack` is
-    # not a reserved boundary key, so a client can still send it; leaving the
-    # check to the vector leg means the doc row is already committed when it
-    # fires.
-    canonicalize_pack_alias(meta)
 
     receipt: dict[str, Any] = {"source_id": source_id, "metadata": meta, "stores": {}}
 
@@ -368,6 +425,72 @@ def write_source(
     return receipt
 
 
+def preflight_source_write(
+    docs: Any,
+    vector: Any,
+    graph: Any,
+    *,
+    text: str,
+    source_id: str,
+    metadata: Mapping[str, Any] | None,
+    principal: Any,
+    pack_id: str,
+) -> None:
+    """Raise what ``write_source`` would raise for this request, writing nothing (#661).
+
+    ``pack_id`` is the id of a default pack that does not exist yet. It comes
+    from ``resolve_write_pack(admit=...)``, which calls this BEFORE it inserts
+    the pack's registry row, so a rejected request leaves no row behind. The new
+    pack is owned by the caller and ready by construction, so ``authorize`` is
+    not repeated here. ``principal`` is a parameter because the caller has not
+    entered ``principal_scope`` yet. The checks and their order follow
+    ``write_source``:
+
+    1. the source slot of another pack (``source_identity_conflict``),
+    2. the checks that read no store (``validate_source_input``),
+    3. the checks of ``add_node`` that read no store (``validate_node_input``),
+    4. the node slot of another pack (``node_identity_conflict``),
+    5. the property normalisation that the graph write runs first
+       (``prepare_node``), only when the graph is available.
+
+    Steps 3 to 5 are skipped for the over-budget id that the graph leg skips.
+    No row can carry the new pack id, so every identity check judges the same
+    way for this id as for the id that ``ensure_default_pack`` stores.
+
+    Known differences from the write:
+
+    - A ``NodeIdentityConflict`` that only the graph store raises inside its own
+      write (same id held by a node of another type without a pack tag) is not
+      mirrored. A caller without a default pack can still leave the row then.
+    - ``prepare_node`` is not the first call of a graph write. The store checks
+      first that it can write at all. In that degraded state a user with a pack
+      gets an error receipt, and this check raises for an invalid body.
+    - The message of the ``pack`` alias rule names ``pack_id``, which is the
+      throwaway id here.
+    """
+    reason = source_identity_conflict(docs, vector, source_id=source_id, pack_id=pack_id)
+    if reason:
+        raise ValueError(identity_reject_message("source", source_id, reason))
+    meta = validate_source_input(
+        metadata, source_id=source_id, principal=principal, pack_id=pack_id,
+    )
+    if _node_leg_skipped(source_id, _existing_node_rows(graph, source_id)):
+        return
+    props = validate_node_input(
+        _source_node_props(text, meta, pack_id),
+        space=_SOURCE_NODE_SPACE, node_type=_SOURCE_NODE_TYPE,
+        principal=principal, pack_id=pack_id, origin="client",
+    )
+    reason = node_identity_conflict(
+        graph, docs, vector, space=_SOURCE_NODE_SPACE, node_type=_SOURCE_NODE_TYPE,
+        node_id=source_id, pack_id=pack_id,
+    )
+    if reason:
+        raise ValueError(identity_reject_message("node", source_id, reason))
+    if graph is not None and getattr(graph, "available", False):
+        prepare_node(_SOURCE_NODE_TYPE, source_id, props, _SOURCE_NODE_SPACE)
+
+
 def _graph_leg(
     receipt: dict[str, Any],
     graph: Any,
@@ -421,28 +544,12 @@ def _graph_leg(
 
     rows = _existing_node_rows(graph, source_id)
 
-    if len(source_id) > SOURCE_NODE_ID_BUDGET and rows == []:
-        # An id past the budget cannot survive as a node id through a fork
-        # remap, and tests/test_pack_fork.py's T77 pins that a source-only id
-        # of that length must NOT make a pack unforkable. So do not CREATE a
-        # node for it.
-        #
-        # The `rows == []` half is not decoration. The carve-out is "do not
-        # create", not "do not look": a node for a long id can already exist
-        # (pack_ingest's text_as_node=True has no length check, and a fork of a
-        # budget-length source produces one). Skipping the update there would
-        # leave the graph on the old text while the doc row moved to the new
-        # one -- the divergence this whole leg exists to prevent. `_existing_
-        # node_rows` returns None for "cannot tell", and `None == []` is False,
-        # so every uncertain answer falls through to the normal path and fails
-        # closed there.
+    if _node_leg_skipped(source_id, rows):
+        # See `_node_leg_skipped`: no node is created for an over-budget id.
         receipt["stores"]["graph"] = _GRAPH_SKIPPED_LONG_ID
         return True
 
-    node_props: dict[str, Any] = {"pack_id": pack_id, "text": text}
-    for key in ("title", "source"):
-        if meta.get(key):
-            node_props[key] = meta[key]
+    node_props = _source_node_props(text, meta, pack_id)
 
     # Properties are REPLACED, not merged (design v13 §4.2). The node is a
     # projection of the source, so it mirrors the latest source write: a
