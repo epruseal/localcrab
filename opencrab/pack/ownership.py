@@ -490,7 +490,7 @@ def find_default_pack(sql: Any, owner_id: str) -> str | None:
 
     This function runs the same SELECT as ``ensure_default_pack`` and never
     inserts.
-    ``None`` means ``ensure_default_pack`` will create the row.
+    ``None`` means that the owner had no default pack at the time of the read.
     """
     from sqlalchemy import text
 

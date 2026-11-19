@@ -228,6 +228,16 @@ class TestResolveWritePackAdmit:
         assert len(seen) == 1 and seen[0].startswith("default-"), seen
         assert [r["pack_id"] for r in _all_packs_for_owner(sql, legacy.user_id)] == [created]
 
+    def test_each_admitted_write_sees_a_fresh_id_of_the_default_shape(self, sql):
+        """클라이언트가 미리 알 수 있는 id로 판정하면 안 된다. 두 번 부른 id가 서로 다르다."""
+        import re
+
+        seen: list[str] = []
+        for name in ("legacy-a-661", "legacy-b-661"):
+            resolve_write_pack(sql, _legacy_principal(sql, name), None, admit=seen.append)
+        assert len(set(seen)) == 2, seen
+        assert all(re.fullmatch(r"default-[0-9a-f]{16}", s) for s in seen), seen
+
 
 # ---------------------------------------------------------------------------
 # _row_to_dict normalizes is_default to bool

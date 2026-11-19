@@ -73,7 +73,7 @@ def _safe_store_status(exc: Exception) -> str:
 
 
 def validate_node_input(
-    properties: dict[str, Any],
+    properties: dict[str, Any] | None,
     *,
     space: str,
     node_type: str,
@@ -85,7 +85,8 @@ def validate_node_input(
 
     ``add_node`` runs this before its first probe. ``preflight_source_write``
     runs the same function, so a caller that has to refuse a request before it
-    creates a pack row cannot disagree with the write about what is valid.
+    creates a pack row cannot disagree with the write about the checks in
+    this function.
     Raises ``ValueError`` and writes nothing.
     """
     # Stamping must run BEFORE canonicalize_pack_alias (#148): that helper

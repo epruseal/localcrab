@@ -454,9 +454,9 @@ def preflight_source_write(
 ) -> None:
     """Raise what ``write_source`` raises for this request. Write nothing (#661).
 
-    ``pack_id`` is the id of a default pack that does not exist yet.
+    ``pack_id`` is a throwaway id with the shape of a new default pack id.
     ``resolve_write_pack(admit=...)`` calls this function BEFORE it inserts the
-    registry row of that pack. A rejected request then leaves no row. The new
+    registry row of the new default pack. A rejected request then leaves no row. The new
     pack belongs to the caller and has the ready status, so this function does
     not repeat ``authorize``. The caller did not enter ``principal_scope``
     yet, so ``principal`` is a parameter. The checks follow the order of
@@ -472,14 +472,15 @@ def preflight_source_write(
        cannot use the CAS path (see below).
 
     Steps 3 to 6 do not run for the over-budget id that the graph leg skips.
-    No row can carry the new pack id. Every identity check therefore gives the
+    No row can carry the throwaway id. Every identity check therefore gives the
     same answer for this id as for the id that ``ensure_default_pack`` stores.
 
     Step 6: the properties of this request carry a pack id that no stored row
     has, so their digest never equals the digest of a stored row. When a node
     row exists and ``_node_digest`` returns no CAS token, the write takes the
-    plain insert path. The store then always raises ``NodeIdentityConflict``
-    with the text that this function uses. A user with a pack gets the same
+    plain insert path. The store then raises ``NodeIdentityConflict`` with the
+    text that this function uses. The Neo4j case in the list below is the
+    exception. A user with a pack gets the same
     answer for a row that the caller does not own. The plain insert accepts a
     row of the caller with equal content.
 

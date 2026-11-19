@@ -402,7 +402,7 @@ def test_a_failing_digest_read_is_judged_like_the_write_does(rest, data_dir, mon
 
 
 def test_the_preflight_does_not_reject_when_no_graph_can_be_read():
-    """그래프가 없거나 사용할 수 없으면 쓰기는 영수증으로 답하고 거부하지 않는다. 사전 검사도 거부하지 않는다."""
+    """그래프가 없거나 사용할 수 없으면 쓰기는 속성 정규화 없이 영수증으로 답한다. 사전 검사는 이 요청을 거부하지 않는다."""
     from types import SimpleNamespace
 
     from opencrab.auth import Principal
@@ -427,6 +427,55 @@ def test_the_preflight_does_not_reject_when_no_graph_can_be_read():
         metadata={"title": float("nan")},
         principal=principal, pack_id="default-new-661",
     ) is None
+    # available 속성이 없는 객체도 사용할 수 없는 저장소로 본다.
+    assert preflight_source_write(
+        None, None, SimpleNamespace(), text="본문", source_id="src-661",
+        metadata={"title": float("nan")},
+        principal=principal, pack_id="default-new-661",
+    ) is None
+
+
+def test_an_id_past_the_node_budget_whose_rows_cannot_be_read_is_rejected():
+    """예산을 넘는 id라도 행 목록을 읽지 못하면 쓰기는 우회로를 타지 않고 소유 확인 불가로 거부한다.
+
+    `None`(읽지 못함)은 `[]`(행 없음)와 다르다. 사전 검사도 같은 답을 낸다.
+    """
+    from types import SimpleNamespace
+
+    from opencrab.auth import Principal
+    from opencrab.pack.source_writer import preflight_source_write
+
+    def _raiser(_node_id):
+        raise RuntimeError("by-id read failed")
+
+    graph = SimpleNamespace(available=True, get_node=lambda *_a: None, get_nodes_by_id=_raiser)
+    principal = Principal(user_id="user_x_661", is_local=False, disabled=False)
+
+    with pytest.raises(ValueError, match="cannot verify existing ownership"):
+        preflight_source_write(
+            None, None, graph, text="본문", source_id="G" * (SOURCE_NODE_ID_BUDGET + 1),
+            metadata=None, principal=principal, pack_id="default-new-661",
+        )
+
+
+def test_a_foreign_vector_row_alone_rejects_an_id_past_the_node_budget():
+    """예산을 넘는 id는 노드 단계를 건너뛴다. 남의 벡터 행은 1단계 source 탐침만 잡는다."""
+    from types import SimpleNamespace
+
+    from opencrab.auth import Principal
+    from opencrab.pack.source_writer import preflight_source_write
+
+    graph = SimpleNamespace(available=True, get_nodes_by_id=lambda _node_id: [])
+    vector = SimpleNamespace(
+        available=True, get_by_id=lambda _id: {"metadata": {"pack_id": "pack-b"}},
+    )
+    principal = Principal(user_id="user_x_661", is_local=False, disabled=False)
+
+    with pytest.raises(ValueError, match=_FOREIGN_SOURCE_DETAIL):
+        preflight_source_write(
+            None, vector, graph, text="본문", source_id="G" * (SOURCE_NODE_ID_BUDGET + 1),
+            metadata=None, principal=principal, pack_id="default-new-661",
+        )
 
 
 @pytest.mark.parametrize("probe", ["get_source", "get_node_doc"])
@@ -551,3 +600,298 @@ def test_a_rejected_cli_ingest_for_a_local_user_without_a_default_pack_changes_n
     assert ok.exit_code == 0, ok.output
     assert len(_packs_of(sql, user_id)) == 1
     sql._engine.dispose()
+
+
+def _cli_legacy_local_user(data_dir, src_dir):
+    """기본 팩이 없는 로컬 사용자와 파일 하나. 저장소를 한 번 열어 기준선 행을 만든다."""
+    from opencrab.config import get_settings
+    from opencrab.stores.factory import make_sql_store
+
+    sql = make_sql_store(get_settings())
+    user_id, _secret = bootstrap_local_user(sql)
+    with sql._engine.begin() as conn:
+        conn.execute(_sql_text("DELETE FROM packs WHERE owner_id = :o"), {"o": user_id})
+    blank = src_dir / "blank.txt"
+    blank.write_text("   ", encoding="utf-8")
+    assert CliRunner().invoke(_cli_main, ["ingest", str(blank)]).exit_code == 0
+    return sql, user_id
+
+
+@pytest.mark.parametrize("plant", ["vector", "graph"])
+def test_a_rejected_cli_ingest_judges_the_vector_and_graph_slots_too(
+    data_dir, src_dir, monkeypatch, plant,
+):
+    """CLI 훅이 doc 저장소만이 아니라 벡터와 그래프도 사전 검사에 넘긴다."""
+    from opencrab.config import get_settings
+    from opencrab.stores.factory import make_graph_store, make_vector_store
+
+    sql, user_id = _cli_legacy_local_user(data_dir, src_dir)
+    src = src_dir / "doc.txt"
+    src.write_text("CLI 본문", encoding="utf-8")
+    source_id = str(src.resolve())
+    if plant == "vector":
+        vector = make_vector_store(get_settings())
+        try:
+            monkeypatch.setattr(
+                type(vector), "get_by_id",
+                lambda _self, _id: {"metadata": {"pack_id": "pack-b"}},
+            )
+        finally:
+            vector.close()
+        detail = _FOREIGN_SOURCE_DETAIL
+    else:
+        graph = make_graph_store(get_settings())
+        graph.upsert_node(
+            node_type="TextUnit", node_id=source_id,
+            properties={"pack_id": "pack-b", "text": "남의 노드"}, space_id="evidence",
+        )
+        if hasattr(graph, "close"):
+            graph.close()
+        detail = _FOREIGN_NODE_DETAIL
+    before = _all_rows(data_dir)
+
+    result = CliRunner().invoke(_cli_main, ["ingest", str(src)])
+
+    assert result.exit_code != 0, result.output
+    assert detail in " ".join(result.output.split()), result.output
+    assert _packs_of(sql, user_id) == []
+    assert _changed(before, _all_rows(data_dir)) == []
+    sql._engine.dispose()
+
+
+def test_the_cli_hook_runs_under_the_write_lock_with_the_request_and_a_throwaway_id(
+    data_dir, src_dir, monkeypatch,
+):
+    """검사는 쓰기 잠금 안에서, 파일 본문과 기본 팩 모양의 임시 id로 돈다."""
+    import contextlib
+
+    import opencrab.locking as locking
+    import opencrab.pack.source_writer as source_writer
+
+    sql, user_id = _cli_legacy_local_user(data_dir, src_dir)
+    depth = {"n": 0}
+    real_lock = locking.write_lock
+
+    @contextlib.contextmanager
+    def _counting_lock(*args, **kwargs):
+        with real_lock(*args, **kwargs):
+            depth["n"] += 1
+            try:
+                yield
+            finally:
+                depth["n"] -= 1
+
+    seen: list[tuple[int, str, str]] = []
+    real_preflight = source_writer.preflight_source_write
+
+    def _recording(*args, **kwargs):
+        seen.append((depth["n"], kwargs["text"], kwargs["pack_id"]))
+        return real_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(locking, "write_lock", _counting_lock)
+    monkeypatch.setattr(source_writer, "preflight_source_write", _recording)
+    good = src_dir / "good.txt"
+    good.write_text("정상 본문", encoding="utf-8")
+
+    ok = CliRunner().invoke(_cli_main, ["ingest", str(good)])
+
+    assert ok.exit_code == 0, ok.output
+    assert len(seen) == 1, seen
+    held, text, throwaway = seen[0]
+    assert held == 1
+    assert text == "정상 본문"
+    assert re.fullmatch(r"default-[0-9a-f]{16}", throwaway), throwaway
+    assert _packs_of(sql, user_id) != [throwaway]
+    sql._engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 판정 줄 전수 변이 실행(runs/mutation-table.txt)이 찾은 시험 공백
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def schema_calls(monkeypatch):
+    """`validate_node_properties`가 받은 (node_type, 속성) 호출을 기록한다."""
+    import opencrab.ontology.builder as builder
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+    real = builder.validate_node_properties
+
+    def _record(node_type, props):
+        calls.append((node_type, dict(props)))
+        return real(node_type, props)
+
+    monkeypatch.setattr(builder, "validate_node_properties", _record)
+    return calls
+
+
+def _principal():
+    from opencrab.auth import Principal
+
+    return Principal(user_id="user_x_661", is_local=False, disabled=False)
+
+
+def test_the_request_body_and_a_throwaway_pack_id_reach_the_node_schema_check(
+    rest, data_dir, schema_calls,
+):
+    """REST 훅은 요청 본문과 기본 팩 모양의 임시 id를 사전 검사에 넘긴다. 쓰기는 저장될 id를 쓴다."""
+    client, ctx = rest
+    legacy_id, headers = _legacy_user(ctx.sql, "legacy")
+
+    resp = _ingest(client, headers, text="본문 661")
+
+    assert resp.status_code == 200, resp.text
+    node_calls = [props for node_type, props in schema_calls if node_type == "TextUnit"]
+    assert len(node_calls) == 2, node_calls
+    preflight_props, write_props = node_calls
+    assert preflight_props["text"] == write_props["text"] == "본문 661"
+    assert re.fullmatch(r"default-[0-9a-f]{16}", preflight_props["pack_id"]), preflight_props
+    assert preflight_props["pack_id"] != write_props["pack_id"]
+    assert _packs_of(ctx.sql, legacy_id) == [write_props["pack_id"]]
+
+
+def test_the_preflight_runs_the_node_schema_check_on_the_properties_of_the_request(schema_calls):
+    """스키마 팩이 TextUnit 스키마를 설치하면 add_node가 거부할 수 있다. 사전 검사도 같은 속성을 검사한다."""
+    from opencrab.pack.source_writer import preflight_source_write
+
+    preflight_source_write(
+        None, None, None, text="본문 661", source_id="src-661",
+        metadata={"title": "제목"}, principal=_principal(), pack_id="default-new-661",
+    )
+
+    assert [t for t, _props in schema_calls] == ["TextUnit"]
+    props = schema_calls[0][1]
+    assert (props["pack_id"], props["text"], props["title"]) == (
+        "default-new-661", "본문 661", "제목",
+    )
+
+
+def test_a_display_node_id_equal_to_the_source_id_is_accepted():
+    """대조군: metadata.node_id가 source id와 같으면 쓰기는 받아들인다. 사전 검사도 거부하지 않는다."""
+    from opencrab.pack.source_writer import preflight_source_write
+
+    assert preflight_source_write(
+        None, None, None, text="본문", source_id="src-661",
+        metadata={"node_id": "src-661"}, principal=_principal(), pack_id="default-new-661",
+    ) is None
+
+
+def test_a_foreign_vector_row_alone_rejects_the_rest_ingest_without_a_default_pack(
+    rest, data_dir, monkeypatch,
+):
+    """REST 훅이 doc과 그래프만이 아니라 벡터도 사전 검사에 넘긴다."""
+    client, ctx = rest
+    monkeypatch.setattr(
+        type(ctx.vector), "get_by_id", lambda _self, _id: {"metadata": {"pack_id": "pack-b"}},
+    )
+    legacy_id, headers = _legacy_user(ctx.sql, "legacy")
+    _member_id, member_headers = _user(ctx.sql, "member")
+    expected = _ingest(client, member_headers)
+    before = _all_rows(data_dir)
+
+    resp = _ingest(client, headers)
+
+    assert expected.status_code == 422, expected.text
+    assert _FOREIGN_SOURCE_DETAIL in expected.json()["detail"]
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == expected.json()
+    assert _packs_of(ctx.sql, legacy_id) == []
+    assert _changed(before, _all_rows(data_dir)) == []
+
+
+def _readable_graph(rows, digest=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        available=True, get_node=lambda *_a: None, get_nodes_by_id=lambda _id: rows,
+        get_node_digest=lambda *_a, **_k: digest,
+    )
+
+
+def _docs_with_a_foreign_node_row():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        available=True, get_source=lambda _id: None,
+        get_node_doc=lambda *_a: {"properties": {"pack_id": "pack-b"}},
+    )
+
+
+@pytest.mark.parametrize(
+    "case", ["id-at-the-budget", "unavailable-graph-that-still-answers"],
+)
+def test_the_long_id_carve_out_needs_a_readable_empty_answer_and_an_id_past_the_budget(case):
+    """우회로는 예산을 넘는 id와 읽을 수 있는 빈 답이 둘 다 있을 때만 탄다. 아니면 노드 슬롯을 본다."""
+    from types import SimpleNamespace
+
+    from opencrab.pack.source_writer import preflight_source_write
+
+    if case == "id-at-the-budget":
+        source_id, graph = "G" * SOURCE_NODE_ID_BUDGET, _readable_graph([])
+    else:
+        source_id = "G" * (SOURCE_NODE_ID_BUDGET + 1)
+        graph = SimpleNamespace(available=False, get_nodes_by_id=lambda _id: [])
+
+    with pytest.raises(ValueError, match=_FOREIGN_NODE_DETAIL):
+        preflight_source_write(
+            _docs_with_a_foreign_node_row(), None, graph, text="본문", source_id=source_id,
+            metadata=None, principal=_principal(), pack_id="default-new-661",
+        )
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"node_type": "TextUnit"}, {"node_type": "Entity"}],
+        [{"node_type": "Entity"}],
+    ],
+    ids=["duplicate-rows", "row-of-another-type"],
+)
+def test_an_existing_row_that_cannot_take_the_cas_path_raises_node_identity_conflict(rows):
+    """쓰기는 이 행들에서 일반 삽입 경로로 가서 NodeIdentityConflict를 낸다. 사전 검사는 같은 예외 종류를 낸다."""
+    from opencrab.common.graph_identity import NodeIdentityConflict
+    from opencrab.pack.source_writer import preflight_source_write
+
+    # digest를 읽을 수 있어도 행이 둘이거나 다른 타입이면 CAS 토큰을 쓰지 않는다.
+    graph = _readable_graph(rows, digest="digest-661")
+    with pytest.raises(NodeIdentityConflict, match="node identity conflict: src-661"):
+        preflight_source_write(
+            None, None, graph, text="본문", source_id="src-661",
+            metadata=None, principal=_principal(), pack_id="default-new-661",
+        )
+
+
+def test_the_preflight_probes_the_typed_node_slot_of_the_source_node_type():
+    """타입 지정 노드 탐침이 읽기에 실패하면 쓰기와 같이 소유 확인 불가로 거부한다."""
+    from types import SimpleNamespace
+
+    from opencrab.pack.source_writer import preflight_source_write
+
+    def _get_node(node_type, _node_id):
+        if node_type == "TextUnit":
+            raise RuntimeError("typed probe failed")
+        return None
+
+    graph = SimpleNamespace(available=True, get_node=_get_node, get_nodes_by_id=lambda _id: [])
+
+    with pytest.raises(ValueError, match="cannot verify existing ownership"):
+        preflight_source_write(
+            None, None, graph, text="본문", source_id="src-661",
+            metadata=None, principal=_principal(), pack_id="default-new-661",
+        )
+
+
+def test_a_single_text_unit_row_with_a_readable_digest_is_not_rejected_by_the_cas_rule():
+    """대조군: 같은 타입 행 하나에 읽을 수 있는 digest가 있으면 쓰기는 CAS 경로로 이어받는다."""
+    from types import SimpleNamespace
+
+    from opencrab.pack.source_writer import preflight_source_write
+
+    graph = _readable_graph([{"node_type": "TextUnit"}])
+    graph = SimpleNamespace(**{**vars(graph), "get_node_digest": lambda *_a, **_k: "digest-661"})
+
+    assert preflight_source_write(
+        None, None, graph, text="본문", source_id="src-661",
+        metadata=None, principal=_principal(), pack_id="default-new-661",
+    ) is None
