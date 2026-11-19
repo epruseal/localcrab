@@ -895,3 +895,16 @@ def test_a_single_text_unit_row_with_a_readable_digest_is_not_rejected_by_the_ca
         None, None, graph, text="본문", source_id="src-661",
         metadata=None, principal=_principal(), pack_id="default-new-661",
     ) is None
+
+
+def test_a_foreign_row_among_duplicate_rows_gets_the_node_slot_answer():
+    """같은 id의 행이 둘이고 무태그 행과 남의 행이 섞이면 쓰기는 노드 슬롯 거부로 답한다. 사전 검사도 같은 문구를 낸다."""
+    from opencrab.pack.source_writer import preflight_source_write
+
+    graph = _readable_graph([{"node_type": "TextUnit"}, {"node_type": "Entity", "pack_id": "pack-b"}])
+    with pytest.raises(ValueError) as excinfo:
+        preflight_source_write(
+            None, None, graph, text="본문", source_id="src-661",
+            metadata=None, principal=_principal(), pack_id="default-new-661",
+        )
+    assert str(excinfo.value) == "src-661: identity is already attributed to a different pack"
