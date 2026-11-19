@@ -908,3 +908,15 @@ def test_a_foreign_row_among_duplicate_rows_gets_the_node_slot_answer():
             metadata=None, principal=_principal(), pack_id="default-new-661",
         )
     assert str(excinfo.value) == "src-661: identity is already attributed to a different pack"
+
+
+def test_a_non_list_answer_of_the_rows_probe_reads_as_cannot_tell():
+    """쓰기와 사전 검사가 함께 쓰는 행 조회는 목록이 아닌 답을 행 없음으로 읽지 않고 알 수 없음(None)으로 돌려준다."""
+    from types import SimpleNamespace
+
+    from opencrab.pack.source_writer import _existing_node_rows
+
+    rows = [{"node_type": "TextUnit"}]
+    for answer, expected in ((tuple(rows), None), ({"node_type": "TextUnit"}, None), (rows, rows), ([], [])):
+        graph = SimpleNamespace(available=True, get_nodes_by_id=lambda _id, answer=answer: answer)
+        assert _existing_node_rows(graph, "src-661") == expected, answer

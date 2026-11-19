@@ -238,6 +238,22 @@ class TestResolveWritePackAdmit:
         assert len(set(seen)) == 2, seen
         assert all(re.fullmatch(r"default-[0-9a-f]{16}", s) for s in seen), seen
 
+    def test_a_caller_without_admit_adds_no_default_pack_lookup(self, sql, alice, monkeypatch):
+        """admit을 넘기지 않는 기존 호출자는 이 변경 전과 같이 조회를 한 번도 더하지 않는다."""
+        import opencrab.pack.ownership as ownership
+
+        calls: list[str] = []
+        real = ownership.find_default_pack
+
+        def spy(sql_store, owner_id):
+            calls.append(owner_id)
+            return real(sql_store, owner_id)
+
+        monkeypatch.setattr(ownership, "find_default_pack", spy)
+        principal = Principal(user_id=alice, is_local=False, disabled=False)
+        assert resolve_write_pack(sql, principal, None) == ensure_default_pack(sql, alice)
+        assert calls == []
+
 
 # ---------------------------------------------------------------------------
 # _row_to_dict normalizes is_default to bool
