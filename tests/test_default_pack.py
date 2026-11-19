@@ -160,6 +160,102 @@ class TestResolveWritePack:
 
 
 # ---------------------------------------------------------------------------
+# resolve_write_pack(admit=...) (#661): 기본 팩 행을 만들기 전의 읽기 전용 사전 검사
+# ---------------------------------------------------------------------------
+
+
+def _legacy_principal(sql, user_id="legacy-user-661"):
+    """기본 팩이 없는 사용자(create_user 이전 행의 모양)."""
+    from sqlalchemy import text
+
+    with sql._engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO users (user_id, display_name, is_local) VALUES (:u, :n, 0)"),
+            {"u": user_id, "n": user_id},
+        )
+    return Principal(user_id=user_id, is_local=False, disabled=False)
+
+
+class TestResolveWritePackAdmit:
+    def test_find_default_pack_reads_without_creating(self, sql, alice):
+        from opencrab.pack.ownership import find_default_pack
+
+        legacy = _legacy_principal(sql)
+        assert find_default_pack(sql, legacy.user_id) is None
+        assert _all_packs_for_owner(sql, legacy.user_id) == []
+        assert find_default_pack(sql, alice) == ensure_default_pack(sql, alice)
+
+    def test_find_default_pack_ignores_a_pack_that_is_not_the_default(self, sql):
+        from opencrab.pack.ownership import create_pack, find_default_pack
+
+        legacy = _legacy_principal(sql)
+        create_pack(sql, legacy.user_id, "not-default-661")
+        assert find_default_pack(sql, legacy.user_id) is None
+
+    def test_admit_is_not_called_when_a_pack_is_requested(self, sql):
+        legacy = _legacy_principal(sql)
+        seen: list[str] = []
+        assert resolve_write_pack(sql, legacy, "named-pack", admit=seen.append) == "named-pack"
+        assert seen == []
+        assert _all_packs_for_owner(sql, legacy.user_id) == []
+
+    def test_admit_is_not_called_when_the_default_pack_exists(self, sql, alice):
+        principal = Principal(user_id=alice, is_local=False, disabled=False)
+        seen: list[str] = []
+        pack_id = resolve_write_pack(sql, principal, None, admit=seen.append)
+        assert seen == []
+        assert pack_id == ensure_default_pack(sql, alice)
+
+    def test_a_rejecting_admit_creates_no_pack_row(self, sql):
+        legacy = _legacy_principal(sql)
+
+        def reject(_pack_id: str) -> None:
+            raise ValueError("rejected by admit")
+
+        with pytest.raises(ValueError, match="rejected by admit"):
+            resolve_write_pack(sql, legacy, None, admit=reject)
+        assert _all_packs_for_owner(sql, legacy.user_id) == []
+
+    def test_an_accepting_admit_sees_a_default_style_id_before_the_pack_exists(self, sql):
+        legacy = _legacy_principal(sql)
+        seen: list[str] = []
+
+        def accept(pack_id: str) -> None:
+            assert _all_packs_for_owner(sql, legacy.user_id) == []
+            seen.append(pack_id)
+
+        created = resolve_write_pack(sql, legacy, None, admit=accept)
+        assert len(seen) == 1 and seen[0].startswith("default-"), seen
+        assert [r["pack_id"] for r in _all_packs_for_owner(sql, legacy.user_id)] == [created]
+
+    def test_each_admitted_write_sees_a_fresh_id_of_the_default_shape(self, sql):
+        """클라이언트가 미리 알 수 있는 id로 판정하면 안 된다. 두 번 부른 id가 서로 다르다."""
+        import re
+
+        seen: list[str] = []
+        for name in ("legacy-a-661", "legacy-b-661"):
+            resolve_write_pack(sql, _legacy_principal(sql, name), None, admit=seen.append)
+        assert len(set(seen)) == 2, seen
+        assert all(re.fullmatch(r"default-[0-9a-f]{16}", s) for s in seen), seen
+
+    def test_a_caller_without_admit_adds_no_default_pack_lookup(self, sql, alice, monkeypatch):
+        """admit을 넘기지 않는 기존 호출자는 이 변경 전과 같이 조회를 한 번도 더하지 않는다."""
+        import opencrab.pack.ownership as ownership
+
+        calls: list[str] = []
+        real = ownership.find_default_pack
+
+        def spy(sql_store, owner_id):
+            calls.append(owner_id)
+            return real(sql_store, owner_id)
+
+        monkeypatch.setattr(ownership, "find_default_pack", spy)
+        principal = Principal(user_id=alice, is_local=False, disabled=False)
+        assert resolve_write_pack(sql, principal, None) == ensure_default_pack(sql, alice)
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # _row_to_dict normalizes is_default to bool
 # ---------------------------------------------------------------------------
 

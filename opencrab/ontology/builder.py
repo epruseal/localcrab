@@ -72,6 +72,54 @@ def _safe_store_status(exc: Exception) -> str:
     return f"error: {type(exc).__name__}"
 
 
+def validate_node_input(
+    properties: dict[str, Any] | None,
+    *,
+    space: str,
+    node_type: str,
+    principal: Any,
+    pack_id: str,
+    origin: str,
+) -> dict[str, Any]:
+    """The checks of ``add_node`` that read no store, and the stamped properties (#661).
+
+    ``add_node`` runs this before its first probe. ``preflight_source_write``
+    runs the same function, so a caller that has to refuse a request before it
+    creates a pack row cannot disagree with the write about the checks in
+    this function.
+    Raises ``ValueError`` and writes nothing.
+    """
+    # Stamping must run BEFORE canonicalize_pack_alias (#148): that helper
+    # rewrites pack tags in place, so a stamp running after it can no longer see
+    # what the caller asked for and a forged pack_id would pass silently.
+    # `stamp` returns a NEW dict, so the caller's properties stay unchanged.
+    props = stamp(
+        properties, principal=principal, pack_id=pack_id, keys=NODE_STAMPED,
+        origin=origin,
+    )
+
+    # Ownership-tag invariant (#171): a row cannot carry `pack` and a truthy
+    # `pack_id` with different values. This is the funnel every graph/doc/vector
+    # node write reaches (MCP, REST, pack ingest, pack loader), so the check
+    # belongs here rather than in each entry point.
+    canonicalize_pack_alias(props)
+
+    # Grammar validation FIRST -- before any probe. `node_type` is
+    # caller-controlled on the REST /api/nodes and MCP ontology_add_node
+    # paths, and Neo4jStore.get_node interpolates it directly into
+    # `MATCH (n:{node_type} ...)`. Probing before validating let an
+    # authenticated caller run mutating Cypher (e.g. a label of
+    # `X) DETACH DELETE n //`) even though the request was rejected a few
+    # lines later. Validation is pure and cheap; it belongs in front.
+    result = validate_node(space, node_type)
+    result.raise_node_grammar_error()
+
+    # Schema property validation (raises ValueError on failure)
+    prop_result = validate_node_properties(node_type, props)
+    prop_result.raise_node_grammar_error()
+    return props
+
+
 class OntologyBuilder:
     """Coordinates multi-store writes for ontology nodes and edges."""
 
@@ -302,31 +350,10 @@ class OntologyBuilder:
             authorize_fork_copy(self._sql, principal, pack_id)
         else:
             authorize(self._sql, principal, pack_id)
-        props = stamp(
-            properties, principal=principal, pack_id=pack_id, keys=NODE_STAMPED,
-            origin=origin,
+        props = validate_node_input(
+            properties, space=space, node_type=node_type,
+            principal=principal, pack_id=pack_id, origin=origin,
         )
-
-        # Ownership-tag invariant (#171): a row cannot carry `pack` and a truthy
-        # `pack_id` with different values. This is the funnel every graph/doc/vector
-        # node write reaches (MCP, REST, pack ingest, pack loader), so the check
-        # belongs here rather than in each entry point.
-        canonicalize_pack_alias(props)
-
-
-        # Grammar validation FIRST -- before any probe. `node_type` is
-        # caller-controlled on the REST /api/nodes and MCP ontology_add_node
-        # paths, and Neo4jStore.get_node interpolates it directly into
-        # `MATCH (n:{node_type} ...)`. Probing before validating let an
-        # authenticated caller run mutating Cypher (e.g. a label of
-        # `X) DETACH DELETE n //`) even though the request was rejected a few
-        # lines later. Validation is pure and cheap; it belongs in front.
-        result = validate_node(space, node_type)
-        result.raise_node_grammar_error()
-
-        # Schema property validation (raises ValueError on failure)
-        prop_result = validate_node_properties(node_type, props)
-        prop_result.raise_node_grammar_error()
 
         # Identity slot guard (#146, promoted to the gate in #148). Node
         # identity is not qualified by pack on any backend, so writing an id

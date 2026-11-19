@@ -45,15 +45,18 @@ from typing import Any, Literal
 from opencrab.common.graph_identity import (
     GraphSchemaMigrationRequired,
     GraphWriteUnavailable,
+    NodeIdentityConflict,
+    prepare_node,
 )
 from opencrab.common.pack_tags import canonicalize_pack_alias
-from opencrab.ontology.builder import SKIPPED_GRAPH_WRITE_FAILED
+from opencrab.ontology.builder import SKIPPED_GRAPH_WRITE_FAILED, validate_node_input
 from opencrab.pack.fork_remap import SOURCE_NODE_ID_BUDGET
 from opencrab.pack.write_gate import (
     SOURCE_STAMPED,
     authorize,
     authorize_fork_copy,
     identity_reject_message,
+    node_identity_conflict,
     source_identity_conflict,
     stamp,
 )
@@ -109,6 +112,69 @@ def _check_display_node_id(
         )
 
 
+def validate_source_input(
+    metadata: Mapping[str, Any] | None,
+    *,
+    source_id: str,
+    principal: Any,
+    pack_id: str,
+    origin: str = "client",
+) -> dict[str, Any]:
+    """The checks of ``write_source`` that read no store, and the stamped metadata.
+
+    Stamps the server-owned identity keys, fills the default space, refuses a
+    separate display ``node_id`` (#544) and a ``pack`` alias that disagrees
+    with ``pack_id`` (#171). Raises ``ValueError`` and writes nothing.
+    ``write_source`` and ``preflight_source_write`` both run this one function,
+    so the two cannot disagree on what a request must look like.
+    """
+    meta = stamp(
+        metadata, principal=principal, pack_id=pack_id, keys=SOURCE_STAMPED,
+        origin=origin,
+    )
+    meta.setdefault("space", _DEFAULT_SPACE)
+    _check_display_node_id(meta, source_id=source_id, origin=origin)
+
+    # #171 ownership-tag invariant, checked BEFORE the first write. `pack` is
+    # not a reserved boundary key, so a client can still send it; leaving the
+    # check to the vector leg means the doc row is already committed when it
+    # fires.
+    canonicalize_pack_alias(meta)
+    return meta
+
+
+def _node_leg_skipped(source_id: str, rows: list[dict[str, Any]] | None) -> bool:
+    """True when the graph leg creates no node for this id (the long-id carve-out).
+
+    An id past the budget cannot survive as a node id through a fork remap, and
+    tests/test_pack_fork.py's T77 pins that a source-only id of that length must
+    NOT make a pack unforkable. So do not CREATE a node for it.
+
+    The ``rows == []`` half is not decoration. The carve-out is "do not
+    create", not "do not look": a node for a long id can already exist
+    (pack_ingest's text_as_node=True has no length check, and a fork of a
+    budget-length source produces one). Skipping the update there would leave
+    the graph on the old text while the doc row moved to the new one -- the
+    divergence this whole leg exists to prevent. ``_existing_node_rows``
+    returns None for "cannot tell", and ``None == []`` is False, so every
+    uncertain answer falls through to the normal path and fails closed there.
+    """
+    return len(source_id) > SOURCE_NODE_ID_BUDGET and rows == []
+
+
+def _source_node_props(text: str, meta: Mapping[str, Any], pack_id: str) -> dict[str, Any]:
+    """The properties of the ``TextUnit`` node that mirrors a source.
+
+    ``_graph_leg`` and ``preflight_source_write`` both call this, so the
+    preflight judges the same properties that the graph write receives.
+    """
+    node_props: dict[str, Any] = {"pack_id": pack_id, "text": text}
+    for key in ("title", "source"):
+        if meta.get(key):
+            node_props[key] = meta[key]
+    return node_props
+
+
 def _docs_available(docs: Any) -> bool:
     return bool(getattr(docs, "available", False))
 
@@ -145,14 +211,29 @@ def _existing_node_rows(graph: Any, source_id: str) -> list[dict[str, Any]] | No
     return rows if isinstance(rows, list) else None
 
 
-def _node_digest(graph: Any, source_id: str) -> str | None:
+def _node_digest(
+    graph: Any, source_id: str, rows: list[dict[str, Any]] | None
+) -> str | None:
     """CAS token for an existing ``TextUnit`` row, or ``None``.
 
     ``None`` sends ``add_node`` down its plain-insert path, where the store's
     own digest comparison rejects a mismatch. That is the correct disposition
     for every ``None`` case here: no row, a row of another type, a backend
     without the method, or a read that failed.
+
+    The token is read only for an existing row of THIS type. All three
+    backends filter ``get_node_digest`` on node_type, so ``if rows`` has the
+    same result today. The check keeps the shape the design states, so a
+    future backend without that filter cannot send the digest of another type
+    into the update path. ``_graph_leg`` and ``preflight_source_write`` both
+    call this function, so they cannot disagree about the path the write takes.
     """
+    if not (
+        rows is not None
+        and len(rows) == 1
+        and rows[0].get("node_type") == _SOURCE_NODE_TYPE
+    ):
+        return None
     getter = getattr(graph, "get_node_digest", None)
     if getter is None:
         return None
@@ -278,18 +359,10 @@ def write_source(
     if reason:
         raise ValueError(identity_reject_message("source", source_id, reason))
 
-    meta = stamp(
-        metadata, principal=principal, pack_id=pack_id, keys=SOURCE_STAMPED,
+    meta = validate_source_input(
+        metadata, source_id=source_id, principal=principal, pack_id=pack_id,
         origin=origin,
     )
-    meta.setdefault("space", _DEFAULT_SPACE)
-    _check_display_node_id(meta, source_id=source_id, origin=origin)
-
-    # #171 ownership-tag invariant, checked BEFORE the first write. `pack` is
-    # not a reserved boundary key, so a client can still send it; leaving the
-    # check to the vector leg means the doc row is already committed when it
-    # fires.
-    canonicalize_pack_alias(meta)
 
     receipt: dict[str, Any] = {"source_id": source_id, "metadata": meta, "stores": {}}
 
@@ -368,6 +441,105 @@ def write_source(
     return receipt
 
 
+def preflight_source_write(
+    docs: Any,
+    vector: Any,
+    graph: Any,
+    *,
+    text: str,
+    source_id: str,
+    metadata: Mapping[str, Any] | None,
+    principal: Any,
+    pack_id: str,
+) -> None:
+    """Raise what ``write_source`` raises for this request. Write nothing (#661).
+
+    ``pack_id`` is a throwaway id with the shape of a new default pack id.
+    ``resolve_write_pack(admit=...)`` calls this function BEFORE it inserts the
+    registry row of the new default pack. A rejected request then leaves no
+    row. The new pack belongs to the caller and has the ready status, so this
+    function does not repeat ``authorize``. The caller did not enter
+    ``principal_scope`` yet, so ``principal`` is a parameter. The checks follow
+    the order of ``write_source``:
+
+    1. the source slot of another pack (``source_identity_conflict``),
+    2. the checks that read no store (``validate_source_input``),
+    3. the checks of ``add_node`` that read no store (``validate_node_input``),
+    4. the node slot of another pack (``node_identity_conflict``),
+    5. the property normalisation that the graph store runs at the start of its
+       own write (``prepare_node``), when the graph is available,
+    6. the refusal of the graph store for an existing node row, when the write
+       cannot use the CAS path (see below).
+
+    Steps 3 to 6 do not run for the over-budget id that the graph leg skips.
+    No row can carry the throwaway id. Every identity check therefore gives the
+    same answer for this id as for the id that ``ensure_default_pack`` stores.
+
+    Step 6: the properties of this request carry a pack id that no stored row
+    has, so their digest never equals the digest of a stored row. When a node
+    row exists and ``_node_digest`` returns no CAS token, the write takes the
+    plain insert path. The store then raises ``NodeIdentityConflict`` with the
+    text that this function uses. The Neo4j case in the list below is the
+    exception. A user with a pack gets the same answer for a row that the
+    caller does not own. The plain insert accepts a row of the caller with
+    equal content.
+
+    Known differences from the write:
+
+    - The Neo4j store compares a cached ``node_digest`` property on the CAS
+      path. The property can be stale or absent. This function does not read
+      it, so the write can still refuse after the pack row exists.
+    - On the CAS path, a damaged incident edge fails the write. The SQL store
+      raises ``GraphMigrationConflict``, and ``add_node`` records it in the
+      receipt (REST status 200). The Neo4j store raises
+      ``GraphPropertyValidationError`` (REST status 422). This function does not
+      read incident edges. On Neo4j, the write can therefore refuse after the
+      pack row exists.
+    - Some outcomes are not deterministic. This function and the write read
+      the stores in separate reads, so a transient read failure in the write
+      can refuse after the pack row exists. The CLI uses two separate lock
+      sections. A writer outside ``write_lock`` can change a slot or create the
+      default pack between the check and the insert. Then the check can also
+      refuse a request that the write accepts.
+    - The CLI also writes the anchor row of the new pack before ``write_source``
+      runs. A rejection that only the write finds leaves that row too.
+    - The graph store checks that it can write before it runs ``prepare_node``
+      and before it compares a node row. In that degraded state a user with a
+      pack gets an error receipt. This function raises for an invalid body or
+      an existing node row.
+    - On Neo4j, a stored node whose properties cannot give a digest (including
+      a node with no ``node_type`` value) makes the write raise
+      ``GraphPropertyValidationError``. This function raises
+      ``NodeIdentityConflict``. Both map to status 422.
+    - The message of the ``pack`` alias rule names ``pack_id``. This function
+      names the throwaway id.
+    """
+    reason = source_identity_conflict(docs, vector, source_id=source_id, pack_id=pack_id)
+    if reason:
+        raise ValueError(identity_reject_message("source", source_id, reason))
+    meta = validate_source_input(
+        metadata, source_id=source_id, principal=principal, pack_id=pack_id,
+    )
+    rows = _existing_node_rows(graph, source_id)
+    if _node_leg_skipped(source_id, rows):
+        return
+    props = validate_node_input(
+        _source_node_props(text, meta, pack_id),
+        space=_SOURCE_NODE_SPACE, node_type=_SOURCE_NODE_TYPE,
+        principal=principal, pack_id=pack_id, origin="client",
+    )
+    reason = node_identity_conflict(
+        graph, docs, vector, space=_SOURCE_NODE_SPACE, node_type=_SOURCE_NODE_TYPE,
+        node_id=source_id, pack_id=pack_id,
+    )
+    if reason:
+        raise ValueError(identity_reject_message("node", source_id, reason))
+    if graph is not None and getattr(graph, "available", False):
+        prepare_node(_SOURCE_NODE_TYPE, source_id, props, _SOURCE_NODE_SPACE)
+    if rows and _node_digest(graph, source_id, rows) is None:
+        raise NodeIdentityConflict(f"node identity conflict: {source_id}")
+
+
 def _graph_leg(
     receipt: dict[str, Any],
     graph: Any,
@@ -421,28 +593,12 @@ def _graph_leg(
 
     rows = _existing_node_rows(graph, source_id)
 
-    if len(source_id) > SOURCE_NODE_ID_BUDGET and rows == []:
-        # An id past the budget cannot survive as a node id through a fork
-        # remap, and tests/test_pack_fork.py's T77 pins that a source-only id
-        # of that length must NOT make a pack unforkable. So do not CREATE a
-        # node for it.
-        #
-        # The `rows == []` half is not decoration. The carve-out is "do not
-        # create", not "do not look": a node for a long id can already exist
-        # (pack_ingest's text_as_node=True has no length check, and a fork of a
-        # budget-length source produces one). Skipping the update there would
-        # leave the graph on the old text while the doc row moved to the new
-        # one -- the divergence this whole leg exists to prevent. `_existing_
-        # node_rows` returns None for "cannot tell", and `None == []` is False,
-        # so every uncertain answer falls through to the normal path and fails
-        # closed there.
+    if _node_leg_skipped(source_id, rows):
+        # See `_node_leg_skipped`: no node is created for an over-budget id.
         receipt["stores"]["graph"] = _GRAPH_SKIPPED_LONG_ID
         return True
 
-    node_props: dict[str, Any] = {"pack_id": pack_id, "text": text}
-    for key in ("title", "source"):
-        if meta.get(key):
-            node_props[key] = meta[key]
+    node_props = _source_node_props(text, meta, pack_id)
 
     # Properties are REPLACED, not merged (design v13 §4.2). The node is a
     # projection of the source, so it mirrors the latest source write: a
@@ -466,18 +622,8 @@ def _graph_leg(
             # text_as_node=True branch makes the mirror-image call for the same
             # reason.
             write_vector=False,
-            # Read the CAS token only for an existing row of THIS type. All
-            # three backends filter `get_node_digest` on node_type, so `if
-            # rows` happens to behave the same today -- narrowed to the shape
-            # the design states so a future backend without that filter cannot
-            # quietly send another type's digest into the update path.
-            _expected_current_digest=(
-                _node_digest(graph, source_id)
-                if rows is not None
-                and len(rows) == 1
-                and rows[0].get("node_type") == _SOURCE_NODE_TYPE
-                else None
-            ),
+            # The CAS token of an existing row of this type (see `_node_digest`).
+            _expected_current_digest=_node_digest(graph, source_id, rows),
         )
     except (GraphSchemaMigrationRequired, GraphWriteUnavailable) as exc:
         # Operational failure of the system of record -- reported, not raised,
