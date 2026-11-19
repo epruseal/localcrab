@@ -456,11 +456,11 @@ def preflight_source_write(
 
     ``pack_id`` is a throwaway id with the shape of a new default pack id.
     ``resolve_write_pack(admit=...)`` calls this function BEFORE it inserts the
-    registry row of the new default pack. A rejected request then leaves no row. The new
-    pack belongs to the caller and has the ready status, so this function does
-    not repeat ``authorize``. The caller did not enter ``principal_scope``
-    yet, so ``principal`` is a parameter. The checks follow the order of
-    ``write_source``:
+    registry row of the new default pack. A rejected request then leaves no
+    row. The new pack belongs to the caller and has the ready status, so this
+    function does not repeat ``authorize``. The caller did not enter
+    ``principal_scope`` yet, so ``principal`` is a parameter. The checks follow
+    the order of ``write_source``:
 
     1. the source slot of another pack (``source_identity_conflict``),
     2. the checks that read no store (``validate_source_input``),
@@ -480,9 +480,9 @@ def preflight_source_write(
     row exists and ``_node_digest`` returns no CAS token, the write takes the
     plain insert path. The store then raises ``NodeIdentityConflict`` with the
     text that this function uses. The Neo4j case in the list below is the
-    exception. A user with a pack gets the same
-    answer for a row that the caller does not own. The plain insert accepts a
-    row of the caller with equal content.
+    exception. A user with a pack gets the same answer for a row that the
+    caller does not own. The plain insert accepts a row of the caller with
+    equal content.
 
     Known differences from the write:
 

@@ -402,7 +402,7 @@ def test_a_failing_digest_read_is_judged_like_the_write_does(rest, data_dir, mon
 
 
 def test_the_preflight_does_not_reject_when_no_graph_can_be_read():
-    """그래프가 없거나 사용할 수 없으면 쓰기는 속성 정규화 없이 영수증으로 답한다. 사전 검사는 이 요청을 거부하지 않는다."""
+    """그래프가 없거나 available이 거짓이면 쓰기는 속성 정규화 없이 영수증으로 답한다. 사전 검사는 이 요청을 거부하지 않는다. `available`이 없는 객체 사례는 사전 검사의 동작만 고정한다."""
     from types import SimpleNamespace
 
     from opencrab.auth import Principal
