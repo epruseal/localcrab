@@ -167,6 +167,16 @@ def failed_shared_file(db_path: str) -> SharedSqliteFile | None:
         return next(iter(objects), None)
 
 
+def reject_single_file_mode(settings: Any) -> None:
+    """단일 SQLite 모드에서는 인증 저장소를 옛 opencrab.db로 여는 경로를 거부한다(#671).
+
+    단일 DB가 사용자와 토큰과 팩 소유권을 함께 담는다. 인증이 옛 파일을 따로 열면 두 저장소가 갈라진다.
+    공유 객체 연결은 후속 단위가 맡고 그때까지 이 거부가 막는다.
+    """
+    if getattr(settings, "single_sqlite_file", ""):
+        raise RuntimeError("single SQLite authentication is not wired")
+
+
 def reject_unmanaged_single_file(db_path: str) -> None:
     """공유 연결 없이 단일 파일 스키마를 열지 않는다."""
     path = Path(db_path)

@@ -1184,3 +1184,189 @@ def test_single_factory_bm25_missing_object_turns_off(tmp_path, monkeypatch, var
     _assert_bm25_turns_off_after(
         built.root, statement, opener=lambda root: factory.make_doc_store(settings)
     )
+
+
+# ---------------------------------------------------------------------------
+# S5: 우회 경로 거부(#671)
+# ---------------------------------------------------------------------------
+
+_AUTH_REFUSAL = "single SQLite authentication is not wired"
+
+
+def _single_env(monkeypatch, root: Path) -> None:
+    """get_settings()가 단일 모드 설정을 읽게 환경변수를 맞춘다."""
+    from opencrab.config import get_settings
+
+    _point_at(monkeypatch, root)
+    monkeypatch.setenv("STORAGE_MODE", "local")
+    monkeypatch.setenv("SINGLE_SQLITE_FILE", str(root / "single.db"))
+    get_settings.cache_clear()
+
+
+def _assert_no_auth_files(root: Path, before: list[str]) -> None:
+    names = _names(root)
+    assert names == before, names
+    assert "opencrab.db" not in names
+    assert "bootstrap.lock" not in names
+
+
+def _http_post(token: str = "tok"):
+    from fastapi.testclient import TestClient
+
+    from opencrab.mcp.http_app import create_app
+
+    client = TestClient(create_app())
+    return client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+@pytest.mark.parametrize("path", ["require_local_principal", "maybe_bootstrap_on_empty", "http_auth_store"])
+def test_single_mode_refuses_auth_bypass_paths(tmp_path, monkeypatch, path):
+    """T-E7(F-20): 단일 모드에서는 인증 세 경로가 옛 opencrab.db를 열기 전에 거부한다.
+
+    게시 root에는 opencrab.db가 없으므로 거부가 부재 검사보다 앞서야 도달한다. root에 새 파일이 생기지 않는다.
+    """
+    from opencrab.auth import maybe_bootstrap_on_empty, require_local_principal
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    _single_env(monkeypatch, built.root)
+    before = _names(built.root)
+    assert "opencrab.db" not in before
+    if path == "require_local_principal":
+        with pytest.raises(RuntimeError, match=_AUTH_REFUSAL):
+            require_local_principal()
+    elif path == "maybe_bootstrap_on_empty":
+        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
+        with pytest.raises(RuntimeError, match=_AUTH_REFUSAL):
+            maybe_bootstrap_on_empty()
+    else:
+        with pytest.raises(RuntimeError, match=_AUTH_REFUSAL):
+            _http_post()
+    _assert_no_auth_files(built.root, before)
+
+
+def test_auth_paths_with_empty_setting_keep_current_behavior(tmp_path, monkeypatch):
+    """T-E7 대조군: 설정이 비어 있으면 HTTP 인증은 이전 동작 그대로 401이다. 파일을 만들지 않는다.
+
+    require_local_principal의 미부트스트랩 오류는 conftest의 쓰기 관문 목록을 건드리므로 기존 시험이 맡는다.
+    """
+    from opencrab.config import get_settings
+
+    root = tmp_path / "plain"
+    root.mkdir()
+    _point_at(monkeypatch, root)
+    monkeypatch.setenv("STORAGE_MODE", "local")
+    monkeypatch.delenv("SINGLE_SQLITE_FILE", raising=False)
+    get_settings.cache_clear()
+    assert _http_post().status_code == 401
+    assert os.listdir(root) == []
+
+
+def test_single_build_context_failure_closes_all(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-E6(F-19): _build_context가 중간(vector)에서 실패하면 이미 만든 저장소가 닫히고 잠금이 풀린다."""
+    from opencrab.mcp import tools as tools_pkg
+    from opencrab.stores import factory
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    _single_env(monkeypatch, built.root)
+
+    def boom(settings):
+        raise ValueError("vector boom")
+
+    monkeypatch.setattr(factory, "make_vector_store", boom)
+    monkeypatch.setattr(tools_pkg, "_context", {})
+    with pytest.raises(ValueError, match="vector boom"):
+        tools_pkg._get_context()
+    assert not tools_pkg._context
+    assert len(_fresh_single_registry) == 1
+    assert _open_entries(_fresh_single_registry) == []
+    _assert_lock_free(built.root)
+
+
+def test_single_write_gates_stay_fail_closed(tmp_path, monkeypatch):
+    """T-N7(증분 정리 한 곳): 게시 DB는 pack_delete_operations 표를 가지고 증분 정리는 단일 모드에서 거부된다.
+
+    팩 인가를 지나야 이 거부에 닿으므로 소유자 principal로 부른다. 삭제와 fork의 같은 거부는 인자가 무거워 S6로 넘긴다.
+    """
+    from pathlib import Path as _Path
+
+    from opencrab.auth import Principal, principal_scope
+    from opencrab.pack.load import load_nodes_incremental
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    graph, docs, vec, sql = _make_four(_single_settings(built.root))
+    try:
+        marker = sql.shared_file.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        assert marker is not None
+        principal = Principal(user_id=built.owner, is_local=True, disabled=False)
+        with principal_scope(principal):
+            with pytest.raises(RuntimeError, match="single SQLite incremental node cleanup is not yet supported"):
+                load_nodes_incremental(
+                    built.pack_id, _Path("unused.jsonl"), None, {}, {}, graph, docs, {}, vec=vec, sql=sql
+                )
+    finally:
+        _close_all((graph, docs, vec, sql))
+
+
+def test_single_backup_stays_refused(tmp_path, monkeypatch):
+    """T-E8(a): 단일 모드 백업은 거부되고 root에 아무것도 만들지 않는다."""
+    from opencrab.stores import backup as bk
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    before = _names(built.root)
+    with pytest.raises(bk.BackupError, match="단일 SQLite"):
+        bk.backup_data_dir(built.root, settings=_single_settings(built.root))
+    assert _names(built.root) == before
+
+
+def test_single_backfill_space_stays_refused(tmp_path, monkeypatch, capsys):
+    """T-E8(b): backfill_space는 단일 모드에서 rc 2로 거부하고 root에 아무것도 만들지 않는다."""
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    try:
+        import backfill_space
+    finally:
+        sys.path.pop(0)
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    _single_env(monkeypatch, built.root)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    before = _names(built.root)
+    rc = backfill_space.main(["--dry-run-scratch", str(scratch)])
+    assert rc == 2
+    assert "single SQLite mode is not supported by this tool" in capsys.readouterr().err
+    assert _names(built.root) == before
+
+
+def test_single_admin_cli_backfill_pack_id_refusals(tmp_path, monkeypatch):
+    """T-E8(c)(d): 관리 CLI backfill-pack-id는 단일 모드에서 우연히 거부된다. 이 거부를 고정한다.
+
+    (c) graph.db가 없으면 종료 코드 1이고 graph.db를 만들지 않는다.
+    (d) graph.db가 있으면 write.lock을 쥔 채 첫 factory 호출이 수명 잠금 순서 위반으로 거부되고 graph.db가 그대로다.
+    """
+    import hashlib
+
+    from click.testing import CliRunner
+
+    from opencrab.cli import main
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    _single_env(monkeypatch, built.root)
+    runner = CliRunner()
+    before = _names(built.root)
+    result = runner.invoke(main, ["packs", "backfill-pack-id", "--apply"])
+    assert result.exit_code == 1, (result.exit_code, result.output)
+    assert not (built.root / "graph.db").exists()
+    assert _names(built.root) == before
+
+    shutil.copy2(tmp_path / "live" / "graph.db", built.root / "graph.db")
+    digest = hashlib.sha256((built.root / "graph.db").read_bytes()).hexdigest()
+    result = runner.invoke(main, ["packs", "backfill-pack-id", "--apply"])
+    assert isinstance(result.exception, RuntimeError), (result.exit_code, result.output, result.exception)
+    assert "lifetime lock order violated" in str(result.exception)
+    assert hashlib.sha256((built.root / "graph.db").read_bytes()).hexdigest() == digest

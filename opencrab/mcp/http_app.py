@@ -568,6 +568,10 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
             from opencrab.stores.sql_store import SQLStore
 
             settings = get_settings()
+            # 단일 모드는 opencrab.db 부재 시 None(401)을 돌려주기 전에 거부한다(#671).
+            from opencrab.stores._single_file import reject_single_file_mode
+
+            reject_single_file_mode(settings)
             if settings.is_local:
                 # Same reason as opencrab.auth.require_local_principal: on
                 # SQLite, *connecting* to a missing path creates it. An

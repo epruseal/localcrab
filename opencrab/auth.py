@@ -599,6 +599,10 @@ def require_local_principal() -> Principal:
     from opencrab.stores.sql_store import SQLStore
 
     settings = get_settings()
+    # 단일 모드 거부는 opencrab.db 부재 검사보다 앞이다. 게시 root에는 그 파일이 없어 뒤에 두면 닿지 않는다(#671).
+    from opencrab.stores._single_file import reject_single_file_mode
+
+    reject_single_file_mode(settings)
     not_bootstrapped = RuntimeError(
         "No local user is bootstrapped. Run 'opencrab init' first -- it "
         "creates the local user and issues its first token. (Looked for a "
@@ -829,9 +833,12 @@ def maybe_bootstrap_on_empty() -> Principal | None:
 
     from opencrab.config import get_settings
     from opencrab.locking import file_lock
+    from opencrab.stores._single_file import reject_single_file_mode
     from opencrab.stores.sql_store import SQLStore
 
     settings = get_settings()
+    # 단일 모드는 SQLStore와 bootstrap.lock을 만들기 전에 거부한다(#671).
+    reject_single_file_mode(settings)
 
     # G2: exactly "local" -- narrower than settings.is_local (also true for
     # "kuzu"), since the plugin contract pins a local sqlite store only.
