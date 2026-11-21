@@ -866,6 +866,8 @@ def _registry_delete(stores: Stores, sql: str, params: dict[str, Any]) -> None:
     # transaction, guarded by every recorded column.
     from sqlalchemy import text
 
+    if stores.sql.shared_file is not None:
+        raise RuntimeError("single SQLite registry repair requires a guarded implementation")
     with stores.sql._engine.begin() as conn:
         conn.execute(text(sql), params)
 

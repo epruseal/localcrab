@@ -276,6 +276,9 @@ def _ro(path: Path, immutable: bool) -> sqlite3.Connection:
 
 
 def _rw(path: Path) -> sqlite3.Connection:
+    from opencrab.stores._single_file import reject_unmanaged_single_file
+
+    reject_unmanaged_single_file(str(path))
     return sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True)
 
 

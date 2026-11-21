@@ -289,6 +289,37 @@ class TestBillingNotBlockedByWriteLockHolder:
         assert result["ok"] is True
         assert elapsed < 1.0  # no lock wait, no retry backoff -- effectively instant
 
+    def test_billing_emit_waits_for_billing_lock(self, tmp_path):
+        import threading
+
+        from opencrab.locking import file_lock
+        from opencrab.stores.sql_store import SQLStore
+
+        store = SQLStore(f"sqlite:///{tmp_path / 'billing.db'}", create_tables=False)
+        hooks = BillingHooks(store)
+        started, completed = threading.Event(), threading.Event()
+        results = []
+
+        def writer():
+            started.set()
+            results.append(hooks.emit("query"))
+            completed.set()
+
+        try:
+            with file_lock("billing.db.lock", str(tmp_path)):
+                thread = threading.Thread(target=writer)
+                thread.start()
+                assert started.wait(5)
+                assert not completed.wait(0.2)
+            thread.join(5)
+            assert not thread.is_alive()
+            assert completed.is_set()
+            assert results[0]["ok"] is True
+            with store._engine.connect() as conn:
+                assert conn.exec_driver_sql("SELECT count(*) FROM billing_events").scalar_one() == 1
+        finally:
+            store.close()
+
     def test_negative_control_the_old_shared_file_shape_really_did_block(self, tmp_path):
         """Proves the contention this fix removes was real: BillingHooks
         wired the pre-#105 way (sharing `sql`'s own file/store, exactly what

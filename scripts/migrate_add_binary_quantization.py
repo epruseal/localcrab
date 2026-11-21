@@ -49,6 +49,9 @@ import time
 def _connect(db_path: str) -> sqlite3.Connection:
     import sqlite_vec
 
+    from opencrab.stores._single_file import reject_unmanaged_single_file
+
+    reject_unmanaged_single_file(db_path)
     conn = sqlite3.connect(db_path)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)

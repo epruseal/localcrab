@@ -86,6 +86,10 @@ class _SqliteConnMixin:
         ``shared``(``opencrab.stores._single_file.SharedSqliteFile``)가 있으면 스레드별 연결과
         쓰기 락과 연결 목록을 그 객체의 것으로 바꿔 같은 파일을 쓰는 저장소들이 나눠 쓴다.
         """
+        if shared is None:
+            from opencrab.stores._single_file import reject_unmanaged_single_file
+
+            reject_unmanaged_single_file(db_path)
         self._db_path = db_path
         self._shared = shared
         # 쓰기 직렬화 락: 스레드별 커넥션이 같은 WAL 파일에 동시에 쓰면 SQLITE_BUSY가
@@ -138,6 +142,8 @@ class _SqliteConnMixin:
     def _conn(self) -> sqlite3.Connection | None:
         """현재 스레드의 커넥션(없으면 생성). 기존 메서드들이 self._conn.X 형태로
         그대로 쓰도록 property로 노출한다."""
+        if self._shared is not None:
+            return self._shared.connection()
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = self._new_conn()
@@ -172,7 +178,19 @@ class _SqliteConnMixin:
         rollback 을 시도하고, 호출자에게는 쓰기 자체가 실패한 것처럼 보인다.
         """
         shared = self._shared
+        if shared is not None and not shared.in_unit_of_work:
+            marker = shared.connection().execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                raise RuntimeError("single SQLite write requires a guarded unit of work")
         if shared is not None and shared.in_unit_of_work:
+            marker = shared.connection().execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None and not getattr(shared._uow, "validated_packs", {}):
+                shared.mark_rollback_only()
+                raise RuntimeError("single SQLite write requires a validated pack")
             # #671: ``unit_of_work()`` 안이면 이미 쓰기 락과 BEGIN IMMEDIATE를 쥐고 있다.
             # 합류 구간(SAVEPOINT)으로 감싸 안쪽 실패만 되돌리고, commit과 체크포인트는 바깥 구간이 맡는다.
             if immediate and exclusive:

@@ -105,7 +105,9 @@ class PGGraphStore(_SqlGraphStoreBase):
 
     _dialect = POSTGRES
 
-    def __init__(self, dsn_or_engine: Any, schema: str = "public") -> None:
+    def __init__(self, dsn_or_engine: Any, schema: str = "public", *, pg_uow: Any = None) -> None:
+        if pg_uow is not None and pg_uow.active:
+            raise RuntimeError("PG store cannot initialize inside a shared unit")
         if not _SCHEMA_IDENT_RE.match(schema):
             raise ValueError(f"Invalid schema identifier: {schema!r}")
         self._schema = schema
@@ -129,6 +131,9 @@ class PGGraphStore(_SqlGraphStoreBase):
             self._engine = create_engine(normalize_pg_url(str(dsn_or_engine)))
             self._owns_engine = True
 
+        if pg_uow is not None and pg_uow.engine is not self._engine:
+            raise ValueError("PostgreSQL unit of work uses a different engine")
+        self._pg_uow = pg_uow
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -137,7 +142,10 @@ class PGGraphStore(_SqlGraphStoreBase):
 
     @contextmanager
     def _conn(self, write: bool = False):
-        cm = self._engine.begin() if write else self._engine.connect()
+        uow = getattr(self, "_pg_uow", None)
+        cm = uow.connection(write=write) if uow is not None else (
+            self._engine.begin() if write else self._engine.connect()
+        )
         with cm as conn:
             yield conn
 
@@ -172,7 +180,7 @@ class PGGraphStore(_SqlGraphStoreBase):
             raise RuntimeError("nested graph transaction is not allowed")
         self._set_graph_tx_active(True)
         try:
-            with self._engine.begin() as conn:
+            with self._conn(write=True) as conn:
                 tx = GraphTx(conn, self._dialect, self._text)
                 tx.execute(
                     "SELECT pg_advisory_xact_lock(:graph_write_namespace, :graph_write_key)",

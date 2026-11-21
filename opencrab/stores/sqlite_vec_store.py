@@ -360,7 +360,10 @@ class SqliteVecStore(_SqliteConnMixin):
     # ------------------------------------------------------------------
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
-        return embed_and_validate(self._ef, self._dim, texts)
+        vectors = embed_and_validate(self._ef, self._dim, texts)
+        if len(vectors) != len(texts):
+            raise RuntimeError("embedding count does not match text count")
+        return vectors
 
     def _serialize(self, vec: list[float]) -> Any:
         import sqlite_vec
@@ -427,6 +430,15 @@ class SqliteVecStore(_SqliteConnMixin):
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
         with self._tx() as conn:
+            if self._shared is not None and self._shared.in_unit_of_work:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    validated = self._shared._uow.validated_packs
+                    if any(not slot_owner(meta) or slot_owner(meta) not in validated for meta in clean_meta):
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("vector owner is not validated")
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
                 conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
         self._ann_cache = None  # in-process write → invalidate ANN cache
@@ -467,10 +479,37 @@ class SqliteVecStore(_SqliteConnMixin):
         validate_lengths(texts, metadatas, ids)
         reject_batch_pack_conflicts(ids, metadatas)
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
-        vectors = self._embed(texts)
+        vectors = self.prepare_upsert_vectors(texts)
+        return self.upsert_precomputed(texts, clean_meta, ids, vectors)
+
+    def prepare_upsert_vectors(self, texts: list[str]) -> list[list[float]]:
+        self._require_available()
+        return self._embed(texts)
+
+    def upsert_precomputed(
+        self, texts: list[str], metadatas: list[dict[str, Any]], ids: list[str],
+        vectors: list[list[float]],
+    ) -> list[str]:
+        self._require_available()
+        validate_lengths(texts, metadatas, ids)
+        if len(vectors) != len(texts) or any(len(vec) != self._dim for vec in vectors):
+            raise ValueError("precomputed vectors do not match texts or dimension")
+        reject_batch_pack_conflicts(ids, metadatas)
+        clean_meta = [_sanitize_metadata(m) for m in metadatas]
         insert_sql = self._insert_sql()
         with self._tx() as conn:
-            reject_foreign_slot_writes(ids, clean_meta, self._slot_owners(conn, ids))
+            owners = self._slot_owners(conn, ids)
+            if self._shared is not None and self._shared.in_unit_of_work:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    validated = self._shared._uow.validated_packs
+                    incoming = [slot_owner(meta) for meta in clean_meta]
+                    if any(not owner or owner not in validated for owner in incoming + list(owners.values())):
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("vector owner is not validated")
+            reject_foreign_slot_writes(ids, clean_meta, owners)
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
                 incoming = slot_owner(meta)
                 conn.execute(
@@ -555,6 +594,16 @@ class SqliteVecStore(_SqliteConnMixin):
         if not ids:
             return
         with self._tx() as conn:
+            if self._shared is not None and self._shared.in_unit_of_work:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    owners = self._slot_owners(conn, ids)
+                    validated = self._shared._uow.validated_packs
+                    if any(not owner or owner not in validated for owner in owners.values()):
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("vector owner is not validated")
             for _id in ids:
                 conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
         self._ann_cache = None  # in-process write → invalidate ANN cache
@@ -565,6 +614,14 @@ class SqliteVecStore(_SqliteConnMixin):
         table" gap, and the write lock serialises concurrent resets. Same
         dim/schema is retained (dim is fixed at construction)."""
         self._require_available()
+        if self._shared is not None:
+            marker = self._shared.connection().execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                if self._shared.in_unit_of_work:
+                    self._shared.mark_rollback_only()
+                raise RuntimeError("single SQLite vector reset is not supported")
         with self._tx() as conn:
             # ensure the table exists (idempotent, schema-preserving) then
             # clear all rows atomically
@@ -623,7 +680,7 @@ class SqliteVecStore(_SqliteConnMixin):
         # the ELSE branch, which sets `fetch_k = _VEC0_K_MAX` (4096) — a
         # bounded, approximate, but non-empty candidate pool.
         pack_scope: frozenset[str] | None = None
-        if pack_values is not None and len(pack_values) > _PACK_KNN_MAX:
+        if self._shared is None and pack_values is not None and len(pack_values) > _PACK_KNN_MAX:
             pack_scope = frozenset(pack_values)
             pack_values = None
             pack_only = False
@@ -649,9 +706,19 @@ class SqliteVecStore(_SqliteConnMixin):
         else:
             fetch_k = _VEC0_K_MAX
 
-        rows = self._select_query_mode(
-            qvec, pack_values, predicate, fetch_k, n_results, pack_scope=pack_scope
-        )
+        if self._shared is not None and pack_values and not self._conn.in_transaction:
+            conn = self._conn
+            conn.execute("BEGIN")
+            try:
+                rows = self._select_query_mode(
+                    qvec, pack_values, predicate, fetch_k, n_results, pack_scope=pack_scope
+                )
+            finally:
+                conn.rollback()
+        else:
+            rows = self._select_query_mode(
+                qvec, pack_values, predicate, fetch_k, n_results, pack_scope=pack_scope
+            )
 
         hits: list[dict[str, Any]] = []
         for row in rows:
@@ -730,7 +797,7 @@ class SqliteVecStore(_SqliteConnMixin):
                 rows.extend(self._knn(qvec, fetch_k, pack=pk))
             rows.sort(key=lambda r: r["distance"])
             return rows
-        if self._ann == "binary" and self._has_bit_column and (
+        if self._shared is None and self._ann == "binary" and self._has_bit_column and (
             predicate is None or pack_scope is not None
         ):
             rows_ann = self._knn_bit_rerank(
@@ -1091,6 +1158,13 @@ class SqliteVecStore(_SqliteConnMixin):
             return []
         insert_sql = self._insert_sql()
         with self._tx() as conn:
+            if self._shared is not None and self._shared.in_unit_of_work:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None and pack_id not in self._shared._uow.validated_packs:
+                    self._shared.mark_rollback_only()
+                    raise RuntimeError("vector owner is not validated")
             for record in clean:
                 meta = _sanitize_metadata(record["metadata"])
                 conn.execute(

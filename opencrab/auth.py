@@ -128,6 +128,21 @@ def create_user(sql: Any, display_name: str, is_local: bool = False) -> str:
     from opencrab.pack.ownership import ensure_default_pack
 
     user_id = f"user_{uuid.uuid4().hex[:12]}"
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        marker = shared.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            from opencrab.stores.sql_store import shared_write_unit
+
+            with shared_write_unit(sql) as conn:
+                conn.execute(
+                    "INSERT INTO users (user_id, display_name, is_local) VALUES (?, ?, ?)",
+                    (user_id, display_name, is_local),
+                )
+                ensure_default_pack(sql, user_id, conn=conn)
+            return user_id
     with sql._engine.begin() as conn:
         conn.execute(
             text(
@@ -151,11 +166,13 @@ def get_local_user(sql: Any) -> Principal | None:
     """
     from sqlalchemy import text
 
-    with sql._engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT user_id, disabled FROM users WHERE is_local = :is_local"),
-            {"is_local": True},
-        ).fetchone()
+    query = "SELECT user_id, disabled FROM users WHERE is_local = :is_local"
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None and shared.in_unit_of_work:
+        row = shared.connection().execute(query, {"is_local": True}).fetchone()
+    else:
+        with sql._engine.connect() as conn:
+            row = conn.execute(text(query), {"is_local": True}).fetchone()
     if row is None:
         return None
     return Principal(user_id=row[0], is_local=True, disabled=row[1] == 1)
@@ -165,12 +182,13 @@ def list_users(sql: Any) -> list[dict[str, Any]]:
     """List all users (for ``opencrab user list``)."""
     from sqlalchemy import text
 
-    with sql._engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT user_id, display_name, is_local, disabled, created_at FROM users"
-            )
-        ).fetchall()
+    query = "SELECT user_id, display_name, is_local, disabled, created_at FROM users"
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None and shared.in_unit_of_work:
+        rows = shared.connection().execute(query).fetchall()
+    else:
+        with sql._engine.connect() as conn:
+            rows = conn.execute(text(query)).fetchall()
     return [
         {
             "user_id": r[0],
@@ -187,6 +205,12 @@ def disable_user(sql: Any, user_id: str) -> bool:
     """Set ``disabled=TRUE`` for *user_id*. Returns False if no such user."""
     from sqlalchemy import text
 
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        from opencrab.stores.sql_store import shared_write_unit
+
+        with shared_write_unit(sql) as conn:
+            return conn.execute("UPDATE users SET disabled=1 WHERE user_id=?", (user_id,)).rowcount > 0
     with sql._engine.begin() as conn:
         result = conn.execute(
             text("UPDATE users SET disabled = :disabled WHERE user_id = :user_id"),
@@ -203,6 +227,12 @@ def enable_user(sql: Any, user_id: str) -> bool:
     """
     from sqlalchemy import text
 
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        from opencrab.stores.sql_store import shared_write_unit
+
+        with shared_write_unit(sql) as conn:
+            return conn.execute("UPDATE users SET disabled=0 WHERE user_id=?", (user_id,)).rowcount > 0
     with sql._engine.begin() as conn:
         result = conn.execute(
             text("UPDATE users SET disabled = :disabled WHERE user_id = :user_id"),
@@ -227,6 +257,23 @@ def issue_token(sql: Any, user_id: str, name: str | None = None) -> tuple[str, s
     """
     from sqlalchemy import text
 
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        from opencrab.stores.sql_store import shared_write_unit
+
+        with shared_write_unit(sql) as conn:
+            row = conn.execute("SELECT disabled FROM users WHERE user_id=?", (user_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown user: {user_id}")
+            if row[0] == 1:
+                raise ValueError(f"User is disabled: {user_id}")
+            secret = _TOKEN_PREFIX + secrets.token_urlsafe(32)
+            token_id = f"tok_{uuid.uuid4().hex[:12]}"
+            conn.execute(
+                "INSERT INTO api_tokens (token_id,user_id,token_hash,name) VALUES (?,?,?,?)",
+                (token_id, user_id, hash_token(secret), name),
+            )
+        return token_id, secret
     with sql._engine.connect() as conn:
         row = conn.execute(
             text("SELECT disabled FROM users WHERE user_id = :user_id"),
@@ -291,6 +338,28 @@ def bootstrap_local_user(
 
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     secret: str | None = None
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        marker = shared.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            from opencrab.stores.sql_store import shared_write_unit
+
+            with shared_write_unit(sql) as conn:
+                conn.execute(
+                    "INSERT INTO users (user_id, display_name, is_local) VALUES (?, ?, ?)",
+                    (user_id, display_name, True),
+                )
+                ensure_default_pack(sql, user_id, conn=conn)
+                if issue_token:
+                    secret = _TOKEN_PREFIX + secrets.token_urlsafe(32)
+                    token_id = f"tok_{uuid.uuid4().hex[:12]}"
+                    conn.execute(
+                        "INSERT INTO api_tokens (token_id, user_id, token_hash, name) VALUES (?, ?, ?, ?)",
+                        (token_id, user_id, hash_token(secret), token_name),
+                    )
+            return user_id, secret
     with sql._engine.begin() as conn:
         conn.execute(
             text(
@@ -342,16 +411,17 @@ def verify_token(sql: Any, presented: str) -> Principal | None:
 
     from sqlalchemy import text
 
-    with sql._engine.connect() as conn:
-        row = conn.execute(
-            text(
-                "SELECT u.user_id, u.is_local FROM api_tokens t "
-                "JOIN users u ON u.user_id = t.user_id "
-                "WHERE t.token_hash = :token_hash "
-                "AND t.revoked_at IS NULL AND u.disabled = :not_disabled"
-            ),
-            {"token_hash": hash_token(presented), "not_disabled": False},
-        ).fetchone()
+    shared = getattr(sql, "shared_file", None)
+    query = ("SELECT u.user_id, u.is_local FROM api_tokens t "
+             "JOIN users u ON u.user_id = t.user_id "
+             "WHERE t.token_hash = :token_hash "
+             "AND t.revoked_at IS NULL AND u.disabled = :not_disabled")
+    params = {"token_hash": hash_token(presented), "not_disabled": False}
+    if shared is not None and shared.in_unit_of_work:
+        row = shared.connection().execute(query, params).fetchone()
+    else:
+        with sql._engine.connect() as conn:
+            row = conn.execute(text(query), params).fetchone()
     if row is None:
         return None
     # This query's WHERE already excludes disabled owners, so the returned
@@ -409,6 +479,16 @@ def revoke_token(sql: Any, token_id: str) -> None:
 
     from opencrab.execution._sql import now_expr
 
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        from opencrab.stores.sql_store import shared_write_unit
+
+        with shared_write_unit(sql) as conn:
+            conn.execute(
+                "UPDATE api_tokens SET revoked_at=datetime('now') WHERE token_id=? AND revoked_at IS NULL",
+                (token_id,),
+            )
+        return
     with sql._engine.begin() as conn:
         conn.execute(
             text(
@@ -424,14 +504,14 @@ def list_tokens(sql: Any, user_id: str) -> list[dict[str, Any]]:
     secret (the latter was never stored)."""
     from sqlalchemy import text
 
-    with sql._engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT token_id, name, created_at, last_used_at, revoked_at "
-                "FROM api_tokens WHERE user_id = :user_id"
-            ),
-            {"user_id": user_id},
-        ).fetchall()
+    query = ("SELECT token_id, name, created_at, last_used_at, revoked_at "
+             "FROM api_tokens WHERE user_id = :user_id")
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None and shared.in_unit_of_work:
+        rows = shared.connection().execute(query, {"user_id": user_id}).fetchall()
+    else:
+        with sql._engine.connect() as conn:
+            rows = conn.execute(text(query), {"user_id": user_id}).fetchall()
     return [
         {
             "token_id": r[0],

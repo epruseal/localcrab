@@ -134,6 +134,9 @@ def _check_ident(name: str, what: str) -> str:
 
 
 def _sqlite_conn(db_path: str) -> sqlite3.Connection:
+    from opencrab.stores._single_file import reject_unmanaged_single_file
+
+    reject_unmanaged_single_file(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
@@ -142,6 +145,9 @@ def _sqlite_conn(db_path: str) -> sqlite3.Connection:
 def _vec_sqlite_conn(db_path: str) -> sqlite3.Connection:
     import sqlite_vec
 
+    from opencrab.stores._single_file import reject_unmanaged_single_file
+
+    reject_unmanaged_single_file(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.enable_load_extension(True)

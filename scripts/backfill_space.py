@@ -311,14 +311,66 @@ def _uri(path: Path, mode: str) -> str:
     return path.resolve().as_uri() + f"?mode={mode}"
 
 
-def _open(path: Path, mode: str, vec: bool) -> sqlite3.Connection:
-    conn = sqlite3.connect(_uri(path, mode), uri=True, timeout=30, isolation_level=None)
-    if vec:
-        import sqlite_vec
+class _CheckedWriteConnection(sqlite3.Connection):
+    def close(self) -> None:
+        super().close()
+        shared = getattr(self, "_lifetime_owner", None)
+        if shared is not None:
+            if not shared._closed:
+                with shared.conns_lock:
+                    if self in shared.all_conns:
+                        shared.all_conns.remove(self)
+                if getattr(self, "_owns_lifetime", False):
+                    shared.close()
+            self._lifetime_owner = None
 
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
+
+def _open(path: Path, mode: str, vec: bool, *, shared: Any = None) -> sqlite3.Connection:
+    if mode == "ro":
+        conn = sqlite3.connect(_uri(path, mode), uri=True, timeout=30, isolation_level=None)
+    else:
+        from opencrab.stores._single_file import SharedSqliteFile
+
+        owned = shared is None
+        if owned:
+            shared = SharedSqliteFile(str(path.absolute()), checked=True)
+        elif (not isinstance(shared, SharedSqliteFile) or not shared._checked
+              or shared._closed or shared.db_path != str(path.absolute())):
+            raise ValueError("SQLite lifetime owner does not match path")
+        conn = None
+        try:
+            if mode != "rw":
+                raise ValueError("unsupported write mode")
+            conn = sqlite3.connect(_uri(path, mode), uri=True, timeout=30,
+                                   isolation_level=None, factory=_CheckedWriteConnection)
+            conn._lifetime_owner = shared
+            conn._owns_lifetime = owned
+            with shared.conns_lock:
+                shared.all_conns.append(conn)
+            shared._check_file_identity()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            shared._check_file_identity()
+            if marker is not None:
+                raise RuntimeError("single SQLite file is not supported by this tool")
+        except BaseException:
+            if conn is None:
+                if owned:
+                    shared.close()
+            else:
+                conn.close()
+            raise
+    try:
+        if vec:
+            import sqlite_vec
+
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -1301,12 +1353,18 @@ def _write_state_batches(
     max_batches: int | None,
     allow_pack_missing: bool,
     before_commit: Any,
+    *, lifetime_owners: dict[Path, Any] | None = None,
 ) -> dict[str, Any]:
     """Write ordered private-state plans and persist outcomes after COMMIT."""
     batches = 0
     remaining = {"doc": 0, "vector": 0}
-    dconn = _open(paths.doc, "rw", False)
-    vconn = _open(paths.vector, "rw", True)
+    owners = lifetime_owners or {}
+    dconn = _open(paths.doc, "rw", False, shared=owners.get(paths.doc.absolute()))
+    try:
+        vconn = _open(paths.vector, "rw", True, shared=owners.get(paths.vector.absolute()))
+    except BaseException:
+        dconn.close()
+        raise
     try:
         for store, conn in (("doc", dconn), ("vector", vconn)):
             cursor = state.execute(
@@ -1351,8 +1409,10 @@ def _write_state_batches(
                     raise
                 batches += 1
     finally:
-        dconn.close()
-        vconn.close()
+        try:
+            dconn.close()
+        finally:
+            vconn.close()
     return _state_stats(state, remaining, batches)
 
 
@@ -1436,7 +1496,11 @@ def _write_batches(
         "remaining": {"doc": 0, "vector": 0},
     }
     dconn = _open(paths.doc, "rw", False)
-    vconn = _open(paths.vector, "rw", True)
+    try:
+        vconn = _open(paths.vector, "rw", True)
+    except BaseException:
+        dconn.close()
+        raise
     try:
         for store, conn in (("doc", dconn), ("vector", vconn)):
             items = plan[store]
@@ -1462,8 +1526,10 @@ def _write_batches(
                 stats["batches"] += 1
                 stats["committed"][store].extend(done)
     finally:
-        dconn.close()
-        vconn.close()
+        try:
+            dconn.close()
+        finally:
+            vconn.close()
     return stats
 
 
@@ -1847,14 +1913,26 @@ def _failure_report(
 def run_apply(
     paths: Paths, args: argparse.Namespace, before_commit: Any = None
 ) -> tuple[int, dict[str, Any]]:
+    from contextlib import ExitStack
+
     from opencrab.locking import write_lock
+    from opencrab.stores._single_file import SharedSqliteFile
     from opencrab.stores.backup import backup_data_dir
 
+    lifetime = ExitStack()
+    lifetime_owners = {}
     try:
+        for path in dict.fromkeys((paths.doc.absolute(), paths.vector.absolute())):
+            shared = SharedSqliteFile(str(path), checked=True)
+            lifetime_owners[path] = shared
+            lifetime.callback(shared.close)
         lock = write_lock(str(paths.data_dir), timeout=args.lock_timeout)
         lock.__enter__()
-    except TimeoutError as exc:
-        return 3, {"error": str(exc)}
+    except BaseException as exc:
+        lifetime.close()
+        if isinstance(exc, TimeoutError):
+            return 3, {"error": str(exc)}
+        raise
     try:
         backup = backup_data_dir(paths.data_dir, args.backup_to, lock_timeout=args.lock_timeout)
         pre_bit = _vector_bit_digest(paths)
@@ -1872,6 +1950,7 @@ def run_apply(
                 args.max_batches,
                 args.allow_pack_missing,
                 before_commit,
+                lifetime_owners=lifetime_owners,
             )
         except BaseException as exc:
             failure = _failure_report(paths, args, exc, state)
@@ -1914,9 +1993,14 @@ def run_apply(
             exc.backfill_report = out
             raise
     finally:
-        if "state" in locals():
-            state.close()
-        lock.__exit__(None, None, None)
+        try:
+            if "state" in locals():
+                state.close()
+        finally:
+            try:
+                lock.__exit__(None, None, None)
+            finally:
+                lifetime.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1969,6 +2053,9 @@ def main(argv: list[str] | None = None, before_commit: Any = None) -> int:
 
     get_settings.cache_clear()
     cfg = get_settings()
+    if cfg.single_sqlite_file:
+        print("single SQLite mode is not supported by this tool", file=sys.stderr)
+        return 2
     if cfg.storage_mode != "local" or cfg.vector_backend_resolved != "sqlite-vec":
         print(
             "only STORAGE_MODE=local with the sqlite-vec vector backend is supported",

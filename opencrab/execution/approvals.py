@@ -14,7 +14,7 @@ import uuid
 from typing import Any
 
 from opencrab.common.timefmt import now_iso
-from opencrab.execution._sql import ensure_tables, now_expr
+from opencrab.execution._sql import ensure_tables, now_expr, write_connection
 
 _TABLE_SQLITE = """
 CREATE TABLE IF NOT EXISTS approval_queue (
@@ -87,7 +87,7 @@ class ApprovalEngine:
         approval_id = f"appr_{uuid.uuid4().hex[:12]}"
         payload_json = json.dumps(payload, ensure_ascii=False)
 
-        with self._sql._engine.begin() as conn:
+        with write_connection(self._sql) as conn:
             conn.execute(
                 text(
                     "INSERT INTO approval_queue "
@@ -150,7 +150,7 @@ class ApprovalEngine:
             "WHERE approval_id = :approval_id AND status = 'pending'"
         )
 
-        with self._sql._engine.begin() as conn:
+        with write_connection(self._sql) as conn:
             result = conn.execute(
                 text(update_sql),
                 {

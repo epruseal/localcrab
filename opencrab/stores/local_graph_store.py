@@ -61,6 +61,166 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         self._init_conn_state(db_path, shared)
         self._init_db()
 
+    def upsert_node(self, node_type, node_id, properties, space_id=None, *, return_receipt=False):
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                validated = self._shared._uow.validated_packs
+                owner = properties.get("pack_id") if isinstance(properties, dict) else None
+                row = conn.execute("SELECT properties FROM graph_nodes WHERE node_id=?", (node_id,)).fetchone()
+                owners = [owner]
+                if row is not None:
+                    import json
+
+                    try:
+                        owners.append(json.loads(row[0]).get("pack_id"))
+                    except (TypeError, ValueError, AttributeError):
+                        owners.append(None)
+                if any(not isinstance(item, str) or item not in validated for item in owners):
+                    self._shared.mark_rollback_only()
+                    raise RuntimeError("graph node owner is not validated")
+        return super().upsert_node(node_type, node_id, properties, space_id, return_receipt=return_receipt)
+
+    def _reject_single_db_batch(self) -> None:
+        if self._shared is None:
+            return
+        conn = self._shared.connection()
+        marker = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            if self._shared.in_unit_of_work:
+                self._shared.mark_rollback_only()
+            raise RuntimeError("single SQLite graph batch scope is not validated")
+
+    def upsert_nodes_batch(self, nodes, *, return_receipt=False):
+        self._reject_single_db_batch()
+        return super().upsert_nodes_batch(nodes, return_receipt=return_receipt)
+
+    def upsert_edges_batch(self, edges, *, return_receipt=False):
+        self._reject_single_db_batch()
+        return super().upsert_edges_batch(edges, return_receipt=return_receipt)
+
+    def update_nodes_batch(self, nodes, *, return_receipt=False):
+        self._reject_single_db_batch()
+        return super().update_nodes_batch(nodes, return_receipt=return_receipt)
+
+    def update_edges_batch(self, edges, *, return_receipt=False):
+        self._reject_single_db_batch()
+        return super().update_edges_batch(edges, return_receipt=return_receipt)
+
+    def update_node(
+        self, node_id, expected_current_digest, new_type, new_properties, new_space_id=None, *, return_receipt=False,
+    ):
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                import json
+
+                owners = [new_properties.get("pack_id") if isinstance(new_properties, dict) else None]
+                rows = conn.execute(
+                    "SELECT properties FROM graph_nodes WHERE node_id=? "
+                    "UNION ALL SELECT properties FROM graph_edges WHERE from_id=? OR to_id=?",
+                    (node_id, node_id, node_id),
+                ).fetchall()
+                for row in rows:
+                    try:
+                        owners.append(json.loads(row[0]).get("pack_id"))
+                    except (TypeError, ValueError, AttributeError):
+                        owners.append(None)
+                if any(not isinstance(owner, str) or owner not in self._shared._uow.validated_packs for owner in owners):
+                    self._shared.mark_rollback_only()
+                    raise RuntimeError("graph owner is not validated")
+        return super().update_node(
+            node_id, expected_current_digest, new_type, new_properties, new_space_id, return_receipt=return_receipt
+        )
+
+    def upsert_edge(self, from_type, from_id, relation, to_type, to_id, properties=None, *, return_receipt=False):
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                import json
+
+                owners = [properties.get("pack_id") if isinstance(properties, dict) else None]
+                row = conn.execute(
+                    "SELECT properties FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?",
+                    (from_id, relation, to_id),
+                ).fetchone()
+                if row is not None:
+                    try:
+                        owners.append(json.loads(row[0]).get("pack_id"))
+                    except (TypeError, ValueError, AttributeError):
+                        owners.append(None)
+                if any(not isinstance(owner, str) or owner not in self._shared._uow.validated_packs for owner in owners):
+                    self._shared.mark_rollback_only()
+                    raise RuntimeError("graph edge owner is not validated")
+        return super().upsert_edge(
+            from_type, from_id, relation, to_type, to_id, properties, return_receipt=return_receipt
+        )
+
+    def update_edge(
+        self, from_type, from_id, relation, to_type, to_id, properties=None, *,
+        expected_current_digest, owner_pack_id, return_receipt=False,
+    ):
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None and owner_pack_id not in self._shared._uow.validated_packs:
+                self._shared.mark_rollback_only()
+                raise RuntimeError("graph edge owner is not validated")
+        return super().update_edge(
+            from_type, from_id, relation, to_type, to_id, properties,
+            expected_current_digest=expected_current_digest, owner_pack_id=owner_pack_id,
+            return_receipt=return_receipt,
+        )
+
+    def delete_edge(self, from_id: str, relation: str, to_id: str, *, owner_pack_id: str) -> bool:
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None and owner_pack_id not in self._shared._uow.validated_packs:
+                self._shared.mark_rollback_only()
+                raise RuntimeError("graph edge owner is not validated")
+        return super().delete_edge(from_id, relation, to_id, owner_pack_id=owner_pack_id)
+
+    def delete_node(self, node_type: str, node_id: str) -> bool:
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                import json
+
+                rows = conn.execute(
+                    "SELECT properties FROM graph_nodes WHERE node_id=? AND node_type=? "
+                    "UNION ALL SELECT properties FROM graph_edges WHERE from_id=? OR to_id=?",
+                    (node_id, node_type, node_id, node_id),
+                ).fetchall()
+                validated = self._shared._uow.validated_packs
+                for row in rows:
+                    try:
+                        owner = json.loads(row[0]).get("pack_id")
+                    except (TypeError, ValueError, AttributeError):
+                        owner = None
+                    if not isinstance(owner, str) or owner not in validated:
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("graph owner is not validated")
+        return super().delete_node(node_type, node_id)
+
     def _configure_connection(self, conn: sqlite3.Connection) -> None:
         """search_nodes()'s keyword predicate (_sql_graph_base.py) matches
         via SQL ``LOWER(...) LIKE``, but SQLite's builtin ``LOWER()`` is
@@ -295,6 +455,8 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         ``GraphTx`` and therefore cannot accidentally write the destination
         connection or issue transaction controls itself.
         """
+        if snapshot_path is not None and self._shared is not None and self._shared.in_unit_of_work:
+            raise RuntimeError("graph snapshot cannot run inside a shared unit of work")
         if snapshot_path is not None and (not immediate or exclusive):
             raise ValueError("snapshot_path requires immediate=True")
         if immediate and exclusive:

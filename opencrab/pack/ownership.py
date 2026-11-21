@@ -168,11 +168,15 @@ def get_pack(sql: Any, pack_id: str) -> dict[str, Any] | None:
     """
     from sqlalchemy import text
 
-    with sql._engine.connect() as conn:
-        row = conn.execute(
-            text(f"SELECT {_SELECT_COLS} FROM packs WHERE pack_id = :pid"),  # noqa: S608
-            {"pid": pack_id},
-        ).fetchone()
+    query = f"SELECT {_SELECT_COLS} FROM packs WHERE pack_id = :pid"  # noqa: S608
+    shared = getattr(sql, "_shared", None)
+    if shared is not None and shared.in_unit_of_work:
+        row = shared.connection().execute(query, {"pid": pack_id}).fetchone()
+    else:
+        uow = getattr(sql, "_pg_uow", None)
+        cm = uow.connection() if uow is not None else sql._engine.connect()
+        with cm as conn:
+            row = conn.execute(text(query), {"pid": pack_id}).fetchone()
     return _row_to_dict(row) if row else None
 
 
@@ -258,6 +262,34 @@ def _insert_pack(
         "forked": forked_from,
         "status": status,
     }
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        marker = shared.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            if conn is not None:
+                raise RuntimeError("single SQLite pack creation requires a shared transaction")
+            import sqlite3
+
+            from opencrab.stores.sql_store import shared_write_unit
+
+            try:
+                with shared_write_unit(sql) as shared_conn:
+                    pending = shared_conn.execute(
+                        "SELECT 1 FROM pack_delete_operations WHERE pack_id=? AND state='pending'",
+                        (pack_id,),
+                    ).fetchone()
+                    if pending:
+                        raise RuntimeError("pack deletion is pending")
+                    shared_conn.execute(str(stmt), params)
+                return True
+            except sqlite3.IntegrityError as exc:
+                if getattr(exc, "sqlite_errorname", None) in (
+                    "SQLITE_CONSTRAINT_PRIMARYKEY", "SQLITE_CONSTRAINT_UNIQUE",
+                ) and "packs.pack_id" in str(exc):
+                    return False
+                raise
     try:
         if conn is not None:
             conn.execute(stmt, params)
@@ -447,6 +479,38 @@ def begin_pack_creation(
     )
 
 
+def _ensure_default_pack_shared(sql: Any, owner_id: str, conn: Any) -> str:
+    import sqlite3
+
+    row = conn.execute(
+        "SELECT pack_id, incarnation FROM packs WHERE owner_id=? AND is_default=1", (owner_id,)
+    ).fetchone()
+    if row is not None:
+        if not row[1]:
+            raise RuntimeError("pack incarnation is missing")
+        sql.shared_file.validate_pack_writes({row[0]: row[1]})
+        return row[0]
+    for _ in range(_MAX_RANDOM_ATTEMPTS):
+        candidate = new_default_pack_id()
+        if conn.execute(
+            "SELECT 1 FROM pack_delete_operations WHERE pack_id=? AND state='pending'", (candidate,)
+        ).fetchone():
+            raise RuntimeError("pack deletion is pending")
+        try:
+            conn.execute(
+                "INSERT INTO packs (pack_id, owner_id, visibility, title, is_default, status) "
+                "VALUES (?, ?, 'private', 'Default pack', 1, 'ready')", (candidate, owner_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            if getattr(exc, "sqlite_errorname", None) in (
+                "SQLITE_CONSTRAINT_PRIMARYKEY", "SQLITE_CONSTRAINT_UNIQUE",
+            ) and "packs.pack_id" in str(exc):
+                continue
+            raise
+        return candidate
+    raise RuntimeError(f"could not allocate a unique default pack_id for owner {owner_id!r}")
+
+
 def ensure_default_pack(sql: Any, owner_id: str, *, conn: Any = None) -> str:
     """Return ``owner_id``'s default pack (``is_default=TRUE/1``), creating
     it on first call. Idempotent: every subsequent call for the same
@@ -474,6 +538,21 @@ def ensure_default_pack(sql: Any, owner_id: str, *, conn: Any = None) -> str:
     owns the commit/rollback. When omitted, this opens its own
     ``sql._engine.begin()`` transaction.
     """
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        marker = shared.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            if conn is not None:
+                if not shared.in_unit_of_work or conn is not shared.connection():
+                    raise RuntimeError("single SQLite default pack requires a shared transaction")
+                with shared.unit_of_work() as shared_conn:
+                    return _ensure_default_pack_shared(sql, owner_id, shared_conn)
+            from opencrab.stores.sql_store import shared_write_unit
+
+            with shared_write_unit(sql) as shared_conn:
+                return _ensure_default_pack_shared(sql, owner_id, shared_conn)
     if conn is not None:
         return _ensure_default_pack_on(sql, owner_id, conn)
     with sql._engine.begin() as owned_conn:
@@ -601,6 +680,28 @@ def resolve_write_pack(
     return ensure_default_pack(sql, principal.user_id)
 
 
+def _guarded_pack_change(sql: Any, pack_id: str, statement: str, params: dict[str, Any]) -> bool | None:
+    shared = getattr(sql, "shared_file", None)
+    if shared is None:
+        return None
+    conn = shared.connection()
+    marker = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+    ).fetchone()
+    if marker is None:
+        return None
+    from opencrab.stores.sql_store import shared_write_unit
+
+    with shared_write_unit(sql) as conn:
+        row = conn.execute("SELECT incarnation FROM packs WHERE pack_id = ?", (pack_id,)).fetchone()
+        if row is None:
+            return False
+        if not row[0]:
+            raise RuntimeError("pack incarnation is missing")
+        shared.validate_pack_writes({pack_id: row[0]})
+        return conn.execute(statement, params).rowcount > 0
+
+
 def delete_pack_row(
     sql: Any,
     pack_id: str,
@@ -645,6 +746,9 @@ def delete_pack_row(
         for i, st in enumerate(only_status):
             params[f"st{i}"] = st
 
+    guarded = _guarded_pack_change(sql, pack_id, f"DELETE FROM packs WHERE {where}", params)
+    if guarded is not None:
+        return guarded
     with sql._engine.begin() as conn:
         result = conn.execute(
             text(f"DELETE FROM packs WHERE {where}"),  # noqa: S608 -- where is a fixed shape, values are bound
@@ -668,12 +772,16 @@ def mark_pack_ready(sql: Any, pack_id: str, owner_id: str) -> bool:
 
     from opencrab.execution._sql import now_expr
 
+    statement = (
+        f"UPDATE packs SET status = 'ready', updated_at = {now_expr(sql)} "
+        "WHERE pack_id = :pid AND owner_id = :oid AND status = 'creating'"
+    )
+    guarded = _guarded_pack_change(sql, pack_id, statement, {"pid": pack_id, "oid": owner_id})
+    if guarded is not None:
+        return guarded
     with sql._engine.begin() as conn:
         result = conn.execute(
-            text(
-                f"UPDATE packs SET status = 'ready', updated_at = {now_expr(sql)} "
-                "WHERE pack_id = :pid AND owner_id = :oid AND status = 'creating'"
-            ),
+            text(statement),
             {"pid": pack_id, "oid": owner_id},
         )
         return result.rowcount > 0
@@ -692,12 +800,16 @@ def mark_pack_partial(sql: Any, pack_id: str, owner_id: str) -> bool:
 
     from opencrab.execution._sql import now_expr
 
+    statement = (
+        f"UPDATE packs SET status = 'partial', updated_at = {now_expr(sql)} "
+        "WHERE pack_id = :pid AND owner_id = :oid AND status = 'creating'"
+    )
+    guarded = _guarded_pack_change(sql, pack_id, statement, {"pid": pack_id, "oid": owner_id})
+    if guarded is not None:
+        return guarded
     with sql._engine.begin() as conn:
         result = conn.execute(
-            text(
-                f"UPDATE packs SET status = 'partial', updated_at = {now_expr(sql)} "
-                "WHERE pack_id = :pid AND owner_id = :oid AND status = 'creating'"
-            ),
+            text(statement),
             {"pid": pack_id, "oid": owner_id},
         )
         return result.rowcount > 0
@@ -773,12 +885,16 @@ def promote_partial_pack(sql: Any, pack_id: str, owner_id: str) -> bool:
 
     from opencrab.execution._sql import now_expr
 
+    statement = (
+        f"UPDATE packs SET status = 'ready', updated_at = {now_expr(sql)} "
+        "WHERE pack_id = :pid AND owner_id = :oid AND status = 'partial'"
+    )
+    guarded = _guarded_pack_change(sql, pack_id, statement, {"pid": pack_id, "oid": owner_id})
+    if guarded is not None:
+        return guarded
     with sql._engine.begin() as conn:
         result = conn.execute(
-            text(
-                f"UPDATE packs SET status = 'ready', updated_at = {now_expr(sql)} "
-                "WHERE pack_id = :pid AND owner_id = :oid AND status = 'partial'"
-            ),
+            text(statement),
             {"pid": pack_id, "oid": owner_id},
         )
         return result.rowcount > 0
@@ -920,6 +1036,27 @@ def set_visibility(sql: Any, principal: Principal, pack_id: str, visibility: str
     if visibility not in VISIBILITIES:
         raise ValueError(f"invalid visibility {visibility!r}; must be one of {VISIBILITIES}")
     assert_writable(sql, principal, pack_id)
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        marker = shared.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            from opencrab.stores.sql_store import shared_write_unit
+
+            with shared_write_unit(sql) as conn:
+                assert_writable(sql, principal, pack_id)
+                row = conn.execute("SELECT incarnation FROM packs WHERE pack_id=?", (pack_id,)).fetchone()
+                if row is None or not row[0]:
+                    raise RuntimeError("pack incarnation is missing")
+                shared.validate_pack_writes({pack_id: row[0]})
+                conn.execute(
+                    "UPDATE packs SET visibility=?, updated_at=datetime('now') WHERE pack_id=?",
+                    (visibility, pack_id),
+                )
+                pack = get_pack(sql, pack_id)
+                assert pack is not None
+                return pack
 
     from sqlalchemy import text
 

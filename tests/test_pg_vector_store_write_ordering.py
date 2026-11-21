@@ -93,6 +93,48 @@ class TestUpsertTextsValidatesBeforeEmbeddingOrOwnershipCheck:
         assert conn.execute.called
 
 
+def test_precomputed_vector_write_does_not_embed() -> None:
+    store, conn = _make_store()
+    vectors = store.prepare_upsert_vectors(["a"])
+    assert store._ef.calls == 1
+    assert store.upsert_precomputed(["a"], [{"pack_id": "p"}], ["x"], vectors) == ["x"]
+    assert store._ef.calls == 1
+    assert conn.execute.called
+
+
+@pytest.mark.parametrize("vectors", [[], [[1.0]]])
+def test_precomputed_vector_rejects_bad_shape_before_write(vectors) -> None:
+    store, conn = _make_store()
+    with pytest.raises(ValueError):
+        store.upsert_precomputed(["a"], [{"pack_id": "p"}], ["x"], vectors)
+    conn.execute.assert_not_called()
+    assert store._ef.calls == 0
+
+
+@pytest.mark.parametrize("vectors", [[], [[0.0] * 4, [0.0] * 4]])
+def test_upsert_preserves_embedding_count_behavior(vectors) -> None:
+    store, conn = _make_store()
+    store._ef = lambda texts: vectors
+    assert store.upsert_texts(["a"], [{"pack_id": "p"}], ["x"]) == ["x"]
+    assert conn.execute.call_count == 1 + min(len(vectors), 1)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True])
+@pytest.mark.parametrize("method", ["add", "upsert", "precomputed"])
+def test_vector_values_reach_pg_as_before(value, method) -> None:
+    store, conn = _make_store()
+    vector = [value, 0.0, 0.0, 0.0]
+    store._ef = lambda texts: [vector for _ in texts]
+    if method == "add":
+        store.add_texts(["a"], [{"pack_id": "p"}], ["x"])
+    elif method == "upsert":
+        store.upsert_texts(["a"], [{"pack_id": "p"}], ["x"])
+    else:
+        store.upsert_precomputed(["a"], [{"pack_id": "p"}], ["x"], [vector])
+    params = conn.execute.call_args.args[1]
+    assert params["embedding"].startswith(f"[{float(value)!r},")
+
+
 class TestImportVectorsValidatesBeforeAnyInsert:
     def test_non_finite_metadata_rejected_before_any_execute(self) -> None:
         store, conn = _make_store()

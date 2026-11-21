@@ -40,6 +40,11 @@ def _get_pg_engine(url: str) -> Any:
     return create_engine(normalize_pg_url(url), pool_pre_ping=True)
 
 
+def _reject_unwired_single_file(settings: Settings) -> None:
+    if getattr(settings, "single_sqlite_file", ""):
+        raise RuntimeError("single SQLite factory is not ready")
+
+
 def make_graph_store(settings: Settings) -> Any:
     """Return PGGraphStore (pg), the disabled Kuzu facade (kuzu), LocalGraphStore (local),
     or Neo4jStore (docker).
@@ -49,6 +54,7 @@ def make_graph_store(settings: Settings) -> Any:
     (LadybugDB/ladybug#527), production 경로를 열려면 transaction owner와
     node/edge 원자적 CAS를 별도로 검증해야 한다.
     """
+    _reject_unwired_single_file(settings)
     if settings.storage_mode == "pg":
         from opencrab.stores.pg_graph_store import PGGraphStore
 
@@ -134,6 +140,7 @@ def make_vector_store(settings: Settings) -> Any:
     설계: docs/vector-backends.md §2. 임베딩은 백엔드와 무관하게 동일.
     한국어 검색 품질: minilm MRR 0.285 vs KURE-v1 1.000.
     """
+    _reject_unwired_single_file(settings)
     backend = settings.vector_backend_resolved
 
     if backend == "sqlite-vec":
@@ -254,6 +261,7 @@ def make_doc_store(settings: Settings) -> Any:
         state.  A fixed filename ("doc_store.db") makes the path predictable
         for operators and migration tooling.
     """
+    _reject_unwired_single_file(settings)
     if settings.is_local:
         # LocalDocStore (JSON) → LocalSQLDocStore (SQLite).
         # See module docstring in local_sql_doc_store.py for full rationale.
@@ -275,14 +283,13 @@ def make_doc_store(settings: Settings) -> Any:
 
 
 def make_sql_store(settings: Settings) -> Any:
-    """Return SQLStore with SQLite (local/kuzu), PostgreSQL (docker), or the
-    shared PG engine's URL (pg — SQLStore itself always create_engine()s from a
-    URL, so it does not participate in the shared-Engine injection of
-    graph/doc/vector; it opens its own connection against the same database)."""
+    """local과 kuzu는 SQLite를 쓰고 pg는 공유 PostgreSQL 엔진을 쓴다."""
     from opencrab.stores.sql_store import SQLStore
 
+    _reject_unwired_single_file(settings)
     url = settings.postgres_url if settings.storage_mode in ("docker", "pg") else settings.sqlite_url
-    return SQLStore(url=url)
+    engine = _get_pg_engine(url) if settings.storage_mode == "pg" else None
+    return SQLStore(url=url, engine=engine)
 
 
 def make_billing_sql_store(settings: Settings, sql_store: Any) -> Any:

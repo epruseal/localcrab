@@ -14,6 +14,7 @@ a raw copy and an online ``.backup()`` is caused by the missing journal.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -474,6 +475,26 @@ class TestInventory:
             known = {t.label for t in bk.local_data_dir_inventory(_Settings())}
             assert "future.db" not in known
 
+    def test_single_database_and_delete_journals_are_inventory_targets(self) -> None:
+        class Settings:
+            vector_db_file = "vectors.db"
+            single_sqlite_file = "unified.db"
+
+        targets = bk.local_data_dir_inventory(Settings())
+        kinds = {target.location: target.kind for target in targets}
+        assert kinds["unified.db"] == "sqlite"
+        assert kinds["delete-pack-journals"] == "directory"
+        assert kinds["billing.db"] == "sqlite"
+
+    def test_single_database_backup_refuses_unbound_journal(self, tmp_path: Path) -> None:
+        class Settings:
+            vector_db_file = "vectors.db"
+            single_sqlite_file = "unified.db"
+
+        with pytest.raises(bk.BackupError, match="단일 SQLite"):
+            bk.backup_data_dir(tmp_path, settings=Settings())
+        assert _published_sets(tmp_path) == []
+
     def test_renamed_vector_file_is_followed_and_default_still_covered(self) -> None:
         targets = bk.local_data_dir_inventory(_Settings(vector_db_file="renamed.db"))
         labels = {t.label for t in targets}
@@ -543,6 +564,284 @@ def populated_dir(tmp_path: Path) -> Path:
     (d / "packs").mkdir()
     (d / "packs" / "p1").mkdir()
     return d
+
+
+class TestSingleDatabaseRecovery:
+    def test_verify_rejects_database_with_omitted_completed_manifest_entry(self, tmp_path: Path) -> None:
+        _make_db(tmp_path / "billing.db")
+        with sqlite3.connect(tmp_path / "single.db") as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+        manifest = {"format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+                    "files": bk._manifest_files(tmp_path),
+                    "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db",
+                                           "billing": "billing.db", "journals": {}, "operations": []}}
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        (tmp_path / "another.db").write_bytes((tmp_path / "single.db").read_bytes())
+        with pytest.raises(bk.BackupError, match="unlisted"):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_rejects_duplicate_journal_keys(self, tmp_path: Path) -> None:
+        from opencrab.pack import delete_journal
+
+        db = tmp_path / "single.db"
+        _make_db(tmp_path / "billing.db")
+        operation = ["a" * 32, "p", "b" * 32, "pending", None, None]
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+            conn.execute("INSERT INTO pack_delete_operations VALUES (?, ?, ?, ?, ?, ?)", operation)
+        journal_path = delete_journal.journal_path(tmp_path, "p")
+        journal_path.parent.mkdir()
+        journal_path.write_text('{"schema":2,"pack_id":"foreign","pack_id":"p","operation_id":"' + "a" * 32
+                                + '","incarnation":"' + "b" * 32 + '","state":"pending","result":null}', encoding="utf-8")
+        manifest = {"format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+                    "files": bk._manifest_files(tmp_path),
+                    "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db", "billing": "billing.db",
+                                           "journals": {"p": journal_path.relative_to(tmp_path).as_posix()},
+                                           "operations": [operation]}}
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(bk.BackupError, match="journal"):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_rejects_duplicate_recovery_manifest_fields(self, tmp_path: Path) -> None:
+        db = tmp_path / "single.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+        _make_db(tmp_path / "billing.db")
+        manifest = {"format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+                    "files": bk._manifest_files(tmp_path),
+                    "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db",
+                                           "billing": "billing.db", "journals": {}, "operations": []}}
+        encoded = json.dumps(manifest).replace('"database": "single.db"',
+                                               '"database": "other.db", "database": "single.db"')
+        (tmp_path / bk.MANIFEST_NAME).write_text(encoded, encoding="utf-8")
+        with pytest.raises(bk.BackupError):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_rejects_non_database_billing_file(self, tmp_path: Path) -> None:
+        db = tmp_path / "single.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+        (tmp_path / "billing.db").write_text("not a database", encoding="utf-8")
+        manifest = {"format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+                    "files": bk._manifest_files(tmp_path),
+                    "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db",
+                                           "billing": "billing.db", "journals": {}, "operations": []}}
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(bk.BackupError):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_rejects_recovery_database_with_symlinked_parent(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        root = tmp_path / "set"
+        outside.mkdir()
+        root.mkdir()
+        with sqlite3.connect(outside / "single.db") as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+        _make_db(root / "billing.db")
+        (root / "link").symlink_to(outside, target_is_directory=True)
+        db = outside / "single.db"
+        files = bk._manifest_files(root)
+        files["link/single.db"] = {"size": db.stat().st_size, "sha256": bk._hash_file(db)}
+        manifest = {"format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [], "files": files,
+                    "single_db_recovery": {"backup_id": "c" * 32, "database": "link/single.db",
+                                           "billing": "billing.db", "journals": {}, "operations": []}}
+        (root / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(bk.BackupError, match="symlink"):
+            bk.verify_backup_set(root)
+
+    def test_verify_rejects_unlisted_journal(self, tmp_path: Path) -> None:
+        from opencrab.pack import delete_journal
+
+        db = tmp_path / "single.db"
+        _make_db(tmp_path / "billing.db")
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+        manifest = {"format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+                    "files": bk._manifest_files(tmp_path),
+                    "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db",
+                                           "billing": "billing.db", "journals": {}, "operations": []}}
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        delete_journal.save_journal(tmp_path, "p", {"schema": 2, "pack_id": "p", "operation_id": "a" * 32,
+                                                    "incarnation": "b" * 32, "state": "pending", "result": None})
+        with pytest.raises(bk.BackupError, match="journal"):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_rejects_single_db_without_recovery_manifest(self, tmp_path: Path) -> None:
+        db = tmp_path / "single.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT PRIMARY KEY)")
+        manifest = {"format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+                    "files": bk._manifest_files(tmp_path)}
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(bk.BackupError, match="recovery"):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_accepts_matching_database_and_journal(self, tmp_path: Path) -> None:
+        from opencrab.pack import delete_journal
+        from opencrab.pack.load import _single_file_delete_evidence
+
+        db = tmp_path / "single.db"
+        _make_db(tmp_path / "billing.db")
+        keys = {kind: [] for kind in ("nodes", "edges", "doc_twins", "doc_extras", "sources", "vectors")}
+        evidence = _single_file_delete_evidence("a" * 32, "b" * 32, [0, 0, 0], keys)
+        operation = ["a" * 32, "p", "b" * 32, "committed", "[0, 0, 0]", json.dumps(evidence)]
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+            conn.execute("INSERT INTO pack_delete_operations VALUES (?, ?, ?, ?, ?, ?)", operation)
+        journal = {"schema": 2, "pack_id": "p", "operation_id": "a" * 32,
+                   "incarnation": "b" * 32, "state": "committed", "result": [0, 0, 0]}
+        delete_journal.save_journal(tmp_path, "p", journal)
+        journal_path = delete_journal.journal_path(tmp_path, "p").relative_to(tmp_path).as_posix()
+        manifest = {
+            "format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+            "files": bk._manifest_files(tmp_path),
+            "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db",
+                                   "billing": "billing.db", "journals": {"p": journal_path},
+                                   "operations": [operation]},
+        }
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        assert bk.verify_backup_set(tmp_path)["files_verified"] == 3
+
+    @pytest.mark.parametrize("current_state", ["committed", "pending"])
+    @pytest.mark.parametrize("recreated", [False, True])
+    def test_verify_rejects_unproven_historical_journal_removal(self, tmp_path: Path, current_state, recreated) -> None:
+        from opencrab.pack import delete_journal
+        from opencrab.pack.load import _single_file_delete_evidence
+
+        _make_db(tmp_path / "billing.db")
+        kinds = ("nodes", "edges", "doc_twins", "doc_extras", "sources", "vectors")
+        old_incarnation = "b" * 32
+        current_incarnation = "e" * 32 if recreated else old_incarnation
+        old_evidence = _single_file_delete_evidence("a" * 32, old_incarnation, [0, 0, 0], {kind: [] for kind in kinds})
+        current_evidence = _single_file_delete_evidence("d" * 32, current_incarnation, [0, 0, 0], {kind: [] for kind in kinds})
+        old = ["a" * 32, "p", old_incarnation, "committed", "[0, 0, 0]", json.dumps(old_evidence)]
+        current = ["d" * 32, "p", current_incarnation, current_state,
+                   "[0, 0, 0]" if current_state == "committed" else None,
+                   json.dumps(current_evidence) if current_state == "committed" else None]
+        with sqlite3.connect(tmp_path / "single.db") as conn:
+            conn.execute("CREATE TABLE packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT INTO packs VALUES (?, ?)", ("p", current_incarnation))
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+            conn.executemany("INSERT INTO pack_delete_operations VALUES (?, ?, ?, ?, ?, ?)", [old, current])
+        journal = {"schema": 2, "pack_id": "p", "operation_id": "d" * 32,
+                   "incarnation": current_incarnation, "state": current_state,
+                   "result": [0, 0, 0] if current_state == "committed" else None}
+        delete_journal.save_journal(tmp_path, "p", journal)
+        journal_path = delete_journal.journal_path(tmp_path, "p").relative_to(tmp_path).as_posix()
+        manifest = {"format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+                    "files": bk._manifest_files(tmp_path),
+                    "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db",
+                                           "billing": "billing.db", "journals": {"p": journal_path},
+                                           "operations": [old, current]}}
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(bk.BackupError, match="journal"):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_rejects_journal_for_recreated_pack(self, tmp_path: Path) -> None:
+        from opencrab.pack import delete_journal
+        from opencrab.pack.load import _single_file_delete_evidence
+
+        _make_db(tmp_path / "billing.db")
+        keys = {kind: [] for kind in ("nodes", "edges", "doc_twins", "doc_extras", "sources", "vectors")}
+        evidence = _single_file_delete_evidence("a" * 32, "b" * 32, [0, 0, 0], keys)
+        operation = ["a" * 32, "p", "b" * 32, "committed", "[0, 0, 0]", json.dumps(evidence)]
+        with sqlite3.connect(tmp_path / "single.db") as conn:
+            conn.execute("CREATE TABLE packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT INTO packs VALUES (?, ?)", ("p", "e" * 32))
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+            conn.execute("INSERT INTO pack_delete_operations VALUES (?, ?, ?, ?, ?, ?)", operation)
+        delete_journal.save_journal(tmp_path, "p", {"schema": 2, "pack_id": "p", "operation_id": "a" * 32,
+                                                   "incarnation": "b" * 32, "state": "committed", "result": [0, 0, 0]})
+        journal_path = delete_journal.journal_path(tmp_path, "p").relative_to(tmp_path).as_posix()
+        manifest = {"format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+                    "files": bk._manifest_files(tmp_path),
+                    "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db", "billing": "billing.db",
+                                           "journals": {"p": journal_path}, "operations": [operation]}}
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(bk.BackupError, match="incarnation"):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_rejects_operation_without_matching_journal(self, tmp_path: Path) -> None:
+        db = tmp_path / "single.db"
+        _make_db(tmp_path / "billing.db")
+        operation = ["a" * 32, "p", "b" * 32, "pending", None, None]
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+            conn.execute("INSERT INTO pack_delete_operations VALUES (?, ?, ?, ?, ?, ?)", operation)
+        manifest = {
+            "format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+            "files": bk._manifest_files(tmp_path),
+            "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db",
+                                   "billing": "billing.db", "journals": {}, "operations": [operation]},
+        }
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(bk.BackupError, match="journal"):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_rejects_mismatched_journal_identity(self, tmp_path: Path) -> None:
+        from opencrab.pack import delete_journal
+
+        db = tmp_path / "single.db"
+        _make_db(tmp_path / "billing.db")
+        operation = ["a" * 32, "p", "b" * 32, "pending", None, None]
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+            conn.execute("INSERT INTO pack_delete_operations VALUES (?, ?, ?, ?, ?, ?)", operation)
+        journal = {"schema": 2, "pack_id": "p", "operation_id": "d" * 32,
+                   "incarnation": "b" * 32, "state": "pending", "result": None}
+        delete_journal.save_journal(tmp_path, "p", journal)
+        journal_path = delete_journal.journal_path(tmp_path, "p").relative_to(tmp_path).as_posix()
+        manifest = {
+            "format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+            "files": bk._manifest_files(tmp_path),
+            "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db",
+                                   "billing": "billing.db", "journals": {"p": journal_path},
+                                   "operations": [operation]},
+        }
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(bk.BackupError, match="journal"):
+            bk.verify_backup_set(tmp_path)
+
+    def test_verify_rejects_unbound_database_operation(self, tmp_path: Path) -> None:
+        db = tmp_path / "single.db"
+        billing = tmp_path / "billing.db"
+        _make_db(billing)
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS packs (pack_id TEXT PRIMARY KEY, incarnation TEXT)")
+            conn.execute("INSERT OR IGNORE INTO packs VALUES (?, ?)", ("p", "b" * 32))
+            conn.execute("INSERT INTO pack_delete_operations VALUES (?, 'p', ?, 'pending', NULL, NULL)", ("a" * 32, "b" * 32))
+        manifest = {
+            "format": bk._MANIFEST_FORMAT, "set_id": "test", "entries": [],
+            "files": bk._manifest_files(tmp_path),
+            "single_db_recovery": {"backup_id": "c" * 32, "database": "single.db",
+                                   "billing": "billing.db", "journals": {}, "operations": []},
+        }
+        (tmp_path / bk.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(bk.BackupError, match="operation"):
+            bk.verify_backup_set(tmp_path)
 
 
 class TestPublishedSet:

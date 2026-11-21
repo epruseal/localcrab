@@ -16,7 +16,7 @@ import uuid
 from typing import Any
 
 from opencrab.common.timefmt import now_iso
-from opencrab.execution._sql import ensure_tables, now_expr
+from opencrab.execution._sql import ensure_tables, now_expr, write_connection
 
 VALID_STATUSES = frozenset(
     {"pending", "running", "approved", "rejected", "completed", "failed"}
@@ -133,7 +133,7 @@ class WorkflowEngine:
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
         payload_json = json.dumps(payload, ensure_ascii=False)
 
-        with self._sql._engine.begin() as conn:
+        with write_connection(self._sql) as conn:
             conn.execute(
                 text(
                     "INSERT INTO workflow_runs "
@@ -204,7 +204,7 @@ class WorkflowEngine:
             "WHERE run_id = :run_id"
         )
 
-        with self._sql._engine.begin() as conn:
+        with write_connection(self._sql) as conn:
             current_row = conn.execute(
                 text("SELECT status FROM workflow_runs WHERE run_id = :run_id"),
                 {"run_id": run_id},
@@ -212,7 +212,7 @@ class WorkflowEngine:
             if current_row is None:
                 raise ValueError(f"Run '{run_id}' not found.")
 
-            current_status = current_row._mapping["status"]
+            current_status = current_row[0]
             if new_status not in VALID_TRANSITIONS.get(current_status, frozenset()):
                 raise ValueError(
                     f"Illegal transition: cannot advance run '{run_id}' "

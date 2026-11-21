@@ -852,6 +852,9 @@ def migrate_sql(
     from sqlalchemy import create_engine, inspect, text  # type: ignore[import]
 
     from opencrab.stores._pg_url import normalize_pg_url
+    from opencrab.stores._single_file import reject_unmanaged_single_file
+
+    reject_unmanaged_single_file(sqlite_path)
 
     # SQLite 스키마 초기화 (SQLStore 생성자가 처리). 이 store 는 스키마 생성용으로만
     # 쓰고, 쓰기는 아래 별도 engine 으로 한다.

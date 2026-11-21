@@ -178,6 +178,29 @@ def _seed_pack(graph, docs, tmp_path, pack_name: str, node_ids: list[str]):
         pack_load.load_nodes(pack_name, f, builder, {})
 
 
+def test_schema2_journal_rejects_invalid_identity_and_state(tmp_path):
+    valid = {
+        "schema": 2, "pack_id": "p", "operation_id": "a" * 32,
+        "incarnation": "b" * 32, "state": "pending", "result": None,
+    }
+    delete_journal.save_journal(tmp_path, "p", valid)
+    assert delete_journal.load_journal(tmp_path, "p", schema=2) == valid
+    invalid = [
+        {**valid, "pack_id": "other"},
+        {**valid, "operation_id": "bad"},
+        {**valid, "incarnation": "z" * 32},
+        {**valid, "state": "unknown"},
+        {**valid, "state": []},
+        {**valid, "state": "committed", "result": None},
+        {**valid, "result": [1, 2, 3]},
+        {**valid, "extra": True},
+    ]
+    for payload in invalid:
+        delete_journal.save_journal(tmp_path, "p", payload)
+        with pytest.raises(delete_journal.DeletePackJournalCorrupt):
+            delete_journal.load_journal(tmp_path, "p", schema=2)
+
+
 def _registry(tmp_path):
     """팩 레지스트리 `SQLStore`(`_seed_pack` 이 행을 만드는 같은 파일)."""
     return SQLStore(f"sqlite:///{tmp_path / 'opencrab.db'}")
@@ -300,6 +323,23 @@ class _AvailableCountingChromaVec:
 # ---------------------------------------------------------------------------
 
 class TestJournalAtomicity:
+    def test_dangling_journal_is_corrupt_not_absent(self, tmp_path):
+        path = delete_journal.journal_path(tmp_path, "pack-a")
+        path.parent.mkdir()
+        path.symlink_to(tmp_path / "missing")
+        with pytest.raises(delete_journal.DeletePackJournalCorrupt):
+            delete_journal.load_journal(tmp_path, "pack-a")
+
+    def test_versioned_journal_requires_explicit_schema(self, tmp_path):
+        payload = {"schema": 2, "pack_id": "pack-a", "operation_id": "a" * 32,
+                   "incarnation": "b" * 32, "state": "pending", "result": None}
+        delete_journal.save_journal(tmp_path, "pack-a", payload)
+        with pytest.raises(delete_journal.DeletePackJournalCorrupt):
+            delete_journal.load_journal(tmp_path, "pack-a")
+        assert delete_journal.load_journal(tmp_path, "pack-a", schema=2) == payload
+        with pytest.raises(delete_journal.DeletePackJournalCorrupt):
+            delete_journal.load_journal(tmp_path, "pack-a", schema=3)
+
     def test_replace_failing_midwrite_leaves_the_previous_journal_intact(
         self, tmp_path, monkeypatch
     ):

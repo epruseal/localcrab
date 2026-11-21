@@ -6,6 +6,20 @@ STORAGE_MODE value, and that Settings.is_local behaves correctly.
 
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.mark.parametrize("factory_name", ["make_graph_store", "make_doc_store", "make_vector_store", "make_sql_store"])
+def test_single_file_setting_refuses_unwired_factory(tmp_path, factory_name) -> None:
+    from opencrab.config import Settings
+    from opencrab.stores import factory
+
+    settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path),
+                        SINGLE_SQLITE_FILE=str(tmp_path / "single.db"))
+    with pytest.raises(RuntimeError, match="not ready"):
+        getattr(factory, factory_name)(settings)
+    assert not (tmp_path / "single.db").exists()
+
 
 def test_settings_local_is_local_true() -> None:
     from opencrab.config import Settings
@@ -185,6 +199,35 @@ def test_factory_pg_sql_store_uses_postgres_url(tmp_path) -> None:
     )
     store = make_sql_store(settings)
     assert "postgresql" in store._url
+
+
+def test_factory_pg_sql_uses_shared_engine_without_dispose(tmp_path, monkeypatch) -> None:
+    from sqlalchemy import create_engine
+
+    from opencrab.config import Settings
+    from opencrab.stores import factory
+
+    engine = create_engine(_UNREACHABLE_PG_URL.replace("postgresql://", "postgresql+psycopg2://"))
+    disposed = []
+    monkeypatch.setattr(factory, "_get_pg_engine", lambda _url: engine)
+    monkeypatch.setattr(engine, "dispose", lambda: disposed.append(True))
+    settings = Settings(STORAGE_MODE="pg", LOCAL_DATA_DIR=str(tmp_path), POSTGRES_URL=_UNREACHABLE_PG_URL)
+    store = factory.make_sql_store(settings)
+    try:
+        assert store._engine is engine
+    finally:
+        store.close()
+    assert not disposed
+
+
+def test_sqlstore_rejects_engine_for_a_different_database(tmp_path) -> None:
+    from sqlalchemy import create_engine
+
+    from opencrab.stores.sql_store import SQLStore
+
+    engine = create_engine("sqlite:///:memory:")
+    with pytest.raises(ValueError, match="engine"):
+        SQLStore("postgresql://test:test@127.0.0.1:1/test", engine=engine)
 
 
 def test_factory_pg_graph_and_doc_share_engine(tmp_path) -> None:

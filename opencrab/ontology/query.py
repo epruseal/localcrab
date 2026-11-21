@@ -972,6 +972,7 @@ class HybridQuery:
         # invalidation because the DB node index served searches. The next
         # memory-path search runs that invalidation first.
         self._bm25_invalidation_skipped = False
+        self._bm25_invalidation_lock = threading.Lock()
 
     def _node_index_store(self) -> Any:
         """Return the doc store when the DB node index serves BM25 (#541).
@@ -1020,9 +1021,10 @@ class HybridQuery:
 
     def _memory_path_entered(self) -> None:
         """Run the invalidation the DB path skipped (design 4.4)."""
-        if self._bm25_invalidation_skipped:
-            self._bm25_invalidation_skipped = False
-            self._bm25.invalidate()
+        with self._bm25_invalidation_lock:
+            if self._bm25_invalidation_skipped:
+                self._bm25.invalidate()
+                self._bm25_invalidation_skipped = False
 
     # -- BM25 cache/worker state, forwarded to the extracted worker so the
     #    public/private surface (and tests pinning it) stays unchanged. --
@@ -1071,8 +1073,21 @@ class HybridQuery:
         #541: while the DB node index serves searches, its triggers and write
         sync keep it fresh, so the memory invalidation is skipped and remembered.
         """
+        from opencrab.stores._single_file import SharedSqliteFile
+
+        shared = getattr(self._doc_store, "shared_file", None)
+        pg_uow = getattr(self._doc_store, "_pg_uow", None)
+        active = shared if isinstance(shared, SharedSqliteFile) and shared.in_unit_of_work else None
+        if active is None and pg_uow is not None and pg_uow.active:
+            active = pg_uow
+        if active is not None:
+            with self._bm25_invalidation_lock:
+                self._bm25_invalidation_skipped = True
+            active.after_commit(self.invalidate_bm25_cache)
+            return
         if self._node_index_store() is not None:
-            self._bm25_invalidation_skipped = True
+            with self._bm25_invalidation_lock:
+                self._bm25_invalidation_skipped = True
             return
         self._bm25.invalidate()
 
@@ -2008,6 +2023,8 @@ class HybridQuery:
         text: str,
         source_id: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        _precomputed_vectors: Any = None,
     ) -> dict[str, Any]:
         """
         Ingest a text chunk into the vector store.
@@ -2041,11 +2058,14 @@ class HybridQuery:
             return result
 
         try:
-            ids = self._chroma.upsert_texts(
-                texts=[text],
-                metadatas=[meta],
-                ids=[source_id],
-            )
+            if _precomputed_vectors is None:
+                ids = self._chroma.upsert_texts(
+                    texts=[text], metadatas=[meta], ids=[source_id],
+                )
+            else:
+                ids = self._chroma.upsert_precomputed(
+                    [text], [meta], [source_id], _precomputed_vectors,
+                )
             # opencrab.ontology.builder.store_write_succeeded() only
             # recognizes exactly "ok" or the "ok (...)" shape (status ==
             # "ok" or status.startswith("ok (")) as success — keep the

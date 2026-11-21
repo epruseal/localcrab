@@ -58,7 +58,9 @@ class PgDocStore(_SqlDocStoreBase):
 
     _dialect = POSTGRES
 
-    def __init__(self, dsn_or_engine: Any, schema: str = "public") -> None:
+    def __init__(self, dsn_or_engine: Any, schema: str = "public", *, pg_uow: Any = None) -> None:
+        if pg_uow is not None and pg_uow.active:
+            raise RuntimeError("PG store cannot initialize inside a shared unit")
         if not _SCHEMA_IDENT_RE.match(schema):
             raise ValueError(f"Invalid schema identifier: {schema!r}")
         self._schema = schema
@@ -81,6 +83,9 @@ class PgDocStore(_SqlDocStoreBase):
             self._engine = create_engine(normalize_pg_url(str(dsn_or_engine)))
             self._owns_engine = True
 
+        if pg_uow is not None and pg_uow.engine is not self._engine:
+            raise ValueError("PostgreSQL unit of work uses a different engine")
+        self._pg_uow = pg_uow
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -89,7 +94,10 @@ class PgDocStore(_SqlDocStoreBase):
 
     @contextmanager
     def _conn(self, write: bool = False):
-        cm = self._engine.begin() if write else self._engine.connect()
+        uow = getattr(self, "_pg_uow", None)
+        cm = uow.connection(write=write) if uow is not None else (
+            self._engine.begin() if write else self._engine.connect()
+        )
         with cm as conn:
             conn.execute(self._text("SET TIME ZONE 'UTC'"))
             yield conn

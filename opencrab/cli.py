@@ -574,7 +574,7 @@ def ingest(path: str, recursive: bool, extension: str, pack_id: str | None) -> N
     cfg = get_settings()
     stores = _make_stores(cfg, graph=True, vector=True, doc=True, sql=True)
     chroma, neo4j, mongo = stores.vector, stores.graph, stores.doc
-    hybrid = HybridQuery(chroma, neo4j)
+    hybrid = HybridQuery(chroma, neo4j, doc_store=mongo)
 
     extensions = [e.strip() for e in extension.split(",")]
     files, refused = _discover_source_files(path, recursive, extension, cfg.local_data_dir)

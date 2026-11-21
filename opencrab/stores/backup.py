@@ -300,6 +300,7 @@ _FIXED_INVENTORY: tuple[BackupTarget, ...] = (
     ),
     BackupTarget("chroma", "chroma", "directory", "ChromaStore PersistentClient directory"),
     BackupTarget("docs", "docs", "directory", "LocalDocStore JSON fallback directory"),
+    BackupTarget("delete-pack-journals", "delete-pack-journals", "directory", "팩 삭제 저널"),
     BackupTarget(
         "graph.kuzu",
         "graph.kuzu",
@@ -358,6 +359,10 @@ def local_data_dir_inventory(settings: Any | None = None) -> list[BackupTarget]:
                 "VECTOR_DB_FILE names a vector store file other than the default",
             )
         )
+        known.add(vector_file)
+    single_file = getattr(settings, "single_sqlite_file", None)
+    if isinstance(single_file, str) and single_file and single_file not in known:
+        targets.append(BackupTarget(single_file, single_file, "sqlite", "단일 SQLite 저장소"))
     return targets
 
 
@@ -826,6 +831,101 @@ def _readonly_integrity(path: Path) -> None:
         raise BackupError(f"{path.name} failed integrity_check: {result}")
 
 
+def _verify_single_db_recovery(root: Path, manifest: dict[str, Any], intact: set[str]) -> None:
+    recovery = manifest.get("single_db_recovery")
+    if not isinstance(recovery, dict):
+        raise BackupError("single SQLite recovery manifest is malformed")
+    backup_id = recovery.get("backup_id")
+    database = recovery.get("database")
+    billing = recovery.get("billing")
+    journals = recovery.get("journals")
+    expected = recovery.get("operations")
+    if (
+        not isinstance(backup_id, str) or len(backup_id) != 32
+        or any(ch not in "0123456789abcdef" for ch in backup_id)
+        or not isinstance(database, str) or database not in intact
+        or not isinstance(billing, str) or billing not in intact or database == billing
+        or not isinstance(journals, dict) or not isinstance(expected, list)
+    ):
+        raise BackupError("single SQLite recovery manifest is malformed or incomplete")
+    if any(not isinstance(path, str) or path not in intact for path in journals.values()):
+        raise BackupError("single SQLite recovery journal is missing")
+    for rel in (database, billing, *journals.values()):
+        cursor = root
+        for component in Path(rel).parts:
+            cursor = cursor / component
+            if cursor.is_symlink():
+                raise BackupError("single SQLite recovery path contains a symlink")
+    _readonly_integrity(root / database)
+    _readonly_integrity(root / billing)
+    try:
+        conn = sqlite3.connect((root / database).resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT operation_id, pack_id, incarnation, state, result_json, evidence_json "
+                "FROM pack_delete_operations ORDER BY operation_id"
+            ).fetchall()
+            pack_rows = conn.execute("SELECT pack_id, incarnation FROM packs").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise BackupError("single SQLite recovery operation table cannot be read") from exc
+    operations = [list(row) for row in rows]
+    if operations != expected:
+        raise BackupError("single SQLite recovery operation list differs from database")
+    if any(not isinstance(row[1], str) or not row[1] for row in rows):
+        raise BackupError("single SQLite recovery operation has invalid pack identity")
+    if not set(journals).issubset({row[1] for row in rows}):
+        raise BackupError("single SQLite recovery journal list differs from operations")
+    from opencrab.pack import delete_journal
+
+    journal_dir = root / "delete-pack-journals"
+    if journal_dir.is_symlink() or (journal_dir.exists() and not journal_dir.is_dir()):
+        raise BackupError("single SQLite recovery journal directory is invalid")
+    actual_journals = {
+        path.relative_to(root).as_posix() for path in journal_dir.rglob("*") if not path.is_dir()
+    } if journal_dir.exists() else set()
+    if actual_journals != set(journals.values()):
+        raise BackupError("single SQLite recovery journal files differ from manifest")
+    from opencrab.pack.load import _verify_single_file_delete_evidence
+
+    by_id = {}
+    for operation_id, pack_id, incarnation, state, result_json, evidence_json in rows:
+        try:
+            if operation_id in by_id:
+                raise ValueError("duplicate operation")
+            result = json.loads(result_json) if result_json is not None else None
+            if state == "committed":
+                _verify_single_file_delete_evidence(evidence_json, operation_id, incarnation, result)
+            elif state != "pending" or result is not None or evidence_json is not None:
+                raise ValueError("invalid pending operation")
+            by_id[operation_id] = (pack_id, incarnation, state, result)
+        except (delete_journal.DeletePackJournalConflict, ValueError, TypeError) as exc:
+            raise BackupError("single SQLite recovery operation is invalid") from exc
+    packs = dict(pack_rows)
+    if len(packs) != len(pack_rows):
+        raise BackupError("single SQLite recovery pack identity is duplicated")
+    matched = set()
+    for pack_id, path in journals.items():
+        expected_path = delete_journal.journal_path(root, pack_id).relative_to(root).as_posix()
+        if path != expected_path:
+            raise BackupError("single SQLite recovery journal path differs from pack identity")
+        try:
+            journal = delete_journal.load_journal(root, pack_id, schema=2)
+        except delete_journal.DeletePackJournalCorrupt as exc:
+            raise BackupError("single SQLite recovery journal is invalid") from exc
+        if journal is None:
+            raise BackupError("single SQLite recovery journal is missing")
+        operation_id = journal["operation_id"]
+        if packs.get(pack_id) != journal["incarnation"]:
+            raise BackupError("single SQLite recovery pack incarnation differs from journal")
+        if by_id.get(operation_id) != (pack_id, journal["incarnation"], journal["state"], journal["result"]):
+            raise BackupError("single SQLite recovery journal differs from operation")
+        matched.add(operation_id)
+    if set(by_id) != matched:
+        raise BackupError("single SQLite recovery operation has no verified journal")
+
+
 def verify_backup_set(set_dir: str | Path) -> dict[str, Any]:
     """Check a published set against its ``MANIFEST.json``. Writes nothing.
 
@@ -849,8 +949,16 @@ def verify_backup_set(set_dir: str | Path) -> dict[str, Any]:
     if root.is_symlink() or not root.is_dir():
         raise BackupError(f"backup set directory does not exist: {root}")
     manifest_path = root / MANIFEST_NAME
+    def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate manifest field")
+            result[key] = value
+        return result
+
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"), object_pairs_hook=unique_pairs)
     except FileNotFoundError as exc:
         raise BackupError(f"{MANIFEST_NAME} is missing from {root.name}") from exc
     except (OSError, ValueError) as exc:
@@ -911,6 +1019,29 @@ def verify_backup_set(set_dir: str | Path) -> dict[str, Any]:
     )
     if problems:
         raise BackupError(f"backup set {root.name} failed verification: " + "; ".join(problems))
+    if "single_db_recovery" in manifest:
+        _verify_single_db_recovery(root, manifest, intact)
+        if unlisted:
+            raise BackupError("single SQLite recovery set has unlisted files")
+    else:
+        for rel in intact:
+            path = root / rel
+            try:
+                with path.open("rb") as fh:
+                    header = fh.read(16)
+                if header != b"SQLite format 3\x00":
+                    continue
+                conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+                try:
+                    marker = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                    ).fetchone()
+                finally:
+                    conn.close()
+            except (OSError, sqlite3.Error) as exc:
+                raise BackupError("backup SQLite recovery marker cannot be read") from exc
+            if marker is not None:
+                raise BackupError("single SQLite recovery manifest is missing")
     return {
         "set": root.name,
         "files_verified": len(intact),
@@ -1209,7 +1340,16 @@ def backup_data_dir(
         if not data_dir.is_dir():
             raise BackupError(f"data directory does not exist: {data_dir}")
 
+        if settings is None:
+            try:
+                from opencrab.config import get_settings
+
+                settings = get_settings()
+            except Exception as exc:
+                raise BackupError(f"cannot read backup configuration, including vector settings ({exc})") from exc
         targets = local_data_dir_inventory(settings)
+        if getattr(settings, "single_sqlite_file", ""):
+            raise BackupError("단일 SQLite 백업은 저널과 복구 세대 검증이 준비되지 않았다")
         wanted = set(exclude)
         unknown = wanted - {t.label for t in targets}
         if unknown:

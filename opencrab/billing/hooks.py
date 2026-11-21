@@ -233,7 +233,9 @@ class BillingHooks:
         }
 
         try:
-            with self._sql._engine.begin() as conn:
+            from opencrab.stores.sql_store import write_lock_for_store
+
+            with write_lock_for_store(self._sql, own_file=True), self._sql._engine.begin() as conn:
                 conn.execute(text(sql), params)
         except Exception as exc:
             # issue #105: this used to retry a handful of times on "database

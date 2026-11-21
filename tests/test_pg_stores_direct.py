@@ -342,6 +342,123 @@ def _fake_embed(dim: int):
     return embed
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True])
+@pytest.mark.parametrize("method", ["add", "upsert", "precomputed"])
+def test_pg_vector_value_contract(pg_engine, value, method) -> None:
+    from sqlalchemy.exc import DBAPIError
+
+    table = f"t{uuid.uuid4().hex[:8]}_value"
+    vector = [value, 0.0, 0.0, 0.0]
+    store = PgVectorStore(
+        pg_engine, embedding_function=lambda texts: [vector for _ in texts],
+        dim=4, collection_name=table,
+    )
+    try:
+        def write():
+            if method == "add":
+                return store.add_texts(["a"], [{"pack_id": "p"}], ["x"])
+            if method == "upsert":
+                return store.upsert_texts(["a"], [{"pack_id": "p"}], ["x"])
+            return store.upsert_precomputed(["a"], [{"pack_id": "p"}], ["x"], [vector])
+
+        if isinstance(value, bool):
+            assert write() == ["x"]
+        else:
+            with pytest.raises(DBAPIError):
+                write()
+    finally:
+        store.close()
+        with pg_engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+
+
+def test_pg_shared_uow_commit_and_rollback(pg_engine, monkeypatch) -> None:
+    from sqlalchemy.exc import DBAPIError
+
+    from opencrab.auth import Principal, create_user, principal_scope
+    from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.pack.ownership import create_pack
+    from opencrab.stores._pg_uow import PgUnitOfWork
+    from opencrab.stores._single_file import RollbackOnlyError
+    from opencrab.stores.sql_store import SQLStore
+
+    suffix = uuid.uuid4().hex[:8]
+    schema = f"t{suffix}_uow"
+    table = f"t{suffix}_vectors"
+    uow = PgUnitOfWork(pg_engine)
+    graph = PGGraphStore(pg_engine, schema=schema, pg_uow=uow)
+    docs = PgDocStore(pg_engine, schema=schema, pg_uow=uow)
+    vector = PgVectorStore(
+        pg_engine, embedding_function=_fake_embed(4), dim=4,
+        collection_name=table, pg_uow=uow,
+    )
+    sql = SQLStore(str(pg_engine.url), engine=pg_engine, pg_uow=uow)
+    owner = None
+    pack = f"p{suffix}"
+    try:
+        assert graph.available and docs.available and vector.available and sql.available
+        owner = create_user(sql, f"owner-{suffix}")
+        pack = create_pack(sql, owner, pack)
+        with principal_scope(Principal(user_id=owner, is_local=False, disabled=False)):
+            with monkeypatch.context() as patch:
+                patch.setattr(docs, "upsert_node_doc", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("doc failure")))
+                receipt = OntologyBuilder(graph, docs, sql, vec=vector).add_node(
+                    "space", "Type", f"b{suffix}", {"title": "t"}, pack_id=pack
+                )
+            assert receipt["stores"]["graph"] == "error: rolled back"
+        assert graph.get_node("Type", f"b{suffix}") is None
+        assert vector.get_by_id(f"b{suffix}") is None
+        with pg_engine.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM ontology_nodes WHERE node_id=:id"), {"id": f"b{suffix}"}).scalar_one() == 0
+            assert conn.execute(text(f'SELECT count(*) FROM "{schema}".doc_nodes WHERE node_id=:id'), {"id": f"b{suffix}"}).scalar_one() == 0
+        with uow.unit_of_work():
+            with uow.connection(write=True) as conn:
+                conn.execute(text("SELECT 1"))
+            with pytest.raises(DBAPIError):
+                with uow.connection(write=True) as conn:
+                    conn.execute(text("SELECT 1 / 0"))
+            with uow.connection() as conn:
+                assert conn.execute(text("SELECT 2")).scalar_one() == 2
+        with uow.unit_of_work():
+            graph.upsert_node("Type", f"n{suffix}", {"pack_id": "p"})
+            docs.upsert_node_doc("space", "Type", f"n{suffix}", {"pack_id": "p"})
+            vector.upsert_precomputed(["a"], [{"pack_id": "p"}], [f"n{suffix}"], [[0.0, 1.0, 0.0, 0.0]])
+            sql.register_node("space", "Type", f"n{suffix}")
+            assert graph.get_node("Type", f"n{suffix}") is not None
+            assert vector.get_by_id(f"n{suffix}") is not None
+            with uow.connection() as conn:
+                assert conn.execute(text(f'SELECT count(*) FROM "{schema}".doc_nodes WHERE node_id=:id'), {"id": f"n{suffix}"}).scalar_one() == 1
+                assert conn.execute(text("SELECT count(*) FROM ontology_nodes WHERE node_id=:id"), {"id": f"n{suffix}"}).scalar_one() == 1
+        with pytest.raises(RollbackOnlyError):
+            with uow.unit_of_work():
+                graph.upsert_node("Type", f"r{suffix}", {"pack_id": "p"})
+                docs.upsert_node_doc("space", "Type", f"r{suffix}", {"pack_id": "p"})
+                vector.upsert_precomputed(["b"], [{"pack_id": "p"}], [f"r{suffix}"], [[0.0, 1.0, 0.0, 0.0]])
+                sql.register_node("space", "Type", f"r{suffix}")
+                uow.mark_rollback_only()
+        assert graph.get_node("Type", f"n{suffix}") is not None
+        assert vector.get_by_id(f"n{suffix}") is not None
+        assert graph.get_node("Type", f"r{suffix}") is None
+        assert vector.get_by_id(f"r{suffix}") is None
+        with pg_engine.connect() as conn:
+            assert conn.execute(text(f'SELECT count(*) FROM "{schema}".doc_nodes WHERE node_id=:id'), {"id": f"n{suffix}"}).scalar_one() == 1
+            assert conn.execute(text("SELECT count(*) FROM ontology_nodes WHERE node_id=:id"), {"id": f"n{suffix}"}).scalar_one() == 1
+            assert conn.execute(text(f'SELECT count(*) FROM "{schema}".doc_nodes WHERE node_id=:id'), {"id": f"r{suffix}"}).scalar_one() == 0
+            assert conn.execute(text("SELECT count(*) FROM ontology_nodes WHERE node_id=:id"), {"id": f"r{suffix}"}).scalar_one() == 0
+    finally:
+        with pg_engine.begin() as conn:
+            conn.execute(text("DELETE FROM ontology_nodes WHERE node_id IN (:a, :b, :c)"), {"a": f"n{suffix}", "b": f"r{suffix}", "c": f"b{suffix}"})
+            if owner is not None:
+                conn.execute(text("DELETE FROM packs WHERE owner_id=:owner"), {"owner": owner})
+                conn.execute(text("DELETE FROM users WHERE user_id=:owner"), {"owner": owner})
+            conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+        _drop_schema(pg_engine, schema)
+        sql.close()
+        vector.close()
+        docs.close()
+        graph.close()
+
+
 class TestPgVectorStoreDirect:
     def test_invalid_collection_name_rejected(self, pg_engine) -> None:
         with pytest.raises(ValueError, match="Unsafe collection_name"):
