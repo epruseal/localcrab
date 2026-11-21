@@ -153,3 +153,41 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 - 예외 주입 시험: `python -m pytest tests/test_load_chunks_single_file.py`.
 - 공유 연결 시험: `python -m pytest tests/test_single_file_store.py`.
 - 측정 도구: `python scripts/bench_single_db.py <samples|latency|judge|concurrent|maintenance> --help`.
+
+## 7. factory 연결과 전환 전제
+
+단계 3.1의 factory 연결을 구현한 상태를 적는다. 이 절의 항목은 모두 시험 이름이나 후속 항목 이름을 하나 이상 가리킨다. 시험은 `tests/test_factory_single_file.py`에 있고 괄호 안은 설계 시험 번호다. 각 시험의 설명 문장이 설계 시험 번호로 시작하므로 번호로 찾을 수 있다.
+
+### 7.1 동작
+
+- `SINGLE_SQLITE_FILE`이 비어 있으면 모든 factory가 다중 파일 구조를 그대로 만든다(T-N1 `test_single_setting_empty_uses_multi_file_paths`).
+- 설정이 있으면 graph, doc, vector, sql factory가 한 `SharedSqliteFile`을 나눠 쓴다. 객체는 경로별 등록부가 하나만 만들고 결속 검증(대장, manifest, marker, metadata 행)을 거친 뒤 등록한다(T-N2 `test_single_four_stores_share_one_file`, T-N4, T-N5, T-G1).
+- billing factory는 등록부에 결속된 열린 SQL 저장소가 있을 때만 root의 `billing.db`를 연다(T-N3, T-E11).
+- 대장 state가 authorized가 아니면 DB를 열기 전에 거부한다. root에 `-wal`과 `-shm`이 생기지 않는다(T-E1, T-G3).
+
+### 7.2 전환 전제
+
+1. 게시된 root의 대장 state가 authorized여야 한다. ready나 staged는 거부된다(T-E1).
+2. 대장, manifest, marker, metadata 행이 서로 맞아야 한다. 어긋나면 거부된다(T-E2).
+3. `STORAGE_MODE=local`이고 sqlite-vec 벡터 백엔드이며 `SINGLE_SQLITE_FILE`이 root 안 `single.db`의 절대 경로여야 한다(T-E3 `test_single_rejects_bad_settings`).
+4. 설정의 `LOCAL_DATA_DIR`과 환경변수 `LOCAL_DATA_DIR`이 모두 root와 같아야 한다. `write.lock`과 `billing.db.lock`과 삭제 저널 디렉터리가 root 아래에 놓이기 때문이다(T-E3).
+5. 이전 데이터 디렉터리의 `packs/`와 삭제 저널을 root로 옮기는 절차는 아직 없다(후속 `followup_671_switch_data_dir_move`).
+6. 단일 모드에서 `write.lock`을 쥔 스레드의 첫 factory 호출은 거부된다. 쓰기 도구가 첫 컨텍스트를 만드는 경로는 이 거부 때문에 열리지 않는다(T-E9 `test_single_first_call_under_write_lock_is_rejected`, 후속 `followup_671_factory_write_lock_first_call`).
+
+### 7.3 지원하지 않는 기능
+
+- stdio 서버와 HTTP 인증: 인증 세 경로가 옛 `opencrab.db`를 열기 전에 거부한다(T-E7 `test_single_mode_refuses_auth_bypass_paths`, 후속 `followup_671_auth_bypass_wiring`). 이 때문에 사본에서 하는 서비스 시험은 factory 수준만 가능하다.
+- 백업과 backfill: 단일 모드를 거부한다(T-E8 a와 b, 후속 `followup_671_backup_backfill_single`). 운영 전환 중에는 백업을 만들 수 없다.
+- 관리 CLI: 단일 모드를 모른다. `packs backfill-pack-id`의 거부는 `graph.db` 부재와 `write.lock` 순서 위반이라는 우연한 거부다(T-E8 c와 d, 후속 `followup_671_admin_cli_single`).
+- 삭제, fork, 증분 노드 정리: `pack_delete_operations` 표가 있으면 거부한다(T-N7 `test_single_write_gates_stay_fail_closed`와 `test_single_delete_and_fork_gates_stay_fail_closed`). 삭제 저널 단위가 이 거부를 푼다.
+- node BM25 색인이 backfill 상태이거나 검색 중 drain이 필요한 경우: 단일 모드에서 진행하지 못하거나 작업 단위 밖에서 쓴다(T-N2가 ready 상태 게시 DB만 허용한다. 후속 `followup_671_bm25_backfill_single`, `followup_671_bm25_drain_single`).
+- 한 공유 객체 위에서 저장소를 동시에 만드는 일: 간헐 오류가 난다. 컨텍스트 초기화 잠금 안의 순차 생성이 전제다(T-G1이 생성자를 직렬화해 이 경로를 피한다. 후속 `followup_671_shared_concurrent_ctor`).
+
+### 7.4 롤백
+
+서비스를 멈춘 뒤 `SINGLE_SQLITE_FILE`을 비우고 `LOCAL_DATA_DIR`을 전환 전 데이터 디렉터리로 되돌린다. 두 설정을 함께 바꾼다. 7.2의 5번에서 root로 옮긴 `packs/`와 저널도 전환 전 디렉터리로 되돌린다. `SINGLE_SQLITE_FILE`만 비우면 `LOCAL_DATA_DIR`이 root인 채로 다중 파일 factory가 root에 빈 `graph.db`, `doc_store.db`, `vectors.db`, `opencrab.db`를 만든다. 단일 모드에서 쓴 데이터는 이전 파일에 없다. 그러므로 이 롤백은 단일 모드에서 새로 쓰기 전까지만 데이터 손실이 없다. 설정이 비어 있는 경로는 코드를 되돌리지 않아도 이전과 같다(T-N1).
+
+### 7.5 재현 명령
+
+- factory 단일 모드 시험: `python -m pytest tests/test_factory_single_file.py tests/test_factory_storage_modes.py`.
+- 이 절의 문서 점검: 저장소 루트에서 `rg -nP` 패턴으로 머신 경로와 커밋 해시를 찾아 0건(종료 코드 1)임을 확인한다.
