@@ -3611,6 +3611,7 @@ def test_delete_helper_rejects_unregistered_incident_edge_without_changes(stores
 
 @pytest.mark.xfail(
     strict=True,
+    raises=RuntimeError,  # 설계가 정한 거부만 흡수한다. 같은 문구는 T-N7(factory 시험)이 정확히 단언한다.
     reason="delete_pack는 pack_delete_operations 표가 있는 단일 SQLite 파일에서 거부된다. "
     "삭제 저널 단위(followup_671_delete_journal_unit)가 그 거부를 풀 때 이 xfail을 지우고 시험을 켠다.",
 )
