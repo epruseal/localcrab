@@ -320,10 +320,10 @@ def test_publication_main_prepares_before_staging(source_dir, tmp_path, monkeypa
     assert not ledger.exists()
     monkeypatch.setattr(merge_mod, "_prepare_publication", original_prepare)
     monkeypatch.setattr(os, "mkdir", check_order)
-    assert merge_mod.main(args) != 0
-    assert json.loads(ledger.read_text())["state"] == "preparing"
-    assert staging.is_dir()
-    assert not root.exists()
+    assert merge_mod.main(args) == 0
+    assert json.loads(ledger.read_text())["state"] == "ready"
+    assert root.is_dir()
+    assert not staging.exists()
     assert merge_mod.main(args) != 0
 
 
@@ -1038,14 +1038,15 @@ def test_publication_main_merges_generated_backup(source_dir, tmp_path, monkeypa
         import subprocess
         import sys
 
-        assert merge_mod.main(args) != 0
+        assert merge_mod.main(args) == 2
+        _assert_ready_cleanup_failed(capsys.readouterr().err)
         owner = merge_mod._publication_owners[str(root)]
         _, ordinal, timing = failure.split(":")
         key = owner.fd_roles["checkpoint-fsync"][int(ordinal)]
         failed_fd = owner.fd_slots[key]
         assert owner.uncertain and fd_close_events == [failed_fd]
         assert owner.fd_slots["source-lock"] is not None
-        assert not root.exists()
+        _assert_ready_published(root)
         assert merge_mod.main(args) != 0
         assert fd_close_events == [failed_fd]
         command = [sys.executable, "-c", "import fcntl,sys; f=open(sys.argv[1], 'rb'); fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)"]
@@ -1260,7 +1261,8 @@ def test_publication_main_merges_generated_backup(source_dir, tmp_path, monkeypa
         import subprocess
         import sys
 
-        assert merge_mod.main(args) != 0
+        assert merge_mod.main(args) == 2
+        _assert_ready_cleanup_failed(capsys.readouterr().err)
         owner = merge_mod._publication_owners[str(root)]
         assert owner.uncertain and not owner.connections
         assert owner.fd_slots["source-lock"] is not None
@@ -1508,13 +1510,12 @@ def test_publication_main_merges_generated_backup(source_dir, tmp_path, monkeypa
             assert not owner.connections and not owner.uncertain and owner.root_lock is None
             assert all(fd is None for fd in owner.fd_slots.values())
             assert str(root) not in merge_mod._publication_owners
-        assert not root.exists()
-        intent = root.with_name(root.name + ".intent.json")
-        staging = root.with_name(root.name + ".staging")
-        assert intent.exists() is (attach_target[0] != "inputs")
-        assert staging.exists() is (attach_target[0] != "inputs")
+        _assert_ready_published(root)
         return
-    assert merge_mod.main(args) != 0
+    if failure is None:
+        assert merge_mod.main(args) == 0
+    else:
+        assert merge_mod.main(args) != 0
     stderr = capsys.readouterr().err
     if failure is None:
         import subprocess
@@ -1550,7 +1551,8 @@ def test_publication_main_merges_generated_backup(source_dir, tmp_path, monkeypa
         assert "injected" in stderr
         assert str(root) not in merge_mod._publication_owners
     staging = tmp_path / "published-generated.staging"
-    assert json.loads((tmp_path / "published-generated.intent.json").read_text())["state"] == "preparing"
+    assert json.loads((tmp_path / "published-generated.intent.json").read_text())["state"] == (
+        "ready" if failure is None else "preparing")
     if failure in {"attach:merge", "detach:merge"}:
         assert not calls
     else:
@@ -1559,14 +1561,15 @@ def test_publication_main_merges_generated_backup(source_dir, tmp_path, monkeypa
         database = staging / "single.db.partial"
         assert not (staging / "billing.db").exists()
     else:
-        database = staging / "single.db"
-        assert not (staging / "single.db.partial").exists()
-        assert (staging / "billing.db").read_bytes() == (backup_root / "billing.db").read_bytes()
+        database = root / "single.db"
+        assert not staging.exists()
+        _assert_ready_published(root)
+        assert (root / "billing.db").read_bytes() == (backup_root / "billing.db").read_bytes()
     assert database.is_file()
-    assert not root.exists()
+    assert failure is None or not root.exists()
     if failure in {"attach:merge", "detach:merge"}:
         return
-    with _conn(database) as conn:
+    with (_conn(database) if failure else _immutable_conn(database)) as conn:
         assert conn.execute("SELECT count(*) FROM vectors_kure").fetchone()[0] == 40
         assert conn.execute("SELECT count(*) FROM graph_nodes").fetchone()[0] == 30
         if not failure:
@@ -4627,17 +4630,71 @@ class _ReadyHarness:
             owners.append(owner)
 
         monkeypatch.setattr(merge_mod._PublicationOwner, "__init__", owner_init)
+        # 역할별 순번의 fd를 열린 시점에 기록한다. 닫기 주입은 정리 단계에서 슬롯이 비워진 뒤에도 fd를 찾아야 한다.
+        self.fds = {}
+        self.by_fd = {}
+        self.events = []
+        original_open_fd = merge_mod._PublicationOwner.open_fd
+        harness = self
+
+        def recording_open_fd(owner, role, *args, **kwargs):
+            index = len(owner.fd_roles.get(role, []))
+            harness.events.append(("open", role))
+            fd = original_open_fd(owner, role, *args, **kwargs)
+            harness.fds[(role, index)] = fd
+            harness.by_fd[fd] = role
+            return fd
+
+        monkeypatch.setattr(merge_mod._PublicationOwner, "open_fd", recording_open_fd)
+        self.r8_calls = 0
+        self.r8_before = []
+        self.r8_after = []
+        self.r8_installed = False
 
     @staticmethod
     def current_owner():
         return getattr(merge_mod._publication_current, "owner", None)
 
     def slot_fd(self, role, n):
-        owner = self.current_owner()
-        if owner is None:
-            return None
-        keys = owner.fd_roles.get(role, [])
-        return owner.fd_slots.get(keys[n]) if len(keys) > n else None
+        return self.fds.get((role, n))
+
+    def install_r8(self):
+        """5절 규칙. 원본 이름이 staging 이름인 R8 호출에서만 동작하고 R0a 프로브 호출은 그대로 넘긴다."""
+        if self.r8_installed:
+            return
+        self.r8_installed = True
+        real = merge_mod._rename_noreplace
+        staging_name = self.ctx.staging.name
+        harness = self
+
+        def wrapped(src_fd, src, dst_fd, dst):
+            if src != staging_name:
+                return real(src_fd, src, dst_fd, dst)
+            harness.r8_calls += 1
+            for hook in harness.r8_before:
+                hook()
+            real(src_fd, src, dst_fd, dst)
+            for hook in harness.r8_after:
+                hook()
+
+        self.monkeypatch.setattr(merge_mod, "_rename_noreplace", wrapped)
+
+    def inject_rename(self, name, n, *, after=False):
+        """os.rename이 대상 마지막 이름이 name인 n번째 호출(0부터)에서 실패한다."""
+        real = os.rename
+        counter = {"n": 0}
+
+        def wrapped(src, dst, *args, **kwargs):
+            if Path(dst).name == name:
+                index = counter["n"]
+                counter["n"] += 1
+                if index == n:
+                    if after:
+                        real(src, dst, *args, **kwargs)
+                    raise OSError(errno.EIO, "injected rename failure")
+            return real(src, dst, *args, **kwargs)
+
+        self.monkeypatch.setattr(os, "rename", wrapped)
 
     def inject_open(self, role, n=0):
         """role의 n번째 open_fd에서 os.open이 실패한다(open_fd가 uncertain을 세운다)."""
@@ -4659,13 +4716,23 @@ class _ReadyHarness:
 
         monkeypatch.setattr(merge_mod._PublicationOwner, "open_fd", wrapped)
 
-    def inject_fd_call(self, function, role, n=0, *, after=False):
-        """os.<function>(fd, ...)이 role의 n번째 fd에서 실패한다. after이면 실제 호출 뒤에 실패한다."""
+    def inject_fd_call(self, function, role, n=0, *, after=False, then=None):
+        """os.<function>(fd, ...)이 role의 n번째 fd에서 실패한다. after이면 실제 호출 뒤에 실패한다.
+
+        then이 있으면 실패 대신 실제 호출 뒤에 then()을 한 번 부르고 결과를 돌려준다. close 주입은 한 번만 동작한다.
+        """
         original = getattr(os, function)
         harness = self
+        done = []
 
         def wrapped(fd, *args, **kwargs):
-            if fd == harness.slot_fd(role, n):
+            target = harness.slot_fd(role, n)
+            if target is not None and fd == target and not (done and (then is not None or function == "close")):
+                done.append(True)
+                if then is not None:
+                    result = original(fd, *args, **kwargs)
+                    then()
+                    return result
                 if after:
                     original(fd, *args, **kwargs)
                 raise OSError(errno.EIO, f"injected {function} failure")
@@ -4918,3 +4985,769 @@ def test_publication_main_refuses_intent_tmp(source_dir, tmp_path, capsys):
     assert "publication preflight failed: publication artifacts already exist" in capsys.readouterr().err
     assert ctx.intent_tmp.read_bytes() == b"leftover"
     assert not ctx.root.exists() and not ctx.staging.exists() and not ctx.intent.exists()
+
+
+def _immutable_conn(path):
+    """게시된 root를 건드리지 않는 읽기 전용 immutable 연결(vec0 확장 포함)."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    return conn
+
+
+def _assert_ready_published(root):
+    """게시가 ready까지 끝난 디스크 상태: root 6개 파일, staging 없음, intent와 root ledger가 ready."""
+    intent = root.with_name(root.name + ".intent.json")
+    staging = root.with_name(root.name + ".staging")
+    assert root.is_dir() and not staging.exists()
+    assert sorted(item.name for item in root.iterdir()) == [
+        "billing.db", "ledger.json", "manifest.json", "marker.json", "single.db", "single.db.lifetime.lock"]
+    assert json.loads(intent.read_text())["state"] == "ready"
+    assert json.loads((root / "ledger.json").read_text())["state"] == "ready"
+    assert not root.with_name(root.name + ".intent.json.tmp").exists()
+
+
+def _assert_ready_cleanup_failed(err):
+    assert "publication ready; cleanup failed" in err
+    assert "publication preflight failed" not in err and "post-ready source check failed" not in err
+
+
+# ---- 게시 ready 경로: R7~R11 (#671 P1 단계 3) ----
+
+_R9_BASE = {"root": True, "stg": False, "intent": "publishing", "intent_tmp": False, "ledger": "staged"}
+_PUBLISH = "publication publish failed:"
+
+
+def _pub(rc, unc, held, prefix, **disk):
+    return (rc, unc, held, prefix, disk)
+
+
+def _r7(**disk):
+    return {"root": False, "stg": True, "ledger_tmp": False, **disk}
+
+
+_PUB_ROWS = {
+    "intent-tmp-create": _pub(1, True, True, _PUBLISH, **_r7(intent="preparing", intent_tmp=False)),
+    "intent-tmp-write": _pub(1, False, False, _PUBLISH, **_r7(intent="preparing", intent_tmp=True)),
+    "intent-tmp-fsync": _pub(1, False, False, _PUBLISH, **_r7(intent="preparing", intent_tmp=True)),
+    "intent-rename-before": _pub(1, False, False, _PUBLISH, **_r7(intent="preparing", intent_tmp=True)),
+    "intent-rename-after": _pub(1, False, False, _PUBLISH, **_r7(intent="publishing", intent_tmp=False)),
+    "intent-parent-fsync": _pub(1, False, False, _PUBLISH, **_r7(intent="publishing", intent_tmp=False)),
+    "intent-parent-open": _pub(1, True, True, _PUBLISH, **_r7(intent="publishing", intent_tmp=False)),
+    "publish-parent-open": _pub(1, True, True, _PUBLISH, **_r7(intent="publishing", intent_tmp=False)),
+    "rename-enosys-einval": _pub(1, False, False, _PUBLISH + " publication rename is unsupported",
+                                 **_r7(intent="publishing", intent_tmp=False)),
+    "rename-exdev": _pub(1, False, False, _PUBLISH, **_r7(intent="publishing", intent_tmp=False)),
+    "rename-error-effect-absent": _pub(1, False, False, _PUBLISH,
+                                       **_r7(intent="publishing", intent_tmp=False)),
+    "rename-eexist": _pub(1, False, False, _PUBLISH, root=True, stg=True, intent="publishing", intent_tmp=False),
+    "rename-error-effect-present": _pub(1, False, False, _PUBLISH, root=True, stg=False, intent="publishing",
+                                        intent_tmp=False, ledger="staged"),
+    "rename-error-both-absent": _pub(1, True, True, _PUBLISH, root=False, stg=False, intent="publishing",
+                                     intent_tmp=False),
+    "rename-error-observe-fails": _pub(1, True, True, _PUBLISH, intent="publishing", intent_tmp=False),
+    "publish-parent-fsync-before": _pub(1, False, False, _PUBLISH, **_R9_BASE),
+    "publish-parent-fsync-after": _pub(1, False, False, _PUBLISH, **_R9_BASE),
+    "root-dir-open": _pub(1, True, True, _PUBLISH, **_R9_BASE),
+    "root-file-open": _pub(1, True, True, _PUBLISH, **_R9_BASE),
+    "verify-fileset": _pub(1, False, False, _PUBLISH + " publication root file set differs", **_R9_BASE),
+    "verify-fileform": _pub(1, False, False, _PUBLISH + " publication root file form differs", **_R9_BASE),
+    "verify-binding": _pub(1, False, False, _PUBLISH + " single SQLite generation binding differs", **_R9_BASE),
+    "verify-metadata-rows": _pub(1, False, False, _PUBLISH + " publication metadata row count differs",
+                                 **_R9_BASE),
+    "verify-vec-load": _pub(1, False, False, _PUBLISH + " sqlite_vec is not importable", **_R9_BASE),
+    "verify-quick-check": _pub(1, False, False, _PUBLISH + " publication quick_check differs", **_R9_BASE),
+    "verify-tables": _pub(1, False, False, _PUBLISH + " publication table counts differ", **_R9_BASE),
+    "verify-billing": _pub(1, False, False, _PUBLISH + " publication billing digest differs", **_R9_BASE),
+    "verify-identity": _pub(1, False, False, _PUBLISH + " publication published identity differs", **_R9_BASE),
+    "verify-sidecar": _pub(1, False, False, _PUBLISH + " publication database sidecar remains", **_R9_BASE),
+    "verify-source-changed": _pub(2, False, False, _PUBLISH + " source file changed during use", **_R9_BASE),
+    "verify-connect": _pub(1, True, True, _PUBLISH, **_R9_BASE),
+    "verify-connect-close": _pub(1, True, True, _PUBLISH, **_R9_BASE),
+    "ledger-tmp-create": _pub(1, True, True, _PUBLISH, **{**_R9_BASE, "ledger_tmp": False}),
+    "ledger-tmp-write": _pub(1, False, False, _PUBLISH, **{**_R9_BASE, "ledger_tmp": True}),
+    "ledger-tmp-fsync": _pub(1, False, False, _PUBLISH, **{**_R9_BASE, "ledger_tmp": True}),
+    "ledger-rename-before": _pub(1, False, False, _PUBLISH, **{**_R9_BASE, "ledger_tmp": True}),
+    "ledger-rename-after": _pub(1, False, False, _PUBLISH, **{**_R9_BASE, "ledger": "ready", "ledger_tmp": False}),
+    "root-dir-sync-open": _pub(1, True, True, _PUBLISH, **{**_R9_BASE, "ledger": "ready"}),
+    "root-dir-fsync": _pub(1, False, False, _PUBLISH, **{**_R9_BASE, "ledger": "ready"}),
+    "readback-open": _pub(1, True, True, _PUBLISH, **{**_R9_BASE, "ledger": "ready"}),
+    "readback-mismatch": _pub(1, False, False, _PUBLISH + " single SQLite generation binding differs",
+                              **{**_R9_BASE, "ledger": "ready"}),
+    "intent-ready-tmp-create": _pub(1, True, True, _PUBLISH, **{**_R9_BASE, "ledger": "ready"}),
+    "intent-ready-tmp-write": _pub(1, False, False, _PUBLISH, **{**_R9_BASE, "ledger": "ready", "intent_tmp": True}),
+    "intent-ready-tmp-fsync": _pub(1, False, False, _PUBLISH, **{**_R9_BASE, "ledger": "ready", "intent_tmp": True}),
+    "intent-ready-rename-before": _pub(1, False, False, _PUBLISH,
+                                       **{**_R9_BASE, "ledger": "ready", "intent_tmp": True}),
+    "intent-ready-rename-after": _pub(1, False, False, _PUBLISH, **{**_R9_BASE, "ledger": "ready", "intent": "ready"}),
+    "intent-ready-parent-fsync": _pub(1, False, False, _PUBLISH, **{**_R9_BASE, "ledger": "ready", "intent": "ready"}),
+    "intent-ready-parent-open": _pub(1, True, True, _PUBLISH, **{**_R9_BASE, "ledger": "ready", "intent": "ready"}),
+}
+
+_CLOSE_ROLES = ["probe-dir", "manifest-write", "marker-write", "ledger-write", "lock-create", "staging-seal",
+                "intent-tmp", "ledger-tmp", "publish-parent", "root-dir", "root-file", "intent-parent"]
+_POST_READY_IDS = [f"{role}-close" for role in _CLOSE_ROLES] + [
+    "inputs-exit-check", "source-lock-exit-identity", "post-ready-source-and-cleanup",
+    "step-failure-then-cleanup-failure"]
+# 6.3의 기존 시험 행(release 10건, checkpoint-close 4건). 새 시험에는 id 집합 단언에만 포함한다.
+_EXISTING_POST_READY_IDS = [
+    "release:source-unlock-before", "release:source-unlock-after", "release:source-close-before",
+    "release:source-close-after", "release:root-unlock-before", "release:root-unlock-after",
+    "release:root-close-before", "release:root-close-after", "release:registry-before",
+    "release:registry-after", "checkpoint-close:0:before", "checkpoint-close:0:after",
+    "checkpoint-close:1:before", "checkpoint-close:1:after"]
+# 6절 표의 failure id 전량. 표를 옮겨 적은 목록이며 시험 인자 집합과 일치해야 한다.
+_DESIGN_FAILURE_IDS = {
+    "rename-unsupported", "probe-mkdir", "probe-rmdir", "probe-unexpected-errno", "probe-dir-open",
+    "uncertain-guard", "identity-mismatch", "lock-create", "tables-connect", "tables-connect-close",
+    "manifest-open", "manifest-write", "manifest-fsync", "marker-open", "marker-write", "marker-fsync",
+    "ledger-open", "ledger-write", "ledger-fsync", "staging-seal-open", "staging-seal-fsync",
+    "intent-tmp-create", "intent-tmp-write", "intent-tmp-fsync", "intent-rename-before",
+    "intent-rename-after", "intent-parent-fsync", "intent-parent-open", "publish-parent-open",
+    "rename-enosys-einval", "rename-exdev", "rename-error-effect-absent", "rename-eexist",
+    "rename-error-effect-present", "rename-error-both-absent", "rename-error-observe-fails",
+    "publish-parent-fsync-before", "publish-parent-fsync-after", "root-dir-open", "root-file-open",
+    "verify-fileset", "verify-fileform", "verify-binding", "verify-metadata-rows", "verify-vec-load",
+    "verify-quick-check", "verify-tables", "verify-billing", "verify-identity", "verify-sidecar",
+    "verify-source-changed", "verify-connect", "verify-connect-close", "ledger-tmp-create",
+    "ledger-tmp-write", "ledger-tmp-fsync", "ledger-rename-before", "ledger-rename-after",
+    "root-dir-sync-open", "root-dir-fsync", "readback-open", "readback-mismatch",
+    "intent-ready-tmp-create", "intent-ready-tmp-write", "intent-ready-tmp-fsync",
+    "intent-ready-rename-before", "intent-ready-rename-after", "intent-ready-parent-fsync",
+    "intent-ready-parent-open",
+    "probe-dir-close", "manifest-write-close", "marker-write-close", "ledger-write-close", "lock-create-close",
+    "staging-seal-close", "intent-tmp-close", "ledger-tmp-close", "publish-parent-close", "root-dir-close",
+    "root-file-close", "intent-parent-close", "inputs-exit-check", "source-lock-exit-identity",
+    "post-ready-source-and-cleanup", "step-failure-then-cleanup-failure",
+    *_EXISTING_POST_READY_IDS}
+
+
+_SECOND_METADATA_ROW = ("INSERT INTO single_file_metadata (singleton, root, database_path, db_uuid, generation) "
+                        "VALUES (2, 'a', 'b', 'c', 'd')")
+
+
+def _variant_hook(ctx, variant, monkeypatch=None):
+    """R8 rename 직후에 root를 변형하는 훅. R9 거부 시험과 판정 일치 시험이 같은 변형을 쓴다."""
+    root, src = ctx.root, ctx.src
+    outside = ctx.root.parent / "outside-link"
+
+    def rewrite_db(statement):
+        conn = sqlite3.connect(root / "single.db", isolation_level=None)
+        try:
+            # singleton 열의 CHECK 제약이 둘째 행을 막으므로 삽입 변형은 제약 검사를 끄고 쓴다.
+            conn.execute("PRAGMA ignore_check_constraints=ON")
+            conn.execute(statement)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+
+    def fileset():
+        (root / "extra.txt").write_text("x")
+
+    def hardlink():
+        os.link(root / "single.db", outside)
+
+    def binding():
+        path = root / "ledger.json"
+        data = json.loads(path.read_text())
+        data["generation"] = "0" * 32 if data["generation"] != "0" * 32 else "1" * 32
+        path.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")))
+
+    def billing():
+        with open(root / "billing.db", "ab") as handle:
+            handle.write(b"\0")
+
+    def identity():
+        copy = outside.with_name("copy.db")
+        shutil.copyfile(root / "single.db", copy)
+        os.replace(copy, root / "single.db")
+
+    def source_changed():
+        info = (src / "graph.db").stat()
+        os.utime(src / "graph.db", ns=(info.st_atime_ns, info.st_mtime_ns + 10_000_000_000))
+
+    def fifo_manifest():
+        os.unlink(root / "manifest.json")
+        os.mkfifo(root / "manifest.json")
+
+    def symlink_marker():
+        os.unlink(root / "marker.json")
+        os.symlink("manifest.json", root / "marker.json")
+
+    def symlink_lock():
+        os.unlink(root / "single.db.lifetime.lock")
+        os.symlink("manifest.json", root / "single.db.lifetime.lock")
+
+    def vec_load():
+        def broken(conn):
+            raise merge_mod.MergeError("sqlite_vec is not importable")
+
+        monkeypatch.setattr(merge_mod, "_load_vec", broken)
+
+    hooks = {
+        "verify-fileset": fileset, "verify-fileform": hardlink, "hardlink-single-db": hardlink,
+        "verify-binding": binding,
+        "verify-metadata-rows": lambda: rewrite_db(_SECOND_METADATA_ROW),
+        "metadata-two-rows": lambda: rewrite_db(_SECOND_METADATA_ROW),
+        "metadata-zero-rows": lambda: rewrite_db("DELETE FROM single_file_metadata"),
+        "verify-tables": lambda: rewrite_db("INSERT INTO graph_nodes VALUES ('extra-node', 'p')"),
+        "verify-billing": billing, "verify-identity": identity, "verify-source-changed": source_changed,
+        "fifo-manifest": fifo_manifest, "symlink-marker": symlink_marker, "symlink-lifetime-lock": symlink_lock,
+        "verify-vec-load": vec_load,
+    }
+    return hooks.get(variant)
+
+
+def _install_publish_failure(h, failure):
+    ctx, mp = h.ctx, h.monkeypatch
+    intent_name = ctx.intent.name
+
+    def r8_raise(code, *, before_action=None):
+        def hook():
+            if before_action is not None:
+                before_action()
+            raise OSError(code, "injected rename failure")
+
+        h.install_r8()
+        h.r8_before.append(hook)
+
+    simple = {
+        "intent-tmp-create": lambda: h.inject_open("intent-tmp", 0),
+        "intent-tmp-write": lambda: h.inject_fd_call("write", "intent-tmp", 0),
+        "intent-tmp-fsync": lambda: h.inject_fd_call("fsync", "intent-tmp", 0),
+        "intent-rename-before": lambda: h.inject_rename(intent_name, 0),
+        "intent-rename-after": lambda: h.inject_rename(intent_name, 0, after=True),
+        "intent-parent-fsync": lambda: h.inject_fd_call("fsync", "intent-parent", 1),
+        "intent-parent-open": lambda: h.inject_open("intent-parent", 1),
+        "publish-parent-open": lambda: (h.install_r8(), h.inject_open("publish-parent", 0)),
+        "rename-enosys-einval": lambda: r8_raise(errno.ENOSYS),
+        "rename-exdev": lambda: r8_raise(errno.EXDEV),
+        "rename-error-effect-absent": lambda: r8_raise(errno.EIO),
+        "rename-eexist": lambda: (h.install_r8(), h.r8_before.append(lambda: os.mkdir(ctx.root))),
+        "rename-error-effect-present": lambda: (h.install_r8(), h.r8_after.append(
+            lambda: (_ for _ in ()).throw(OSError(errno.EIO, "injected rename failure")))),
+        "rename-error-both-absent": lambda: r8_raise(errno.EIO, before_action=lambda: shutil.rmtree(ctx.staging)),
+        "publish-parent-fsync-before": lambda: h.inject_fd_call("fsync", "publish-parent", 0),
+        "publish-parent-fsync-after": lambda: h.inject_fd_call("fsync", "publish-parent", 0, after=True),
+        "root-dir-open": lambda: h.inject_open("root-dir", 0),
+        "root-file-open": lambda: h.inject_open("root-file", 0),
+        "ledger-tmp-create": lambda: h.inject_open("ledger-tmp", 0),
+        "ledger-tmp-write": lambda: h.inject_fd_call("write", "ledger-tmp", 0),
+        "ledger-tmp-fsync": lambda: h.inject_fd_call("fsync", "ledger-tmp", 0),
+        "ledger-rename-before": lambda: h.inject_rename("ledger.json", 0),
+        "ledger-rename-after": lambda: h.inject_rename("ledger.json", 0, after=True),
+        "root-dir-sync-open": lambda: h.inject_open("root-dir", 1),
+        "root-dir-fsync": lambda: h.inject_fd_call("fsync", "root-dir", 1),
+        "readback-open": lambda: h.inject_open("root-file", 3),
+        "intent-ready-tmp-create": lambda: h.inject_open("intent-tmp", 1),
+        "intent-ready-tmp-write": lambda: h.inject_fd_call("write", "intent-tmp", 1),
+        "intent-ready-tmp-fsync": lambda: h.inject_fd_call("fsync", "intent-tmp", 1),
+        "intent-ready-rename-before": lambda: h.inject_rename(intent_name, 1),
+        "intent-ready-rename-after": lambda: h.inject_rename(intent_name, 1, after=True),
+        "intent-ready-parent-fsync": lambda: h.inject_fd_call("fsync", "intent-parent", 2),
+        "intent-ready-parent-open": lambda: h.inject_open("intent-parent", 2),
+    }
+    root_marker = "published/single.db?mode=ro&immutable=1"
+    if failure in simple:
+        simple[failure]()
+    elif failure == "rename-error-observe-fails":
+        armed = []
+        real_exists = merge_mod._publication_exists
+
+        def exists(path):
+            if armed and Path(path) == ctx.staging:
+                raise PermissionError(errno.EACCES, "injected observe failure")
+            return real_exists(path)
+
+        mp.setattr(merge_mod, "_publication_exists", exists)
+        r8_raise(errno.EIO, before_action=lambda: armed.append(True))
+    elif failure == "verify-connect":
+        h.inject_connect(root_marker, fail_open=True)
+    elif failure == "verify-connect-close":
+        h.inject_connect(root_marker, fail_close=True)
+    elif failure == "verify-quick-check":
+        h.inject_connect(root_marker, bad_quick_check=True)
+    elif failure == "verify-sidecar":
+        real_lexists = os.path.lexists
+
+        def lexists(path):
+            return True if str(path) == str(ctx.root / "single.db-wal") else real_lexists(path)
+
+        mp.setattr(os.path, "lexists", lexists)
+    elif failure == "readback-mismatch":
+        from opencrab.stores import _single_file
+
+        real_read = _single_file.read_binding_fd
+        count = []
+
+        def read(directory_fd, name, fd):
+            raw = real_read(directory_fd, name, fd)
+            if name == "ledger.json":
+                count.append(True)
+                if len(count) == 2:
+                    data = json.loads(raw)
+                    data["generation"] = "f" * 32 if data["generation"] != "f" * 32 else "e" * 32
+                    return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+            return raw
+
+        mp.setattr(_single_file, "read_binding_fd", read)
+    else:
+        hook = _variant_hook(ctx, failure, mp)
+        assert hook is not None, failure
+        h.install_r8()
+        h.r8_after.append(hook)
+
+
+def _run_publish_failure(source_dir, tmp_path, monkeypatch, capsys, failure):
+    rc, uncertain, held, message, disk = _PUB_ROWS[failure]
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    tree = _source_tree(source_dir)
+    _install_publish_failure(harness, failure)
+    try:
+        assert merge_mod.main(ctx.args) == rc
+        err = capsys.readouterr().err
+        assert message in err
+        assert "publication ready" not in err
+        if failure == "verify-source-changed":
+            assert "publication preflight failed: source file changed during use" in err
+        owner = harness.owners[-1]
+        assert owner.uncertain is uncertain
+        assert _flock_contended(ctx.lock_src) is held
+        assert _flock_contended(ctx.lock_root) is held
+        actual = _ready_disk(ctx)
+        assert {key: actual[key] for key in disk} == disk
+        if failure == "publish-parent-open":
+            assert harness.r8_calls == 0
+        if failure not in ("verify-source-changed",):
+            assert _source_tree(source_dir) == tree
+        assert not any(source_dir.glob("*-wal")) and not any(source_dir.glob("*-shm"))
+        if held:
+            assert str(owner.root) in {str(key) for key in merge_mod._publication_owners}
+        else:
+            assert all(fd is None for fd in owner.fd_slots.values()) and not owner.connections
+    finally:
+        harness.discard()
+
+
+@pytest.mark.parametrize("failure", list(_PUB_ROWS))
+def test_publication_ready_publish_failure_states(source_dir, tmp_path, monkeypatch, capsys, failure):
+    _run_publish_failure(source_dir, tmp_path, monkeypatch, capsys, failure)
+
+
+def _install_post_ready(h, failure):
+    ctx = h.ctx
+
+    def touch_source():
+        info = (ctx.src / "graph.db").stat()
+        os.utime(ctx.src / "graph.db", ns=(info.st_atime_ns, info.st_mtime_ns + 10_000_000_000))
+
+    def replace_source_lock():
+        fresh = ctx.lock_src.with_name("lock.new")
+        fresh.touch()
+        os.replace(fresh, ctx.lock_src)
+
+    if failure.endswith("-close") and failure[:-len("-close")] in _CLOSE_ROLES:
+        h.inject_fd_call("close", failure[:-len("-close")], 0)
+    elif failure == "inputs-exit-check":
+        h.inject_fd_call("fsync", "intent-parent", 2, then=touch_source)
+    elif failure == "source-lock-exit-identity":
+        h.inject_fd_call("fsync", "intent-parent", 2, then=replace_source_lock)
+    elif failure == "post-ready-source-and-cleanup":
+        h.inject_fd_call("fsync", "intent-parent", 2, then=touch_source)
+        h.inject_fd_call("close", "root-file", 0)
+    elif failure == "step-failure-then-cleanup-failure":
+        h.install_r8()
+        h.r8_after.append(_variant_hook(ctx, "verify-fileset"))
+        h.inject_fd_call("close", "root-dir", 0)
+    else:
+        raise AssertionError(failure)
+
+
+@pytest.mark.parametrize("failure", _POST_READY_IDS)
+def test_publication_ready_post_ready_failure_states(source_dir, tmp_path, monkeypatch, capsys, failure):
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    tree = _source_tree(source_dir)
+    _install_post_ready(harness, failure)
+    try:
+        assert merge_mod.main(ctx.args) == 2
+        err = capsys.readouterr().err
+        lines = [line for line in err.splitlines() if line.startswith("publication")]
+        owner = harness.owners[-1]
+        if failure.endswith("-close"):
+            assert any(line.startswith("publication ready; cleanup failed: ") for line in lines)
+            assert "publication preflight failed" not in err and "post-ready source check failed" not in err
+            assert owner.uncertain
+            assert _flock_contended(ctx.lock_root) is False and _flock_contended(ctx.lock_src) is True
+            _assert_ready_published(ctx.root)
+        elif failure in ("inputs-exit-check", "source-lock-exit-identity"):
+            cause = ("source file changed during use" if failure == "inputs-exit-check"
+                     else "source lifetime lock changed")
+            assert f"publication ready; post-ready source check failed: {cause}" in lines
+            assert "cleanup failed" not in err and "publication preflight failed" not in err
+            assert not owner.uncertain
+            assert _flock_contended(ctx.lock_root) is False and _flock_contended(ctx.lock_src) is False
+            _assert_ready_published(ctx.root)
+        elif failure == "post-ready-source-and-cleanup":
+            line = next(item for item in lines if item.startswith("publication ready;"))
+            assert line.startswith("publication ready; post-ready source check failed: source file changed "
+                                   "during use; cleanup failed: ")
+            assert "injected close failure" in line
+            assert "publication error cause: OSError" in err
+            assert owner.uncertain
+            assert _flock_contended(ctx.lock_root) is False and _flock_contended(ctx.lock_src) is True
+            _assert_ready_published(ctx.root)
+        else:
+            assert lines[0] == "publication publish failed: publication root file set differs"
+            assert lines[-1].startswith("publication preflight failed: ") and "injected close failure" in lines[-1]
+            assert "publication ready" not in err
+            assert owner.uncertain
+            assert _flock_contended(ctx.lock_root) is False and _flock_contended(ctx.lock_src) is True
+            actual = _ready_disk(ctx)
+            assert {key: actual[key] for key in _R9_BASE} == _R9_BASE
+        if failure not in ("inputs-exit-check", "source-lock-exit-identity", "post-ready-source-and-cleanup"):
+            assert _source_tree(source_dir) == tree
+    finally:
+        harness.discard()
+
+
+def test_publication_ready_failure_id_set_is_complete():
+    """6절 표의 failure id 전량이 시험 인자 집합에 있다(누락 0, 초과 0)."""
+    covered = (set(_READY_ROWS) | set(_PUB_ROWS) | set(_POST_READY_IDS) | set(_EXISTING_POST_READY_IDS))
+    assert covered == _DESIGN_FAILURE_IDS
+    assert not set(_READY_ROWS) & set(_PUB_ROWS)
+
+
+def test_publication_ready_main_publishes(source_dir, tmp_path, capsys):
+    from opencrab.stores._single_file import load_single_file_binding
+
+    ctx = _ready_setup(source_dir, tmp_path)
+    tree = _source_tree(source_dir)
+    assert merge_mod.main(ctx.args) == 0
+    err = capsys.readouterr().err
+    assert err.splitlines().count("publication ready") == 1
+    _assert_ready_published(ctx.root)
+    with _immutable_conn(ctx.root / "single.db") as conn:
+        assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+        metadata = dict(zip(("root", "database", "db_uuid", "generation"),
+                            conn.execute("SELECT root, database_path, db_uuid, generation "
+                                         "FROM single_file_metadata").fetchone(), strict=True))
+        assert conn.execute("SELECT count(*) FROM vectors_kure").fetchone()[0] == 40
+        assert conn.execute("SELECT count(*) FROM doc_sources_fts").fetchone()[0] == 40
+    dir_fd = os.open(ctx.root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        load_single_file_binding(str(ctx.root), str(ctx.root / "single.db"), dir_fd, dir_fd, "ledger.json",
+                                 "manifest.json", "marker.json", metadata, state="ready")
+    finally:
+        os.close(dir_fd)
+    assert _source_tree(source_dir) == tree
+    assert not any(source_dir.glob("*-wal")) and not any(source_dir.glob("*-shm"))
+    assert _flock_contended(ctx.lock_src) is False and _flock_contended(ctx.lock_root) is False
+
+
+def test_publication_ready_reader_default_rejects_ready(source_dir, tmp_path):
+    from opencrab.stores._single_file import decode_binding_json, validate_single_file_binding
+
+    ctx = _ready_setup(source_dir, tmp_path)
+    assert merge_mod.main(ctx.args) == 0
+    raws = {name: (ctx.root / name).read_bytes() for name in ("ledger.json", "manifest.json", "marker.json")}
+    ledger, manifest, marker = (decode_binding_json(raws[name]) for name in raws)
+    with _immutable_conn(ctx.root / "single.db") as conn:
+        metadata = dict(zip(("root", "database", "db_uuid", "generation"),
+                            conn.execute("SELECT root, database_path, db_uuid, generation "
+                                         "FROM single_file_metadata").fetchone(), strict=True))
+    digest = hashlib.sha256(raws["manifest.json"]).hexdigest()
+    for state in ("ready", "staged"):
+        with pytest.raises(RuntimeError, match="single SQLite generation is not authorized"):
+            validate_single_file_binding(str(ctx.root), str(ctx.root / "single.db"), {**ledger, "state": state},
+                                         manifest, marker, metadata, digest)
+
+
+def test_publication_ready_staged_never_ready_before_verify(source_dir, tmp_path, monkeypatch):
+    from opencrab.stores import _single_file
+
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    harness.install_r8()
+    events = []
+    armed = []
+
+    def state():
+        try:
+            return json.loads((ctx.root / "ledger.json").read_text())["state"]
+        except FileNotFoundError:
+            return None
+
+    harness.r8_after.append(lambda: (armed.append(True), events.append(("rename-noreplace", state()))))
+    real_verify = merge_mod._verify_published
+
+    def verify(*args, **kwargs):
+        events.append(("verify-before", state()))
+        result = real_verify(*args, **kwargs)
+        events.append(("verify-after", state()))
+        return result
+
+    monkeypatch.setattr(merge_mod, "_verify_published", verify)
+    real_read = _single_file.read_binding_fd
+
+    def read(directory_fd, name, fd):
+        if armed:
+            events.append(("read-binding", state()))
+        return real_read(directory_fd, name, fd)
+
+    monkeypatch.setattr(_single_file, "read_binding_fd", read)
+    real_rename = os.rename
+
+    def rename(src, dst, *args, **kwargs):
+        if Path(dst).name != "ledger.json":
+            return real_rename(src, dst, *args, **kwargs)
+        events.append(("ledger-rename-before", state()))
+        result = real_rename(src, dst, *args, **kwargs)
+        events.append(("ledger-rename-after", state()))
+        return result
+
+    monkeypatch.setattr(os, "rename", rename)
+    assert merge_mod.main(ctx.args) == 0
+    tags = [tag for tag, _ in events]
+    assert tags.count("read-binding") == 4
+    after = tags.index("ledger-rename-after")
+    assert all(value == "staged" for _, value in events[:after])
+    assert events[after][1] == "ready"
+    fourth = [index for index, tag in enumerate(tags) if tag == "read-binding"][3]
+    assert fourth > after and events[fourth][1] == "ready"
+    assert tags.index("verify-after") < tags.index("ledger-rename-before")
+
+
+def test_publication_ready_manifest_digest_binds_files(source_dir, tmp_path):
+    from opencrab.stores._single_file import load_single_file_binding
+
+    ctx = _ready_setup(source_dir, tmp_path)
+    assert merge_mod.main(ctx.args) == 0
+    digest = hashlib.sha256((ctx.root / "manifest.json").read_bytes()).hexdigest()
+    assert json.loads((ctx.root / "marker.json").read_text())["manifest_digest"] == digest
+    assert json.loads((ctx.root / "ledger.json").read_text())["manifest_digest"] == digest
+    assert json.loads(ctx.intent.read_text())["manifest_digest"] == digest
+    with _immutable_conn(ctx.root / "single.db") as conn:
+        metadata = dict(zip(("root", "database", "db_uuid", "generation"),
+                            conn.execute("SELECT root, database_path, db_uuid, generation "
+                                         "FROM single_file_metadata").fetchone(), strict=True))
+    manifest_path = ctx.root / "manifest.json"
+    original = manifest_path.read_bytes()
+    assert b'"version":1' in original
+    manifest_path.write_bytes(original.replace(b'"version":1', b'"version":2'))
+    dir_fd = os.open(ctx.root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(RuntimeError, match="manifest binding differs"):
+            load_single_file_binding(str(ctx.root), str(ctx.root / "single.db"), dir_fd, dir_fd, "ledger.json",
+                                     "manifest.json", "marker.json", metadata, state="ready")
+    finally:
+        os.close(dir_fd)
+
+
+def test_publication_ready_file_modes(source_dir, tmp_path):
+    ctx = _ready_setup(source_dir, tmp_path)
+    assert merge_mod.main(ctx.args) == 0
+    assert stat_mode(ctx.root) == 0o700
+    for name in ("billing.db", "ledger.json", "manifest.json", "marker.json", "single.db",
+                 "single.db.lifetime.lock"):
+        assert (name, stat_mode(ctx.root / name)) == (name, 0o600)
+
+
+def stat_mode(path):
+    return os.lstat(path).st_mode & 0o777
+
+
+def test_publication_ready_uses_immutable_connection(source_dir, tmp_path, monkeypatch):
+    ctx = _ready_setup(source_dir, tmp_path)
+    uris = []
+    real_connect = sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        if "/single.db?mode=ro" in str(database):  # 게시 흐름의 R3와 R9 연결. 기존 .partial 연결은 제외한다
+            uris.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    listings = []
+    real_counts = merge_mod._publication_table_counts
+
+    def counts(conn):
+        for directory in (ctx.staging, ctx.root):
+            if directory.is_dir():
+                listings.append(sorted(item.name for item in directory.iterdir()))
+        return real_counts(conn)
+
+    monkeypatch.setattr(merge_mod, "_publication_table_counts", counts)
+    assert merge_mod.main(ctx.args) == 0
+    assert any("published.staging/single.db" in uri for uri in uris)
+    assert any("published/single.db" in uri for uri in uris)
+    assert all("immutable=1" in uri for uri in uris)
+    assert len(uris) == 2 and len(listings) == 2
+    assert all(not any(name.endswith(("-wal", "-shm", "-journal")) for name in names) for names in listings)
+
+
+def test_publication_ready_q1_and_fd_order(source_dir, tmp_path, monkeypatch):
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    events = harness.events
+    real_close, real_flock = os.close, merge_mod.fcntl.flock
+
+    def close(fd):
+        role = harness.by_fd.get(fd)
+        if role is not None:
+            events.append(("close", role))
+        return real_close(fd)
+
+    def flock(fd, operation):
+        if operation == merge_mod.fcntl.LOCK_UN:
+            owner = harness.current_owner()
+            events.append(("unlock", len(owner.connections) if owner else None))
+        return real_flock(fd, operation)
+
+    real_mounts = merge_mod._PublicationOwner.read_mounts
+
+    def mounts(owner, work):
+        result = real_mounts(owner, work)  # 이 호출은 stream을 안에서 닫고 돌아온다
+        events.append(("mounts-done", None))
+        return result
+
+    monkeypatch.setattr(merge_mod._PublicationOwner, "read_mounts", mounts)
+    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(merge_mod.fcntl, "flock", flock)
+    assert merge_mod.main(ctx.args) == 0
+    kinds = [kind for kind, _ in events]
+    first_unlock, last_unlock = kinds.index("unlock"), len(kinds) - 1 - kinds[::-1].index("unlock")
+    assert first_unlock < last_unlock
+    assert events[first_unlock][1] == 0  # 연결은 root 해제 전에 모두 수집된다
+    assert events.index(("mounts-done", None)) < events.index(("open", "intent"))
+    new_roles = ("probe-dir", "manifest-write", "marker-write", "ledger-write", "lock-create", "staging-seal",
+                 "intent-tmp", "ledger-tmp", "publish-parent", "root-dir", "root-file", "intent-parent")
+    for role in new_roles:
+        indexes = [index for index, event in enumerate(events) if event == ("close", role)]
+        assert indexes, role
+        assert all(first_unlock < index < last_unlock for index in indexes), role
+    for role in new_roles:
+        assert merge_mod._classify_fd_role(role) == "other"
+
+
+def test_publication_ready_repeat_main_refuses(source_dir, tmp_path, capsys):
+    ctx = _ready_setup(source_dir, tmp_path)
+    assert merge_mod.main(ctx.args) == 0
+    capsys.readouterr()
+    before = {path.name: path.read_bytes() for path in ctx.root.iterdir()}
+    assert merge_mod.main(ctx.args) == 2
+    assert "publication artifacts already exist" in capsys.readouterr().err
+    assert {path.name: path.read_bytes() for path in ctx.root.iterdir()} == before
+
+
+@pytest.mark.parametrize("failure", ["rename-error-effect-absent", "rename-eexist", "rename-error-effect-present",
+                                     "rename-error-both-absent"])
+def test_publication_rename_error_classification(source_dir, tmp_path, monkeypatch, capsys, failure):
+    """R8 관측 조합 네 가지: 미수행, 외부 root, 수행됨, uncertain."""
+    _run_publish_failure(source_dir, tmp_path, monkeypatch, capsys, failure)
+
+
+def test_publication_rename_refuses_existing_empty_root(source_dir, tmp_path, monkeypatch, capsys):
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    _install_publish_failure(harness, "rename-eexist")
+    try:
+        assert merge_mod.main(ctx.args) == 1
+        assert _PUBLISH in capsys.readouterr().err
+        assert ctx.root.is_dir() and list(ctx.root.iterdir()) == []
+        assert (ctx.staging / "ledger.json").exists()
+    finally:
+        harness.discard()
+
+
+def test_publication_rename_uncertain_blocks_reentry(source_dir, tmp_path, monkeypatch, capsys):
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    _install_publish_failure(harness, "rename-error-both-absent")
+    try:
+        assert merge_mod.main(ctx.args) == 1
+        capsys.readouterr()
+        assert harness.owners[-1].uncertain
+        mark = harness.r8_calls
+        assert merge_mod.main(ctx.args) == 2
+        assert "publication owner already exists" in capsys.readouterr().err
+        with pytest.raises(merge_mod.MergeError, match="publication owner already exists"):
+            with merge_mod._publication_owner(ctx.root):
+                pass
+        assert harness.r8_calls == mark
+    finally:
+        harness.discard()
+
+
+@pytest.mark.parametrize("variant", ["control", "fifo-manifest", "hardlink-single-db", "symlink-marker",
+                                     "symlink-lifetime-lock", "metadata-two-rows", "metadata-zero-rows"])
+def test_publication_ready_verify_matches_reader(source_dir, tmp_path, monkeypatch, capsys, variant):
+    """R9("staged")와 읽는 쪽 validate_binding이 같은 변형을 둘 다 거부한다. 대조군은 둘 다 통과한다."""
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    causes = {"fifo-manifest": "publication root file form differs",
+              "hardlink-single-db": "publication root file form differs",
+              "symlink-marker": "publication root file form differs",
+              "symlink-lifetime-lock": "publication root file form differs",
+              "metadata-two-rows": "publication metadata row count differs",
+              "metadata-zero-rows": "publication metadata row count differs"}
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    hook = _variant_hook(ctx, variant, monkeypatch)
+    if hook is not None:
+        harness.install_r8()
+        harness.r8_after.append(hook)
+    try:
+        rc = merge_mod.main(ctx.args)
+        err = capsys.readouterr().err
+        if variant == "control":
+            assert rc == 0
+        else:
+            assert rc == 1 and f"{_PUBLISH} {causes[variant]}" in err
+            assert _ready_disk(ctx)["intent"] == "publishing" and _ready_disk(ctx)["ledger"] == "staged"
+        ledger_path = ctx.root / "ledger.json"
+        ledger_path.write_text(json.dumps({**json.loads(ledger_path.read_text()), "state": "authorized"},
+                                          sort_keys=True, separators=(",", ":")))
+        shared, dir_fd, rejected = None, None, False
+        try:
+            shared = SharedSqliteFile(str(ctx.root / "single.db"), checked=True)
+            dir_fd = os.open(ctx.root, os.O_RDONLY | os.O_DIRECTORY)
+            shared.validate_binding(str(ctx.root), dir_fd, dir_fd, "ledger.json", "manifest.json", "marker.json")
+        except Exception:
+            rejected = True
+        finally:
+            if dir_fd is not None:
+                os.close(dir_fd)
+            if shared is not None:
+                shared.close()
+        assert rejected is (variant != "control")
+    finally:
+        harness.discard()
+
+
+def test_publication_ready_verify_value_error_class(source_dir, tmp_path, monkeypatch, capsys):
+    """R9의 읽기 ValueError는 단계 except가 받아 rc 1이다. preflight rc 2가 아니다."""
+    from opencrab.stores import _single_file
+
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    harness.install_r8()
+    armed = []
+    harness.r8_after.append(lambda: armed.append(True))
+    real_read = _single_file.read_binding_fd
+
+    def read(directory_fd, name, fd):
+        if armed:
+            raise ValueError("file must be regular and have one link")
+        return real_read(directory_fd, name, fd)
+
+    monkeypatch.setattr(_single_file, "read_binding_fd", read)
+    try:
+        assert merge_mod.main(ctx.args) == 1
+        err = capsys.readouterr().err
+        assert f"{_PUBLISH} file must be regular and have one link" in err
+        assert "publication preflight failed" not in err
+    finally:
+        harness.discard()

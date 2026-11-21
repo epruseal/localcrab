@@ -1833,6 +1833,9 @@ def _publication_effect(operation: Any, paths: tuple[Path, ...]) -> None:
 
 _RENAME_NOREPLACE = 1  # linux/fs.h의 RENAME_NOREPLACE
 _CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_PUBLISHED_NAMES = ("billing.db", "ledger.json", "manifest.json", "marker.json", "single.db",
+                    "single.db.lifetime.lock")
 
 
 def _rename_noreplace(src_dir_fd: int, src: str, dst_dir_fd: int, dst: str) -> None:
@@ -1947,6 +1950,156 @@ def _publication_write_binding(owner: _PublicationOwner, work: _PublicationWork,
     return digest
 
 
+def _publication_write_intent(owner: _PublicationOwner, work: _PublicationWork, root: Path,
+                              payload: dict[str, str]) -> None:
+    """R7과 R10b. intent를 임시 파일에 쓰고 rename으로 교체한 뒤 상위 디렉터리를 fsync한다."""
+    target = root.with_name(root.name + ".intent.json")
+    temporary = root.with_name(root.name + ".intent.json.tmp")
+    _publication_write_file(owner, work, "intent-tmp", temporary, _publication_json(payload))
+    _publication_effect(lambda: os.rename(temporary, target), (temporary, target))
+    parent_fd = owner.open_fd("intent-parent", root.parent, _DIR_FLAGS, work=work)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        _close_deferred(owner, "intent-parent", parent_fd, work)
+
+
+def _publication_publish_rename(owner: _PublicationOwner, work: _PublicationWork, staging: Path,
+                                root: Path) -> None:
+    """R8. 상위 디렉터리 fd를 먼저 열고 NOREPLACE rename으로 staging을 root로 게시한다."""
+    parent_fd = owner.open_fd("publish-parent", root.parent, _DIR_FLAGS, work=work)
+    try:
+        try:
+            _publication_effect(lambda: _rename_noreplace(parent_fd, staging.name, parent_fd, root.name),
+                                (staging, root))
+        except OSError as exc:
+            if exc.errno in (errno.ENOSYS, errno.EINVAL):
+                raise MergeError("publication rename is unsupported") from exc
+            if exc.errno == errno.EXDEV:
+                raise MergeError("publication rename crosses file systems") from exc
+            observed = owner.effect_observations[-1] if owner.effect_observations else {}
+            staging_exists, root_exists = observed.get(str(staging)), observed.get(str(root))
+            if staging_exists is True and root_exists is False:
+                raise MergeError(f"publication rename was not performed: {exc}") from exc
+            if staging_exists is True and root_exists is True and exc.errno == errno.EEXIST:
+                raise MergeError("publication root already exists") from exc
+            if staging_exists is False and root_exists is True:
+                raise MergeError(f"publication rename reported an error after it took effect: {exc}") from exc
+            owner.uncertain = True  # _publication_effect는 관측만 남기므로 결과를 모르면 여기서 직접 세운다
+            raise MergeError(f"publication rename outcome is unknown: {exc}") from exc
+        os.fsync(parent_fd)
+    finally:
+        _close_deferred(owner, "publish-parent", parent_fd, work)
+
+
+def _verify_published(root: Path, intent: dict[str, str], identity: tuple[Any, Any], needs_vec: bool,
+                      check_inputs: Any, owner: _PublicationOwner, work: _PublicationWork) -> tuple[Any, ...]:
+    """R9. 게시된 root를 읽기 전용으로 검증한다. 대장은 아직 staged여야 한다."""
+    # 호출 시점에 가져온다. 시험이 모듈 속성을 감싸므로 머리에서 import하면 감싼 함수가 걸리지 않는다.
+    from opencrab.stores._single_file import (
+        decode_binding_json,
+        read_binding_fd,
+        validate_single_file_binding,
+    )
+
+    single_identity, billing_identity = identity
+    root_fd = owner.open_fd("root-dir", root, _DIR_FLAGS, work=work)
+    try:
+        root_stat = os.lstat(root)
+        opened = os.fstat(root_fd)
+        if (not stat.S_ISDIR(root_stat.st_mode) or os.path.realpath(root) != str(root)
+                or (root_stat.st_dev, root_stat.st_ino) != (opened.st_dev, opened.st_ino)):
+            raise MergeError("publication root directory differs")
+        if sorted(os.listdir(root_fd)) != sorted(_PUBLISHED_NAMES):
+            raise MergeError("publication root file set differs")
+        entries = {}
+        for name in _PUBLISHED_NAMES:
+            entries[name] = os.lstat(name, dir_fd=root_fd)
+            if not stat.S_ISREG(entries[name].st_mode) or entries[name].st_nlink != 1:
+                raise MergeError("publication root file form differs")
+        raws = {}
+        for name in ("ledger.json", "manifest.json", "marker.json"):
+            fd = owner.open_fd("root-file", name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                               dir_fd=root_fd, work=work)
+            try:
+                raws[name] = read_binding_fd(root_fd, name, fd)
+            finally:
+                _close_deferred(owner, "root-file", fd, work)
+        ledger, manifest, marker = (decode_binding_json(raws[name])
+                                    for name in ("ledger.json", "manifest.json", "marker.json"))
+        digest = hashlib.sha256(raws["manifest.json"]).hexdigest()
+        conn = _connect(root / "single.db", mode="ro", immutable=True, work=work)
+        try:
+            rows = conn.execute("SELECT root, database_path, db_uuid, generation FROM single_file_metadata").fetchall()
+            if len(rows) != 1:
+                raise MergeError("publication metadata row count differs")
+            if needs_vec:
+                _load_vec(conn)
+            if conn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise MergeError("publication quick_check differs")
+            if _publication_table_counts(conn) != manifest.get("tables"):
+                raise MergeError("publication table counts differ")
+        finally:
+            _close_conn(conn, work)
+        metadata = dict(zip(("root", "database", "db_uuid", "generation"), rows[0], strict=True))
+        validate_single_file_binding(str(root), str(root / "single.db"), ledger, manifest, marker, metadata,
+                                     digest, state="staged")
+        if any(ledger.get(key) != intent.get(key)
+               for key in ("root", "database", "db_uuid", "generation", "manifest_digest")):
+            raise MergeError("publication ledger differs from intent")
+        billing = manifest.get("billing", {})
+        fd = os.open("billing.db", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            sha, size = hashlib.sha256(), 0
+            while chunk := os.pread(fd, 1024 * 1024, size):
+                sha.update(chunk)
+                size += len(chunk)
+        finally:
+            os.close(fd)
+        if size != billing.get("size") or sha.hexdigest() != billing.get("sha256"):
+            raise MergeError("publication billing digest differs")
+        if ((entries["single.db"].st_dev, entries["single.db"].st_ino) != single_identity[:2]
+                or (entries["billing.db"].st_dev, entries["billing.db"].st_ino) != billing_identity[:2]):
+            raise MergeError("publication published identity differs")
+        check_inputs()
+        for suffix in ("-wal", "-shm", "-journal"):
+            if os.path.lexists(str(root / "single.db") + suffix):
+                raise MergeError("publication database sidecar remains")
+        return manifest, marker, metadata, digest
+    finally:
+        _close_deferred(owner, "root-dir", root_fd, work)
+
+
+def _publication_mark_ready(owner: _PublicationOwner, work: _PublicationWork, root: Path,
+                            intent: dict[str, str], verified: tuple[Any, ...]) -> None:
+    """R10a. root 안 ledger를 ready로 교체하고 디렉터리를 fsync한 뒤 다시 읽어 확인한다."""
+    from opencrab.stores._single_file import (
+        decode_binding_json,
+        read_binding_fd,
+        validate_single_file_binding,
+    )
+
+    manifest, marker, metadata, digest = verified
+    ready = {"state": "ready", "root": intent["root"], "database": intent["database"],
+             "db_uuid": intent["db_uuid"], "generation": intent["generation"], "manifest_digest": digest}
+    temporary, target = root / "ledger.json.tmp", root / "ledger.json"
+    _publication_write_file(owner, work, "ledger-tmp", temporary, _publication_json(ready))
+    _publication_effect(lambda: os.rename(temporary, target), (temporary, target))
+    root_fd = owner.open_fd("root-dir", root, _DIR_FLAGS, work=work)
+    try:
+        os.fsync(root_fd)
+        fd = owner.open_fd("root-file", "ledger.json", os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                           dir_fd=root_fd, work=work)
+        try:
+            raw = read_binding_fd(root_fd, "ledger.json", fd)
+        finally:
+            _close_deferred(owner, "root-file", fd, work)
+    finally:
+        _close_deferred(owner, "root-dir", root_fd, work)
+    validate_single_file_binding(str(root), str(root / "single.db"), decode_binding_json(raw), manifest, marker,
+                                 metadata, digest, state="ready")
+
+
 def _publication_exists(path: Path) -> bool:
     try:
         os.lstat(path)
@@ -1980,6 +2133,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--publication-root --apply requires --verify and --immutable-source")
         if not args.apply and args.report:
             parser.error("--publication-root plan does not accept --report")
+        ready_reached = False
         try:
             from opencrab.stores._single_file import read_binding_fd
 
@@ -2139,17 +2293,39 @@ def main(argv: list[str] | None = None) -> int:
                             if (_publication_identity(database) != single_identity  # R1
                                     or _publication_identity(staging / "billing.db") != billing_identity):
                                 raise MergeError("publication staging identity differs")
-                            _publication_write_binding(owner, work, staging, intent, manifest, manifest_raw,
-                                                       evidence_raw)  # R2~R6
+                            manifest_digest = _publication_write_binding(owner, work, staging, intent, manifest,
+                                                                         manifest_raw, evidence_raw)  # R2~R6
                         except (MergeError, OSError, RuntimeError, sqlite3.DatabaseError) as exc:
                             print(f"publication staging failed: {exc}", file=sys.stderr)
                             return 1
+                        try:
+                            publishing = {**intent, "state": "publishing", "manifest_digest": manifest_digest}
+                            _publication_write_intent(owner, work, root, publishing)  # R7
+                            _publication_publish_rename(owner, work, staging, root)  # R8
+                            needs_vec = any(m == "vec0" for i in pl["sources"].values()
+                                            for m in i["virtual"].values())
+                            verified = _verify_published(root, publishing, (single_identity, billing_identity),
+                                                         needs_vec, check_inputs, owner, work)  # R9
+                            _publication_mark_ready(owner, work, root, publishing, verified)  # R10a
+                            _publication_write_intent(owner, work, root, {**publishing, "state": "ready"})  # R10b
+                        except (MergeError, OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
+                            print(f"publication publish failed: {exc}", file=sys.stderr)
+                            return 1
+                        ready_reached = True
+                        print("publication ready", file=sys.stderr)
+                        return 0
                     finally:
                         owner.defer_root_release = True
-                    print("publication staging is not ready", file=sys.stderr)
-                    return 1
         except (MergeError, OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
-            print(f"publication preflight failed: {exc}", file=sys.stderr)
+            if not ready_reached:
+                print(f"publication preflight failed: {exc}", file=sys.stderr)
+            elif owner.cleanup_error is None:
+                print(f"publication ready; post-ready source check failed: {exc}", file=sys.stderr)
+            elif exc is owner.cleanup_error:
+                print(f"publication ready; cleanup failed: {exc}", file=sys.stderr)
+            else:
+                print(f"publication ready; post-ready source check failed: {exc}; "
+                      f"cleanup failed: {owner.cleanup_error}", file=sys.stderr)
             if exc.__cause__ is not None:
                 print(f"publication error cause: {type(exc.__cause__).__name__}", file=sys.stderr)
             return 2
