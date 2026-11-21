@@ -177,25 +177,76 @@ def reject_single_file_mode(settings: Any) -> None:
         raise RuntimeError("single SQLite authentication is not wired")
 
 
+# 보호 검사가 파일 모드별로 기다리는 시간(초)이다. WAL 파일은 `_new_conn`의 기본 대기와 같다.
+_UNMANAGED_CHECK_TIMEOUT = 0.2
+_UNMANAGED_WAL_WAIT = 5.0
+_MARKER_QUERY = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+
+
+def sqlite_busy_or_locked(exc: BaseException) -> bool:
+    """SQLite 오류가 BUSY나 LOCKED(확장 코드 포함)인지 반환한다."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return isinstance(code, int) and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+def _journal_kind(path: str) -> str:
+    """파일 헤더 100바이트를 잠금 없이 읽어 저널 모드를 돌려준다.
+
+    바이트 18과 19가 (2, 2)이면 wal, (1, 1)이면 rollback이다. 매직 불일치, 혼합, 100바이트 미만,
+    읽기 오류는 other다(판정 불가).
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(100)
+    except OSError:
+        return "other"
+    if len(head) < 100 or head[:16] != b"SQLite format 3\x00":
+        return "other"
+    if (head[18], head[19]) == (2, 2):
+        return "wal"
+    if (head[18], head[19]) == (1, 1):
+        return "rollback"
+    return "other"
+
+
+def _single_marker(uri: str, timeout: float) -> bool:
+    """URI로 연 연결에서 단일 파일 표식 표가 있는지 반환한다."""
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=timeout)) as conn:
+        return conn.execute(_MARKER_QUERY).fetchone() is not None
+
+
 def reject_unmanaged_single_file(db_path: str) -> None:
     """공유 연결 없이 단일 파일 스키마를 열지 않는다.
 
-    한계: 이 검사는 최선 노력이다. 다른 연결이 파일을 잠가 표식을 읽지 못하면(busy, locked) 검사를
-    건너뛴다. 이어지는 `SQLStore._connect`가 같은 잠금을 만나 저장소를 사용 불가로 둔다.
-    그 판단이 이 생성자 오류보다 앞선 기존 계약이다(HTTP 인증 조회가 이를 503으로 바꾼다).
+    헤더로 저널 모드를 가른다. WAL 파일은 `_UNMANAGED_WAL_WAIT`만큼 기다리고 읽지 못하면 그 BUSY를 올린다.
+    롤백 저널 파일이 잠겨 있으면 잠금 없는 읽기(immutable)로 표식만 판정하고, 헤더를 다시 읽어 여전히
+    롤백일 때만 그 결과를 쓴다. 판정할 수 없으면 거부한다(fail-closed). 롤백 DB에 hot journal이 남아
+    읽기 전용 연결이 회복하지 못하면(READONLY) rw 연결로 저널을 회복한 뒤 판정한다.
+
+    잔여 위험(설계 문서 5절): immutable 읽기는 스키마를 바꾸는 중인 롤백 파일이나 merge 부분 파일이나
+    저널 회복 중인 파일에서 틀린 결과를 낼 수 있다. 게시된 단일 파일은 늘 WAL이라 이 경로에 닿지 않는다.
     """
     path = Path(db_path)
     if db_path == ":memory:" or not path.is_file():
         return
+    resolved = path.resolve()
+    base = resolved.as_uri() + "?mode=ro"
+    kind = _journal_kind(str(resolved))
     try:
-        with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
-            found = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-            ).fetchone()
+        found = _single_marker(base, _UNMANAGED_WAL_WAIT if kind == "wal" else _UNMANAGED_CHECK_TIMEOUT)
     except sqlite3.OperationalError as exc:
-        if (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-            return
-        raise
+        if kind == "rollback" and ((getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF) == sqlite3.SQLITE_READONLY:
+            # hot journal: 읽기 전용 연결은 저널을 되돌리지 못한다. rw 연결이 회복한다. 실패는 그대로 올린다.
+            found = _single_marker(resolved.as_uri() + "?mode=rw", _UNMANAGED_CHECK_TIMEOUT)
+        else:
+            if not sqlite_busy_or_locked(exc) or kind != "rollback":
+                raise
+            try:
+                found = _single_marker(base + "&immutable=1", 0)
+            except sqlite3.Error:
+                raise exc from None
+            if _journal_kind(str(resolved)) != "rollback":
+                raise exc
     if found:
         raise RuntimeError("single SQLite file requires shared connection")
 

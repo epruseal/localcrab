@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1431,3 +1433,601 @@ def test_single_delete_and_fork_gates_stay_fail_closed(tmp_path, monkeypatch):
         assert after == before
     finally:
         _close_all((graph, docs, vec, sql))
+
+
+# ---------------------------------------------------------------------------
+# B1: 공유 연결 없이 단일 파일을 여는 경로의 보호 검사(#671, 설계 6판 V1~V8c)
+# ---------------------------------------------------------------------------
+
+# 하네스 상한이다. 이 값 때문에 통과하는 시험은 없다.
+_WAIT = 20.0
+# 시험이 검사의 대기 상수를 줄일 때 존재하지 않는 이름을 조용히 넘기지 않게 한다.
+_STRICT_CONSTS = True
+_REFUSAL = "single SQLite file requires shared connection"
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+_GUARD_TARGETS = [
+    "guard", "sqlstore", "graph", "doc", "vector",
+    "fwd_sqlite_conn", "fwd_vec_sqlite_conn", "cleanup_rw", "quantization_connect",
+]
+_RECOVERY_TARGETS = [
+    "guard", "sqlstore", "fwd_sqlite_conn", "fwd_vec_sqlite_conn", "cleanup_rw", "quantization_connect",
+]
+
+
+@pytest.fixture
+def fast_guard(monkeypatch):
+    """검사의 대기 상수를 시험 길이로 줄인다."""
+    from opencrab.stores import _single_file
+
+    monkeypatch.setattr(_single_file, "_UNMANAGED_CHECK_TIMEOUT", 0.05, raising=_STRICT_CONSTS)
+    monkeypatch.setattr(_single_file, "_UNMANAGED_WAL_WAIT", 0.3, raising=_STRICT_CONSTS)
+    return _single_file
+
+
+def _header(path) -> tuple[int, int]:
+    with open(path, "rb") as handle:
+        head = handle.read(100)
+    return head[18], head[19]
+
+
+def _make_db(path, mode: str, with_marker: bool) -> Path:
+    """작은 SQLite 파일을 만든다. mode는 delete(헤더 1, 1)와 wal(헤더 2, 2)이다."""
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        assert conn.execute(f"PRAGMA journal_mode={mode}").fetchone()[0] == mode
+        conn.execute("CREATE TABLE t(x)")
+        if with_marker:
+            conn.execute("CREATE TABLE pack_delete_operations(operation_id TEXT)")
+        if mode == "wal":
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    finally:
+        conn.close()
+    assert _header(path) == ((1, 1) if mode == "delete" else (2, 2))
+    return Path(path)
+
+
+def _table_names(path) -> list[str]:
+    """부작용 없이(immutable) 표 이름을 읽는다. 잠금이 풀린 파일에만 쓴다."""
+    uri = f"{Path(path).as_uri()}?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        return sorted(row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'"))
+    finally:
+        conn.close()
+
+
+def _snapshot(path, *, tables: bool = True) -> SimpleNamespace:
+    path = Path(path)
+    return SimpleNamespace(
+        sha=hashlib.sha256(path.read_bytes()).hexdigest(),
+        names=set(os.listdir(path.parent)),
+        tables=_table_names(path) if tables else None,
+    )
+
+
+def _assert_unchanged(path, before, *, same_bytes: bool = True) -> None:
+    """본파일 바이트와 표 이름 목록이 같고 새 이름은 그 DB의 부속 파일뿐임을 확인한다."""
+    after = _snapshot(path, tables=before.tables is not None)
+    if same_bytes:
+        assert after.sha == before.sha
+    assert after.tables == before.tables
+    assert before.names <= after.names, before.names - after.names
+    base = Path(path).name
+    assert after.names - before.names <= {base + "-wal", base + "-shm", base + "-journal"}
+
+
+class _Holder:
+    """스레드 하나가 잠금을 쥐고 release 신호까지 놓지 않는다. 타이머는 쓰지 않는다.
+
+    delete는 롤백 저널 DB에 BEGIN EXCLUSIVE를, wal은 locking_mode=EXCLUSIVE와 쓰기 트랜잭션을 쥔다.
+    둘 다 커밋하지 않고 닫을 때 롤백한다. WAL DB는 BEGIN EXCLUSIVE로 읽기가 막히지 않는다.
+    """
+
+    def __init__(self, path, kind: str) -> None:
+        self.path = str(path)
+        self.kind = kind
+        self.acquired = threading.Event()
+        self.release = threading.Event()
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        conn = None
+        try:
+            conn = sqlite3.connect(self.path, timeout=0, isolation_level=None)
+            if self.kind == "delete":
+                conn.execute("BEGIN EXCLUSIVE")
+            else:
+                conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("CREATE TABLE held_probe(x)")
+            self.acquired.set()
+            self.release.wait(timeout=_WAIT)
+        except BaseException as exc:  # noqa: BLE001
+            self.error = exc
+        finally:
+            if conn is not None:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+                with contextlib.suppress(sqlite3.Error):
+                    conn.close()
+            self.acquired.set()
+
+    def start(self) -> None:
+        self.thread.start()
+        assert self.acquired.wait(_WAIT), "holder did not take the lock"
+        assert self.error is None, self.error
+
+    def stop(self) -> None:
+        self.release.set()
+        self.thread.join(_WAIT)
+        assert not self.thread.is_alive()
+        assert self.error is None, self.error
+
+
+@contextlib.contextmanager
+def _held(path, kind: str):
+    holder = _Holder(path, kind)
+    holder.start()
+    try:
+        yield holder
+    finally:
+        holder.stop()
+
+
+def _assert_locked(path) -> None:
+    """잠금을 쥔 동안 일반 읽기가 BUSY나 LOCKED로 실패함을 시험 안에서 직접 확인한다."""
+    uri = f"{Path(path).as_uri()}?mode=ro"
+    try:
+        with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as conn:
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    except sqlite3.OperationalError as exc:
+        assert (exc.sqlite_errorcode & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED), exc
+    else:
+        raise AssertionError("the holder did not block a plain read")
+
+
+def _spy_releasing(monkeypatch, holder: _Holder) -> None:
+    """검사가 반환하거나 예외를 낸 직후 잠금을 푼다."""
+    from opencrab.stores import _single_file
+
+    real = _single_file.reject_unmanaged_single_file
+
+    def spy(db_path):
+        try:
+            return real(db_path)
+        finally:
+            holder.release.set()
+
+    monkeypatch.setattr(_single_file, "reject_unmanaged_single_file", spy)
+
+
+def _poke(path, offset: int, data: bytes) -> None:
+    with open(path, "r+b") as handle:
+        handle.seek(offset)
+        handle.write(data)
+
+
+def _op_error(code: int, message: str = "shim error") -> sqlite3.OperationalError:
+    exc = sqlite3.OperationalError(message)
+    exc.sqlite_errorcode = code
+    return exc
+
+
+class _ConnProxy:
+    def __init__(self, conn, on_close) -> None:
+        self._conn = conn
+        self._on_close = on_close
+
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+
+    def close(self) -> None:
+        self._conn.close()
+        self._on_close()
+
+
+class _Sqlite3Shim:
+    """opencrab.stores._single_file 안의 sqlite3 이름만 대신하는 객체다. connect만 가로챈다.
+
+    on_connect(uri)는 연결 전에 불리며 예외를 올릴 수 있다. on_close(uri)는 immutable URI 연결이
+    닫힌 직후에 불린다. 그 밖의 속성(오류 클래스와 상수)은 실제 모듈에 위임한다.
+    """
+
+    def __init__(self, on_connect=None, on_close=None) -> None:
+        self.calls: list[str] = []
+        self._on_connect = on_connect
+        self._on_close = on_close
+
+    def connect(self, database, *args, **kwargs):
+        self.calls.append(database)
+        if self._on_connect is not None:
+            self._on_connect(database)
+        conn = sqlite3.connect(database, *args, **kwargs)
+        if self._on_close is not None and "immutable=1" in database:
+            on_close = self._on_close
+            return _ConnProxy(conn, lambda: on_close(database))
+        return conn
+
+    def __getattr__(self, name):
+        return getattr(sqlite3, name)
+
+
+def _install_shim(monkeypatch, shim: _Sqlite3Shim) -> _Sqlite3Shim:
+    from opencrab.stores import _single_file
+
+    monkeypatch.setattr(_single_file, "sqlite3", shim)
+    return shim
+
+
+def _script(name: str):
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    import importlib
+
+    return importlib.import_module(name)
+
+
+def _call_target(target: str, path, *, create_tables: bool = True):
+    """검사를 거치는 진입점 하나를 부른다. 닫을 객체나 None을 돌려준다."""
+    text = str(path)
+    if target == "guard":
+        from opencrab.stores import _single_file
+
+        return _single_file.reject_unmanaged_single_file(text)
+    if target == "sqlstore":
+        from opencrab.stores.sql_store import SQLStore
+
+        return SQLStore(f"sqlite:///{text}", create_tables=create_tables)
+    if target in _STORE_CLASS:
+        import importlib
+
+        module, name = _STORE_CLASS[target]
+        cls = getattr(importlib.import_module(module), name)
+        if target == "vector":
+            return cls(text, _hash_embed, _DIM, collection_name="vectors_kure")
+        return cls(text)
+    if target == "fwd_sqlite_conn":
+        return _script("migrate_sqlite_to_pg")._sqlite_conn(text)
+    if target == "fwd_vec_sqlite_conn":
+        return _script("migrate_sqlite_to_pg")._vec_sqlite_conn(text)
+    if target == "cleanup_rw":
+        return _script("cleanup_openclaw_heartbeat_493")._rw(Path(text))
+    if target == "quantization_connect":
+        return _script("migrate_add_binary_quantization")._connect(text)
+    raise AssertionError(target)
+
+
+def _close_result(result) -> None:
+    close = getattr(result, "close", None)
+    if close is not None:
+        close()
+
+
+@pytest.mark.parametrize("target", _GUARD_TARGETS)
+def test_unmanaged_check_refuses_locked_marker_db(tmp_path, fast_guard, target):
+    """V1: 롤백 DB가 잠겨 있어도 표식이 있으면 아홉 진입점이 모두 거부한다. 파일은 그대로다."""
+    path = _make_db(tmp_path / "locked.db", "delete", True)
+    before = _snapshot(path)
+    with _held(path, "delete"):
+        _assert_locked(path)
+        with pytest.raises(RuntimeError, match=_REFUSAL):
+            _call_target(target, path)
+    _assert_unchanged(path, before)
+
+
+@pytest.mark.parametrize("target", _GUARD_TARGETS)
+def test_unmanaged_check_refuses_locked_wal_db(tmp_path, fast_guard, target):
+    """V1w: WAL DB가 잠겨 있으면 판정하지 않고 대기 상수만큼 기다린 뒤 BUSY를 올린다."""
+    path = _make_db(tmp_path / "locked.db", "wal", True)
+    before = _snapshot(path)
+    with _held(path, "wal"):
+        _assert_locked(path)
+        began = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError) as info:
+            _call_target(target, path)
+        elapsed = time.monotonic() - began
+    assert type(info.value) is sqlite3.OperationalError, type(info.value)
+    assert (info.value.sqlite_errorcode & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    assert elapsed >= 0.27, elapsed
+    _assert_unchanged(path, before)
+
+
+@pytest.mark.parametrize("kind", ["delete", "wal"])
+def test_locked_marker_db_is_not_opened_even_when_lock_is_released_after_the_check(
+    tmp_path, monkeypatch, fast_guard, kind
+):
+    """V2(B1 재현): 검사 직후 잠금이 풀려도 표식 있는 파일에 SQLStore가 스키마를 만들지 않는다."""
+    from opencrab.stores.sql_store import SQLStore
+
+    path = _make_db(tmp_path / "locked.db", kind, True)
+    before = _snapshot(path)
+    holder = _Holder(path, kind)
+    holder.start()
+    try:
+        _assert_locked(path)
+        _spy_releasing(monkeypatch, holder)
+        expected = RuntimeError if kind == "delete" else sqlite3.OperationalError
+        with pytest.raises(expected) as info:
+            SQLStore(f"sqlite:///{path}")
+    finally:
+        holder.stop()
+    assert type(info.value) is expected, type(info.value)
+    _assert_unchanged(path, before)
+    assert "users" not in _table_names(path)
+
+
+_V3_ROWS = ["immutable-fails", "magic-mismatch", "mixed-header", "toctou", "truncated-0", "truncated-50"]
+
+
+@pytest.mark.parametrize("target", _GUARD_TARGETS)
+@pytest.mark.parametrize("row", _V3_ROWS)
+def test_unmanaged_check_undeterminable_is_refused(tmp_path, monkeypatch, fast_guard, row, target):
+    """V3(i)~(v): 롤백 DB를 쥐고 있는데 immutable 판정을 믿을 수 없으면 처음 BUSY를 올린다.
+
+    행마다 이 시험이 DB와 holder를 새로 만든다(대상끼리 헤더 변조가 새지 않는다). 파일 바이트를 바꾸는 행은
+    holder가 잠금을 쥔 뒤에 바꾼다.
+    """
+    path = _make_db(tmp_path / "locked.db", "delete", True)
+    readable = row in ("immutable-fails", "toctou")
+    with _held(path, "delete"):
+        _assert_locked(path)
+        if row == "magic-mismatch":
+            _poke(path, 0, b"X" * 16)
+        elif row == "mixed-header":
+            _poke(path, 18, bytes([1, 2]))
+        elif row == "truncated-0":
+            os.truncate(path, 0)
+        elif row == "truncated-50":
+            os.truncate(path, 50)
+        _assert_locked(path)
+        before = _snapshot(path, tables=readable)
+        if row == "immutable-fails":
+
+            def on_connect(database):
+                if "immutable=1" in database:
+                    raise sqlite3.DatabaseError("shim: immutable read failed")
+
+            _install_shim(monkeypatch, _Sqlite3Shim(on_connect=on_connect))
+        elif row == "toctou":
+            _install_shim(monkeypatch, _Sqlite3Shim(on_close=lambda database: _poke(path, 18, bytes([2, 2]))))
+        with pytest.raises(sqlite3.OperationalError) as info:
+            _call_target(target, path)
+    assert type(info.value) is sqlite3.OperationalError, type(info.value)
+    assert (info.value.sqlite_errorcode & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    _assert_unchanged(path, before, same_bytes=row != "toctou")
+
+
+def test_unmanaged_check_error_class_outside_busy_is_not_retried(tmp_path, monkeypatch, fast_guard):
+    """V3 대조군 1: BUSY와 LOCKED가 아닌 오류는 immutable로 내려가지 않고 그대로 전파된다."""
+    from opencrab.stores import _single_file
+
+    path = _make_db(tmp_path / "locked.db", "delete", True)
+    with _held(path, "delete"):
+        _assert_locked(path)
+
+        def on_connect(database):
+            raise _op_error(sqlite3.SQLITE_ERROR, "shim: SQL logic error")
+
+        shim = _install_shim(monkeypatch, _Sqlite3Shim(on_connect=on_connect))
+        with pytest.raises(sqlite3.OperationalError) as info:
+            _single_file.reject_unmanaged_single_file(str(path))
+    assert info.value.sqlite_errorcode == sqlite3.SQLITE_ERROR
+    assert len(shim.calls) == 1, shim.calls
+
+
+@pytest.mark.parametrize("mode", ["delete", "wal"])
+def test_unmanaged_check_without_lock_decides_by_marker(tmp_path, fast_guard, mode):
+    """V3 대조군 2: 잠금이 없으면 표식 있는 파일은 거부하고 없는 파일은 통과한다."""
+    from opencrab.stores import _single_file
+
+    marked = _make_db(tmp_path / "marked.db", mode, True)
+    plain = _make_db(tmp_path / "plain.db", mode, False)
+    with pytest.raises(RuntimeError, match=_REFUSAL):
+        _single_file.reject_unmanaged_single_file(str(marked))
+    assert _single_file.reject_unmanaged_single_file(str(plain)) is None
+
+
+def test_unmanaged_check_short_files_without_lock(tmp_path, fast_guard):
+    """V3 짧은 파일 행: 0바이트는 표 없음으로 통과하고 100바이트 미만은 NOTADB(DatabaseError)다."""
+    from opencrab.stores import _single_file
+
+    zero = tmp_path / "zero.db"
+    zero.write_bytes(b"")
+    began = time.monotonic()
+    assert _single_file.reject_unmanaged_single_file(str(zero)) is None
+    assert time.monotonic() - began < 1.0
+    for name, data in (("garbage.db", b"x" * 50), ("magic-only.db", b"SQLite format 3\x00" + b"\x00" * 20)):
+        short = tmp_path / name
+        short.write_bytes(data)
+        with pytest.raises(sqlite3.DatabaseError) as info:
+            _single_file.reject_unmanaged_single_file(str(short))
+        assert not isinstance(info.value, sqlite3.OperationalError)
+        assert info.value.sqlite_errorcode == sqlite3.SQLITE_NOTADB
+
+
+def test_published_single_db_is_wal(tmp_path, monkeypatch):
+    """V4: 게시된 단일 파일은 WAL(헤더 2, 2)이고 -wal 파일이 없으며 표식 표가 보인다.
+
+    게시 파일이 롤백 모드가 아니라서 보호 검사의 immutable 경로에 닿지 않는다.
+    """
+    built = _authorized_root(tmp_path, monkeypatch)
+    single = built.root / "single.db"
+    assert _header(single) == (2, 2)
+    assert not (built.root / "single.db-wal").exists()
+    assert "pack_delete_operations" in _table_names(single)
+
+
+@pytest.mark.parametrize("ctor", ["sqlstore", "factory-billing"])
+def test_non_single_rollback_db_keeps_main_availability(tmp_path, monkeypatch, fast_guard, ctor):
+    """V5(L1 요구 1): 단일이 아닌 롤백 DB의 일시 잠금에서 main과 같이 저장소가 사용 가능하고 billing이 쓴다."""
+    from opencrab.billing.hooks import BillingHooks
+    from opencrab.config import Settings
+    from opencrab.stores import factory
+    from opencrab.stores.sql_store import SQLStore
+
+    path = tmp_path / "billing.db"
+    seed = SQLStore(f"sqlite:///{path}", create_tables=False)
+    BillingHooks(seed)
+    seed.close()
+    assert _header(path) == (1, 1)
+    assert "billing_events" in _table_names(path)
+    holder = _Holder(path, "delete")
+    holder.start()
+    try:
+        _assert_locked(path)
+        _spy_releasing(monkeypatch, holder)
+        began = time.monotonic()
+        if ctor == "sqlstore":
+            store = SQLStore(f"sqlite:///{path}", create_tables=False)
+        else:
+            settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path))
+            store = factory.make_billing_sql_store(settings, None)
+        elapsed = time.monotonic() - began
+    finally:
+        holder.stop()
+    try:
+        assert store.available
+        assert store._engine is not None
+        assert elapsed < 2.0, elapsed
+        result = BillingHooks(store).emit("node_write")
+        assert result["ok"] is True, result
+        with contextlib.closing(sqlite3.connect(path)) as conn:
+            assert conn.execute("SELECT count(*) FROM billing_events").fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+def test_busy_non_single_rollback_store_is_unavailable_like_main(tmp_path, monkeypatch, fast_guard):
+    """V6(A2 군): 잠금이 끝까지 유지되면 스키마를 만드는 저장소는 main과 같이 사용 불가이고 다음 객체는 정상이다.
+
+    이 시험은 spy를 설치하지 않는다. 잠금은 with 블록이 끝날 때만 풀린다.
+    """
+    import sqlalchemy
+
+    from opencrab.stores.sql_store import SQLStore
+
+    real_create_engine = sqlalchemy.create_engine
+
+    def short_timeout(*args, **kwargs):
+        connect_args = dict(kwargs.get("connect_args") or {})
+        connect_args["timeout"] = 0.2
+        kwargs["connect_args"] = connect_args
+        return real_create_engine(*args, **kwargs)
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", short_timeout)
+    path = _make_db(tmp_path / "plain.db", "delete", False)
+    with _held(path, "delete"):
+        _assert_locked(path)
+        blocked = SQLStore(f"sqlite:///{path}", create_tables=True)
+    try:
+        assert blocked.available is False
+    finally:
+        blocked.close()
+    healed = SQLStore(f"sqlite:///{path}", create_tables=True)
+    try:
+        assert healed.available is True
+    finally:
+        healed.close()
+
+
+def _hot_journal_db(base: Path, name: str, with_marker: bool) -> tuple[Path, list[str]]:
+    """hot journal이 남은 롤백 DB를 자식 프로세스 없이 만든다.
+
+    쓰기 연결이 캐시를 넘겨 쓰는 중(커밋 전)에 DB와 -journal을 다른 이름으로 복사한다. 사본이 hot journal 상태다.
+    돌려주는 목록은 되돌린 뒤 표 이름이다.
+    """
+    src = base / f"{name}-src.db"
+    conn = sqlite3.connect(src, isolation_level=None)
+    try:
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        conn.execute("CREATE TABLE t(x)")
+        if with_marker:
+            conn.execute("CREATE TABLE pack_delete_operations(operation_id TEXT)")
+        for _ in range(5):
+            conn.execute("INSERT INTO t(x) VALUES ('a')")
+        conn.execute("PRAGMA cache_size=2")
+        conn.execute("PRAGMA cache_spill=1")
+        conn.execute("BEGIN")
+        for _ in range(400):
+            conn.execute("INSERT INTO t(x) VALUES (?)", ("y" * 3000,))
+        copy = base / f"{name}.db"
+        shutil.copy(src, copy)
+        shutil.copy(f"{src}-journal", f"{copy}-journal")
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+    tables = ["pack_delete_operations", "t"] if with_marker else ["t"]
+    return copy, tables
+
+
+@pytest.mark.parametrize("with_marker", [False, True], ids=["no-marker", "marker"])
+@pytest.mark.parametrize("target", _RECOVERY_TARGETS)
+def test_unmanaged_check_recovers_hot_journal_rollback_db(tmp_path, fast_guard, target, with_marker):
+    """V8(R4b-3): 비정상 종료가 남긴 hot journal을 검사가 회복한 뒤 판정한다. 저장소가 계속 막히지 않는다."""
+    path, tables = _hot_journal_db(tmp_path, "hot", with_marker)
+    journal = Path(f"{path}-journal")
+    assert journal.exists() and journal.stat().st_size > 0
+    with pytest.raises(sqlite3.OperationalError) as pre:
+        with contextlib.closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.1)) as conn:
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    assert pre.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK, pre.value
+    began = time.monotonic()
+    if with_marker:
+        with pytest.raises(RuntimeError, match=_REFUSAL):
+            _call_target(target, path, create_tables=False)
+    else:
+        result = _call_target(target, path, create_tables=False)
+        try:
+            if target == "sqlstore":
+                assert result.available is True
+        finally:
+            _close_result(result)
+    assert time.monotonic() - began < 1.0
+    assert not journal.exists()
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 5
+        names = sorted(row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'"))
+    assert names == tables
+
+
+def test_hot_journal_recovery_failure_is_propagated(tmp_path, monkeypatch, fast_guard):
+    """V8b: 읽기 전용 읽기가 776이고 rw 재시도가 BUSY로 실패하면 그 BUSY를 올린다. immutable로 내려가지 않는다."""
+    from opencrab.stores import _single_file
+
+    path = _make_db(tmp_path / "rollback.db", "delete", True)
+
+    def on_connect(database):
+        if "immutable=1" in database:
+            return
+        if "mode=rw" in database:
+            raise _op_error(sqlite3.SQLITE_BUSY, "shim: rw retry busy")
+        raise _op_error(sqlite3.SQLITE_READONLY_ROLLBACK, "shim: hot journal")
+
+    shim = _install_shim(monkeypatch, _Sqlite3Shim(on_connect=on_connect))
+    with pytest.raises(sqlite3.OperationalError) as info:
+        _single_file.reject_unmanaged_single_file(str(path))
+    assert info.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
+    assert len(shim.calls) == 2, shim.calls
+    assert not any("immutable=1" in call for call in shim.calls), shim.calls
+
+
+@pytest.mark.parametrize("kind", ["wal", "other"])
+def test_readonly_error_is_propagated_without_retry_unless_rollback(tmp_path, monkeypatch, fast_guard, kind):
+    """V8c: 헤더가 rollback이 아니면 READONLY를 rw 재시도 없이 그대로 올린다."""
+    from opencrab.stores import _single_file
+
+    if kind == "wal":
+        path = _make_db(tmp_path / "wal.db", "wal", True)
+    else:
+        path = _make_db(tmp_path / "other.db", "delete", True)
+        _poke(path, 0, b"X" * 16)
+
+    def on_connect(database):
+        raise _op_error(sqlite3.SQLITE_READONLY_ROLLBACK, "shim: hot journal")
+
+    shim = _install_shim(monkeypatch, _Sqlite3Shim(on_connect=on_connect))
+    with pytest.raises(sqlite3.OperationalError) as info:
+        _single_file.reject_unmanaged_single_file(str(path))
+    assert info.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
+    assert len(shim.calls) == 1, shim.calls
