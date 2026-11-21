@@ -10,13 +10,16 @@ import pytest
 
 
 @pytest.mark.parametrize("factory_name", ["make_graph_store", "make_doc_store", "make_vector_store", "make_sql_store"])
-def test_single_file_setting_refuses_unwired_factory(tmp_path, factory_name) -> None:
-    from opencrab.config import Settings
+def test_single_file_setting_refuses_unwired_factory(tmp_path, monkeypatch, factory_name) -> None:
+    """단일 모드 factory는 없는 single.db를 거부하고 파일을 만들지 않는다(#671, F-06)."""
+    from opencrab.config import Settings, get_settings
     from opencrab.stores import factory
 
-    settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path),
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(tmp_path), EMBEDDING_BACKEND="openai",
                         SINGLE_SQLITE_FILE=str(tmp_path / "single.db"))
-    with pytest.raises(RuntimeError, match="not ready"):
+    with pytest.raises(FileNotFoundError):
         getattr(factory, factory_name)(settings)
     assert not (tmp_path / "single.db").exists()
 

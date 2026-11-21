@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import threading
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
@@ -40,9 +41,68 @@ def _get_pg_engine(url: str) -> Any:
     return create_engine(normalize_pg_url(url), pool_pre_ping=True)
 
 
-def _reject_unwired_single_file(settings: Settings) -> None:
-    if getattr(settings, "single_sqlite_file", ""):
-        raise RuntimeError("single SQLite factory is not ready")
+# 단일 SQLite 모드(#671). 경로별 공유 파일 등록부이며 모듈 잠금이 지킨다. 닫힌 객체는 남겨 두고
+# 다음 호출이 새 객체로 바꾼다. 소유자 없는 객체는 호출 쪽이 닫는다(_build_on_single_file).
+_SINGLE_FILES: dict[str, Any] = {}
+_SINGLE_FILES_LOCK = threading.RLock()
+
+
+def _single_mode_checks(settings: Settings) -> str:
+    """단일 모드 설정을 검사하고 single.db 경로를 돌려준다. 파일을 만지기 전에 거부한다."""
+    if settings.storage_mode != "local":
+        raise RuntimeError("single SQLite requires STORAGE_MODE=local")
+    if settings.vector_backend_resolved != "sqlite-vec":
+        raise RuntimeError("single SQLite requires the sqlite-vec vector backend")
+    path = settings.single_sqlite_file
+    message = "single SQLite requires LOCAL_DATA_DIR to be the database directory"
+    if not os.path.isabs(path):
+        raise RuntimeError(message)
+    root = os.path.dirname(path)
+    # MCP 쓰기 잠금은 환경변수 LOCAL_DATA_DIR을 우선하고 저장소 쓰기 잠금은 DB 디렉터리를 쓴다.
+    # 둘이 갈라지면 write.lock이 서로 다른 파일이 되므로 둘 다 root와 같아야 한다.
+    if os.path.realpath(settings.local_data_dir) != root:
+        raise RuntimeError(message)
+    env_dir = os.environ.get("LOCAL_DATA_DIR")
+    if env_dir:
+        from opencrab.config import expand_user_path
+
+        if os.path.realpath(expand_user_path(env_dir)) != root:
+            raise RuntimeError(message)
+    return path
+
+
+def _open_single_file(path: str) -> Any:
+    """경로의 열린 공유 객체를 돌려준다. 없으면 만들고 결속을 검증한 뒤 등록한다."""
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    with _SINGLE_FILES_LOCK:
+        shared = _SINGLE_FILES.get(path)
+        if shared is not None and not shared._closed:
+            return shared
+        shared = SharedSqliteFile(path, checked=True)
+        try:
+            root = os.path.dirname(path)
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                shared.validate_binding(root, root_fd, root_fd, "ledger.json", "manifest.json", "marker.json")
+            finally:
+                os.close(root_fd)
+        except BaseException:
+            shared.close()
+            raise
+        _SINGLE_FILES[path] = shared
+        return shared
+
+
+def _build_on_single_file(shared: Any, build: Any) -> Any:
+    """저장소를 만든다. 생성이 실패하고 소유자가 없으면 공유 객체를 닫아 수명 잠금을 푼다."""
+    try:
+        return build()
+    except BaseException:
+        with shared.lock:
+            if not shared._users and not shared._closed:
+                shared.close()
+        raise
 
 
 def make_graph_store(settings: Settings) -> Any:
@@ -54,7 +114,12 @@ def make_graph_store(settings: Settings) -> Any:
     (LadybugDB/ladybug#527), production 경로를 열려면 transaction owner와
     node/edge 원자적 CAS를 별도로 검증해야 한다.
     """
-    _reject_unwired_single_file(settings)
+    if getattr(settings, "single_sqlite_file", ""):
+        from opencrab.stores.local_graph_store import LocalGraphStore
+
+        path = _single_mode_checks(settings)
+        shared = _open_single_file(path)
+        return _build_on_single_file(shared, lambda: LocalGraphStore(db_path=path, shared=shared))
     if settings.storage_mode == "pg":
         from opencrab.stores.pg_graph_store import PGGraphStore
 
@@ -140,7 +205,7 @@ def make_vector_store(settings: Settings) -> Any:
     설계: docs/vector-backends.md §2. 임베딩은 백엔드와 무관하게 동일.
     한국어 검색 품질: minilm MRR 0.285 vs KURE-v1 1.000.
     """
-    _reject_unwired_single_file(settings)
+    single_path = _single_mode_checks(settings) if getattr(settings, "single_sqlite_file", "") else ""
     backend = settings.vector_backend_resolved
 
     if backend == "sqlite-vec":
@@ -161,6 +226,22 @@ def make_vector_store(settings: Settings) -> Any:
                 "(유효값: 미설정(off) 또는 'binary')"
             )
         from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+        if single_path:
+            shared = _open_single_file(single_path)
+
+            def build() -> Any:
+                return SqliteVecStore(
+                    db_path=single_path,
+                    embedding_function=_make_kure_embedding_function(settings),
+                    dim=settings.embed_dim,
+                    collection_name=settings.vector_collection,
+                    ann=settings.vector_ann,
+                    ann_coarse_k=settings.vector_ann_coarse_k,
+                    shared=shared,
+                )
+
+            return _build_on_single_file(shared, build)
 
         db_path = os.path.join(settings.local_data_dir, settings.vector_db_file)
         ef = _make_kure_embedding_function(settings)
@@ -261,7 +342,12 @@ def make_doc_store(settings: Settings) -> Any:
         state.  A fixed filename ("doc_store.db") makes the path predictable
         for operators and migration tooling.
     """
-    _reject_unwired_single_file(settings)
+    if getattr(settings, "single_sqlite_file", ""):
+        from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+        path = _single_mode_checks(settings)
+        shared = _open_single_file(path)
+        return _build_on_single_file(shared, lambda: LocalSQLDocStore(path, shared=shared))
     if settings.is_local:
         # LocalDocStore (JSON) → LocalSQLDocStore (SQLite).
         # See module docstring in local_sql_doc_store.py for full rationale.
@@ -286,7 +372,10 @@ def make_sql_store(settings: Settings) -> Any:
     """local과 kuzu는 SQLite를 쓰고 pg는 공유 PostgreSQL 엔진을 쓴다."""
     from opencrab.stores.sql_store import SQLStore
 
-    _reject_unwired_single_file(settings)
+    if getattr(settings, "single_sqlite_file", ""):
+        path = _single_mode_checks(settings)
+        shared = _open_single_file(path)
+        return _build_on_single_file(shared, lambda: SQLStore(url=f"sqlite:///{path}", shared=shared))
     url = settings.postgres_url if settings.storage_mode in ("docker", "pg") else settings.sqlite_url
     engine = _get_pg_engine(url) if settings.storage_mode == "pg" else None
     return SQLStore(url=url, engine=engine)
@@ -323,6 +412,18 @@ def make_billing_sql_store(settings: Settings, sql_store: Any) -> Any:
     otherwise sit there as 5 confusingly-empty tables in a file meant to
     hold exactly one.
     """
+    if getattr(settings, "single_sqlite_file", ""):
+        # 결속을 마친 열린 SQL 저장소가 아니면 billing 파일을 만들지 않는다. 호출 순서에 기대지 않는다.
+        path = settings.single_sqlite_file
+        shared = getattr(sql_store, "shared_file", None)
+        with _SINGLE_FILES_LOCK:
+            bound = _SINGLE_FILES.get(path)
+        if shared is None or shared is not bound or shared._closed:
+            raise RuntimeError("single SQLite billing requires the bound SQL store")
+        from opencrab.stores.sql_store import SQLStore
+
+        return SQLStore(url=f"sqlite:///{os.path.dirname(path)}/billing.db", create_tables=False)
+
     if settings.storage_mode in ("docker", "pg"):
         return sql_store
 

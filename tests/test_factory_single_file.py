@@ -336,9 +336,12 @@ def test_single_doc_fts_and_bm25_init_is_read_only(tmp_path, monkeypatch):
         watcher.close()
 
 
-def _assert_bm25_turns_off_after(root: Path, *statements: str) -> None:
-    """대조군(수정 전 켜짐)을 확인한 뒤 DB를 고치면 node BM25가 꺼진다. data_version은 그대로다."""
-    docs = _open_doc_store(root)
+def _assert_bm25_turns_off_after(root: Path, *statements: str, opener=_open_doc_store) -> None:
+    """대조군(수정 전 켜짐)을 확인한 뒤 DB를 고치면 node BM25가 꺼진다. data_version은 그대로다.
+
+    opener는 root를 받아 doc 저장소를 여는 함수다. 기본은 생성자 직접 호출이고 factory 형태는 S4가 넘긴다.
+    """
+    docs = opener(root)
     try:
         assert docs.supports_node_bm25 is True
     finally:
@@ -347,7 +350,7 @@ def _assert_bm25_turns_off_after(root: Path, *statements: str) -> None:
     watcher = sqlite3.connect(root / "single.db")
     try:
         before = watcher.execute("PRAGMA data_version").fetchone()[0]
-        docs = _open_doc_store(root)
+        docs = opener(root)
         try:
             assert docs.supports_node_bm25 is False
             assert docs.node_bm25_ready() is False
@@ -445,3 +448,739 @@ def test_doc_store_write_path_init_unchanged(tmp_path, mode):
         conn.close()
     assert "doc_nodes_bm25_meta" in names and "doc_sources_fts" in names
     assert "pack_delete_operations" not in names
+
+
+# ---------------------------------------------------------------------------
+# S4: factory 단일 모드 분기(#671)
+# ---------------------------------------------------------------------------
+
+_LIFETIME_LOCK_NAME = "single.db.lifetime.lock"
+_FACTORY_NAMES = ("make_graph_store", "make_doc_store", "make_vector_store", "make_sql_store")
+
+_HOLD_LOCK_CODE = (
+    "import sys; from opencrab.locking import acquire_file_lock; "
+    "lock = acquire_file_lock('single.db.lifetime.lock', sys.argv[1], timeout=0); "
+    "print('held', flush=True); sys.stdin.readline()"
+)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_single_registry(monkeypatch):
+    """시험마다 factory의 경로별 등록부를 비우고, 끝나면 남은 공유 객체를 닫는다."""
+    from opencrab.stores import factory
+
+    registry: dict = {}
+    monkeypatch.setattr(factory, "_SINGLE_FILES", registry, raising=False)
+    yield registry
+    for shared in list(registry.values()):
+        for owner in list(shared._users):
+            shared.release(owner)
+        if not shared._closed:
+            shared.close()
+
+
+def _open_entries(registry) -> list:
+    return [shared for shared in registry.values() if not shared._closed]
+
+
+def _names(root: Path) -> list[str]:
+    """수명 잠금 파일만 뺀 root 이름 집합."""
+    return sorted(name for name in os.listdir(root) if name != _LIFETIME_LOCK_NAME)
+
+
+def _point_at(monkeypatch, root: Path) -> None:
+    """환경변수 LOCAL_DATA_DIR을 root로 맞추고 임베딩을 해시로 바꾼다(네트워크를 쓰지 않는다)."""
+    from opencrab.config import get_settings
+    from opencrab.stores import factory
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(root))
+    get_settings.cache_clear()
+    monkeypatch.setattr(factory, "_make_kure_embedding_function", lambda settings: _hash_embed)
+
+
+def _single_settings(root: Path, **overrides):
+    from opencrab.config import Settings
+
+    values = {
+        "STORAGE_MODE": "local",
+        "LOCAL_DATA_DIR": str(root),
+        "SINGLE_SQLITE_FILE": str(root / "single.db"),
+        "EMBEDDING_BACKEND": "openai",
+        "EMBED_DIM": _DIM,
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def _make_four(settings):
+    """graph, docs, vec, sql 순서로 factory 네 개를 부른다. 중간에 실패하면 만든 것을 닫는다."""
+    from opencrab.stores import factory
+
+    made = []
+    try:
+        for name in _FACTORY_NAMES:
+            made.append(getattr(factory, name)(settings))
+    except BaseException:
+        _close_all(made)
+        raise
+    return tuple(made)
+
+
+def _close_all(stores) -> None:
+    for store in reversed(list(stores)):
+        store.close()
+
+
+def _assert_lock_free(root: Path) -> None:
+    result = _exclusive_lock_attempt(root)
+    assert result.returncode == 0, result.stderr
+
+
+def _authorized_and_pointed(tmp_path, monkeypatch):
+    built = _authorized_root(tmp_path, monkeypatch)
+    _point_at(monkeypatch, built.root)
+    return built
+
+
+def test_single_setting_empty_uses_multi_file_paths(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-N1(대조군): 설정이 비어 있으면 다섯 factory가 다중 파일 이름을 만들고 single.db는 없다."""
+    from opencrab.config import Settings
+    from opencrab.stores import factory
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _point_at(monkeypatch, data)
+    settings = Settings(STORAGE_MODE="local", LOCAL_DATA_DIR=str(data), EMBEDDING_BACKEND="openai", EMBED_DIM=_DIM)
+    assert settings.single_sqlite_file == ""
+    graph = factory.make_graph_store(settings)
+    docs = factory.make_doc_store(settings)
+    vec = factory.make_vector_store(settings)
+    sql = factory.make_sql_store(settings)
+    billing = factory.make_billing_sql_store(settings, sql)
+    try:
+        names = set(os.listdir(data))
+        assert graph.shared_file is None and docs.shared_file is None
+        assert vec.shared_file is None and sql.shared_file is None
+    finally:
+        _close_all([billing, vec, docs, graph, sql])
+    assert {"graph.db", "doc_store.db", "vectors.db", "opencrab.db", "billing.db"} <= names, names
+    assert "single.db" not in names
+    assert _fresh_single_registry == {}
+
+
+def test_single_four_stores_share_one_file(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-N2: authorized root에서 네 factory가 한 공유 객체를 쓰고 기능과 행 수가 게시와 같다(F-14, G6)."""
+    from opencrab.stores._single_file import is_single_file
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    graph, docs, vec, sql = _make_four(_single_settings(built.root))
+    try:
+        assert is_single_file(graph, docs, vec, sql) is True
+        shared = sql.shared_file
+        assert all(store.shared_file is shared for store in (graph, docs, vec))
+        assert list(_fresh_single_registry.values()) == [shared]
+        assert docs.supports_keyword is True
+        assert docs.supports_node_bm25 is True
+        assert docs.node_bm25_ready() is True
+        assert vec.count() == built.counts["vectors.db:vectors_kure_rowids"]
+        conn = shared.connection()
+        assert conn.execute("SELECT COUNT(*) FROM doc_nodes").fetchone()[0] == built.counts["doc_store.db:doc_nodes"]
+        assert conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0] == built.counts["graph.db:graph_nodes"]
+        marker = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        assert marker is not None
+    finally:
+        _close_all((graph, docs, vec, sql))
+
+
+def test_single_billing_store_uses_root_billing_db(tmp_path, monkeypatch):
+    """T-N3: 결속을 마친 sql과 함께 부른 billing 저장소는 root의 billing.db를 쓰고 공유 객체가 없다(F-23 정상)."""
+    from sqlalchemy.engine import make_url
+
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    graph, docs, vec, sql = _make_four(settings)
+    billing = factory.make_billing_sql_store(settings, sql)
+    try:
+        assert make_url(billing._url).database == str(built.root / "billing.db")
+        assert billing.shared_file is None
+    finally:
+        billing.close()
+        _close_all((graph, docs, vec, sql))
+
+
+def test_single_second_call_reuses_open_shared_file(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-N4: 열린 객체가 있으면 같은 객체를 쓴다(F-15). write.lock을 쥔 채라도 성공한다(F-21 대조군)."""
+    from opencrab.locking import write_lock
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    graph, docs, vec, sql = _make_four(settings)
+    try:
+        shared = sql.shared_file
+        again = factory.make_sql_store(settings)
+        try:
+            assert again.shared_file is shared
+        finally:
+            again.close()
+        with write_lock(str(built.root)):
+            under_lock = factory.make_graph_store(settings)
+            try:
+                assert under_lock.shared_file is shared
+            finally:
+                under_lock.close()
+        assert list(_fresh_single_registry.values()) == [shared]
+        assert shared._closed is False
+    finally:
+        _close_all((graph, docs, vec, sql))
+
+
+def test_single_reopen_after_close_makes_new_shared_file(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-N5: 모두 닫은 뒤 다시 부르면 새 객체가 결속을 다시 검증한다(F-16). 그 사이 ready가 되면 거부한다(F-08)."""
+    from opencrab.stores import factory
+    from opencrab.stores._single_file import is_single_file
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    first = _make_four(settings)
+    old = first[3].shared_file
+    _close_all(first)
+    assert old._closed is True
+    second = _make_four(settings)
+    try:
+        assert second[3].shared_file is not old
+        assert is_single_file(*second) is True
+        assert list(_fresh_single_registry.values()) == [second[3].shared_file]
+    finally:
+        _close_all(second)
+    _write_ledger_state(built.root, "ready")
+    with pytest.raises(RuntimeError, match="single SQLite generation is not authorized"):
+        factory.make_sql_store(settings)
+    assert _open_entries(_fresh_single_registry) == []
+    _assert_lock_free(built.root)
+
+
+def test_single_lifetime_lock_is_shared_while_open(tmp_path, monkeypatch):
+    """T-N8: 저장소가 열려 있는 동안 다른 프로세스의 독점 시도가 막히고 닫은 뒤에는 성공한다."""
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    stores = _make_four(_single_settings(built.root))
+    try:
+        held = _exclusive_lock_attempt(built.root)
+        assert held.returncode != 0
+        assert "TimeoutError" in held.stderr, held.stderr
+    finally:
+        _close_all(stores)
+    _assert_lock_free(built.root)
+
+
+def test_single_add_read_round_trip(tmp_path, monkeypatch):
+    """T-N6: 팩 검증 뒤 graph와 doc 노드를 쓰고, 닫았다 다시 연 저장소가 읽는다. BM25 pending은 비어 있다."""
+    from opencrab.stores import _node_bm25_sqlite as nbm
+    from opencrab.stores.sql_store import shared_write_unit
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    incarnation = built.incarnations[0]
+    graph, docs, vec, sql = _make_four(settings)
+    try:
+        shared = sql.shared_file
+        with shared_write_unit(sql):
+            shared.validate_pack_writes({built.pack_id: incarnation})
+            graph.upsert_node("Entity", "n2", {"pack_id": built.pack_id, "name": "node two"})
+            docs.upsert_node_doc("space1", "Entity", "n2", {"pack_id": built.pack_id, "name": "node two"})
+    finally:
+        _close_all((graph, docs, vec, sql))
+    graph, docs, vec, sql = _make_four(settings)
+    try:
+        conn = sql.shared_file.connection()
+        assert conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0] == built.counts["graph.db:graph_nodes"] + 1
+        assert conn.execute("SELECT COUNT(*) FROM doc_nodes").fetchone()[0] == built.counts["doc_store.db:doc_nodes"] + 1
+        assert nbm.pending_count(conn) == 0
+        assert docs.node_bm25_ready() is True
+    finally:
+        _close_all((graph, docs, vec, sql))
+
+
+@pytest.mark.parametrize("state", ["ready", "staged"])
+def test_single_rejects_unauthorized_state_without_sidecars(tmp_path, monkeypatch, state, _fresh_single_registry):
+    """T-E1: authorized가 아닌 대장은 DB를 열기 전에 거부한다(F-08). root가 바뀌지 않고 잠금이 풀린다."""
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    _write_ledger_state(built.root, state)
+    settings = _single_settings(built.root)
+    before = _names(built.root)
+    for name in _FACTORY_NAMES:
+        with pytest.raises(RuntimeError, match="single SQLite generation is not authorized"):
+            getattr(factory, name)(settings)
+    assert _names(built.root) == before
+    assert not any(n.endswith(("-wal", "-shm")) for n in os.listdir(built.root))
+    assert _open_entries(_fresh_single_registry) == []
+    _assert_lock_free(built.root)
+
+
+def _tamper_ledger_missing(root: Path) -> None:
+    (root / "ledger.json").unlink()
+
+
+def _tamper_manifest(root: Path) -> None:
+    path = root / "manifest.json"
+    os.chmod(path, 0o600)
+    path.write_bytes(path.read_bytes() + b"\n")
+
+
+def _tamper_marker(root: Path) -> None:
+    path = root / "marker.json"
+    os.chmod(path, 0o600)
+    data = json.loads(path.read_text())
+    data["manifest_digest"] = "a" * 64
+    path.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")))
+
+
+def _tamper_generation(root: Path) -> None:
+    _edit_single_db(root, f"UPDATE single_file_metadata SET generation = '{'b' * 32}'")
+
+
+def _tamper_zero_rows(root: Path) -> None:
+    _edit_single_db(root, "DELETE FROM single_file_metadata")
+
+
+def _tamper_two_rows(root: Path) -> None:
+    from tests.test_merge_sqlite_stores import _SECOND_METADATA_ROW
+
+    _edit_single_db(root, "PRAGMA ignore_check_constraints=ON", _SECOND_METADATA_ROW)
+
+
+_TAMPER_ROWS = {
+    "ledger-missing": (_tamper_ledger_missing, FileNotFoundError, None),
+    "manifest-bytes": (_tamper_manifest, RuntimeError, "single SQLite manifest binding differs"),
+    "marker-digest": (_tamper_marker, RuntimeError, "single SQLite manifest binding differs"),
+    "metadata-generation": (_tamper_generation, RuntimeError, "single SQLite generation binding differs"),
+    "metadata-zero-rows": (_tamper_zero_rows, RuntimeError, "single SQLite metadata row is invalid"),
+    "metadata-two-rows": (_tamper_two_rows, RuntimeError, "single SQLite metadata row is invalid"),
+    "root-moved": (None, RuntimeError, "single SQLite path binding differs"),
+}
+
+
+@pytest.mark.parametrize("variant", list(_TAMPER_ROWS))
+def test_single_rejects_missing_ledger_and_tampered_binding(tmp_path, monkeypatch, variant, _fresh_single_registry):
+    """T-E2: 대장 없음과 결속 변조를 행마다 새 root에서 거부한다(F-07, F-09~F-12). 잠금이 풀린다."""
+    from opencrab.stores import factory
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    tamper, exc_type, message = _TAMPER_ROWS[variant]
+    root = built.root
+    if tamper is None:
+        moved = root.parent / "moved"
+        root.rename(moved)
+        root = moved
+    else:
+        tamper(root)
+    _point_at(monkeypatch, root)
+    settings = _single_settings(root)
+    kwargs = {"match": message} if message else {}
+    with pytest.raises(exc_type, **kwargs):
+        factory.make_sql_store(settings)
+    assert _open_entries(_fresh_single_registry) == []
+    _assert_lock_free(root)
+
+
+def test_single_rejects_bad_settings(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-E3: 설정 행마다 파일을 만지기 전에 거부한다(F-02~F-04). root 이름 집합과 등록부가 그대로다."""
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    root = built.root
+    other = tmp_path / "other"
+    other.mkdir()
+    link = tmp_path / "link"
+    os.symlink(root, link)
+    data_dir_message = "single SQLite requires LOCAL_DATA_DIR to be the database directory"
+    rows = [
+        ("docker", {"STORAGE_MODE": "docker"}, None, _FACTORY_NAMES, RuntimeError,
+         "single SQLite requires STORAGE_MODE=local"),
+        ("pg", {"STORAGE_MODE": "pg"}, None, _FACTORY_NAMES, RuntimeError,
+         "single SQLite requires STORAGE_MODE=local"),
+        ("kuzu", {"STORAGE_MODE": "kuzu"}, None, _FACTORY_NAMES, RuntimeError,
+         "single SQLite requires STORAGE_MODE=local"),
+        ("chroma", {"VECTOR_BACKEND": "chroma"}, None, _FACTORY_NAMES, RuntimeError,
+         "single SQLite requires the sqlite-vec vector backend"),
+        ("pgvector", {"VECTOR_BACKEND": "pgvector"}, None, _FACTORY_NAMES, RuntimeError,
+         "single SQLite requires the sqlite-vec vector backend"),
+        ("embedding-not-openai", {"VECTOR_BACKEND": "sqlite-vec", "EMBEDDING_BACKEND": "local"}, None,
+         ("make_vector_store",), ValueError, "EMBEDDING_BACKEND=openai"),
+        ("bad-vector-ann", {"VECTOR_ANN": "bogus"}, None, ("make_vector_store",), ValueError,
+         "Unknown VECTOR_ANN"),
+        ("relative-path", {"SINGLE_SQLITE_FILE": "single.db"}, None, _FACTORY_NAMES, RuntimeError,
+         data_dir_message),
+        ("setting-differs", {"LOCAL_DATA_DIR": str(other)}, None, _FACTORY_NAMES, RuntimeError,
+         data_dir_message),
+        ("env-differs", {}, str(other), _FACTORY_NAMES, RuntimeError, data_dir_message),
+        ("symlink-parent", {"LOCAL_DATA_DIR": str(link), "SINGLE_SQLITE_FILE": str(link / "single.db")},
+         str(link), _FACTORY_NAMES, RuntimeError, data_dir_message),
+    ]
+    before = _names(root)
+    for label, overrides, env_value, names, exc_type, message in rows:
+        settings = _single_settings(root, **overrides)
+        if env_value is not None:
+            monkeypatch.setenv("LOCAL_DATA_DIR", env_value)
+        try:
+            for name in names:
+                with pytest.raises(exc_type, match=message):
+                    getattr(factory, name)(settings)
+        finally:
+            monkeypatch.setenv("LOCAL_DATA_DIR", str(root))
+        assert _names(root) == before, label
+        assert _fresh_single_registry == {}, label
+    _assert_lock_free(root)
+
+
+@pytest.mark.parametrize("variant", ["missing", "symlink", "hardlink"])
+def test_single_rejects_bad_single_db_file(tmp_path, monkeypatch, variant, _fresh_single_registry):
+    """T-E3, F-06과 F-25: single.db가 없거나 심볼릭 링크이거나 링크 수가 2이면 거부한다. 파일을 만들지 않는다."""
+    from opencrab.stores import factory
+
+    root = tmp_path / "plain"
+    root.mkdir()
+    _point_at(monkeypatch, root)
+    other = tmp_path / "other.db"
+    other.write_bytes(b"")
+    if variant == "symlink":
+        os.symlink(other, root / "single.db")
+        exc_type, message = ValueError, "file must be regular and have one link"
+    elif variant == "hardlink":
+        (root / "single.db").write_bytes(b"")
+        os.link(root / "single.db", tmp_path / "alias.db")
+        exc_type, message = ValueError, "file must be regular and have one link"
+    else:
+        exc_type, message = FileNotFoundError, None
+    before = _names(root)
+    settings = _single_settings(root)
+    for name in _FACTORY_NAMES:
+        with pytest.raises(exc_type, match=message):
+            getattr(factory, name)(settings)
+    assert _names(root) == before
+    assert _fresh_single_registry == {}
+    if variant == "missing":
+        assert not (root / "single.db").exists()
+
+
+def test_single_symlinked_parent_swap_is_rejected(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-E3, F-05: 3.2절 경로 검사 뒤 SharedSqliteFile 생성 중에 상위가 바뀌면 거부한다."""
+    from opencrab.stores import factory
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    root = tmp_path / "plain"
+    root.mkdir()
+    (root / "single.db").write_bytes(b"")
+    _point_at(monkeypatch, root)
+    state = {"inside": False, "fired": False}
+    real_open = SharedSqliteFile._open_checked_file
+    real_realpath = os.path.realpath
+
+    def wrapped_open(self):
+        state["inside"] = True
+        try:
+            return real_open(self)
+        finally:
+            state["inside"] = False
+
+    def fake_realpath(path, *args, **kwargs):
+        if state["inside"] and not state["fired"]:
+            state["fired"] = True
+            return str(path) + "-elsewhere"
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(SharedSqliteFile, "_open_checked_file", wrapped_open)
+    monkeypatch.setattr(os.path, "realpath", fake_realpath)
+    before = _names(root)
+    with pytest.raises(ValueError, match="SQLite path has a symlinked parent"):
+        factory.make_sql_store(_single_settings(root))
+    monkeypatch.setattr(os.path, "realpath", real_realpath)
+    assert state["fired"] is True
+    assert _names(root) == before
+    assert _fresh_single_registry == {}
+    _assert_lock_free(root)
+
+
+def test_single_store_close_flow_releases_lock(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-E4: sql과 graph를 닫으면 잠금이 풀리고 이어서 네 factory가 새 객체로 다시 열린다(F-16)."""
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    sql = factory.make_sql_store(settings)
+    graph = factory.make_graph_store(settings)
+    old = sql.shared_file
+    assert graph.shared_file is old
+    graph.close()
+    sql.close()
+    assert old._closed is True
+    _assert_lock_free(built.root)
+    stores = _make_four(settings)
+    try:
+        assert stores[3].shared_file is not old
+    finally:
+        _close_all(stores)
+
+
+def test_single_vector_ctor_unsafe_collection_closes_unowned_shared(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-E5e: 소유자 없이 만든 공유 객체는 생성자 실패 때 호출 쪽이 닫는다(F-17). 다음 호출은 새 객체를 만든다."""
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="Unsafe collection_name"):
+        factory.make_vector_store(_single_settings(built.root, VECTOR_COLLECTION="bad name"))
+    assert _open_entries(_fresh_single_registry) == []
+    assert len(_fresh_single_registry) == 1
+    old = next(iter(_fresh_single_registry.values()))
+    assert old._closed is True
+    _assert_lock_free(built.root)
+    vec = factory.make_vector_store(_single_settings(built.root))
+    try:
+        assert vec.shared_file is not old
+        assert vec.count() == built.counts["vectors.db:vectors_kure_rowids"]
+    finally:
+        vec.close()
+
+
+def test_single_first_call_under_write_lock_is_rejected(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-E9(F-21): write.lock을 쥔 스레드의 첫 factory 호출은 수명 잠금 순서 위반으로 거부된다.
+
+    이 거부는 의도된 현재 동작이며 후속(followup_671_factory_write_lock_first_call)이 고친다.
+    """
+    from opencrab.locking import write_lock
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    with write_lock(str(built.root)):
+        before = _names(built.root)
+        with pytest.raises(RuntimeError, match="lifetime lock order violated"):
+            factory.make_sql_store(settings)
+        assert _names(built.root) == before
+        assert _fresh_single_registry == {}
+    sql = factory.make_sql_store(settings)
+    sql.close()
+
+
+def test_single_lifetime_lock_timeout(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-E10(F-22): 다른 프로세스가 수명 잠금을 독점하면 대기 시간이 지나 TimeoutError로 거부된다."""
+    from opencrab import locking
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    monkeypatch.setattr(locking, "default_lock_wait_timeout", lambda: 0.3)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_LOCK_CODE, str(built.root)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        before = _names(built.root)
+        with pytest.raises(TimeoutError, match="timed out waiting for file lock"):
+            factory.make_sql_store(settings)
+        assert _names(built.root) == before
+        assert _fresh_single_registry == {}
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=30)
+    sql = factory.make_sql_store(settings)
+    sql.close()
+
+
+def test_single_billing_requires_bound_sql_store(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-E11(F-23): 결속을 마친 열린 SQL 저장소가 아니면 billing 저장소를 만들지 않는다."""
+    from opencrab.stores import factory
+    from opencrab.stores._single_file import SharedSqliteFile
+    from opencrab.stores.sql_store import SQLStore
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    message = "single SQLite billing requires the bound SQL store"
+    multi_dir = tmp_path / "multi"
+    multi_dir.mkdir()
+    multi = SQLStore(url=f"sqlite:///{multi_dir}/opencrab.db")
+    unregistered_path = str(built.root / "single.db")
+    unregistered = SharedSqliteFile(unregistered_path, checked=True)
+    unregistered_sql = SQLStore(url=f"sqlite:///{unregistered_path}", shared=unregistered)
+    bound = _make_four(settings)
+    try:
+        before = _names(built.root)
+        for candidate in (multi, unregistered_sql):
+            with pytest.raises(RuntimeError, match=message):
+                factory.make_billing_sql_store(settings, candidate)
+        _close_all(bound)
+        with pytest.raises(RuntimeError, match=message):
+            factory.make_billing_sql_store(settings, bound[3])
+        assert _names(built.root) == before
+    finally:
+        multi.close()
+        unregistered_sql.close()
+
+
+def test_single_concurrent_first_calls_share_one_object(tmp_path, monkeypatch, _fresh_single_registry):
+    """T-G1: 두 스레드의 동시 첫 호출은 공유 객체 하나를 만들고 결속 검증은 한 번 한다."""
+    import threading
+
+    from opencrab.stores import factory
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    real_validate = SharedSqliteFile.validate_binding
+    calls: list[int] = []
+
+    def counting(self, *args, **kwargs):
+        calls.append(threading.get_ident())
+        time.sleep(0.3)
+        return real_validate(self, *args, **kwargs)
+
+    monkeypatch.setattr(SharedSqliteFile, "validate_binding", counting)
+
+    # 한 공유 객체 위에서 저장소를 동시에 만드는 것은 지원하지 않는다(설계 11절 가정 3). 두 번째 생성자의
+    # acquire가 첫 생성자가 쓰는 연결에 훅을 걸어 "Error creating function"이 날 수 있다. 이 시험은 등록부의
+    # 동시성만 본다. 그래서 저장소 생성자만 직렬화하고 등록부 조회와 결속 검증은 동시에 부른다.
+    from opencrab.stores.local_graph_store import LocalGraphStore
+
+    real_init = LocalGraphStore.__init__
+    construct_lock = threading.Lock()
+
+    def serial_init(self, *args, **kwargs):
+        with construct_lock:
+            return real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(LocalGraphStore, "__init__", serial_init)
+    barrier = threading.Barrier(2)
+    results: list = []
+    errors: list = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=10)
+            results.append(factory.make_graph_store(settings))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    try:
+        assert errors == []
+        assert len(results) == 2
+        assert len(calls) == 1, calls
+        assert results[0].shared_file is results[1].shared_file
+        assert list(_fresh_single_registry.values()) == [results[0].shared_file]
+    finally:
+        _close_all(results)
+
+
+def test_single_open_close_cycle_leaks_no_descriptors(tmp_path, monkeypatch):
+    """root 디렉터리 fd는 결속 검증 뒤(성공과 실패 모두) 닫힌다. 열고 닫는 순환이 fd를 남기지 않는다."""
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+
+    def cycle() -> None:
+        _close_all(_make_four(settings))
+
+    def failing_cycle() -> None:
+        _write_ledger_state(built.root, "ready")
+        try:
+            with pytest.raises(RuntimeError, match="not authorized"):
+                factory.make_sql_store(settings)
+        finally:
+            _write_ledger_state(built.root, "authorized")
+
+    import gc
+
+    cycle()
+    failing_cycle()
+    gc.collect()
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(3):
+        cycle()
+        failing_cycle()
+    gc.collect()
+    assert len(os.listdir("/proc/self/fd")) <= before
+
+
+def test_single_authorized_root_with_stale_sidecars(tmp_path, monkeypatch):
+    """T-G2: 이전 서비스가 남긴 -wal과 -shm이 있는 authorized root에도 연결된다."""
+    from opencrab.stores._single_file import is_single_file
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    root = built.root
+    (root / "single.db-wal").write_bytes(b"")
+    (root / "single.db-shm").write_bytes(b"")
+    stores = _make_four(_single_settings(root))
+    try:
+        assert is_single_file(*stores) is True
+        assert stores[1].node_bm25_ready() is True
+        assert stores[3].shared_file.connection().execute("SELECT COUNT(*) FROM doc_nodes").fetchone()[0] >= 1
+    finally:
+        _close_all(stores)
+
+
+def test_single_factory_doc_fts_and_bm25_init_is_read_only(tmp_path, monkeypatch):
+    """T-G5(factory 형태): doc factory의 초기화는 쓰기를 하지 않는다. data_version이 같다."""
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    watcher = sqlite3.connect(built.root / "single.db")
+    try:
+        before = watcher.execute("PRAGMA data_version").fetchone()[0]
+        docs = factory.make_doc_store(settings)
+        try:
+            assert docs.supports_keyword is True
+            assert docs.supports_node_bm25 is True
+            assert docs._bm25_cache is not None
+            after = watcher.execute("PRAGMA data_version").fetchone()[0]
+        finally:
+            docs.close()
+        assert after == before
+    finally:
+        watcher.close()
+
+
+@pytest.mark.parametrize("variant", ["count-mismatch", "stats-row-missing"])
+def test_single_factory_bm25_ready_count_mismatch_turns_off(tmp_path, monkeypatch, variant):
+    """T-G6(factory 형태): 정합이 어긋난 게시 DB는 doc factory가 node BM25를 끈 채로 연다(F-24)."""
+    from opencrab.stores import _node_bm25_sqlite as nbm
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    if variant == "count-mismatch":
+        statement = f"UPDATE {nbm.STATS} SET doc_count = doc_count + 1 WHERE id = 1"
+    else:
+        statement = f"DELETE FROM {nbm.STATS} WHERE id = 1"
+    _assert_bm25_turns_off_after(
+        built.root, statement, opener=lambda root: factory.make_doc_store(settings)
+    )
+
+
+@pytest.mark.parametrize("variant", ["trigger", "vocab-table"])
+def test_single_factory_bm25_missing_object_turns_off(tmp_path, monkeypatch, variant):
+    """T-G7(factory 형태): BM25 객체가 없는 게시 DB는 doc factory가 node BM25를 끈 채로 연다(F-24)."""
+    from opencrab.stores import _node_bm25_sqlite as nbm
+    from opencrab.stores import factory
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    settings = _single_settings(built.root)
+    if variant == "trigger":
+        statement = f"DROP TRIGGER {nbm.TRIGGERS[0]}"
+    else:
+        statement = f"DROP TABLE {nbm.VINST}"
+    _assert_bm25_turns_off_after(
+        built.root, statement, opener=lambda root: factory.make_doc_store(settings)
+    )
