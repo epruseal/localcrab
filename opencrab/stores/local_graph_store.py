@@ -59,7 +59,13 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         self._available = False
         self._schema_state = "unconfigured"
         self._init_conn_state(db_path, shared)
-        self._init_db()
+        try:
+            self._init_db()
+        except BaseException:
+            # 일반 예외는 _init_db가 삼킨다. 중단(KeyboardInterrupt 등)이 생성자 밖으로 나가면
+            # 등록한 공유 소유자를 풀지 않아 수명 잠금이 남는다(#671).
+            self.close()
+            raise
 
     def upsert_node(self, node_type, node_id, properties, space_id=None, *, return_receipt=False):
         if self._shared is not None and self._shared.in_unit_of_work:

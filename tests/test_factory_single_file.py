@@ -13,6 +13,8 @@ import os
 import resource
 import shutil
 import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -202,3 +204,72 @@ def test_single_validate_binding_authorized_opens_db_once(tmp_path, monkeypatch)
     _validate_binding_on(built.root)
     monkeypatch.setattr(sqlite3, "connect", real_connect)
     assert len(connect_calls) == 1
+
+
+class _InitInterrupt(BaseException):
+    """`except Exception`을 지나 생성자 밖으로 나가는 중단(KeyboardInterrupt 같은 경로)."""
+
+
+_EXCLUSIVE_LOCK_CODE = (
+    "import sys; from opencrab.locking import acquire_file_lock; "
+    "acquire_file_lock('single.db.lifetime.lock', sys.argv[1], timeout=0)"
+)
+
+
+def _exclusive_lock_attempt(root: Path) -> subprocess.CompletedProcess:
+    """하위 프로세스가 수명 잠금을 독점으로 시도한다. 소유자가 남으면 TimeoutError로 실패한다."""
+    return subprocess.run(
+        [sys.executable, "-c", _EXCLUSIVE_LOCK_CODE, str(root)], capture_output=True, text=True
+    )
+
+
+def _build_store(kind: str, root: Path, shared):
+    from opencrab.stores.local_graph_store import LocalGraphStore
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+    path = str(root / "single.db")
+    if kind == "graph":
+        return LocalGraphStore(path, shared=shared)
+    if kind == "doc":
+        return LocalSQLDocStore(path, shared=shared)
+    return SqliteVecStore(
+        path, _hash_embed, _DIM, collection_name="vectors_kure", shared=shared
+    )
+
+
+_STORE_CLASS = {
+    "graph": ("opencrab.stores.local_graph_store", "LocalGraphStore"),
+    "doc": ("opencrab.stores.local_sql_doc_store", "LocalSQLDocStore"),
+    "vector": ("opencrab.stores.sqlite_vec_store", "SqliteVecStore"),
+}
+
+
+@pytest.mark.parametrize("kind", ["graph", "doc", "vector"])
+def test_single_ctor_baseexception_releases_owner(tmp_path, monkeypatch, kind):
+    """T-E5a~c: 생성자의 `_init_db`가 BaseException으로 끝나면 등록한 공유 소유자를 푼다.
+
+    소유자가 남으면 공유 수명 잠금이 풀리지 않아 다른 프로세스의 독점 시도가 막힌다.
+    """
+    import importlib
+
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    module_name, class_name = _STORE_CLASS[kind]
+    store_class = getattr(importlib.import_module(module_name), class_name)
+
+    def boom(self):
+        raise _InitInterrupt
+
+    monkeypatch.setattr(store_class, "_init_db", boom)
+    shared = SharedSqliteFile(str(built.root / "single.db"), checked=True)
+    try:
+        with pytest.raises(_InitInterrupt):
+            _build_store(kind, built.root, shared)
+        assert shared._users == []
+        result = _exclusive_lock_attempt(built.root)
+        assert result.returncode == 0, result.stderr
+    finally:
+        for owner in list(shared._users):
+            shared.release(owner)

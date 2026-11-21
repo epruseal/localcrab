@@ -93,11 +93,17 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         self._bm25_cache: _ncache.PostingCache | None = None
         self._bm25_token: _ncache.TokenSource | None = None
         self._init_conn_state(db_path, shared)
-        self._init_db()
-        if self.supports_node_bm25 and _ncache.enabled():
-            # Opened now, not at the first query, so that a replaced database file is seen.
-            self._bm25_token = _ncache.TokenSource(self._db_path, self._new_conn)
-            self._bm25_cache = _ncache.PostingCache()
+        try:
+            self._init_db()
+            if self.supports_node_bm25 and _ncache.enabled():
+                # Opened now, not at the first query, so that a replaced database file is seen.
+                self._bm25_token = _ncache.TokenSource(self._db_path, self._new_conn)
+                self._bm25_cache = _ncache.PostingCache()
+        except BaseException:
+            # _init_db와 캐시 생성의 실패가 생성자 밖으로 나가면 등록한 공유 소유자를
+            # 풀지 않아 수명 잠금이 남는다(#671).
+            self.close()
+            raise
 
     def close(self) -> None:
         # #667: ``close`` also runs from inside ``_init_db`` (bootstrap lock timeout), before
