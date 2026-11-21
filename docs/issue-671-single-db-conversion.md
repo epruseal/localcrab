@@ -179,7 +179,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 - stdio 서버와 HTTP 인증: 인증 세 경로가 옛 `opencrab.db`를 열기 전에 거부한다(T-E7 `test_single_mode_refuses_auth_bypass_paths`, 후속 `followup_671_auth_bypass_wiring`). 이 때문에 사본에서 하는 서비스 시험은 factory 수준만 가능하다.
 - 백업과 backfill: 단일 모드를 거부한다(T-E8 a와 b, 후속 `followup_671_backup_backfill_single`). 운영 전환 중에는 백업을 만들 수 없다.
 - 관리 CLI: 단일 모드를 모른다. `packs backfill-pack-id`의 거부는 `graph.db` 부재와 `write.lock` 순서 위반이라는 우연한 거부다(T-E8 c와 d, 후속 `followup_671_admin_cli_single`).
-- 삭제, fork, 증분 노드 정리: `pack_delete_operations` 표가 있으면 거부한다(T-N7 `test_single_write_gates_stay_fail_closed`와 `test_single_delete_and_fork_gates_stay_fail_closed`). 삭제 저널 단위가 이 거부를 푼다.
+- 삭제, fork, 증분 노드 정리: `pack_delete_operations` 표가 있으면 거부한다(T-N7 `test_single_write_gates_stay_fail_closed`와 `test_single_delete_and_fork_gates_stay_fail_closed`). 삭제 저널 단위(후속 `followup_671_delete_journal_unit`)가 이 거부를 풀고, 그때 `test_single_file_delete_reserves_before_external_journal`의 xfail을 지운다.
 - node BM25 색인이 backfill 상태이거나 검색 중 drain이 필요한 경우: 단일 모드에서 진행하지 못하거나 작업 단위 밖에서 쓴다(T-N2가 ready 상태 게시 DB만 허용한다. 후속 `followup_671_bm25_backfill_single`, `followup_671_bm25_drain_single`).
 - 한 공유 객체 위에서 저장소를 동시에 만드는 일: 간헐 오류가 난다. 컨텍스트 초기화 잠금 안의 순차 생성이 전제다(T-G1이 생성자를 직렬화해 이 경로를 피한다. 후속 `followup_671_shared_concurrent_ctor`).
 
