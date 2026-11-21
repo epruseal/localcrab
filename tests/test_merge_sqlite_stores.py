@@ -1263,6 +1263,7 @@ def test_publication_main_merges_generated_backup(source_dir, tmp_path, monkeypa
 
         assert merge_mod.main(args) == 2
         _assert_ready_cleanup_failed(capsys.readouterr().err)
+        _assert_ready_published(root)
         owner = merge_mod._publication_owners[str(root)]
         assert owner.uncertain and not owner.connections
         assert owner.fd_slots["source-lock"] is not None
@@ -1510,7 +1511,11 @@ def test_publication_main_merges_generated_backup(source_dir, tmp_path, monkeypa
             assert not owner.connections and not owner.uncertain and owner.root_lock is None
             assert all(fd is None for fd in owner.fd_slots.values())
             assert str(root) not in merge_mod._publication_owners
-        _assert_ready_published(root)
+        assert not root.exists()
+        intent = root.with_name(root.name + ".intent.json")
+        staging = root.with_name(root.name + ".staging")
+        assert intent.exists() is (attach_target[0] != "inputs")
+        assert staging.exists() is (attach_target[0] != "inputs")
         return
     if failure is None:
         assert merge_mod.main(args) == 0
@@ -4576,6 +4581,13 @@ def _source_tree(path):
     return tree
 
 
+def _source_parent_names(source_dir):
+    """원본 상위 디렉터리의 항목 이름(.source.lifetime.lock 포함). 게시 산출물(published로 시작)과
+    시험 변형이 만드는 outside-link는 뺀다. 시험 배치에서는 원본 상위와 게시 상위가 같은 디렉터리다."""
+    return sorted(item.name for item in source_dir.parent.iterdir()
+                  if not item.name.startswith("published") and item.name != "outside-link")
+
+
 def _ready_disk(ctx):
     """root, staging, intent, tmp, root ledger의 디스크 상태. 파일이 없으면 None이다."""
     def state_of(path):
@@ -4888,6 +4900,7 @@ def _run_ready_failure(source_dir, tmp_path, monkeypatch, capsys, failure):
     ctx = _ready_setup(source_dir, tmp_path)
     harness = _ReadyHarness(monkeypatch, ctx)
     tree = _source_tree(source_dir)
+    parent_names = _source_parent_names(source_dir)
     lock_before = ctx.lock_src.stat()
     _install_ready_failure(harness, failure)
     try:
@@ -4902,6 +4915,7 @@ def _run_ready_failure(source_dir, tmp_path, monkeypatch, capsys, failure):
         actual = _ready_disk(ctx)
         assert {key: actual[key] for key in disk} == disk
         assert _source_tree(source_dir) == tree
+        assert _source_parent_names(source_dir) == parent_names
         assert ctx.lock_src.stat().st_mtime_ns == lock_before.st_mtime_ns
         assert not any(source_dir.glob("*-wal")) and not any(source_dir.glob("*-shm"))
         if held:
@@ -5304,6 +5318,7 @@ def _run_publish_failure(source_dir, tmp_path, monkeypatch, capsys, failure):
     ctx = _ready_setup(source_dir, tmp_path)
     harness = _ReadyHarness(monkeypatch, ctx)
     tree = _source_tree(source_dir)
+    parent_names = _source_parent_names(source_dir)
     _install_publish_failure(harness, failure)
     try:
         assert merge_mod.main(ctx.args) == rc
@@ -5322,6 +5337,7 @@ def _run_publish_failure(source_dir, tmp_path, monkeypatch, capsys, failure):
             assert harness.r8_calls == 0
         if failure not in ("verify-source-changed",):
             assert _source_tree(source_dir) == tree
+        assert _source_parent_names(source_dir) == parent_names
         assert not any(source_dir.glob("*-wal")) and not any(source_dir.glob("*-shm"))
         if held:
             assert str(owner.root) in {str(key) for key in merge_mod._publication_owners}
@@ -5370,6 +5386,7 @@ def test_publication_ready_post_ready_failure_states(source_dir, tmp_path, monke
     ctx = _ready_setup(source_dir, tmp_path)
     harness = _ReadyHarness(monkeypatch, ctx)
     tree = _source_tree(source_dir)
+    parent_names = _source_parent_names(source_dir)
     _install_post_ready(harness, failure)
     try:
         assert merge_mod.main(ctx.args) == 2
@@ -5409,6 +5426,7 @@ def test_publication_ready_post_ready_failure_states(source_dir, tmp_path, monke
             assert {key: actual[key] for key in _R9_BASE} == _R9_BASE
         if failure not in ("inputs-exit-check", "source-lock-exit-identity", "post-ready-source-and-cleanup"):
             assert _source_tree(source_dir) == tree
+        assert _source_parent_names(source_dir) == parent_names
     finally:
         harness.discard()
 
@@ -5425,6 +5443,7 @@ def test_publication_ready_main_publishes(source_dir, tmp_path, capsys):
 
     ctx = _ready_setup(source_dir, tmp_path)
     tree = _source_tree(source_dir)
+    parent_names = _source_parent_names(source_dir)
     assert merge_mod.main(ctx.args) == 0
     err = capsys.readouterr().err
     assert err.splitlines().count("publication ready") == 1
@@ -5443,6 +5462,7 @@ def test_publication_ready_main_publishes(source_dir, tmp_path, capsys):
     finally:
         os.close(dir_fd)
     assert _source_tree(source_dir) == tree
+    assert _source_parent_names(source_dir) == parent_names
     assert not any(source_dir.glob("*-wal")) and not any(source_dir.glob("*-shm"))
     assert _flock_contended(ctx.lock_src) is False and _flock_contended(ctx.lock_root) is False
 
