@@ -9,10 +9,13 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -4520,3 +4523,398 @@ def test_q1_direct_pending(tmp_path, syscalls):
     assert _flock_contended(root_lock) and _flock_contended(source_lock)
     assert syscalls.count("unlock", fileno) == 0
     _discard_owner(owner)
+
+
+# ---- 게시 ready 경로 (#671 P1) ----
+
+
+def _ready_setup(source_dir, tmp_path):
+    """합성 백업 세트와 증거를 만들고 main 인자와 경로를 돌려준다. 기존 prepares_before_staging와 같은 입력이다."""
+    from types import SimpleNamespace
+
+    with sqlite3.connect(source_dir / "billing.db") as conn:
+        conn.execute("CREATE TABLE billing_events (id INTEGER)")
+    names = [*merge_mod.FILES, "billing.db"]
+    entries = [{"label": name, "path": name, "status": "verified", "capture": "copied_under_lock"}
+               for name in names]
+    entries += [{"label": name, "status": "skipped"}
+                for name in ("chroma", "docs", "delete-pack-journals", "graph.kuzu", "packs")]
+    metadata = {name: {"size": (source_dir / name).stat().st_size,
+                       "sha256": hashlib.sha256((source_dir / name).read_bytes()).hexdigest()}
+                for name in names}
+    raw = json.dumps({"format": 1, "entries": entries, "files": metadata, "set_id": "set1",
+                      "created_at": "2026-01-01T00:00:03Z"}).encode()
+    (source_dir / "MANIFEST.json").write_bytes(raw)
+    (tmp_path / "src.source.lifetime.lock").touch()
+    evidence = {"version": 1, "snapshot_id": "set1", "source_manifest_sha256": hashlib.sha256(raw).hexdigest(),
+                "preparer_id": "test", "frozen_from": "2026-01-01T00:00:00Z",
+                "frozen_until": "2026-01-01T00:00:02Z", "writer_stopped": True,
+                "billing_same_snapshot": True, "packs_observation": "absent",
+                "backup_at": "2026-01-01T00:00:03Z", "packs_checked_at": "2026-01-01T00:00:01Z",
+                "capture_from": "2026-01-01T00:00:00Z", "capture_until": "2026-01-01T00:00:02Z"}
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps(evidence))
+    root = tmp_path / "published"
+    args = ["--source-dir", str(source_dir), "--publication-root", str(root), "--evidence-file",
+            str(evidence_path), "--apply", "--verify", "--immutable-source", "--min-free-gib", "0"]
+    return SimpleNamespace(
+        args=args, root=root, src=source_dir, staging=tmp_path / "published.staging",
+        intent=tmp_path / "published.intent.json", intent_tmp=tmp_path / "published.intent.json.tmp",
+        lock_src=tmp_path / "src.source.lifetime.lock", lock_root=tmp_path / "published.lifetime.lock")
+
+
+def _source_tree(path):
+    """원본 트리의 (경로, 크기, sha256, mtime_ns, ctime_ns). 원본 불변 단언에 쓴다."""
+    tree = {}
+    for item in sorted(path.rglob("*")):
+        info = item.lstat()
+        digest = hashlib.sha256(item.read_bytes()).hexdigest() if item.is_file() else None
+        tree[str(item.relative_to(path))] = (info.st_size, digest, info.st_mtime_ns, info.st_ctime_ns)
+    return tree
+
+
+def _ready_disk(ctx):
+    """root, staging, intent, tmp, root ledger의 디스크 상태. 파일이 없으면 None이다."""
+    def state_of(path):
+        try:
+            return json.loads(path.read_text())["state"]
+        except FileNotFoundError:
+            return None
+        except (ValueError, KeyError):
+            return "partial"  # 쓰기가 실패해 O_EXCL로 만든 파일이 부분 상태로 남은 경우다
+
+    return {"root": ctx.root.exists(), "stg": ctx.staging.exists(), "intent": state_of(ctx.intent),
+            "intent_tmp": ctx.intent_tmp.exists(), "ledger_tmp": (ctx.root / "ledger.json.tmp").exists(),
+            "ledger": state_of(ctx.root / "ledger.json") if ctx.root.exists()
+            else state_of(ctx.staging / "ledger.json")}
+
+
+class _ConnProxy:
+    """sqlite 연결 대역. close 실패나 quick_check 결과를 바꾼다. 나머지는 원 연결로 넘긴다."""
+
+    def __init__(self, inner, *, fail_close=False, bad_quick_check=False):
+        self.inner = inner
+        self.fail_close = fail_close
+        self.bad_quick_check = bad_quick_check
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def close(self, *args, **kwargs):
+        if self.fail_close:
+            raise sqlite3.OperationalError("injected close failure")
+        return self.inner.close()
+
+    def execute(self, sql, *args):
+        if self.bad_quick_check and sql.strip().upper().startswith("PRAGMA QUICK_CHECK"):
+            return sqlite3.connect(":memory:").execute("SELECT 'bad'")
+        return self.inner.execute(sql, *args)
+
+
+class _ReadyHarness:
+    """한 시험의 owner 수집과 주입 설치를 맡는다."""
+
+    def __init__(self, monkeypatch, ctx):
+        self.monkeypatch = monkeypatch
+        self.ctx = ctx
+        self.owners = []
+        self.proxies = []
+        original_init = merge_mod._PublicationOwner.__init__
+        owners = self.owners
+
+        def owner_init(owner, *init_args, **kwargs):
+            original_init(owner, *init_args, **kwargs)
+            owners.append(owner)
+
+        monkeypatch.setattr(merge_mod._PublicationOwner, "__init__", owner_init)
+
+    @staticmethod
+    def current_owner():
+        return getattr(merge_mod._publication_current, "owner", None)
+
+    def slot_fd(self, role, n):
+        owner = self.current_owner()
+        if owner is None:
+            return None
+        keys = owner.fd_roles.get(role, [])
+        return owner.fd_slots.get(keys[n]) if len(keys) > n else None
+
+    def inject_open(self, role, n=0):
+        """role의 n번째 open_fd에서 os.open이 실패한다(open_fd가 uncertain을 세운다)."""
+        original = merge_mod._PublicationOwner.open_fd
+        real_open = os.open
+        monkeypatch = self.monkeypatch
+
+        def wrapped(owner, name, *args, **kwargs):
+            if name == role and len(owner.fd_roles.get(role, [])) == n:
+                def boom(*a, **k):
+                    raise OSError(errno.EIO, "injected open failure")
+
+                monkeypatch.setattr(os, "open", boom)
+                try:
+                    return original(owner, name, *args, **kwargs)
+                finally:
+                    monkeypatch.setattr(os, "open", real_open)
+            return original(owner, name, *args, **kwargs)
+
+        monkeypatch.setattr(merge_mod._PublicationOwner, "open_fd", wrapped)
+
+    def inject_fd_call(self, function, role, n=0, *, after=False):
+        """os.<function>(fd, ...)이 role의 n번째 fd에서 실패한다. after이면 실제 호출 뒤에 실패한다."""
+        original = getattr(os, function)
+        harness = self
+
+        def wrapped(fd, *args, **kwargs):
+            if fd == harness.slot_fd(role, n):
+                if after:
+                    original(fd, *args, **kwargs)
+                raise OSError(errno.EIO, f"injected {function} failure")
+            return original(fd, *args, **kwargs)
+
+        self.monkeypatch.setattr(os, function, wrapped)
+
+    def inject_connect(self, marker, *, fail_open=False, fail_close=False, bad_quick_check=False):
+        """URI에 marker가 든 sqlite 연결 열기나 닫기가 실패한다."""
+        real_connect = sqlite3.connect
+        harness = self
+
+        def wrapped(database, *args, **kwargs):
+            if marker in str(database):
+                if fail_open:
+                    raise sqlite3.OperationalError("injected connect failure")
+                proxy = _ConnProxy(real_connect(database, *args, **kwargs), fail_close=fail_close,
+                                   bad_quick_check=bad_quick_check)
+                harness.proxies.append(proxy)
+                return proxy
+            return real_connect(database, *args, **kwargs)
+
+        self.monkeypatch.setattr(sqlite3, "connect", wrapped)
+
+    def inject_probe(self, mode):
+        """R0a 프로브만 실패시킨다. 5절 규칙: 원본 이름이 .rp-a인 호출에서만 동작한다."""
+        real_rename = merge_mod._rename_noreplace
+        monkeypatch = self.monkeypatch
+        if mode in ("rename-unsupported", "probe-unexpected-errno"):
+            code = errno.ENOSYS if mode == "rename-unsupported" else errno.EACCES
+
+            def wrapped(src_fd, src, dst_fd, dst):
+                if src == ".rp-a":
+                    raise OSError(code, "injected probe failure")
+                return real_rename(src_fd, src, dst_fd, dst)
+
+            monkeypatch.setattr(merge_mod, "_rename_noreplace", wrapped)
+        elif mode == "probe-mkdir":
+            real = os.mkdir
+
+            def wrapped_mkdir(path, *args, **kwargs):
+                if str(path) == ".rp-a":
+                    raise OSError(errno.EIO, "injected probe mkdir failure")
+                return real(path, *args, **kwargs)
+
+            monkeypatch.setattr(os, "mkdir", wrapped_mkdir)
+        else:
+            real = os.rmdir
+
+            def wrapped_rmdir(path, *args, **kwargs):
+                if str(path) == ".rp-b":
+                    raise OSError(errno.EIO, "injected probe rmdir failure")
+                return real(path, *args, **kwargs)
+
+            monkeypatch.setattr(os, "rmdir", wrapped_rmdir)
+
+    def inject_hook_h(self, action):
+        """주입 방법 H. staging billing.db가 처음 존재한 뒤 첫 check_inputs() 호출(staging 마지막 호출) 뒤에 action을 한 번 실행한다."""
+        original = merge_mod._publication_inputs
+        staging = self.ctx.staging
+
+        @contextlib.contextmanager
+        def wrapped(*args, **kwargs):
+            with original(*args, **kwargs) as (fds, check):
+                done = []
+
+                def hooked():
+                    check()
+                    if not done and (staging / "billing.db").exists():
+                        done.append(True)
+                        action()
+
+                yield fds, hooked
+
+        self.monkeypatch.setattr(merge_mod, "_publication_inputs", wrapped)
+
+    def discard(self):
+        for proxy in self.proxies:
+            try:
+                proxy.inner.close()
+            except Exception:
+                pass
+        for owner in self.owners:
+            if str(owner.root) in {str(key) for key in merge_mod._publication_owners}:
+                _discard_owner(owner)
+
+
+def _install_ready_failure(harness, failure):
+    """6절 failure id의 주입을 설치한다."""
+    ctx = harness.ctx
+    if failure in ("rename-unsupported", "probe-mkdir", "probe-rmdir", "probe-unexpected-errno"):
+        harness.inject_probe(failure)
+    elif failure == "uncertain-guard":
+        harness.inject_hook_h(lambda: setattr(harness.current_owner(), "uncertain", True))
+    elif failure == "identity-mismatch":
+        def swap():
+            copy = ctx.staging / "billing.copy"
+            shutil.copyfile(ctx.staging / "billing.db", copy)
+            os.replace(copy, ctx.staging / "billing.db")
+
+        harness.inject_hook_h(swap)
+    elif failure == "probe-dir-open":
+        harness.inject_open("probe-dir")
+    elif failure == "lock-create":
+        harness.inject_open("lock-create")
+    elif failure == "tables-connect":
+        harness.inject_connect("published.staging/single.db?mode=ro&immutable=1", fail_open=True)
+    elif failure == "tables-connect-close":
+        # 앞선 staging 연결이 같은 경로를 쓰므로 R3의 immutable 연결만 고른다.
+        harness.inject_connect("published.staging/single.db?mode=ro&immutable=1", fail_close=True)
+    elif failure.endswith("-open") and failure.rsplit("-open", 1)[0] in ("manifest", "marker", "ledger", "staging-seal"):
+        stem = failure.rsplit("-open", 1)[0]
+        harness.inject_open(stem if stem == "staging-seal" else stem + "-write")
+    elif failure.endswith(("-write", "-fsync")) and failure.split("-")[0] in ("manifest", "marker", "ledger"):
+        stem, call = failure.rsplit("-", 1)
+        harness.inject_fd_call(call, stem + "-write")
+    elif failure == "staging-seal-fsync":
+        harness.inject_fd_call("fsync", "staging-seal")
+    else:
+        raise AssertionError(f"unknown failure id {failure}")
+
+
+# (rc, uncertain, 잠금 보유, 메시지 접두어, 디스크 상태). 6절 표를 그대로 옮긴 것이다.
+_STAGING_ROW = {"root": False, "stg": True, "intent": "preparing"}
+_READY_ROWS = {
+    "rename-unsupported": (1, False, False, "publication staging failed: publication rename is unsupported", _STAGING_ROW),
+    "probe-mkdir": (1, False, False, "publication staging failed: publication rename probe failed", _STAGING_ROW),
+    "probe-rmdir": (1, False, False, "publication staging failed: publication rename probe failed", _STAGING_ROW),
+    "probe-unexpected-errno": (1, False, False, "publication staging failed: publication rename probe failed", _STAGING_ROW),
+    "probe-dir-open": (1, True, True, "publication staging failed:", _STAGING_ROW),
+    "uncertain-guard": (1, True, True, "publication staging failed: publication owner is uncertain", _STAGING_ROW),
+    "identity-mismatch": (1, False, False, "publication staging failed: publication staging identity differs", _STAGING_ROW),
+    "lock-create": (1, True, True, "publication staging failed:", _STAGING_ROW),
+    "tables-connect": (1, True, True, "publication staging failed:", _STAGING_ROW),
+    "tables-connect-close": (1, True, True, "publication staging failed:", _STAGING_ROW),
+    "manifest-open": (1, True, True, "publication staging failed:", _STAGING_ROW),
+    "manifest-write": (1, False, False, "publication staging failed:", _STAGING_ROW),
+    "manifest-fsync": (1, False, False, "publication staging failed:", _STAGING_ROW),
+    "marker-open": (1, True, True, "publication staging failed:", _STAGING_ROW),
+    "marker-write": (1, False, False, "publication staging failed:", _STAGING_ROW),
+    "marker-fsync": (1, False, False, "publication staging failed:", _STAGING_ROW),
+    "ledger-open": (1, True, True, "publication staging failed:", _STAGING_ROW),
+    "ledger-write": (1, False, False, "publication staging failed:", _STAGING_ROW),
+    "ledger-fsync": (1, False, False, "publication staging failed:", _STAGING_ROW),
+    "staging-seal-open": (1, True, True, "publication staging failed:", _STAGING_ROW),
+    "staging-seal-fsync": (1, False, False, "publication staging failed:", _STAGING_ROW),
+}
+_R0A_IDS = ["rename-unsupported", "probe-mkdir", "probe-rmdir", "probe-unexpected-errno", "probe-dir-open"]
+
+
+def _run_ready_failure(source_dir, tmp_path, monkeypatch, capsys, failure):
+    rc, uncertain, held, message, disk = _READY_ROWS[failure]
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    tree = _source_tree(source_dir)
+    lock_before = ctx.lock_src.stat()
+    _install_ready_failure(harness, failure)
+    try:
+        assert merge_mod.main(ctx.args) == rc, capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert message in err
+        assert "publication ready" not in err
+        owner = harness.owners[-1]
+        assert owner.uncertain is uncertain
+        assert _flock_contended(ctx.lock_src) is held
+        assert _flock_contended(ctx.lock_root) is held
+        actual = _ready_disk(ctx)
+        assert {key: actual[key] for key in disk} == disk
+        assert _source_tree(source_dir) == tree
+        assert ctx.lock_src.stat().st_mtime_ns == lock_before.st_mtime_ns
+        assert not any(source_dir.glob("*-wal")) and not any(source_dir.glob("*-shm"))
+        if held:
+            assert str(owner.root) in {str(key) for key in merge_mod._publication_owners}
+        else:
+            assert all(fd is None for fd in owner.fd_slots.values()) and not owner.connections
+    finally:
+        harness.discard()
+
+
+@pytest.mark.parametrize("failure", _R0A_IDS)
+def test_publication_r0a_probe_classification(source_dir, tmp_path, monkeypatch, capsys, failure):
+    _run_ready_failure(source_dir, tmp_path, monkeypatch, capsys, failure)
+
+
+@pytest.mark.parametrize("failure", list(_READY_ROWS))
+def test_publication_ready_failure_states(source_dir, tmp_path, monkeypatch, capsys, failure):
+    _run_ready_failure(source_dir, tmp_path, monkeypatch, capsys, failure)
+
+
+def test_publication_ready_skips_when_uncertain(source_dir, tmp_path, monkeypatch, capsys):
+    """RG. owner가 uncertain이면 R1 이후 쓰기 호출이 0건이다. 세는 기준은 RG 지점 이후다."""
+    ctx = _ready_setup(source_dir, tmp_path)
+    harness = _ReadyHarness(monkeypatch, ctx)
+    counts = {"armed": False, "write": 0, "create": 0, "rename": 0}
+    real_write, real_open, real_rename = os.write, os.open, merge_mod._rename_noreplace
+
+    def write(*args, **kwargs):
+        counts["write"] += counts["armed"]
+        return real_write(*args, **kwargs)
+
+    def open_spy(path, flags, *args, **kwargs):
+        counts["create"] += bool(counts["armed"] and flags & os.O_CREAT)
+        return real_open(path, flags, *args, **kwargs)
+
+    def rename(*args):
+        counts["rename"] += counts["armed"]
+        return real_rename(*args)
+
+    monkeypatch.setattr(os, "write", write)
+    monkeypatch.setattr(os, "open", open_spy)
+    monkeypatch.setattr(merge_mod, "_rename_noreplace", rename)
+
+    def hook():
+        counts["armed"] = True
+        harness.current_owner().uncertain = True
+
+    harness.inject_hook_h(hook)
+    try:
+        assert merge_mod.main(ctx.args) == 1
+        assert "publication owner is uncertain" in capsys.readouterr().err
+        assert counts["armed"] and counts["write"] == 0 and counts["create"] == 0 and counts["rename"] == 0
+        assert not (ctx.staging / "manifest.json").exists()
+        assert not (ctx.staging / "single.db.lifetime.lock").exists()
+    finally:
+        harness.discard()
+
+
+def test_publication_rename_noreplace_supported_on_tmp_path(tmp_path):
+    """이 파일시스템이 NOREPLACE를 지원하는지 확인한다. 미지원이면 skip이 아니라 실패다."""
+    (tmp_path / "a").mkdir()
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        merge_mod._rename_noreplace(fd, "a", fd, "b")
+        assert not (tmp_path / "a").exists() and (tmp_path / "b").is_dir()
+        (tmp_path / "c").mkdir()
+        with pytest.raises(OSError) as existing:
+            merge_mod._rename_noreplace(fd, "b", fd, "c")
+        assert existing.value.errno == errno.EEXIST and (tmp_path / "b").is_dir()
+        with pytest.raises(OSError) as missing:
+            merge_mod._rename_noreplace(fd, "missing", fd, "d")
+        assert missing.value.errno == errno.ENOENT
+    finally:
+        os.close(fd)
+
+
+def test_publication_main_refuses_intent_tmp(source_dir, tmp_path, capsys):
+    ctx = _ready_setup(source_dir, tmp_path)
+    ctx.intent_tmp.write_bytes(b"leftover")
+    assert merge_mod.main(ctx.args) == 2
+    assert "publication preflight failed: publication artifacts already exist" in capsys.readouterr().err
+    assert ctx.intent_tmp.read_bytes() == b"leftover"
+    assert not ctx.root.exists() and not ctx.staging.exists() and not ctx.intent.exists()

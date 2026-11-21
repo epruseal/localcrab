@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -94,6 +95,9 @@ _FD_EXACT = {
     "mounts": "other", "intent": "other", "intent-parent": "other", "staging-parent": "other",
     "staging-dir": "other", "merge-partial": "other", "checkpoint-fsync": "other",
     "billing-write": "other", "billing-read": "other",
+    "probe-dir": "other", "manifest-write": "other", "marker-write": "other", "ledger-write": "other",
+    "lock-create": "other", "staging-seal": "other", "intent-tmp": "other", "publish-parent": "other",
+    "root-dir": "other", "root-file": "other", "ledger-tmp": "other",
 }
 _FD_PREFIX = (("source:", "consumer"), ("directory:", "consumer"))
 _FD_CATEGORIES = {"source-lock", "source-parent", "root", "consumer", "other", "independent"}
@@ -1827,6 +1831,122 @@ def _publication_effect(operation: Any, paths: tuple[Path, ...]) -> None:
         raise primary
 
 
+_RENAME_NOREPLACE = 1  # linux/fs.h의 RENAME_NOREPLACE
+_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+
+
+def _rename_noreplace(src_dir_fd: int, src: str, dst_dir_fd: int, dst: str) -> None:
+    """renameat2(RENAME_NOREPLACE)로 이름을 바꾼다. 실패하면 커널 errno를 담은 OSError를 낸다.
+
+    heartbeat 정리 스크립트의 같은 이름 함수는 AT_FDCWD 경로를 받고 그 스크립트의 예외를 내므로 쓰지 않는다.
+    libc에 renameat2가 없으면 ENOSYS를 낸다. 일반 rename으로 되돌아가지 않는다(D3).
+    """
+    import ctypes
+
+    try:
+        function = ctypes.CDLL(None, use_errno=True).renameat2
+    except (OSError, AttributeError):
+        raise OSError(errno.ENOSYS, "renameat2 is not available") from None
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if function(src_dir_fd, os.fsencode(src), dst_dir_fd, os.fsencode(dst), _RENAME_NOREPLACE) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def _publication_rename_probe(staging: Path, owner: _PublicationOwner, work: _PublicationWork) -> None:
+    """R0a. staging 안에서 NOREPLACE rename 지원을 확인한다. 부작용은 staging 안에 갇힌다."""
+    probe_fd = owner.open_fd("probe-dir", staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, work=work)
+    try:
+        try:
+            os.mkdir(".rp-a", 0o700, dir_fd=probe_fd)
+        except OSError as exc:
+            raise MergeError(f"publication rename probe failed: {exc}") from exc
+        try:
+            _rename_noreplace(probe_fd, ".rp-a", probe_fd, ".rp-b")
+        except OSError as exc:
+            if exc.errno in (errno.ENOSYS, errno.EINVAL):
+                raise MergeError("publication rename is unsupported") from exc
+            raise MergeError(f"publication rename probe failed: {exc}") from exc
+        try:
+            os.rmdir(".rp-b", dir_fd=probe_fd)
+        except OSError as exc:
+            raise MergeError(f"publication rename probe failed: {exc}") from exc
+    finally:
+        _close_deferred(owner, "probe-dir", probe_fd, work)
+
+
+def _publication_identity(path: Path) -> tuple[int, int, int]:
+    info = os.lstat(path)
+    return info.st_dev, info.st_ino, info.st_size
+
+
+def _publication_json(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _publication_write_file(owner: _PublicationOwner, work: _PublicationWork, role: str, path: Path | str,
+                            data: bytes, *, dir_fd: int | None = None) -> None:
+    """새 파일을 O_EXCL로 만들어 쓰고 fsync한다. 쓰기와 fsync는 owner 밖 직접 호출이다."""
+    fd = owner.open_fd(role, path, _CREATE_FLAGS, 0o600, dir_fd=dir_fd, work=work)
+    try:
+        view = memoryview(data)
+        while view:
+            count = os.write(fd, view)
+            if count <= 0:
+                raise OSError("publication write made no progress")
+            view = view[count:]
+        os.fsync(fd)
+    finally:
+        _close_deferred(owner, role, fd, work)
+
+
+def _publication_table_counts(conn: Any) -> dict[str, int]:
+    """일반 테이블의 행 수. 가상 테이블은 확장이 필요해 센 값이 환경에 의존하므로 뺀다(기존 verify의 판정과 같다)."""
+    names = [name for typ, name, sql in conn.execute("SELECT type, name, sql FROM sqlite_master").fetchall()
+             if typ == "table" and not (sql and sql.upper().startswith("CREATE VIRTUAL"))
+             and not name.startswith("sqlite_")]
+    return {name: conn.execute('SELECT count(*) FROM "' + name.replace('"', '""') + '"').fetchone()[0]
+            for name in sorted(names)}
+
+
+def _publication_write_binding(owner: _PublicationOwner, work: _PublicationWork, staging: Path,
+                               intent: dict[str, str], source: dict[str, Any], manifest_raw: bytes,
+                               evidence_raw: bytes) -> str:
+    """R2~R6. staging에 수명 잠금 파일과 결속 파일을 쓰고 manifest_digest를 돌려준다."""
+    lock_fd = owner.open_fd("lock-create", staging / "single.db.lifetime.lock", _CREATE_FLAGS, 0o600, work=work)
+    _close_deferred(owner, "lock-create", lock_fd, work)
+    conn = _connect(staging / "single.db", mode="ro", immutable=True, work=work)
+    try:
+        tables = _publication_table_counts(conn)
+    finally:
+        _close_conn(conn, work)
+    billing = source["files"]["billing.db"]
+    manifest = {"version": 1, "root": intent["root"], "database": intent["database"],
+                "db_uuid": intent["db_uuid"], "generation": intent["generation"],
+                "source_set_id": source["set_id"],
+                "source_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+                "evidence_sha256": hashlib.sha256(evidence_raw).hexdigest(),
+                "billing": {"size": billing["size"], "sha256": billing["sha256"]}, "tables": tables}
+    manifest_bytes = _publication_json(manifest)
+    digest = hashlib.sha256(manifest_bytes).hexdigest()
+    _publication_write_file(owner, work, "manifest-write", staging / "manifest.json", manifest_bytes)
+    _publication_write_file(owner, work, "marker-write", staging / "marker.json",
+                            _publication_json({"db_uuid": intent["db_uuid"], "generation": intent["generation"],
+                                               "manifest_digest": digest}))
+    _publication_write_file(owner, work, "ledger-write", staging / "ledger.json",
+                            _publication_json({"state": "staged", "root": intent["root"],
+                                               "database": intent["database"], "db_uuid": intent["db_uuid"],
+                                               "generation": intent["generation"], "manifest_digest": digest}))
+    seal_fd = owner.open_fd("staging-seal", staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, work=work)
+    try:
+        os.fsync(seal_fd)
+    finally:
+        _close_deferred(owner, "staging-seal", seal_fd, work)
+    return digest
+
+
 def _publication_exists(path: Path) -> bool:
     try:
         os.lstat(path)
@@ -1910,14 +2030,15 @@ def main(argv: list[str] | None = None) -> int:
                         raise MergeError("publication and source overlap")
                     staging = root.with_name(root.name + ".staging")
                     ledger = root.with_name(root.name + ".intent.json")
-                    if any(_publication_exists(path) for path in (root, staging, ledger)):
+                    intent_tmp = root.with_name(root.name + ".intent.json.tmp")
+                    if any(_publication_exists(path) for path in (root, staging, ledger, intent_tmp)):
                         raise MergeError("publication artifacts already exist")
                     refuse_ram_fs("publication directory", root.parent, work=work)
                     check_free(root.parent, args.min_free_gib,
                                int(pl["source_bytes"] * MERGE_SPACE_FACTOR))
                     lock = owner.acquire_root_lock(root, work=work)
                     try:
-                        if any(_publication_exists(path) for path in (root, staging, ledger)):
+                        if any(_publication_exists(path) for path in (root, staging, ledger, intent_tmp)):
                             raise MergeError("publication artifacts already exist")
                         check_inputs()
                         check_free(root.parent, args.min_free_gib,
@@ -1933,6 +2054,7 @@ def main(argv: list[str] | None = None) -> int:
                         finally:
                             _close_deferred(owner, "staging-parent", parent_fd, work)
                         try:
+                            _publication_rename_probe(staging, owner, work)
                             check_inputs()
                             check_free(staging, args.min_free_gib)
                             merged = merge(args.source_dir, staging / "single.db", files, pl,
@@ -1963,6 +2085,7 @@ def main(argv: list[str] | None = None) -> int:
                             _publication_checkpoint(database, (str(root), str(root / "single.db"),
                                                                intent["db_uuid"], intent["generation"]),
                                                     work=work)
+                            single_identity = _publication_identity(database)
                             check_free(staging, args.min_free_gib, os.fstat(source_fds["billing.db"]).st_size)
                             billing_fd = owner.open_fd("billing-write", staging / "billing.db",
                                                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
@@ -2001,6 +2124,7 @@ def main(argv: list[str] | None = None) -> int:
                                         or copied_offset != expected["size"]
                                         or copied_digest.hexdigest() != expected["sha256"]):
                                     raise MergeError("publication billing identity or digest differs")
+                                billing_identity = (copied_stat.st_dev, copied_stat.st_ino, copied_stat.st_size)
                             finally:
                                 _close_deferred(owner, "billing-read", copied_fd, work)
                             copied = _connect(staging / "billing.db", mode="ro", immutable=True, work=work)
@@ -2010,6 +2134,13 @@ def main(argv: list[str] | None = None) -> int:
                             finally:
                                 _close_conn(copied, work)
                             check_inputs()
+                            if owner.uncertain:  # RG. 예외를 삼키는 이후 변경이 uncertain을 세운 채 쓰기로 들어가지 않게 한다.
+                                raise MergeError("publication owner is uncertain")
+                            if (_publication_identity(database) != single_identity  # R1
+                                    or _publication_identity(staging / "billing.db") != billing_identity):
+                                raise MergeError("publication staging identity differs")
+                            _publication_write_binding(owner, work, staging, intent, manifest, manifest_raw,
+                                                       evidence_raw)  # R2~R6
                         except (MergeError, OSError, RuntimeError, sqlite3.DatabaseError) as exc:
                             print(f"publication staging failed: {exc}", file=sys.stderr)
                             return 1
