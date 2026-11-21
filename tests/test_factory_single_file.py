@@ -1660,6 +1660,34 @@ def _install_shim(monkeypatch, shim: _Sqlite3Shim) -> _Sqlite3Shim:
     return shim
 
 
+def _record_guard(monkeypatch) -> list:
+    """검사가 올린 예외를 기록한다. 호출자가 받은 예외와 같은 객체인지 대조하는 데 쓴다.
+
+    quantization_connect는 검사 뒤 자기 연결이 5초 대기 끝에 BUSY를 올리므로, 검사가 fail-open이거나
+    호출 지점이 검사의 예외를 삼켜도 예외 종류만 보는 단언은 통과한다. 객체 동일성이 그 경우를 가른다.
+    """
+    from opencrab.stores import _single_file
+
+    real = _single_file.reject_unmanaged_single_file
+    raised: list = []
+
+    def spy(db_path):
+        try:
+            return real(db_path)
+        except BaseException as exc:
+            raised.append(exc)
+            raise
+
+    monkeypatch.setattr(_single_file, "reject_unmanaged_single_file", spy)
+    return raised
+
+
+def _assert_guard_exception(received, raised: list) -> None:
+    """호출자가 받은 예외가 검사 자신이 올린 마지막 예외와 같은 객체인지 확인한다."""
+    assert raised, "the unmanaged check did not raise"
+    assert received is raised[-1], (type(received), type(raised[-1]))
+
+
 def _script(name: str):
     if str(_SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(_SCRIPTS_DIR))
@@ -1705,28 +1733,38 @@ def _close_result(result) -> None:
 
 
 @pytest.mark.parametrize("target", _GUARD_TARGETS)
-def test_unmanaged_check_refuses_locked_marker_db(tmp_path, fast_guard, target):
-    """V1: 롤백 DB가 잠겨 있어도 표식이 있으면 아홉 진입점이 모두 거부한다. 파일은 그대로다."""
+def test_unmanaged_check_refuses_locked_marker_db(tmp_path, monkeypatch, fast_guard, target):
+    """V1: 롤백 DB가 잠겨 있어도 표식이 있으면 아홉 진입점이 모두 거부한다. 파일은 그대로다.
+
+    호출자가 받은 예외는 검사 자신의 예외 객체다.
+    """
     path = _make_db(tmp_path / "locked.db", "delete", True)
     before = _snapshot(path)
+    raised = _record_guard(monkeypatch)
     with _held(path, "delete"):
         _assert_locked(path)
-        with pytest.raises(RuntimeError, match=_REFUSAL):
+        with pytest.raises(RuntimeError, match=_REFUSAL) as info:
             _call_target(target, path)
+    _assert_guard_exception(info.value, raised)
     _assert_unchanged(path, before)
 
 
 @pytest.mark.parametrize("target", _GUARD_TARGETS)
-def test_unmanaged_check_refuses_locked_wal_db(tmp_path, fast_guard, target):
-    """V1w: WAL DB가 잠겨 있으면 판정하지 않고 대기 상수만큼 기다린 뒤 BUSY를 올린다."""
+def test_unmanaged_check_refuses_locked_wal_db(tmp_path, monkeypatch, fast_guard, target):
+    """V1w: WAL DB가 잠겨 있으면 판정하지 않고 대기 상수만큼 기다린 뒤 BUSY를 올린다.
+
+    호출자가 받은 예외는 검사 자신의 예외 객체다.
+    """
     path = _make_db(tmp_path / "locked.db", "wal", True)
     before = _snapshot(path)
+    raised = _record_guard(monkeypatch)
     with _held(path, "wal"):
         _assert_locked(path)
         began = time.monotonic()
         with pytest.raises(sqlite3.OperationalError) as info:
             _call_target(target, path)
         elapsed = time.monotonic() - began
+    _assert_guard_exception(info.value, raised)
     assert type(info.value) is sqlite3.OperationalError, type(info.value)
     assert (info.value.sqlite_errorcode & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
     assert elapsed >= 0.27, elapsed
@@ -1770,6 +1808,7 @@ def test_unmanaged_check_undeterminable_is_refused(tmp_path, monkeypatch, fast_g
     """
     path = _make_db(tmp_path / "locked.db", "delete", True)
     readable = row in ("immutable-fails", "toctou")
+    raised = _record_guard(monkeypatch)
     with _held(path, "delete"):
         _assert_locked(path)
         if row == "magic-mismatch":
@@ -1793,6 +1832,7 @@ def test_unmanaged_check_undeterminable_is_refused(tmp_path, monkeypatch, fast_g
             _install_shim(monkeypatch, _Sqlite3Shim(on_close=lambda database: _poke(path, 18, bytes([2, 2]))))
         with pytest.raises(sqlite3.OperationalError) as info:
             _call_target(target, path)
+    _assert_guard_exception(info.value, raised)
     assert type(info.value) is sqlite3.OperationalError, type(info.value)
     assert (info.value.sqlite_errorcode & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
     _assert_unchanged(path, before, same_bytes=row != "toctou")
