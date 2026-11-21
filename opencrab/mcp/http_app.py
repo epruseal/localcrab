@@ -607,7 +607,17 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
         says nothing about the token, and a 401 would send the client into an
         OAuth flow.
         """
-        store = _auth_store()
+        try:
+            store = _auth_store()
+        except Exception as exc:  # noqa: BLE001
+            # The unmanaged single-file check (#671) refuses a locked file with a raw sqlite3 BUSY. That is a
+            # store that cannot answer now (503). Anything the code does not classify, such as the single-mode
+            # refusal, propagates as before. This try covers only the store lookup; the verify_token try below
+            # keeps its own answer (None, then 401) for an unclassified error.
+            reason = token_store_unavailable_reason(exc)
+            if reason is None:
+                raise
+            raise _unavailable(reason) from None
         if store is None:
             return None
         if not getattr(store, "available", False):

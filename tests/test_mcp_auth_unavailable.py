@@ -768,3 +768,95 @@ def test_no_product_code_calls_stop_for_tests():
     assert hasattr(http_mod, "_AuthWorker") and hasattr(http_mod._AuthWorker, "stop_for_tests")
     doc = http_mod._AuthWorker.stop_for_tests.__doc__ or ""
     assert "test" in doc.lower()
+
+
+# ---------------------------------------------------------------------------
+# 7 -- #671: the unmanaged single-file check refuses with a raw sqlite3 error
+# ---------------------------------------------------------------------------
+
+# Keeps a typo in the patched constant names from passing silently.
+_STRICT_CONSTS = True
+
+
+@pytest.mark.parametrize("code", [5, 6, 261, 262, 517])
+def test_raw_sqlite_busy_is_classified_store_busy(code):
+    """V7 (i): a raw sqlite3 BUSY or LOCKED (not wrapped by SQLAlchemy) is "store-busy"."""
+    from opencrab.auth import token_store_unavailable_reason
+
+    exc = sqlite3.OperationalError("database is locked")
+    exc.sqlite_errorcode = code
+    assert token_store_unavailable_reason(exc) == "store-busy"
+
+
+@pytest.mark.parametrize("code", [1, 8, 14, 776])
+def test_raw_sqlite_other_codes_and_other_errors_are_not_classified(code):
+    """V7 (i): any other raw sqlite3 code, a code-less error, and a RuntimeError stay unclassified."""
+    from opencrab.auth import token_store_unavailable_reason
+
+    exc = sqlite3.OperationalError("some failure")
+    exc.sqlite_errorcode = code
+    assert token_store_unavailable_reason(exc) is None
+    assert token_store_unavailable_reason(sqlite3.OperationalError("no code")) is None
+    assert token_store_unavailable_reason(RuntimeError("anything else")) is None
+
+
+@contextlib.contextmanager
+def _wal_exclusive_lock(db_path: Path):
+    """Hold a WAL file the way an exclusive-locking-mode writer does: plain readers get BUSY."""
+    conn = sqlite3.connect(db_path, timeout=0, isolation_level=None)
+    conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("CREATE TABLE held_probe(x)")
+    try:
+        yield
+    finally:
+        conn.execute("ROLLBACK")
+        conn.close()
+
+
+def test_unmanaged_check_refusal_on_a_locked_wal_token_file_is_503_then_recovers(env, monkeypatch, caplog):
+    """V7 (ii): the check raises a raw BUSY out of ``_auth_store()``; the lookup answers 503, not 500."""
+    from opencrab.stores import _single_file
+
+    monkeypatch.setattr(_single_file, "_UNMANAGED_WAL_WAIT", 0.3, raising=_STRICT_CONSTS)
+    monkeypatch.setattr(_single_file, "_UNMANAGED_CHECK_TIMEOUT", 0.05, raising=_STRICT_CONSTS)
+    conn = sqlite3.connect(env.db_path)
+    assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    conn.close()
+    caplog.set_level(logging.WARNING, logger=http_mod.logger.name)
+
+    async def scenario(client):
+        with _wal_exclusive_lock(env.db_path):
+            with pytest.raises(sqlite3.OperationalError) as pre:
+                direct = sqlite3.connect(f"{env.db_path.as_uri()}?mode=ro", uri=True, timeout=0.1)
+                try:
+                    direct.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+                finally:
+                    direct.close()
+            assert pre.value.sqlite_errorcode & 0xFF in (5, 6)
+            locked = await _post(client, env.headers)
+        healed = await _post(client, env.headers)
+        return locked, healed
+
+    locked, healed = _run(scenario)
+
+    _assert_unavailable(locked)
+    assert any("store-busy" in record.getMessage() for record in caplog.records), caplog.text
+    assert healed.status_code == 200, "the refused store was cached or the worker is stuck"
+
+
+def test_auth_store_error_without_a_reason_still_propagates(env, monkeypatch):
+    """V7 (iii): an error out of ``_auth_store()`` that is not classified (the single-mode refusal) is not
+    turned into a 401 or a 503. It reaches the caller as it did before."""
+    import opencrab.stores.sql_store as store_mod
+
+    def refuse(self, url, create_tables=True, **kwargs):  # noqa: ARG001, FBT002
+        raise RuntimeError("stand-in single-mode refusal")
+
+    monkeypatch.setattr(store_mod.SQLStore, "__init__", refuse)
+
+    async def scenario(client):
+        with pytest.raises(RuntimeError, match="stand-in single-mode refusal"):
+            await _post(client, env.headers)
+
+    _run(scenario)

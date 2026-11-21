@@ -458,6 +458,12 @@ def token_store_unavailable_reason(exc: BaseException) -> str | None:
 
     if isinstance(exc, PoolTimeoutError):
         return "store-unavailable"
+    if isinstance(exc, sqlite3.OperationalError):
+        # The unmanaged single-file check (#671) raises the driver error itself, before SQLAlchemy wraps
+        # anything. Only a lock is "store-busy"; the local import below named the SQLAlchemy class.
+        from opencrab.stores._single_file import sqlite_busy_or_locked
+
+        return "store-busy" if sqlite_busy_or_locked(exc) else None
     if not isinstance(exc, OperationalError):
         return None
     orig = getattr(exc, "orig", None)
