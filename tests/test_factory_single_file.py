@@ -1370,3 +1370,31 @@ def test_single_admin_cli_backfill_pack_id_refusals(tmp_path, monkeypatch):
     assert isinstance(result.exception, RuntimeError), (result.exit_code, result.output, result.exception)
     assert "lifetime lock order violated" in str(result.exception)
     assert hashlib.sha256((built.root / "graph.db").read_bytes()).hexdigest() == digest
+
+
+def test_single_delete_and_fork_gates_stay_fail_closed(tmp_path, monkeypatch):
+    """T-N7(삭제와 fork): 단일 모드에서 delete_pack과 fork_pack은 pack_delete_operations 표가 있으면 거부된다.
+
+    팩 인가를 지나야 이 거부에 닿으므로 소유자 principal로 부른다. 거부된 뒤 DB 행이 그대로다.
+    """
+    from opencrab.auth import Principal, principal_scope
+    from opencrab.pack.fork import fork_pack
+    from opencrab.pack.load import delete_pack
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    graph, docs, vec, sql = _make_four(_single_settings(built.root))
+    try:
+        conn = sql.shared_file.connection()
+        before = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in ("graph_nodes", "doc_nodes", "packs", "pack_delete_operations")}
+        assert before["packs"] >= 1
+        principal = Principal(user_id=built.owner, is_local=True, disabled=False)
+        with principal_scope(principal):
+            with pytest.raises(RuntimeError, match="single SQLite deletion is not yet supported"):
+                delete_pack(built.pack_id, graph, docs, vec, sql=sql)
+            result = fork_pack(sql, graph, docs, vec, None, None, principal=principal, src_pack_id=built.pack_id)
+        assert result == {"error": "single SQLite fork is not yet supported"}, result
+        after = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in before}
+        assert after == before
+    finally:
+        _close_all((graph, docs, vec, sql))
