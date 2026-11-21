@@ -1078,7 +1078,9 @@ class HybridQuery:
         shared = getattr(self._doc_store, "shared_file", None)
         pg_uow = getattr(self._doc_store, "_pg_uow", None)
         active = shared if isinstance(shared, SharedSqliteFile) and shared.in_unit_of_work else None
-        if active is None and pg_uow is not None and pg_uow.active:
+        # `active` 는 실 작업 단위에서 bool 이다. `is True` 는 속성을 흉내만 내는 대체 객체(MagicMock 등)가
+        # 진행 중인 작업 단위로 오인되어 무효화가 영영 미뤄지는 일을 막는다.
+        if active is None and pg_uow is not None and pg_uow.active is True:
             active = pg_uow
         if active is not None:
             with self._bm25_invalidation_lock:
