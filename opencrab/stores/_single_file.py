@@ -31,10 +31,18 @@ def sqlite_unit_active() -> bool:
     return getattr(_active_units, "depth", 0) > 0
 
 
-def validate_single_file_binding(root: str, db_path: str, ledger: dict, manifest: dict, marker: dict,
-                                 metadata: dict, manifest_digest: str) -> None:
-    """검증한 대장과 세대 결속이 설정 경로와 일치하는지 확인한다."""
+_BINDING_STATES = ("authorized", "staged", "ready")
 
+
+def validate_single_file_binding(root: str, db_path: str, ledger: dict, manifest: dict, marker: dict,
+                                 metadata: dict, manifest_digest: str, *, state: str = "authorized") -> None:
+    """검증한 대장과 세대 결속이 설정 경로와 일치하는지 확인한다.
+
+    state는 대장이 가져야 할 상태다. 읽는 쪽의 기본값은 authorized이며 게시자만 staged와 ready를 넘긴다.
+    """
+
+    if state not in _BINDING_STATES:
+        raise RuntimeError("single SQLite state argument is invalid")
     if not all(isinstance(value, dict) for value in (ledger, manifest, marker, metadata)):
         raise RuntimeError("single SQLite binding is invalid")
     if not {"state", "root", "database", "db_uuid", "generation", "manifest_digest"}.issubset(ledger):
@@ -49,8 +57,9 @@ def validate_single_file_binding(root: str, db_path: str, ledger: dict, manifest
         raise RuntimeError("single SQLite path is invalid")
     if os.path.commonpath((root, db_path)) != root or db_path == root:
         raise RuntimeError("single SQLite path is outside root")
-    if ledger.get("state") != "authorized":
-        raise RuntimeError("single SQLite generation is not authorized")
+    if ledger.get("state") != state:
+        raise RuntimeError("single SQLite generation is not authorized" if state == "authorized"
+                           else "single SQLite generation state differs")
     for key, expected in (("root", root), ("database", db_path)):
         if any(item.get(key) != expected for item in (ledger, manifest, metadata)):
             raise RuntimeError("single SQLite path binding differs")
@@ -136,7 +145,8 @@ def decode_binding_json(raw: bytes) -> dict:
 
 
 def load_single_file_binding(root: str, db_path: str, ledger_dir_fd: int, target_dir_fd: int,
-                             ledger_name: str, manifest_name: str, marker_name: str, metadata: dict) -> None:
+                             ledger_name: str, manifest_name: str, marker_name: str, metadata: dict,
+                             *, state: str = "authorized") -> None:
     """고정 디렉터리의 대장, manifest와 표식을 읽어 결속을 검사한다."""
     import hashlib
 
@@ -145,7 +155,7 @@ def load_single_file_binding(root: str, db_path: str, ledger_dir_fd: int, target
     manifest = decode_binding_json(manifest_raw)
     marker = decode_binding_json(read_binding_file(target_dir_fd, marker_name))
     validate_single_file_binding(root, db_path, ledger, manifest, marker, metadata,
-                                 hashlib.sha256(manifest_raw).hexdigest())
+                                 hashlib.sha256(manifest_raw).hexdigest(), state=state)
 
 
 def failed_shared_file(db_path: str) -> SharedSqliteFile | None:

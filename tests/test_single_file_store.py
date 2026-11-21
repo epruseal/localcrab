@@ -4687,3 +4687,59 @@ def test_lower_udf_is_consistent_on_the_shared_connection(stores):
     # SQLite 내장 lower는 ASCII만 바꾼다. 비ASCII 대문자가 바뀌어야 UDF가 이 연결에 걸렸다는 증거다.
     assert vec._conn.execute("SELECT lower('Ä')").fetchone()[0] == "ä"
     assert docs._conn.execute("SELECT lower('Ä')").fetchone()[0] == "ä"
+
+
+def _binding_parts(tmp_path, state):
+    import hashlib
+
+    root, db = str(tmp_path.resolve()), str(tmp_path / "single.db")
+    identity = {"root": root, "database": db, "db_uuid": "a" * 32, "generation": "b" * 32}
+    manifest = dict(identity)
+    digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    ledger = {**identity, "state": state, "manifest_digest": digest}
+    marker = {"db_uuid": identity["db_uuid"], "generation": identity["generation"], "manifest_digest": digest}
+    return root, db, ledger, manifest, marker, dict(identity), digest
+
+
+def test_single_file_binding_accepts_explicit_staged_and_ready_state(tmp_path):
+    from opencrab.stores._single_file import load_single_file_binding, validate_single_file_binding
+
+    for state in ("staged", "ready", "authorized"):
+        root, db, ledger, manifest, marker, metadata, digest = _binding_parts(tmp_path, state)
+        validate_single_file_binding(root, db, ledger, manifest, marker, metadata, digest, state=state)
+        other = "ready" if state != "ready" else "staged"
+        with pytest.raises(RuntimeError, match="state differs"):
+            validate_single_file_binding(root, db, ledger, manifest, marker, metadata, digest, state=other)
+        (tmp_path / "ledger").write_text(json.dumps(ledger))
+        (tmp_path / "manifest").write_text(json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+        (tmp_path / "marker").write_text(json.dumps(marker))
+        directory = os.open(tmp_path, os.O_RDONLY)
+        try:
+            # 디렉터리 읽기 경로도 같은 state 인자를 그대로 넘긴다.
+            load_single_file_binding(root, db, directory, directory, "ledger", "manifest", "marker", metadata,
+                                     state=state)
+            if state != "authorized":
+                with pytest.raises(RuntimeError, match="not authorized"):
+                    load_single_file_binding(root, db, directory, directory, "ledger", "manifest", "marker", metadata)
+        finally:
+            os.close(directory)
+
+
+def test_single_file_binding_default_state_unchanged(tmp_path):
+    from opencrab.stores._single_file import validate_single_file_binding
+
+    for state in ("staged", "ready"):
+        root, db, ledger, manifest, marker, metadata, digest = _binding_parts(tmp_path, state)
+        with pytest.raises(RuntimeError, match="single SQLite generation is not authorized"):
+            validate_single_file_binding(root, db, ledger, manifest, marker, metadata, digest)
+    root, db, ledger, manifest, marker, metadata, digest = _binding_parts(tmp_path, "authorized")
+    validate_single_file_binding(root, db, ledger, manifest, marker, metadata, digest)
+
+
+def test_single_file_binding_rejects_unknown_state(tmp_path):
+    from opencrab.stores._single_file import validate_single_file_binding
+
+    root, db, ledger, manifest, marker, metadata, digest = _binding_parts(tmp_path, "ready")
+    for state in ("weird", "", None, "Ready"):
+        with pytest.raises(RuntimeError, match="state argument"):
+            validate_single_file_binding(root, db, ledger, manifest, marker, metadata, digest, state=state)
