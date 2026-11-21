@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import resource
 import shutil
 import sqlite3
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from tests.test_merge_sqlite_stores import _ready_setup, merge_mod
 
@@ -140,3 +143,62 @@ def test_authorized_root_helper_self_check(tmp_path, monkeypatch, capsys):
               f"bm25_state={meta.get('state')} pending={pending} doc_count={indexed[0]} doc_nodes={rows} "
               f"incarnations={built.incarnations}")
         print("S0-COUNTS " + json.dumps(built.counts, sort_keys=True))
+
+
+def _validate_binding_on(root: Path):
+    """root의 single.db에 checked 공유 객체를 열어 validate_binding을 한 번 부른다."""
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    shared = SharedSqliteFile(str(root / "single.db"), checked=True)
+    dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        shared.validate_binding(str(root), dir_fd, dir_fd, "ledger.json", "manifest.json", "marker.json")
+    finally:
+        os.close(dir_fd)
+        shared.close()
+
+
+def _write_ledger_state(root: Path, state: str) -> None:
+    ledger_path = root / "ledger.json"
+    ledger = json.loads(ledger_path.read_text())
+    ledger_path.write_text(json.dumps({**ledger, "state": state}, sort_keys=True, separators=(",", ":")))
+
+
+@pytest.mark.parametrize("state", ["ready", "staged"])
+def test_single_validate_binding_order_regression(tmp_path, monkeypatch, state):
+    """T-G3: 대장이 authorized가 아니면 validate_binding은 DB를 열기 전에 거부한다.
+
+    DB를 먼저 열면 mode=ro 연결이 WAL DB 옆에 -wal과 -shm을 만든다(S1이 막는 결함).
+    """
+    built = _authorized_root(tmp_path, monkeypatch)
+    _write_ledger_state(built.root, state)
+    names_before = sorted(os.listdir(built.root))
+    real_connect = sqlite3.connect
+    connect_calls: list[str] = []
+
+    def spy(*args, **kwargs):
+        connect_calls.append(str(args[0]) if args else "")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    with pytest.raises(RuntimeError, match="single SQLite generation is not authorized"):
+        _validate_binding_on(built.root)
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    assert connect_calls == []
+    assert sorted(os.listdir(built.root)) == names_before
+
+
+def test_single_validate_binding_authorized_opens_db_once(tmp_path, monkeypatch):
+    """T-G3 대조군: authorized 대장은 검증을 통과하고 DB 연결은 한 번 불린다."""
+    built = _authorized_root(tmp_path, monkeypatch)
+    real_connect = sqlite3.connect
+    connect_calls: list[str] = []
+
+    def spy(*args, **kwargs):
+        connect_calls.append(str(args[0]) if args else "")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    _validate_binding_on(built.root)
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    assert len(connect_calls) == 1

@@ -311,6 +311,10 @@ class SharedSqliteFile:
         ledger_stat = os.fstat(ledger_dir_fd)
         if (ledger_stat.st_dev, ledger_stat.st_ino) != (parent_stat.st_dev, parent_stat.st_ino):
             raise RuntimeError("single SQLite ledger directory differs")
+        # DB를 열기 전에 대장 state만 먼저 거른다. mode=ro 연결도 WAL DB 옆에 -wal과 -shm을 만들므로
+        # ready나 staged 게시 root는 열지 않고 거부한다. 권위 있는 전체 검증은 아래 load_single_file_binding이 한다.
+        if decode_binding_json(read_binding_file(ledger_dir_fd, ledger_name)).get("state") != "authorized":
+            raise RuntimeError("single SQLite generation is not authorized")
         conn = sqlite3.connect(Path(self.db_path).as_uri() + "?mode=ro", uri=True)
         try:
             self._check_file_identity()
