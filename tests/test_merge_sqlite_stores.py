@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import sqlite3
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -329,7 +330,7 @@ def test_publication_main_prepares_before_staging(source_dir, tmp_path, monkeypa
 
 @pytest.mark.parametrize("failure", [None, "verify", "checkpoint", "sidecar", "wal", "sync", "busy", "frames", "close", "busy_close", "owner_close", "owner_close_systemexit", "owner_close_exception", "open:staging-parent", "open:merge-partial", "open:checkpoint-fsync", "open:staging-dir", "open:billing-write", "open:billing-read", "open:checkpoint-fsync#2", "connect:billing.db", "connect:single.db.partial", "close:billing.db", "close:single.db.partial", "attach:merge", "detach:merge", "mkdir:before", "mkdir:after", "link:before", "link:after", "unlink:before", "unlink:after", "fsync:intent-parent", "fsync:staging-parent", "fsync:staging-dir", "fsync:checkpoint-fsync", "fsync:billing-write", "fsync-after:intent-parent", "fsync-after:staging-parent", "fsync-after:staging-dir", "fsync-after:checkpoint-fsync", "fsync-after:billing-write", "fsync:intent-stream", "fsync-after:intent-stream", "fsync:checkpoint-fsync#2", "fsync-after:checkpoint-fsync#2", "checkpoint-close:0:before", "checkpoint-close:0:after", "checkpoint-close:1:before", "checkpoint-close:1:after", "observe:root", "observe:staging", "observe:intent", "observe-after:mkdir", "observe-after:link", "observe-after:unlink", "create-after:intent", "create-after:merge-partial", "create-after:billing-write", "create-observe:intent", "create-observe:merge-partial", "create-observe:billing-write", "multi-close", "attach-after-close-fail", "detach-after-close-fail", "close-instance:0", "intent-write", "intent-flush", "intent-write-after", "intent-flush-after", "input-open:input-root", "input-open:source:billing.db", "input-open:source:graph.db", "input-open:source:doc_store.db", "input-open:source:vectors.db", "input-open:source:opencrab.db", "input-open:directory:chroma", "input-open:directory:docs", "input-open:directory:delete-pack-journals", "input-connect:integrity", "input-connect:memory", "input-attach:before", "input-attach:after", "input-detach:before", "input-detach:after", "flock-before:source", "flock-before:root", "flock-after:source", "flock-after:root", "vec:attach-before", "vec:attach-after", "vec:detach-before", "vec:detach-after", "release:source-unlock-before", "release:source-unlock-after", "release:source-close-before", "release:source-close-after", "release:root-unlock-before", "release:root-unlock-after", "release:root-close-before", "release:root-close-after", "release:registry-before", "release:registry-after", "root-fdopen-before", "root-fdopen-after", "intent-fdopen-before", "intent-fdopen-after", "registry-add-before", "registry-add-after", "mounts:open-before", "mounts:open-after", "mounts:fdopen-before", "mounts:fdopen-after", "mounts:read-before", "mounts:read-after", "mounts:close-before", "mounts:close-after"])
 def test_publication_main_merges_generated_backup(source_dir, tmp_path, monkeypatch, failure, capsys):
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
     from types import SimpleNamespace
 
     from opencrab.stores.backup import backup_data_dir
@@ -347,9 +348,9 @@ def test_publication_main_merges_generated_backup(source_dir, tmp_path, monkeypa
         (source_dir / failure.rsplit(":", 1)[1]).mkdir()
     backups = tmp_path / "backups"
     backups.mkdir()
-    begin = datetime.now(timezone.utc) - timedelta(seconds=2)
+    begin = datetime.now(UTC) - timedelta(seconds=2)
     backup = backup_data_dir(source_dir, backups, settings=SimpleNamespace(vector_db_file="vectors.db"))
-    end = datetime.now(timezone.utc) + timedelta(seconds=1)
+    end = datetime.now(UTC) + timedelta(seconds=1)
     backup_root = backup.set_dir
     (backups / (backup_root.name + ".source.lifetime.lock")).touch()
     raw = (backup_root / "MANIFEST.json").read_bytes()

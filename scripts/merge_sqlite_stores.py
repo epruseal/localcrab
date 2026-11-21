@@ -52,9 +52,10 @@ import shutil
 import sqlite3
 import stat
 import sys
-import time
 import threading
+import time
 import urllib.parse
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -113,11 +114,11 @@ def _classify_fd_role(role: str) -> str | None:
     return None
 
 
-class _PublicationFlockBeforeTest(Exception):
+class _PublicationFlockBeforeTest(Exception):  # noqa: N818 (시험이 이 이름으로 주입하는 신호이며 오류가 아니다)
     pass
 
 
-class _PublicationCloseBeforeTest(Exception):
+class _PublicationCloseBeforeTest(Exception):  # noqa: N818 (시험이 이 이름으로 주입하는 신호이며 오류가 아니다)
     def __init__(self, retry: Any) -> None:
         super().__init__("test close before SQLite")
         self.retry = retry
@@ -1650,7 +1651,7 @@ def _publication_source_lock(root: Path, *, work: _PublicationWork | None = None
 
 def _publication_evidence(manifest_raw: bytes, evidence_raw: bytes) -> dict[str, Any]:
     """백업 세트와 동결 증거의 식별 및 시간을 대조한다."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from opencrab.stores._single_file import decode_binding_json
 
@@ -1679,7 +1680,7 @@ def _publication_evidence(manifest_raw: bytes, evidence_raw: bytes) -> dict[str,
             raise MergeError("publication evidence timestamp is invalid") from exc
         if result.utcoffset() != timedelta(0):
             raise MergeError("publication evidence timestamp is not UTC")
-        return result.astimezone(timezone.utc)
+        return result.astimezone(UTC)
 
     start, end = stamp(evidence["frozen_from"]), stamp(evidence["frozen_until"])
     first, last = stamp(evidence["capture_from"]), stamp(evidence["capture_until"])
