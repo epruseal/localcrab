@@ -273,3 +273,175 @@ def test_single_ctor_baseexception_releases_owner(tmp_path, monkeypatch, kind):
     finally:
         for owner in list(shared._users):
             shared.release(owner)
+
+
+def _open_doc_store(root: Path):
+    """root의 single.db에 checked 공유 객체를 열고 doc 저장소를 만든다. 닫으면 공유 객체도 닫힌다."""
+    from opencrab.stores._single_file import SharedSqliteFile
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    path = str(root / "single.db")
+    shared = SharedSqliteFile(path, checked=True)
+    try:
+        return LocalSQLDocStore(path, shared=shared)
+    except BaseException:
+        for owner in list(shared._users):
+            shared.release(owner)
+        raise
+
+
+def _edit_single_db(root: Path, *statements: str) -> None:
+    """독립 연결로 게시 DB를 고치고 commit한 뒤 닫는다."""
+    conn = sqlite3.connect(root / "single.db")
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_single_doc_store_fts_and_bm25_on_published_root(tmp_path, monkeypatch):
+    """T-N2의 doc 저장소 몫: 게시 root에서 FTS와 node BM25가 켜진 채로 열린다.
+
+    게시 DB는 pack_delete_operations를 가져 작업 단위 밖 _tx()가 거부되므로, 쓰기 없는 판정이
+    없으면 두 기능이 조용히 꺼진다.
+    """
+    built = _authorized_root(tmp_path, monkeypatch)
+    docs = _open_doc_store(built.root)
+    try:
+        assert docs.supports_keyword is True
+        assert docs.supports_node_bm25 is True
+        assert docs.node_bm25_ready() is True
+    finally:
+        docs.close()
+
+
+def test_single_doc_fts_and_bm25_init_is_read_only(tmp_path, monkeypatch):
+    """T-G5: 초기화가 쓰기를 하지 않는다. 독립 연결의 data_version이 생성 전후로 같다."""
+    built = _authorized_root(tmp_path, monkeypatch)
+    watcher = sqlite3.connect(built.root / "single.db")
+    try:
+        before = watcher.execute("PRAGMA data_version").fetchone()[0]
+        docs = _open_doc_store(built.root)
+        try:
+            assert docs.supports_keyword is True
+            assert docs.supports_node_bm25 is True
+            assert docs._bm25_cache is not None
+            after = watcher.execute("PRAGMA data_version").fetchone()[0]
+        finally:
+            docs.close()
+        assert after == before
+    finally:
+        watcher.close()
+
+
+def _assert_bm25_turns_off_after(root: Path, *statements: str) -> None:
+    """대조군(수정 전 켜짐)을 확인한 뒤 DB를 고치면 node BM25가 꺼진다. data_version은 그대로다."""
+    docs = _open_doc_store(root)
+    try:
+        assert docs.supports_node_bm25 is True
+    finally:
+        docs.close()
+    _edit_single_db(root, *statements)
+    watcher = sqlite3.connect(root / "single.db")
+    try:
+        before = watcher.execute("PRAGMA data_version").fetchone()[0]
+        docs = _open_doc_store(root)
+        try:
+            assert docs.supports_node_bm25 is False
+            assert docs.node_bm25_ready() is False
+            after = watcher.execute("PRAGMA data_version").fetchone()[0]
+        finally:
+            docs.close()
+        assert after == before
+    finally:
+        watcher.close()
+
+
+@pytest.mark.parametrize("variant", ["count-mismatch", "stats-row-missing"])
+def test_single_bm25_ready_count_mismatch_turns_off(tmp_path, monkeypatch, variant):
+    """T-G6: state가 ready이고 pending이 비었는데 doc_count와 doc_nodes 행 수가 다르면 꺼진다.
+
+    입력 행마다 새 _authorized_root를 쓴다(다른 경로로 복사하면 대장 결속이 먼저 거부한다).
+    """
+    from opencrab.stores import _node_bm25_sqlite as nbm
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    if variant == "count-mismatch":
+        statement = f"UPDATE {nbm.STATS} SET doc_count = doc_count + 1 WHERE id = 1"
+    else:
+        statement = f"DELETE FROM {nbm.STATS} WHERE id = 1"
+    _assert_bm25_turns_off_after(built.root, statement)
+
+
+@pytest.mark.parametrize("variant", ["trigger", "vocab-table"])
+def test_single_bm25_missing_object_turns_off(tmp_path, monkeypatch, variant):
+    """T-G7: BM25 객체가 하나라도 없으면 꺼진다. 입력 행마다 새 _authorized_root를 쓴다."""
+    from opencrab.stores import _node_bm25_sqlite as nbm
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    if variant == "trigger":
+        statement = f"DROP TRIGGER {nbm.TRIGGERS[0]}"
+    else:
+        statement = f"DROP TABLE {nbm.VINST}"
+    _assert_bm25_turns_off_after(built.root, statement)
+
+
+def test_single_doc_ctor_cache_failure_releases_owner(tmp_path, monkeypatch):
+    """T-E5d: doc 생성자의 BM25 캐시 생성(97~100행)이 실패하면 소유자를 푼다.
+
+    게시 root에서는 S3가 있어야 이 구간에 닿는다(supports_node_bm25가 참이어야 한다).
+    """
+    import importlib
+
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    module = importlib.import_module("opencrab.stores.local_sql_doc_store")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("token source failed")
+
+    monkeypatch.setattr(module._ncache, "TokenSource", boom)
+    path = str(built.root / "single.db")
+    shared = SharedSqliteFile(path, checked=True)
+    try:
+        with pytest.raises(RuntimeError, match="token source failed"):
+            module.LocalSQLDocStore(path, shared=shared)
+        assert shared._users == []
+        result = _exclusive_lock_attempt(built.root)
+        assert result.returncode == 0, result.stderr
+    finally:
+        for owner in list(shared._users):
+            shared.release(owner)
+
+
+@pytest.mark.parametrize("mode", ["multi-file", "shared-without-delete-table"])
+def test_doc_store_write_path_init_unchanged(tmp_path, mode):
+    """대조군: pack_delete_operations가 없는 경로(다중 파일, 표 없는 공유)는 쓰는 초기화를 그대로 탄다.
+
+    FTS와 node BM25 객체를 이 호출이 만들고 두 기능이 켜진다.
+    """
+    from opencrab.stores._single_file import SharedSqliteFile
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+
+    path = tmp_path / "doc.db"
+    shared = None
+    if mode == "shared-without-delete-table":
+        sqlite3.connect(path).close()
+        shared = SharedSqliteFile(str(path), checked=True)
+    docs = LocalSQLDocStore(str(path), shared=shared)
+    try:
+        assert docs.supports_keyword is True
+        assert docs.supports_node_bm25 is True
+        assert docs.node_bm25_ready() is True
+    finally:
+        docs.close()
+    conn = sqlite3.connect(path)
+    try:
+        names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    finally:
+        conn.close()
+    assert "doc_nodes_bm25_meta" in names and "doc_sources_fts" in names
+    assert "pack_delete_operations" not in names

@@ -151,6 +151,13 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                     logger.warning("LocalSQLDocStore init failed: %s", exc)
                     self._available = False
                     return
+                if self._shared_guarded():
+                    # #671: 게시 DB는 pack_delete_operations를 가져 작업 단위 밖 _tx()가 거부된다.
+                    # 아래 쓰기 초기화는 그 거부를 삼켜 FTS와 node BM25를 조용히 끈다. 이 경우에는
+                    # 쓰기 없이 객체 존재와 형식만 읽어 두 값을 정한다.
+                    self._fts_ok = self._read_only_fts_ok(conn)
+                    self._node_bm25_ok = self._read_only_node_bm25_ok(conn)
+                    return
                 # FTS5 키워드 색인(선택) — 빌드에 FTS5 모듈이 없으면 graceful 비활성.
                 # 본문(doc_sources.text)을 한+영 unicode61 토크나이저로 색인 → 약어·표준번호·영어
                 # 다중어 질의 정확매칭(하이브리드 키워드 레그). 미가용 시 supports_keyword=False.
@@ -219,6 +226,62 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         except Exception as exc:
             logger.warning("node BM25 index unavailable (graceful): %s", exc)
             self._node_bm25_ok = False
+
+    def _shared_guarded(self) -> bool:
+        """공유 모드이고 pack_delete_operations 표가 있는지. ``_tx()``의 보호와 같은 질의다."""
+        if self._shared is None:
+            return False
+        return self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone() is not None
+
+    def _read_only_fts_ok(self, conn: Any) -> bool:
+        """쓰기 없이 doc FTS 객체 존재와 배치를 확인한다(#671). 색인 생성과 백필은 하지 않는다."""
+        try:
+            present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+            if not {_sfts.FTS, _sfts.CONTENT, _sfts.INDEX} <= present or not _sfts.layout_ok(conn):
+                logger.warning("FTS5 keyword index unavailable (read-only check): objects missing or layout differs")
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001 -- graceful off, same as the write path
+            logger.warning("FTS5 keyword index unavailable (read-only check): %s", exc)
+            return False
+
+    def _read_only_node_bm25_ok(self, conn: Any) -> bool:
+        """쓰기 없이 node BM25 객체 존재, 형식, ready 정합을 확인한다(#671).
+
+        쓰기 모드의 ``ensure_schema``는 형식이나 정합이 어긋나면 색인을 비우고 backfill로
+        되돌린다. 그것은 쓰기이므로 여기서는 하지 않고 기능을 끈다. state가 backfill이면 참이다.
+        """
+        from opencrab.ontology.bm25 import max_text_chars_setting
+
+        try:
+            present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+            required = {
+                _nbm.META, _nbm.STATS, _nbm.DOCS, _nbm.PENDING, _nbm.FTS, _nbm.VROW, _nbm.VINST,
+                *_nbm.TRIGGERS,
+            }
+            if not required <= present:
+                logger.warning("node BM25 index unavailable (read-only check): objects missing")
+                return False
+            meta = _nbm._meta(conn)
+            if (
+                meta.get("format") != _nbm.FORMAT
+                or _nbm._decode_chars(meta.get("max_text_chars")) != max_text_chars_setting()
+            ):
+                logger.warning("node BM25 index unavailable (read-only check): format or MAX_NODE_CHARS differs")
+                return False
+            if meta.get("state") == _nbm.STATE_READY:
+                if conn.execute(f"SELECT 1 FROM {_nbm.PENDING} LIMIT 1").fetchone() is None:
+                    rows = conn.execute("SELECT COUNT(*) FROM doc_nodes").fetchone()[0]
+                    indexed = conn.execute(f"SELECT doc_count FROM {_nbm.STATS} WHERE id=1").fetchone()
+                    if indexed is None or int(indexed[0]) != int(rows):
+                        logger.warning("node BM25 index unavailable (read-only check): row count differs")
+                        return False
+            return True
+        except Exception as exc:  # noqa: BLE001 -- graceful off, same as the write path
+            logger.warning("node BM25 index unavailable (read-only check): %s", exc)
+            return False
 
     # ------------------------------------------------------------------
     # Availability / lifecycle
