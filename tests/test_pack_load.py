@@ -1080,6 +1080,20 @@ class _RecordingVec:
         """`incremental_finalize` 가 부른다. 이게 없으면 그 함수를 아예 호출할 수 없다."""
         self.deleted.extend(ids)
 
+    def prepare_upsert_vectors(self, texts):
+        """단일 SQLite 원자 적재 경로가 먼저 부른다(#671). 실 스토어와 같은 시그니처다.
+
+        스텁은 임베딩을 하지 않으므로 글마다 자리표시 벡터 하나를 돌려준다.
+        """
+        return [[0.0] for _ in texts]
+
+    def upsert_precomputed(self, texts, metadatas, ids, vectors):
+        """미리 계산한 벡터로 쓰는 경로(#671). 길이 검증과 기록은 `upsert_texts` 와 같다."""
+        if len(vectors) != len(texts):
+            raise ValueError("precomputed vectors do not match texts or dimension")
+        self.upsert_texts(texts, metadatas, ids)
+        return list(ids)
+
 
 def _chunk(i, text="본문"):
     return {"id": f"c{i}", "document_id": "n1", "text": text}
@@ -4763,7 +4777,9 @@ class TestStubsMatchTheRealStoreContract:
     코드로 대사한다 — 스텁이 실계약을 잘못 베끼는 것이 **구조적으로 불가능**해진다.
     """
 
-    @pytest.mark.parametrize("method", ["upsert_texts", "delete"])
+    @pytest.mark.parametrize(
+        "method", ["upsert_texts", "delete", "prepare_upsert_vectors", "upsert_precomputed"],
+    )
     def test_recording_vec_signature_matches_the_real_store(self, method):
         from opencrab.stores.sqlite_vec_store import SqliteVecStore
         real = inspect.signature(getattr(SqliteVecStore, method))

@@ -30,6 +30,9 @@ NAMES = frozenset({"update_edge", "update_edges_batch"})
 ALLOWED = {
     ("opencrab/stores/neo4j_store.py", "Neo4jStore.update_edges_batch"): 1,
     ("opencrab/stores/kuzu_graph_store.py", "KuzuUnavailableGraphStore"): 2,
+    # 단일 SQLite 모드의 인가 덮개(#671). 배치는 단일 모드에서 거부하고 단건은 팩 검증 뒤에 위임한다.
+    ("opencrab/stores/local_graph_store.py", "LocalGraphStore.update_edges_batch"): 1,
+    ("opencrab/stores/local_graph_store.py", "LocalGraphStore.update_edge"): 1,
     ("opencrab/ontology/builder.py", "OntologyBuilder.add_edge"): 1,
 }
 GATED = ("opencrab/ontology/builder.py", "OntologyBuilder.add_edge")

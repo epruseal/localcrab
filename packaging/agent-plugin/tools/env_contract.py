@@ -57,6 +57,7 @@ ENV_CONTRACT: dict[str, str] = {
     "LOCAL_GGUF_PATH": "상태 위치",
     "VECTOR_BACKEND": "설정 소스 선택",
     "VECTOR_DB_FILE": "상태 위치",
+    "SINGLE_SQLITE_FILE": "상태 위치",
     "VECTOR_COLLECTION": "튜너블",
     "VECTOR_ANN": "튜너블",
     "VECTOR_ANN_COARSE_K": "튜너블",
