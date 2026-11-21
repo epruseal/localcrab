@@ -783,10 +783,43 @@ def test_single_rejects_missing_ledger_and_tampered_binding(tmp_path, monkeypatc
     _point_at(monkeypatch, root)
     settings = _single_settings(root)
     kwargs = {"match": message} if message else {}
+    before = _names(root)
     with pytest.raises(exc_type, **kwargs):
         factory.make_sql_store(settings)
+    if variant == "ledger-missing":
+        # F-07: 대장이 없으면 DB를 열기 전에 거부하므로 root에 새 이름도 -wal/-shm도 생기지 않는다.
+        assert _names(root) == before
+        assert not any(name.endswith(("-wal", "-shm")) for name in os.listdir(root))
     assert _open_entries(_fresh_single_registry) == []
     _assert_lock_free(root)
+
+
+def test_single_failed_close_owner_is_refused_without_changes(tmp_path, monkeypatch, _fresh_single_registry):
+    """F-13: 이전 닫기에 실패한 소유자가 남아 있으면 factory 네 함수가 파일을 만지기 전에 거부한다."""
+    from opencrab.stores import _single_file as sf
+    from opencrab.stores import factory
+
+    built = _authorized_root(tmp_path, monkeypatch)
+    root = built.root
+    _point_at(monkeypatch, root)
+    settings = _single_settings(root)
+    marker = object()
+    key = os.path.abspath(str(root / "single.db"))
+    with sf._failed_shared_files_lock:
+        sf._failed_shared_files.setdefault(key, set()).add(marker)
+    try:
+        before = _names(root)
+        for name in _FACTORY_NAMES:
+            with pytest.raises(RuntimeError, match="failed SQLite file owner requires close retry"):
+                getattr(factory, name)(settings)
+        assert _names(root) == before
+        assert _open_entries(_fresh_single_registry) == []
+        _assert_lock_free(root)
+    finally:
+        with sf._failed_shared_files_lock:
+            sf._failed_shared_files.get(key, set()).discard(marker)
+            if not sf._failed_shared_files.get(key):
+                sf._failed_shared_files.pop(key, None)
 
 
 def test_single_rejects_bad_settings(tmp_path, monkeypatch, _fresh_single_registry):
