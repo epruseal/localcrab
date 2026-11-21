@@ -178,14 +178,24 @@ def reject_single_file_mode(settings: Any) -> None:
 
 
 def reject_unmanaged_single_file(db_path: str) -> None:
-    """공유 연결 없이 단일 파일 스키마를 열지 않는다."""
+    """공유 연결 없이 단일 파일 스키마를 열지 않는다.
+
+    한계: 이 검사는 최선 노력이다. 다른 연결이 파일을 잠가 표식을 읽지 못하면(busy, locked) 검사를
+    건너뛴다. 이어지는 `SQLStore._connect`가 같은 잠금을 만나 저장소를 사용 불가로 둔다.
+    그 판단이 이 생성자 오류보다 앞선 기존 계약이다(HTTP 인증 조회가 이를 503으로 바꾼다).
+    """
     path = Path(db_path)
     if db_path == ":memory:" or not path.is_file():
         return
-    with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
-        found = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-        ).fetchone()
+    try:
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            found = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            return
+        raise
     if found:
         raise RuntimeError("single SQLite file requires shared connection")
 
