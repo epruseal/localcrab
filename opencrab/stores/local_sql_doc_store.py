@@ -99,10 +99,12 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                 # Opened now, not at the first query, so that a replaced database file is seen.
                 self._bm25_token = _ncache.TokenSource(self._db_path, self._new_conn)
                 self._bm25_cache = _ncache.PostingCache()
-        except BaseException:
+        except BaseException as exc:
             # _init_db와 캐시 생성의 실패가 생성자 밖으로 나가면 등록한 공유 소유자를
-            # 풀지 않아 수명 잠금이 남는다(#671).
-            self.close()
+            # 풀지 않아 수명 잠금이 남는다(#671). 잠금 시간 초과는 _init_db가 이미 닫고
+            # 올렸으므로 다시 닫지 않는다(#578).
+            if not isinstance(exc, StoreBootstrapLockTimeoutError):
+                self.close()
             raise
 
     def close(self) -> None:

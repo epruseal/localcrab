@@ -61,10 +61,12 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
         self._init_conn_state(db_path, shared)
         try:
             self._init_db()
-        except BaseException:
+        except BaseException as exc:
             # 일반 예외는 _init_db가 삼킨다. 중단(KeyboardInterrupt 등)이 생성자 밖으로 나가면
-            # 등록한 공유 소유자를 풀지 않아 수명 잠금이 남는다(#671).
-            self.close()
+            # 등록한 공유 소유자를 풀지 않아 수명 잠금이 남는다(#671). 잠금 시간 초과는
+            # _init_db가 이미 닫고 올렸으므로 다시 닫지 않는다(#578).
+            if not isinstance(exc, StoreBootstrapLockTimeoutError):
+                self.close()
             raise
 
     def upsert_node(self, node_type, node_id, properties, space_id=None, *, return_receipt=False):

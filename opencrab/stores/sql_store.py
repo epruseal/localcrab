@@ -472,8 +472,12 @@ class SQLStore:
                 raise
         try:
             self._connect()
-        except BaseException:
-            self.close()
+        except BaseException as exc:
+            # 잠금 시간 초과는 _connect가 이미 닫고 올렸으므로 다시 닫지 않는다(#578).
+            from opencrab.locking import StoreBootstrapLockTimeoutError
+
+            if not isinstance(exc, StoreBootstrapLockTimeoutError):
+                self.close()
             raise
 
     # ------------------------------------------------------------------
