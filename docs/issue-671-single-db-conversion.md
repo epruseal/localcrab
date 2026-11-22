@@ -173,7 +173,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 4. 설정의 `LOCAL_DATA_DIR`과 환경변수 `LOCAL_DATA_DIR`이 모두 root와 같아야 한다. `write.lock`과 `billing.db.lock`과 삭제 저널 디렉터리가 root 아래에 놓이기 때문이다(T-E3).
 5. 이전 데이터 디렉터리의 `packs/`와 삭제 저널을 root로 옮기는 절차는 아직 없다(후속 `followup_671_switch_data_dir_move`).
 6. 단일 모드에서 `write.lock`을 쥔 스레드의 첫 factory 호출은 거부된다. 쓰기 도구가 첫 컨텍스트를 만드는 경로는 이 거부 때문에 열리지 않는다(T-E9 `test_single_first_call_under_write_lock_is_rejected`, 후속 `followup_671_factory_write_lock_first_call`).
-7. `SINGLE_SQLITE_FILE` 없이 단일 root(`ledger.json`이나 `single.db`가 있는 디렉터리)를 `LOCAL_DATA_DIR`로 받은 프로세스는 파일을 만들거나 열기 전에 거부된다. 서버, CLI, 백업(데이터 디렉터리와 목적지 둘 다), `migrate_chroma_to_sqlite_vec.py`, `migrate_to_local.py`, `import_obsidian_vault.py`가 모두 해당한다. 그래서 롤백은 root를 치운 뒤에 환경 설정을 고친다(7.4). 검사는 열려는 DB 파일의 바로 위 디렉터리만 본다. 거부 사유는 `single SQLite root requires SINGLE_SQLITE_FILE`이다(`tests/test_five_file_single_root_guard.py`).
+7. `SINGLE_SQLITE_FILE` 없이 단일 root(`ledger.json`이나 `single.db`가 있는 디렉터리)를 `LOCAL_DATA_DIR`로 받은 프로세스는, root에 파일을 만들거나 DB를 열기 전에 거부된다. 거부 지점은 다섯 파일 factory와 직접 생성자, chroma 분기, bootstrap-on-empty, 백업(데이터 디렉터리와 목적지 둘 다), `migrate_chroma_to_sqlite_vec.py`, `migrate_to_local.py`, `import_obsidian_vault.py`, 그리고 `LOCAL_DATA_DIR`을 필수 인자나 기본값으로 받아 root 아래에 쓰는 스크립트 다섯(`repair_store_mismatch_499.py`, `cleanup_openclaw_heartbeat_493.py`, `export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`)이다. query, ingest, serve stdio는 인증 조회가 먼저 not-bootstrapped로 끝나므로(root에 `opencrab.db`가 없다) 이 거부 사유가 나오기 전에 종료한다. 두 경우 모두 root는 바뀌지 않는다. 출력 경로를 명시해야 쓰는 스크립트와 읽기 전용 스크립트는 root 아래에 쓰지 않으므로 이 거부와 무관하다(전수 판정은 설계 문서 6.2와 6.3). 그래서 롤백은 root를 치운 뒤에 환경 설정을 고친다(7.4). 팩토리와 생성자 경로의 검사는 열려는 DB 파일의 바로 위 디렉터리만 보고, 출력 경로를 기본값으로 받는 세 스크립트(`export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`)는 그 경로의 모든 상위 디렉터리를 본다. 거부 사유는 `single SQLite root requires SINGLE_SQLITE_FILE`이다(`tests/test_five_file_single_root_guard.py`).
 
 ### 7.3 지원하지 않는 기능
 
@@ -187,7 +187,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 
 ### 7.4 롤백
 
-서비스를 멈춘 뒤 `SINGLE_SQLITE_FILE`을 비우고 `LOCAL_DATA_DIR`을 전환 전 데이터 디렉터리로 되돌린다. 두 설정을 함께 바꾼다. 7.2의 5번에서 root로 옮긴 `packs/`와 저널도 전환 전 디렉터리로 되돌린다. `SINGLE_SQLITE_FILE`만 비우면 `LOCAL_DATA_DIR`이 root인 채로 다중 파일 factory가 root에 빈 `graph.db`, `doc_store.db`, `vectors.db`, `opencrab.db`를 만든다. 단일 모드에서 쓴 데이터는 이전 파일에 없다. 그러므로 이 롤백은 단일 모드에서 새로 쓰기 전까지만 데이터 손실이 없다. 설정이 비어 있는 경로는 코드를 되돌리지 않아도 이전과 같다(T-N1). authorized 상태는 되돌리는 명령이 없다. 게시 root를 되돌릴 때는 root를 보존 이름으로 옮긴다.
+순서는 다음 넷이다. 첫째, 서비스를 멈춘다. 둘째, 게시 root를 보존 이름으로 옮긴다. 7.2의 5번에서 root로 옮긴 `packs/`와 저널도 전환 전 디렉터리로 되돌린다. 셋째, `SINGLE_SQLITE_FILE`을 비우고 `LOCAL_DATA_DIR`을 전환 전 데이터 디렉터리로 되돌린다. 두 설정을 함께 바꾼다. 넷째, 서비스를 시작한다. root를 옮기기 전에 설정만 바꾸면 안 된다. `SINGLE_SQLITE_FILE`만 비우고 `LOCAL_DATA_DIR`이 root인 채로 두면 다섯 파일 factory가 root를 거부한다(7.2의 7번). 그 거부는 root를 바꾸지 않으므로 서비스는 뜨지 않고 root에는 빈 파일이 생기지 않는다. 단일 모드에서 쓴 데이터는 이전 파일에 없다. 그러므로 이 롤백은 단일 모드에서 새로 쓰기 전까지만 데이터 손실이 없다. 설정이 비어 있는 경로는 코드를 되돌리지 않아도 이전과 같다(T-N1). authorized 상태는 되돌리는 명령이 없다. 게시 root를 되돌릴 때는 root를 보존 이름으로 옮긴다.
 
 ### 7.5 재현 명령
 
