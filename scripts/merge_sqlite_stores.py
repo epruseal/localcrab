@@ -43,7 +43,8 @@ WAL 모드 원본을 읽기 전용으로 열어도 SQLite가 원본 옆에 빈 `
         --verification-pass <독립 검증 PASS 파일> --copy-test-pass <사본 시험 PASS 파일> [--apply]
 
 ``--apply`` 없이 부르면 점검만 하고 root를 바꾸지 않는다. 적용은 root 안 ledger.json 하나만 바꾼다.
-PASS 파일은 존재와 형태만 본다. 성공하면 stderr에 두 파일의 sha256을 찍는다. 그 값의 대조는 호출자의 몫이다.
+PASS 파일은 존재와 형태만 본다. 성공하면 stderr에 PASS 파일의 경로와 sha256을 찍는다. copy-test는 독립 검증
+PASS 파일 하나, production은 두 PASS 파일의 값이다. 그 값의 대조는 호출자의 몫이다.
 종료 코드: 0 성공(점검만 성공 포함), 2 사용법과 점검 실패(root를 바꾸지 않았다)나 적용 뒤 정리 실패,
 1 쓰기 단계 실패(ledger는 옛 바이트일 수도 새 바이트일 수도 있다. stderr의 observed ledger state를 본다).
 """

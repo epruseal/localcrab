@@ -167,7 +167,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 
 ### 7.2 전환 전제
 
-1. 게시된 root의 대장 state가 authorized여야 한다. ready나 staged는 거부된다(T-E1). 게시 도구는 대장을 ready까지만 올린다. 병합 도구의 `authorize` 하위 명령이 ready를 authorized로 한 번 올린다. 사본 시험은 `python scripts/merge_sqlite_stores.py authorize --root <게시 root> --run-kind copy-test --verification-pass <독립 검증 PASS 파일> --copy-test-run-id <식별자> --apply`로, 운영은 `--run-kind production --verification-pass <독립 검증 PASS 파일> --copy-test-pass <사본 시험 PASS 파일> --apply`로 실행한다. `--apply`가 없으면 점검만 하고 root를 바꾸지 않는다. 이 명령은 PASS 파일의 존재와 형태만 보고 두 파일의 sha256을 stderr의 `authorize applied` 줄에 찍는다. 그 값을 실행 기록과 대조하는 일은 호출자의 몫이다.
+1. 게시된 root의 대장 state가 authorized여야 한다. ready나 staged는 거부된다(T-E1). 게시 도구는 대장을 ready까지만 올린다. 병합 도구의 `authorize` 하위 명령이 ready를 authorized로 한 번 올린다. 사본 시험은 `python scripts/merge_sqlite_stores.py authorize --root <게시 root> --run-kind copy-test --verification-pass <독립 검증 PASS 파일> --copy-test-run-id <식별자> --apply`로, 운영은 `--run-kind production --verification-pass <독립 검증 PASS 파일> --copy-test-pass <사본 시험 PASS 파일> --apply`로 실행한다. `--apply`가 없으면 점검만 하고 root를 바꾸지 않는다. 이 명령은 PASS 파일의 존재와 형태만 본다. 성공하면 사본 시험 실행은 독립 검증 PASS 파일 하나의 sha256을, 운영 실행은 두 PASS 파일의 sha256을 stderr의 `authorize applied` 줄에 찍는다. 그 값을 실행 기록과 대조하는 일은 호출자의 몫이다.
 2. 대장, manifest, marker, metadata 행이 서로 맞아야 한다. 어긋나면 거부된다(T-E2).
 3. `STORAGE_MODE=local`이고 sqlite-vec 벡터 백엔드이며 `SINGLE_SQLITE_FILE`이 root 안 `single.db`의 절대 경로여야 한다(T-E3 `test_single_rejects_bad_settings`).
 4. 설정의 `LOCAL_DATA_DIR`과 환경변수 `LOCAL_DATA_DIR`이 모두 root와 같아야 한다. `write.lock`과 `billing.db.lock`과 삭제 저널 디렉터리가 root 아래에 놓이기 때문이다(T-E3).

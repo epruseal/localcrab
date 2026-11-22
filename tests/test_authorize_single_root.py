@@ -406,6 +406,15 @@ def test_bt_e7_binding_mismatch_mvp(ready, capsys, variant):
     _reject_case(ctx, capsys, "binding differs: " + text)
 
 
+@pytest.mark.parametrize("content, text", [(b"{", "binding JSON is invalid"), (b"[]", "binding JSON is not an object")],
+                         ids=["broken", "list"])
+@pytest.mark.parametrize("name", ["ledger.json", "manifest.json", "marker.json"])
+def test_bt_e7c_binding_file_invalid(ready, capsys, name, content, text):
+    """BT-E7c [MLP] 결속 파일 하나가 JSON이 아니거나 객체가 아니다. 사유는 파일 형태 거부로 시작한다."""
+    (ready.root / name).write_bytes(content)
+    _reject_case(ready, capsys, "binding file is invalid: " + text)
+
+
 @pytest.mark.parametrize("rows", [0, 2])
 def test_bt_e7b_metadata_row_count_mvp(ready, capsys, rows):
     """BT-E7b [MVP] single_file_metadata 행이 0개나 2개다."""
@@ -912,6 +921,22 @@ def test_bt_e19j_root_swapped_before_write(ready, tmp_path, monkeypatch, capsys)
     _assert_write_failed(rc, err, "root directory differs after write", "ready")
     assert (ready.root / "ledger.json").read_bytes() == old_bytes
     assert os.listdir(ready.root) == ["ledger.json"]
+    assert (moved / "ledger.json").read_bytes() == _authorized_bytes(json.loads(old_bytes))
+
+
+def test_bt_e19k_root_swapped_to_empty_directory_reports_unreadable(ready, tmp_path, monkeypatch, capsys):
+    """BT-E19k [MLP] 교체된 root에 ledger.json이 없다. 관찰 상태는 unreadable이다(W10 변형)."""
+    moved = tmp_path / "published.moved"
+    old_bytes = (ready.root / "ledger.json").read_bytes()
+
+    def swap():
+        os.rename(ready.root, moved)
+        os.mkdir(ready.root)
+
+    _after_preflight(monkeypatch, swap)
+    rc, err = _run(_cmd(ready), capsys)
+    _assert_write_failed(rc, err, "root directory differs after write", "unreadable")
+    assert os.listdir(ready.root) == []
     assert (moved / "ledger.json").read_bytes() == _authorized_bytes(json.loads(old_bytes))
 
 
