@@ -1457,8 +1457,13 @@ def packs_backfill_pack_id(
         from dataclasses import asdict
 
         from opencrab.locking import write_lock
+        from opencrab.stores._single_file import reject_single_root
         from opencrab.stores.factory import make_graph_store
 
+        # B11: without SINGLE_SQLITE_FILE a single root is refused before the lock exists.
+        # Single mode keeps its own refusal (T-E8 d).
+        if not cfg.single_sqlite_file:
+            reject_single_root(cfg.local_data_dir)
         # #630: hold write.lock from the plan to the close of the store.
         # Another writer then cannot change the graph between the plan and
         # the write, and cannot see this write inside its own hold. The store
@@ -1837,8 +1842,12 @@ def packs_source_fts_orphans(apply_changes: bool) -> None:
         return
 
     from opencrab.locking import write_lock
+    from opencrab.stores._single_file import reject_single_root
     from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
+    # B11: same rule as backfill-pack-id. A single root is refused before write.lock exists.
+    if not cfg.single_sqlite_file:
+        reject_single_root(cfg.local_data_dir)
     # #630 pattern: take write.lock first. The store bootstrap takes the same
     # lock file again on this thread, which file_lock allows. Only the
     # acquisition timeout is converted.

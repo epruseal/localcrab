@@ -622,6 +622,45 @@ def test_t11_e22_import_pack_graph_rejects_before_connecting_or_writing_status(t
     assert not (root / "packs").exists() and not (root / "deep").exists()
 
 
+@pytest.mark.parametrize("command", ["backfill-pack-id", "source-fts-orphans"])
+def test_t11_e23_pack_admin_cli_rejects_before_write_lock(tmp_path, monkeypatch, command):
+    """T11-E23: packs backfill-pack-id와 source-fts-orphans의 --apply가 write.lock을 잡기 전에 거부한다.
+
+    두 명령은 graph.db나 doc_store.db가 있어야 잠금에 닿는다. 표식이 있는 디렉터리에 그 파일을 함께 둔 혼합
+    디렉터리로 시험한다.
+    """
+    from click.testing import CliRunner
+
+    from opencrab.cli import main
+
+    root = _synthetic_root(tmp_path, ("ledger.json", "graph.db", "doc_store.db"))
+    _env(monkeypatch, root)
+    before = _snapshot(root)
+    result = CliRunner().invoke(main, ["packs", command, "--apply"])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RuntimeError), repr(result.exception)
+    assert _msg() in str(result.exception)
+    assert not (root / "write.lock").exists()
+    assert _snapshot(root) == before
+
+
+def test_t11_e24_backfill_space_rejects_before_missing_check_and_lock(tmp_path, monkeypatch, capsys):
+    """T11-E24: backfill_space.main이 단일 root에서 write.lock과 저장소 파일 열기 앞에 종료 코드 2로 거부한다."""
+    module = _script("backfill_space")
+    root = _synthetic_root(tmp_path, ("ledger.json", "graph.db", "doc_store.db", "vectors.db", "opencrab.db"))
+    _env(monkeypatch, root)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    before = _snapshot(root)
+    code = module.main(["--dry-run-scratch", str(scratch)])
+    err = capsys.readouterr().err
+    assert code == 2, err
+    assert _msg() in err, err
+    assert _snapshot(root) == before
+    assert not (root / "write.lock").exists()
+    assert list(scratch.iterdir()) == []
+
+
 @pytest.mark.parametrize("variant", ["a_defaults_via_main", "b_output_root_under_root", "c_local_data_dir_is_root"])
 def test_t11_e21_build_nemotron_rejects_before_stage_mkdir(tmp_path, monkeypatch, variant):
     """T11-E21: build_nemotron_personas_korea_pack이 stage 디렉터리를 만들기 전에 거부한다."""

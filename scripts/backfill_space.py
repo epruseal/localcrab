@@ -2056,6 +2056,13 @@ def main(argv: list[str] | None = None, before_commit: Any = None) -> int:
     if cfg.single_sqlite_file:
         print("single SQLite mode is not supported by this tool", file=sys.stderr)
         return 2
+    from opencrab.stores._single_file import reject_single_root
+
+    try:
+        reject_single_root(cfg.local_data_dir)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if cfg.storage_mode != "local" or cfg.vector_backend_resolved != "sqlite-vec":
         print(
             "only STORAGE_MODE=local with the sqlite-vec vector backend is supported",
