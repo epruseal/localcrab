@@ -661,6 +661,92 @@ def test_t11_e24_backfill_space_rejects_before_missing_check_and_lock(tmp_path, 
     assert list(scratch.iterdir()) == []
 
 
+@pytest.fixture
+def _real_crabharness(monkeypatch):
+    """이 체크아웃의 crabharness 패키지를 import 경로 맨 앞에 두고, 끝나면 모듈 등록부를 되돌린다."""
+    repo_root = Path(__file__).resolve().parent.parent
+    removed = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name == "crabharness" or name.startswith("crabharness.")
+    }
+    monkeypatch.syspath_prepend(str(repo_root / "crabharness"))
+    yield
+    for name in list(sys.modules):
+        if name == "crabharness" or name.startswith("crabharness."):
+            del sys.modules[name]
+    sys.modules.update(removed)
+
+
+def _write_crabharness_package(tmp_path: Path) -> str:
+    import json
+
+    package = {
+        "package_id": "pkg-1",
+        "mission_id": "mis-1",
+        "run_id": "run-1",
+        "nodes": [{"space": "resource", "node_type": "Dataset", "node_id": "ds1", "properties": {}}],
+        "edges": [],
+    }
+    path = tmp_path / "package.json"
+    path.write_text(json.dumps(package), encoding="utf-8")
+    return str(path)
+
+
+def test_t11_e25_crabharness_apply_rejects_before_write_lock(tmp_path, monkeypatch, _real_crabharness):
+    """T11-E25: crabharness의 apply_promotion_package가 write.lock을 잡기 전에 단일 root를 거부한다."""
+    from crabharness.apply import apply_promotion_package
+
+    root = _synthetic_root(tmp_path)
+    _env(monkeypatch, root)
+    package = _write_crabharness_package(tmp_path)
+    _expect_rejected_and_unchanged(root, lambda: apply_promotion_package(package))
+    assert not (root / "write.lock").exists()
+
+
+@pytest.mark.parametrize("entry", ["crabharness_apply", "source_fts_orphans_apply"])
+def test_t11_g10_single_mode_still_reaches_write_lock(tmp_path, monkeypatch, _real_crabharness, entry):
+    """T11-G10: 단일 모드에서는 root의 write.lock이 정상 구성원이다. 두 진입이 B11 거부에 막히지 않고 잠금에 닿는다.
+
+    crabharness apply와 packs source-fts-orphans --apply는 SINGLE_SQLITE_FILE이 있을 때 거부 지점을 건너뛰어야 한다.
+    write_lock을 가로채 닿았는지 본다.
+    """
+    import shutil
+
+    from opencrab import locking
+    from tests.test_factory_single_file import _single_env
+
+    built = _authorized(tmp_path, monkeypatch)
+    _single_env(monkeypatch, built.root)
+    reached = []
+
+    class _ReachedLockError(Exception):
+        pass
+
+    real_write_lock = locking.write_lock
+
+    def spy(*args, **kwargs):
+        reached.append(1)
+        if entry == "crabharness_apply":
+            raise _ReachedLockError
+        return real_write_lock(*args, **kwargs)
+
+    monkeypatch.setattr(locking, "write_lock", spy)
+    if entry == "crabharness_apply":
+        from crabharness.apply import apply_promotion_package
+
+        with pytest.raises(_ReachedLockError):
+            apply_promotion_package(_write_crabharness_package(tmp_path))
+    else:
+        from click.testing import CliRunner
+
+        from opencrab.cli import main
+
+        shutil.copy2(tmp_path / "live" / "doc_store.db", built.root / "doc_store.db")
+        CliRunner().invoke(main, ["packs", "source-fts-orphans", "--apply"])
+    assert reached
+
+
 @pytest.mark.parametrize("variant", ["a_defaults_via_main", "b_output_root_under_root", "c_local_data_dir_is_root"])
 def test_t11_e21_build_nemotron_rejects_before_stage_mkdir(tmp_path, monkeypatch, variant):
     """T11-E21: build_nemotron_personas_korea_pack이 stage 디렉터리를 만들기 전에 거부한다."""

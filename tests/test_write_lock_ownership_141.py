@@ -432,6 +432,8 @@ def test_apply_promotion_package_holds_write_lock_across_live_write(tmp_path, mo
 
     class _FakeSettings:
         local_data_dir = str(tmp_path)
+        # B11: 적용 함수가 단일 모드 여부를 읽는다. 실제 Settings의 기본값과 같다.
+        single_sqlite_file = ""
 
     def fake_make_graph_store(settings):
         # 별도 스레드에서 같은 디렉터리 write.lock 을 즉시(0.05s 타임아웃)
