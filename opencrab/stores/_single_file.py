@@ -223,7 +223,7 @@ def reject_unmanaged_single_file(db_path: str) -> None:
     롤백일 때만 그 결과를 쓴다. 판정할 수 없으면 거부한다(fail-closed). 롤백 DB에 hot journal이 남아
     읽기 전용 연결이 회복하지 못하면(READONLY) rw 연결로 저널을 회복한 뒤 판정한다.
 
-    잔여 위험(설계 문서 5절): immutable 읽기는 스키마를 바꾸는 중인 롤백 파일이나 merge 부분 파일이나
+    잔여 위험(전환 문서 7.3절): immutable 읽기는 스키마를 바꾸는 중인 롤백 파일이나 merge 부분 파일이나
     저널 회복 중인 파일에서 틀린 결과를 낼 수 있다. 관리 밖에서 롤백 모드로 바꾼 단일 파일 사본에도
     같은 오판 가능성이 있다. 게시된 단일 파일은 늘 WAL이라 이 경로에 닿지 않는다.
     hot journal 회복 재시도는 저널 회복이라는 쓰기를 한다. finalize 중에 종료해 hot journal이 남은

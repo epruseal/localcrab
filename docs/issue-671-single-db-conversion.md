@@ -99,7 +99,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
   1. `write.lock`을 잡고 서비스를 정지한다(서비스 매니저로 정지한다).
   2. 다섯 파일 전체를 백업한다. 백업 사본으로 복구 시험을 먼저 한다.
   3. 병합 도구를 계획 모드로 돌려 이름 충돌과 쪽 크기를 확인한다.
-  4. 병합 도구를 `--apply --verify`로 돌린다. 출력은 `.partial`로 만들어지고 검증을 통과해야 게시된다. 게시는 파일 fsync, `os.link`로 새 이름 연결과 `.partial` 제거, 디렉터리 fsync 순서다(기존 대상은 덮어쓰지 않는다)(복사 중에는 `synchronous=OFF`이므로 게시 전 fsync가 내용 내구성을 보장한다). 전원 손실 내구성 자체는 이번 측정에서 시험하지 않았다.
+  4. 병합 도구를 `--apply --verify`로 돌린다. 출력은 `.partial`로 만들어지고 검증을 통과해야 게시된다. 게시는 파일 fsync, `os.link`로 새 이름 연결과 `.partial` 제거, 디렉터리 fsync 순서이며 기존 대상은 덮어쓰지 않는다. 복사 중에는 `synchronous=OFF`이므로 게시 전 fsync가 내용 내구성을 보장한다. 전원 손실 내구성 자체는 이번 측정에서 시험하지 않았다.
   5. 게시 전후에 실데이터 질의를 한다(아래 받아들임 기준).
   6. 설정에 단일 파일 경로를 넣고 서비스를 시작한다. 원본 다섯 파일은 보존 기간 동안 건드리지 않는다.
 - billing: `billing_events`와 `idx_billing_tenant`가 registry와 이름이 겹친다. billing은 #105의 격리 사유도 있어 기본 결정은 분리 유지다. 합치려면 한쪽 테이블 이름을 바꾸고 `BillingHooks`의 이름을 함께 바꾸는 변경이 필요하다. 기록 문서의 billing 판정이 "병합 가능"일 때만 이 변경을 이 단계에 넣는다.
@@ -167,7 +167,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 
 ### 7.2 전환 전제
 
-1. 게시된 root의 대장 state가 authorized여야 한다. ready나 staged는 거부된다(T-E1).
+1. 게시된 root의 대장 state가 authorized여야 한다. ready나 staged는 거부된다(T-E1). 게시 도구는 대장을 ready까지만 올린다. 병합 도구의 `authorize` 하위 명령이 ready를 authorized로 한 번 올린다. 사본 시험은 `python scripts/merge_sqlite_stores.py authorize --root <게시 root> --run-kind copy-test --verification-pass <독립 검증 PASS 파일> --copy-test-run-id <식별자> --apply`로, 운영은 `--run-kind production --verification-pass <독립 검증 PASS 파일> --copy-test-pass <사본 시험 PASS 파일> --apply`로 실행한다. `--apply`가 없으면 점검만 하고 root를 바꾸지 않는다. 이 명령은 PASS 파일의 존재와 형태만 보고 두 파일의 sha256을 stderr의 `authorize applied` 줄에 찍는다. 그 값을 실행 기록과 대조하는 일은 호출자의 몫이다.
 2. 대장, manifest, marker, metadata 행이 서로 맞아야 한다. 어긋나면 거부된다(T-E2).
 3. `STORAGE_MODE=local`이고 sqlite-vec 벡터 백엔드이며 `SINGLE_SQLITE_FILE`이 root 안 `single.db`의 절대 경로여야 한다(T-E3 `test_single_rejects_bad_settings`).
 4. 설정의 `LOCAL_DATA_DIR`과 환경변수 `LOCAL_DATA_DIR`이 모두 root와 같아야 한다. `write.lock`과 `billing.db.lock`과 삭제 저널 디렉터리가 root 아래에 놓이기 때문이다(T-E3).
@@ -186,9 +186,10 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 
 ### 7.4 롤백
 
-서비스를 멈춘 뒤 `SINGLE_SQLITE_FILE`을 비우고 `LOCAL_DATA_DIR`을 전환 전 데이터 디렉터리로 되돌린다. 두 설정을 함께 바꾼다. 7.2의 5번에서 root로 옮긴 `packs/`와 저널도 전환 전 디렉터리로 되돌린다. `SINGLE_SQLITE_FILE`만 비우면 `LOCAL_DATA_DIR`이 root인 채로 다중 파일 factory가 root에 빈 `graph.db`, `doc_store.db`, `vectors.db`, `opencrab.db`를 만든다. 단일 모드에서 쓴 데이터는 이전 파일에 없다. 그러므로 이 롤백은 단일 모드에서 새로 쓰기 전까지만 데이터 손실이 없다. 설정이 비어 있는 경로는 코드를 되돌리지 않아도 이전과 같다(T-N1).
+서비스를 멈춘 뒤 `SINGLE_SQLITE_FILE`을 비우고 `LOCAL_DATA_DIR`을 전환 전 데이터 디렉터리로 되돌린다. 두 설정을 함께 바꾼다. 7.2의 5번에서 root로 옮긴 `packs/`와 저널도 전환 전 디렉터리로 되돌린다. `SINGLE_SQLITE_FILE`만 비우면 `LOCAL_DATA_DIR`이 root인 채로 다중 파일 factory가 root에 빈 `graph.db`, `doc_store.db`, `vectors.db`, `opencrab.db`를 만든다. 단일 모드에서 쓴 데이터는 이전 파일에 없다. 그러므로 이 롤백은 단일 모드에서 새로 쓰기 전까지만 데이터 손실이 없다. 설정이 비어 있는 경로는 코드를 되돌리지 않아도 이전과 같다(T-N1). authorized 상태는 되돌리는 명령이 없다. 게시 root를 되돌릴 때는 root를 보존 이름으로 옮긴다.
 
 ### 7.5 재현 명령
 
 - factory 단일 모드 시험: `python -m pytest tests/test_factory_single_file.py tests/test_factory_storage_modes.py`.
+- authorize 하위 명령 시험: `python -m pytest tests/test_authorize_single_root.py`.
 - 이 절의 문서 점검: 저장소 루트에서 `rg -nP` 패턴으로 머신 경로와 커밋 해시를 찾아 0건(종료 코드 1)임을 확인한다.
