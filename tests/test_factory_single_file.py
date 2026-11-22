@@ -1225,9 +1225,6 @@ def test_single_factory_bm25_missing_object_turns_off(tmp_path, monkeypatch, var
 # S5: 우회 경로 거부(#671)
 # ---------------------------------------------------------------------------
 
-_AUTH_REFUSAL = "single SQLite authentication is not wired"
-
-
 def _single_env(monkeypatch, root: Path) -> None:
     """get_settings()가 단일 모드 설정을 읽게 환경변수를 맞춘다."""
     from opencrab.config import get_settings
@@ -1236,13 +1233,6 @@ def _single_env(monkeypatch, root: Path) -> None:
     monkeypatch.setenv("STORAGE_MODE", "local")
     monkeypatch.setenv("SINGLE_SQLITE_FILE", str(root / "single.db"))
     get_settings.cache_clear()
-
-
-def _assert_no_auth_files(root: Path, before: list[str]) -> None:
-    names = _names(root)
-    assert names == before, names
-    assert "opencrab.db" not in names
-    assert "bootstrap.lock" not in names
 
 
 def _http_post(token: str = "tok"):
@@ -1256,31 +1246,6 @@ def _http_post(token: str = "tok"):
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         headers={"Authorization": f"Bearer {token}"},
     )
-
-
-@pytest.mark.parametrize("path", ["require_local_principal", "maybe_bootstrap_on_empty", "http_auth_store"])
-def test_single_mode_refuses_auth_bypass_paths(tmp_path, monkeypatch, path):
-    """T-E7(F-20): 단일 모드에서는 인증 세 경로가 옛 opencrab.db를 열기 전에 거부한다.
-
-    게시 root에는 opencrab.db가 없으므로 거부가 부재 검사보다 앞서야 도달한다. root에 새 파일이 생기지 않는다.
-    """
-    from opencrab.auth import maybe_bootstrap_on_empty, require_local_principal
-
-    built = _authorized_root(tmp_path, monkeypatch)
-    _single_env(monkeypatch, built.root)
-    before = _names(built.root)
-    assert "opencrab.db" not in before
-    if path == "require_local_principal":
-        with pytest.raises(RuntimeError, match=_AUTH_REFUSAL):
-            require_local_principal()
-    elif path == "maybe_bootstrap_on_empty":
-        monkeypatch.setenv("OPENCRAB_BOOTSTRAP_ON_EMPTY", "1")
-        with pytest.raises(RuntimeError, match=_AUTH_REFUSAL):
-            maybe_bootstrap_on_empty()
-    else:
-        with pytest.raises(RuntimeError, match=_AUTH_REFUSAL):
-            _http_post()
-    _assert_no_auth_files(built.root, before)
 
 
 def test_auth_paths_with_empty_setting_keep_current_behavior(tmp_path, monkeypatch):

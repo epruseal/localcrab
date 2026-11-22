@@ -456,6 +456,11 @@ def token_store_unavailable_reason(exc: BaseException) -> str | None:
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+    from opencrab.stores._single_file import SingleFileUnavailableError
+
+    if isinstance(exc, SingleFileUnavailableError):
+        # 단일 SQLite 인증 저장소를 열지 못했다(#671). make_auth_sql_store가 이유를 이미 정했다.
+        return exc.reason
     if isinstance(exc, PoolTimeoutError):
         return "store-unavailable"
     if isinstance(exc, sqlite3.OperationalError):
@@ -572,6 +577,12 @@ def principal_scope(principal: Principal) -> Iterator[None]:
 # calls the same two functions cli.py's `serve --transport stdio` does.
 # ---------------------------------------------------------------------------
 
+_SINGLE_NOT_BOOTSTRAPPED = (
+    "No local user exists in the single SQLite database. A single root takes its users from the "
+    "merge input. This process does not create users."
+)
+
+
 def require_local_principal() -> Principal:
     """Return the enabled local-user Principal, or raise with what to do.
 
@@ -599,69 +610,64 @@ def require_local_principal() -> Principal:
     missing file. A *connection* failure is not: swallowing it as "run init"
     would send an operator chasing the wrong problem.
     """
-    from pathlib import Path
-
     from opencrab.config import get_settings
-    from opencrab.stores.sql_store import SQLStore
+    from opencrab.stores.factory import make_auth_sql_store
 
     settings = get_settings()
-    # 단일 모드 거부는 opencrab.db 부재 검사보다 앞이다. 게시 root에는 그 파일이 없어 뒤에 두면 닿지 않는다(#671).
-    from opencrab.stores._single_file import reject_single_file_mode
-
-    reject_single_file_mode(settings)
-    not_bootstrapped = RuntimeError(
-        "No local user is bootstrapped. Run 'opencrab init' first -- it "
-        "creates the local user and issues its first token. (Looked for a "
-        f"local user under {settings.local_data_dir!r}. If this process is "
-        "a stdio MCP server with an explicit LOCAL_DATA_DIR, set "
-        "OPENCRAB_BOOTSTRAP_ON_EMPTY=1 to bootstrap it automatically "
-        "instead of running 'opencrab init' by hand -- see #245.)"
-    )
-
-    if settings.is_local:
-        # File first: on SQLite, *connecting* to a missing path creates it.
-        if not Path(settings.local_data_dir, "opencrab.db").is_file():
-            raise not_bootstrapped
-        url = settings.sqlite_url
+    if settings.single_sqlite_file:
+        # 단일 root의 사용자는 병합 입력에서 온다. init과 bootstrap-on-empty는 사용자를 만들지 않으므로
+        # 그 안내를 따르면 막다른 길이다(#671).
+        not_bootstrapped = RuntimeError(_SINGLE_NOT_BOOTSTRAPPED)
     else:
-        # docker and pg both mean PostgreSQL. No file to check, and
-        # `make_sql_store` is not used here because it would take SQLStore's
-        # default create_tables=True and run DDL -- this function must not.
-        url = settings.postgres_url
-
-    sql = SQLStore(url=url, create_tables=False)
-
-    if not getattr(sql, "available", False):
-        # SQLStore swallows the connect error into a log line and a False
-        # flag, so the reason is not retrievable here. What IS known: the
-        # local file existed (checked above) or this is a remote database.
-        # Either way the store failed to open, which is not the same thing as
-        # "you have not run init" -- reporting it as that would send an
-        # operator to fix the wrong problem.
-        raise RuntimeError(
-            "Could not open the SQL store. This is not a missing bootstrap -- "
-            "the database exists (or is remote) but did not connect. Check the "
-            "preceding 'SQL store unavailable' log line for the driver error, "
-            "then the file permissions or the PostgreSQL connection settings."
+        not_bootstrapped = RuntimeError(
+            "No local user is bootstrapped. Run 'opencrab init' first -- it "
+            "creates the local user and issues its first token. (Looked for a "
+            f"local user under {settings.local_data_dir!r}. If this process is "
+            "a stdio MCP server with an explicit LOCAL_DATA_DIR, set "
+            "OPENCRAB_BOOTSTRAP_ON_EMPTY=1 to bootstrap it automatically "
+            "instead of running 'opencrab init' by hand -- see #245.)"
         )
 
-    try:
-        principal = get_local_user(sql)
-    except Exception as exc:  # noqa: BLE001
-        # Distinguish "no users table yet" (not bootstrapped) from a real
-        # query/driver failure, which must surface as itself.
-        if _looks_like_missing_table(exc):
-            raise not_bootstrapped from exc
-        raise
-
-    if principal is None:
+    # make_auth_sql_store keeps the no-create rule: no DDL, and on SQLite no connect to a missing
+    # opencrab.db. None means there is demonstrably nothing to look up.
+    sql = make_auth_sql_store(settings)
+    if sql is None:
         raise not_bootstrapped
-    if principal.disabled:
-        raise RuntimeError(
-            f"The local user ({principal.user_id}) is disabled. Re-enable it "
-            f"with 'opencrab user enable {principal.user_id}'."
-        )
-    return principal
+    try:
+        if not getattr(sql, "available", False):
+            # SQLStore swallows the connect error into a log line and a False
+            # flag, so the reason is not retrievable here. What IS known: the
+            # local file existed (checked above) or this is a remote database.
+            # Either way the store failed to open, which is not the same thing as
+            # "you have not run init" -- reporting it as that would send an
+            # operator to fix the wrong problem.
+            raise RuntimeError(
+                "Could not open the SQL store. This is not a missing bootstrap -- "
+                "the database exists (or is remote) but did not connect. Check the "
+                "preceding 'SQL store unavailable' log line for the driver error, "
+                "then the file permissions or the PostgreSQL connection settings."
+            )
+
+        try:
+            principal = get_local_user(sql)
+        except Exception as exc:  # noqa: BLE001
+            # Distinguish "no users table yet" (not bootstrapped) from a real
+            # query/driver failure, which must surface as itself.
+            if _looks_like_missing_table(exc):
+                raise not_bootstrapped from exc
+            raise
+
+        if principal is None:
+            raise not_bootstrapped
+        if principal.disabled:
+            raise RuntimeError(
+                f"The local user ({principal.user_id}) is disabled. Re-enable it "
+                f"with 'opencrab user enable {principal.user_id}'."
+            )
+        return principal
+    finally:
+        # 단일 모드에서 닫지 않으면 공유 파일의 소유자가 남아 수명 잠금을 쥔 채로 둔다.
+        _close_store(sql)
 
 
 def _looks_like_missing_table(exc: Exception) -> bool:
@@ -839,12 +845,22 @@ def maybe_bootstrap_on_empty() -> Principal | None:
 
     from opencrab.config import get_settings
     from opencrab.locking import file_lock
-    from opencrab.stores._single_file import reject_single_file_mode, reject_single_root
+    from opencrab.stores._single_file import reject_single_root
+    from opencrab.stores.factory import make_auth_sql_store
     from opencrab.stores.sql_store import SQLStore
 
     settings = get_settings()
-    # 단일 모드는 SQLStore와 bootstrap.lock을 만들기 전에 거부한다(#671).
-    reject_single_file_mode(settings)
+    if settings.single_sqlite_file:
+        # 단일 모드는 읽기만 한다(#671). 단일 root의 사용자는 병합이 가져온 것이므로 만들지 않는다. 결속 검증이
+        # 잘못된 디렉터리를 이미 막으므로 아래 G2~G4와 reject_single_root는 비단일 모드만 지난다.
+        # 열기 오류는 삼키지 않고 호출자에게 올린다. None은 사용자 없음과 비활성 사용자에만 쓴다. 그때
+        # 호출자가 require_local_principal의 진단을 낸다.
+        sql = make_auth_sql_store(settings)
+        try:
+            outcome = _discover_local_user(sql)
+        finally:
+            _close_store(sql)
+        return None if outcome is _NOT_FOUND else outcome
 
     # G2: exactly "local" -- narrower than settings.is_local (also true for
     # "kuzu"), since the plugin contract pins a local sqlite store only.

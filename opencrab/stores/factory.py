@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from functools import lru_cache
@@ -18,6 +19,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from opencrab.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=8)
@@ -382,6 +385,53 @@ def make_sql_store(settings: Settings) -> Any:
     url = settings.postgres_url if settings.storage_mode in ("docker", "pg") else settings.sqlite_url
     engine = _get_pg_engine(url) if settings.storage_mode == "pg" else None
     return SQLStore(url=url, engine=engine)
+
+
+def make_auth_sql_store(settings: Settings) -> Any:
+    """인증 조회용 SQL 저장소를 연다. 조회할 것이 없다고 확정되면 None을 돌려준다(비단일 모드만).
+
+    인증 경로 셋(require_local_principal, maybe_bootstrap_on_empty, HTTP 토큰 조회)이 이 함수 하나를
+    지난다. 모두 읽기만 하므로 create_tables=False로 연다. DDL을 돌리면 write.lock과 새 파일이 생긴다.
+
+    단일 모드는 공유 파일 위에서 열고 결속 검증을 거친다. 열기 단계의 오류(RuntimeError, ValueError,
+    OSError, sqlite3.Error)는 SingleFileUnavailableError로 바꿔 올린다. HTTP 조회가 이 예외를 503으로
+    답하게 하려는 것이다. 비가용 저장소는 닫고 같은 예외를 올려, 호출자에게 공유 파일의 소유자가 새지
+    않게 한다. 비단일 모드는 옛 규칙 그대로다. 로컬 모드는 opencrab.db가 파일로 없으면 None이다(연결이
+    파일을 만들기 때문이다). 비가용 저장소는 그대로 돌려준다.
+    """
+    import sqlite3
+
+    from opencrab.stores._single_file import SingleFileUnavailableError, sqlite_busy_or_locked
+    from opencrab.stores.sql_store import SQLStore
+
+    if getattr(settings, "single_sqlite_file", ""):
+        try:
+            path = _single_mode_checks(settings)
+            shared = _open_single_file(path)
+            store = _build_on_single_file(
+                shared, lambda: SQLStore(url=f"sqlite:///{path}", create_tables=False, shared=shared)
+            )
+            if not getattr(store, "available", False):
+                store.close()
+                raise SingleFileUnavailableError("single SQLite store is not available")
+            return store
+        except SingleFileUnavailableError:
+            raise
+        except sqlite3.Error as exc:
+            reason = "store-busy" if sqlite_busy_or_locked(exc) else "store-unavailable"
+            logger.warning("single SQLite auth store open failed (%s): %s", reason, exc)
+            raise SingleFileUnavailableError(str(exc), reason=reason) from exc
+        except (RuntimeError, ValueError, OSError) as exc:
+            reason = "store-busy" if isinstance(exc, TimeoutError) else "store-unavailable"
+            logger.warning("single SQLite auth store open failed (%s): %s", reason, exc)
+            raise SingleFileUnavailableError(str(exc), reason=reason) from exc
+    if settings.is_local:
+        from pathlib import Path
+
+        if not Path(settings.local_data_dir, "opencrab.db").is_file():
+            return None
+        return SQLStore(url=settings.sqlite_url, create_tables=False)
+    return SQLStore(url=settings.postgres_url, create_tables=False)
 
 
 def make_billing_sql_store(settings: Settings, sql_store: Any) -> Any:

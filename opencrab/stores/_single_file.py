@@ -167,14 +167,17 @@ def failed_shared_file(db_path: str) -> SharedSqliteFile | None:
         return next(iter(objects), None)
 
 
-def reject_single_file_mode(settings: Any) -> None:
-    """단일 SQLite 모드에서는 인증 저장소를 옛 opencrab.db로 여는 경로를 거부한다(#671).
+class SingleFileUnavailableError(RuntimeError):
+    """단일 SQLite 인증 저장소를 지금 열지 못했다(#671).
 
-    단일 DB가 사용자와 토큰과 팩 소유권을 함께 담는다. 인증이 옛 파일을 따로 열면 두 저장소가 갈라진다.
-    공유 객체 연결은 후속 단위가 맡고 그때까지 이 거부가 막는다.
+    ``reason``은 호출자가 503으로 답할 때 쓰는 이유 코드다. 잠금이 풀리면 열리는 경우는 "store-busy"이고
+    그 밖의 열기 실패(미승인, 결속 불일치, 설정 오류, 잠금이 아닌 sqlite3 오류, 비가용 저장소)는
+    "store-unavailable"이다. 원 예외는 ``__cause__``에 남는다.
     """
-    if getattr(settings, "single_sqlite_file", ""):
-        raise RuntimeError("single SQLite authentication is not wired")
+
+    def __init__(self, message: str, reason: str = "store-unavailable") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 # 보호 검사가 파일 모드별로 기다리는 시간(초)이다. WAL 파일은 `_new_conn`의 기본 대기와 같다.

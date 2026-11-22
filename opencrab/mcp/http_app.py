@@ -562,26 +562,16 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
         ``_auth_store`` returns it unchanged, and ``_lookup`` answers 503 for it.
         """
         if not auth_sql:
-            from pathlib import Path
-
             from opencrab.config import get_settings
-            from opencrab.stores.sql_store import SQLStore
+            from opencrab.stores.factory import make_auth_sql_store
 
-            settings = get_settings()
-            # 단일 모드는 opencrab.db 부재 시 None(401)을 돌려주기 전에 거부한다(#671).
-            from opencrab.stores._single_file import reject_single_file_mode
-
-            reject_single_file_mode(settings)
-            if settings.is_local:
-                # Same reason as opencrab.auth.require_local_principal: on
-                # SQLite, *connecting* to a missing path creates it. An
-                # unauthenticated request must not leave a database behind.
-                if not Path(settings.local_data_dir, "opencrab.db").is_file():
-                    return None
-                url = settings.sqlite_url
-            else:
-                url = settings.postgres_url
-            store = SQLStore(url=url, create_tables=False)
+            # One rule for every auth path (opencrab.auth.require_local_principal too): no DDL, and on
+            # SQLite no connect to a missing opencrab.db, since an unauthenticated request must not leave a
+            # database behind. None means there is nothing to look up (401). A single SQLite file that
+            # cannot be opened raises SingleFileUnavailableError, which _lookup answers with 503 (#671).
+            store = make_auth_sql_store(get_settings())
+            if store is None:
+                return None
             if not getattr(store, "available", False):
                 # Do NOT cache a store that failed to connect. SQLStore
                 # swallows a connect failure into `available = False` and
