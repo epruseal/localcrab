@@ -392,7 +392,7 @@ def test_pg_shared_uow_commit_and_rollback(pg_engine, monkeypatch) -> None:
         pg_engine, embedding_function=_fake_embed(4), dim=4,
         collection_name=table, pg_uow=uow,
     )
-    sql = SQLStore(str(pg_engine.url), engine=pg_engine, pg_uow=uow)
+    sql = SQLStore(pg_engine.url.render_as_string(hide_password=False), engine=pg_engine, pg_uow=uow)
     owner = None
     pack = f"p{suffix}"
     try:
@@ -403,10 +403,10 @@ def test_pg_shared_uow_commit_and_rollback(pg_engine, monkeypatch) -> None:
             with monkeypatch.context() as patch:
                 patch.setattr(docs, "upsert_node_doc", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("doc failure")))
                 receipt = OntologyBuilder(graph, docs, sql, vec=vector).add_node(
-                    "space", "Type", f"b{suffix}", {"title": "t"}, pack_id=pack
+                    "subject", "User", f"b{suffix}", {"name": "t", "email": "t@example.com", "role": "admin"}, pack_id=pack
                 )
             assert receipt["stores"]["graph"] == "error: rolled back"
-        assert graph.get_node("Type", f"b{suffix}") is None
+        assert graph.get_node("User", f"b{suffix}") is None
         assert vector.get_by_id(f"b{suffix}") is None
         with pg_engine.connect() as conn:
             assert conn.execute(text("SELECT count(*) FROM ontology_nodes WHERE node_id=:id"), {"id": f"b{suffix}"}).scalar_one() == 0
