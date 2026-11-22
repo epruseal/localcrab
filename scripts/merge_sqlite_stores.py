@@ -35,6 +35,17 @@ WAL 모드 원본을 읽기 전용으로 열어도 SQLite가 원본 옆에 빈 `
 
 종료 코드: 0 성공, 1 병합이나 검증 실패, 2 사용법과 사전 점검 실패(이름 충돌 포함),
 3 디스크 여유 하한 위반이나 디스크 가득 참이다. 중단된 부분 파일은 보존한다.
+
+게시한 root를 쓰기 가능한 상태로 올리는 하위 명령(게시 도구는 대장을 ready까지만 올린다):
+    python merge_sqlite_stores.py authorize --root <게시 root> --run-kind copy-test \\
+        --verification-pass <독립 검증 PASS 파일> --copy-test-run-id <식별자> [--apply]
+    python merge_sqlite_stores.py authorize --root <게시 root> --run-kind production \\
+        --verification-pass <독립 검증 PASS 파일> --copy-test-pass <사본 시험 PASS 파일> [--apply]
+
+``--apply`` 없이 부르면 점검만 하고 root를 바꾸지 않는다. 적용은 root 안 ledger.json 하나만 바꾼다.
+PASS 파일은 존재와 형태만 본다. 성공하면 stderr에 두 파일의 sha256을 찍는다. 그 값의 대조는 호출자의 몫이다.
+종료 코드: 0 성공(점검만 성공 포함), 2 사용법과 점검 실패(root를 바꾸지 않았다)나 적용 뒤 정리 실패,
+1 쓰기 단계 실패(ledger는 옛 바이트일 수도 새 바이트일 수도 있다. stderr의 observed ledger state를 본다).
 """
 
 from __future__ import annotations
@@ -2109,7 +2120,362 @@ def _publication_exists(path: Path) -> bool:
     return True
 
 
+_AUTHORIZE_ERRORS = (MergeError, OSError, RuntimeError, ValueError, sqlite3.DatabaseError)
+_AUTHORIZE_KEYS = frozenset(("state", "root", "database", "db_uuid", "generation", "manifest_digest"))
+_AUTHORIZE_RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+
+
+def _authorize_root(root: Path) -> Path:
+    """BR2. root 경로가 게시 도구가 만든 정규 디렉터리 경로인지 본다."""
+    if not root.is_absolute():
+        raise MergeError("root path is not absolute")
+    if not root.name or root.name in (".", ".."):
+        raise MergeError("root name is invalid")
+    if os.path.realpath(root.parent) != str(root.parent) or os.path.realpath(root) != str(root):
+        raise MergeError("root path is not canonical")
+    try:
+        info = os.lstat(root)
+    except FileNotFoundError as exc:
+        raise MergeError("root directory is missing") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise MergeError("root path is not a directory")
+    return root
+
+
+def _authorize_evidence(paths: list[Path], root: Path) -> list[tuple[str, str]]:
+    """BR3과 D3. PASS 파일의 존재와 형태만 보고 (경로, sha256)를 돌려준다. 내용은 해석하지 않는다."""
+    result, identities = [], []
+    for path in paths:
+        try:
+            fd = os.open(path, _READ_FLAGS)
+        except FileNotFoundError as exc:
+            raise MergeError("evidence path is missing") from exc
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise MergeError("evidence path is a symlink") from exc
+            raise MergeError("evidence path is not readable") from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise MergeError("evidence path is not a regular file")
+            if info.st_size == 0:
+                raise MergeError("evidence file is empty")
+            digest = hashlib.sha256()
+            while chunk := os.read(fd, 1024 * 1024):
+                digest.update(chunk)
+        finally:
+            os.close(fd)
+        identities.append((info.st_dev, info.st_ino))
+        result.append((str(path), digest.hexdigest()))
+    if len(set(identities)) != len(identities):
+        raise MergeError("evidence files are not distinct")
+    for path in paths:
+        if os.path.commonpath((os.path.realpath(path), str(root))) == str(root):
+            raise MergeError("evidence path is inside root")
+    return result
+
+
+def _authorize_lock_identity(root: Path) -> tuple[int, int]:
+    """BR4. 바깥 잠금 파일이 이미 있어야 한다. 없으면 만들지 않고 거부한다."""
+    try:
+        info = os.lstat(root.parent / (root.name + ".lifetime.lock"))
+    except FileNotFoundError as exc:
+        raise MergeError("root lifetime lock is missing") from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise MergeError("root lifetime lock identity differs")
+    return info.st_dev, info.st_ino
+
+
+def _authorize_acquire(owner: _PublicationOwner, work: _PublicationWork, root: Path,
+                       identity: tuple[int, int]) -> Any:
+    """BR4. 바깥 잠금을 배타 비차단으로 잡고 획득한 파일이 사전 확인한 파일인지 다시 본다."""
+    try:
+        lock = owner.acquire_root_lock(root, work=work)
+    except BlockingIOError as exc:
+        raise MergeError("root lifetime lock is busy") from exc
+    except MergeError as exc:
+        if str(exc) == "publication lifetime lock identity differs":
+            raise MergeError("root lifetime lock identity differs") from exc
+        raise
+    held = os.fstat(lock.fileno())
+    if (held.st_dev, held.st_ino) != identity:
+        raise MergeError("root lifetime lock identity differs")
+    return lock
+
+
+def _authorize_read_intent(owner: _PublicationOwner, work: _PublicationWork, root: Path) -> dict[str, Any]:
+    from opencrab.stores._single_file import decode_binding_json, read_binding_fd
+
+    name = root.name + ".intent.json"
+    parent_fd = owner.open_fd("intent-parent", root.parent, _DIR_FLAGS, work=work)
+    try:
+        try:
+            info = os.lstat(name, dir_fd=parent_fd)
+        except FileNotFoundError as exc:
+            raise MergeError("intent is missing") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise MergeError("intent is invalid")
+        fd = owner.open_fd("intent", name, _READ_FLAGS, dir_fd=parent_fd, work=work)
+        try:
+            return decode_binding_json(read_binding_fd(parent_fd, name, fd))
+        except RuntimeError as exc:
+            raise MergeError("intent is invalid") from exc
+        finally:
+            _close_deferred(owner, "intent", fd, work)
+    finally:
+        _close_deferred(owner, "intent-parent", parent_fd, work)
+
+
+def _authorize_billing_matches(root_fd: int, billing: Any) -> bool:
+    """billing.db의 크기와 sha256을 manifest의 값에 대조한다. 읽는 방식은 R9와 같은 청크 pread다."""
+    if not isinstance(billing, dict):
+        return False
+    fd = os.open("billing.db", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+    try:
+        sha, size = hashlib.sha256(), 0
+        while chunk := os.pread(fd, 1024 * 1024, size):
+            sha.update(chunk)
+            size += len(chunk)
+    finally:
+        os.close(fd)
+    return size == billing.get("size") and sha.hexdigest() == billing.get("sha256")
+
+
+def _authorize_preflight(owner: _PublicationOwner, work: _PublicationWork, root: Path,
+                         root_fd: int) -> tuple[Any, ...]:
+    """BR5. 잠금 아래에서 모든 상태를 다시 읽어 점검한다. 쓰지 않는다."""
+    # 호출 시점에 가져온다. 시험이 모듈 속성을 감싸므로 머리에서 import하면 감싼 함수가 걸리지 않는다.
+    from opencrab.stores._single_file import (
+        decode_binding_json,
+        read_binding_fd,
+        validate_single_file_binding,
+    )
+
+    root_stat = os.lstat(root)
+    opened = os.fstat(root_fd)
+    if (not stat.S_ISDIR(root_stat.st_mode) or os.path.realpath(root) != str(root)
+            or (root_stat.st_dev, root_stat.st_ino) != (opened.st_dev, opened.st_ino)):
+        raise MergeError("root directory differs")
+    if sorted(os.listdir(root_fd)) != sorted(_PUBLISHED_NAMES):
+        raise MergeError("root file set differs")
+    for name in _PUBLISHED_NAMES:
+        info = os.lstat(name, dir_fd=root_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise MergeError("root file form differs")
+    if any(os.path.lexists(root.with_name(root.name + suffix)) for suffix in (".staging", ".intent.json.tmp")):
+        raise MergeError("root artifacts remain")
+    intent = _authorize_read_intent(owner, work, root)
+    if set(intent) != _AUTHORIZE_KEYS:  # 키 집합을 state보다 먼저 본다. state 키가 없는 intent가 KeyError를 내지 않게 한다.
+        raise MergeError("intent key set differs")
+    if intent["state"] != "ready":
+        raise MergeError("intent state differs")
+    raws = {}
+    for name in ("ledger.json", "manifest.json", "marker.json"):
+        fd = owner.open_fd("root-file", name, _READ_FLAGS, dir_fd=root_fd, work=work)
+        try:
+            raws[name] = read_binding_fd(root_fd, name, fd)
+        finally:
+            _close_deferred(owner, "root-file", fd, work)
+    try:
+        ledger, manifest, marker = (decode_binding_json(raws[name])
+                                    for name in ("ledger.json", "manifest.json", "marker.json"))
+    except RuntimeError as exc:
+        raise MergeError(f"binding file is invalid: {exc}") from exc
+    digest = hashlib.sha256(raws["manifest.json"]).hexdigest()
+    if set(ledger) != _AUTHORIZE_KEYS:
+        raise MergeError("ledger key set differs")
+    if ledger["state"] != "ready":
+        raise MergeError("ledger state differs")
+    conn = _connect(root / "single.db", mode="ro", immutable=True, work=work)
+    try:
+        rows = conn.execute("SELECT root, database_path, db_uuid, generation FROM single_file_metadata").fetchall()
+        if len(rows) != 1:
+            raise MergeError("metadata row count differs")
+        tables = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL").fetchall()
+        if any(sql.upper().startswith("CREATE VIRTUAL") and _module_of(sql) == "vec0" for (sql,) in tables):
+            _load_vec(conn)
+        if conn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise MergeError("quick_check differs")
+    finally:
+        _close_conn(conn, work)
+    metadata = dict(zip(("root", "database", "db_uuid", "generation"), rows[0], strict=True))
+    try:
+        validate_single_file_binding(str(root), str(root / "single.db"), ledger, manifest, marker, metadata,
+                                     digest, state="ready")
+    except RuntimeError as exc:
+        raise MergeError(f"binding differs: {exc}") from exc
+    if any(ledger[key] != intent[key] for key in ("root", "database", "db_uuid", "generation", "manifest_digest")):
+        raise MergeError("ledger differs from intent")
+    if not _authorize_billing_matches(root_fd, manifest.get("billing")):
+        raise MergeError("billing digest differs")
+    for suffix in ("-wal", "-shm", "-journal"):  # 점검 도중 factory 밖 열기 경로가 만든 곁파일을 잡는다.
+        if os.path.lexists(str(root / "single.db") + suffix):
+            raise MergeError("root database sidecar remains")
+    info = os.lstat("ledger.json", dir_fd=root_fd)
+    return ledger, manifest, marker, metadata, digest, (info.st_dev, info.st_ino, info.st_size)
+
+
+def _authorize_rename(owner: _PublicationOwner, root_fd: int) -> None:
+    """BR8. root fd 기준 rename 하나와 오류 결과의 분류. rename은 원자적이므로 ledger는 옛 바이트나 새 바이트다."""
+    try:
+        os.rename("ledger.json.tmp", "ledger.json", src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    except OSError as exc:
+        try:
+            os.lstat("ledger.json.tmp", dir_fd=root_fd)
+        except FileNotFoundError:
+            remains = False
+        except OSError:
+            owner.uncertain = True
+            raise MergeError(f"ledger rename failed: outcome unknown: {exc.strerror or exc}") from exc
+        else:
+            remains = True
+        outcome = "not performed" if remains else "took effect"
+        raise MergeError(f"ledger rename failed: {outcome}: {exc.strerror or exc}") from exc
+
+
+def _authorize_write(owner: _PublicationOwner, work: _PublicationWork, root: Path, root_fd: int,
+                     checked: tuple[Any, ...]) -> bytes:
+    """BR7. R10a와 같은 순서로 ledger를 authorized로 교체한다. 점검한 root 디렉터리 fd에 매어 쓴다."""
+    from opencrab.stores._single_file import (
+        decode_binding_json,
+        read_binding_fd,
+        validate_single_file_binding,
+    )
+
+    ledger, manifest, marker, metadata, digest, identity = checked
+    payload = _publication_json({**ledger, "state": "authorized"})
+    info = os.lstat("ledger.json", dir_fd=root_fd)
+    if (info.st_dev, info.st_ino, info.st_size) != identity:
+        raise MergeError("ledger changed before rename")
+    if owner.uncertain:
+        raise MergeError("owner is uncertain")
+    try:
+        fd = owner.open_fd("ledger-tmp", "ledger.json.tmp", _CREATE_FLAGS, 0o600, dir_fd=root_fd, work=work)
+    except OSError as exc:
+        raise MergeError(f"ledger tmp open failed: {exc.strerror or exc}") from exc
+    try:
+        view = memoryview(payload)
+        while view:
+            count = os.write(fd, view)
+            if count <= 0:
+                raise OSError("authorize write made no progress")
+            view = view[count:]
+        os.fsync(fd)
+    except OSError as exc:
+        raise MergeError(f"ledger tmp write failed: {exc.strerror or exc}") from exc
+    finally:
+        _close_deferred(owner, "ledger-tmp", fd, work)
+    _authorize_rename(owner, root_fd)
+    try:
+        os.fsync(root_fd)
+    except OSError as exc:
+        raise MergeError(f"root fsync failed: {exc.strerror or exc}") from exc
+    fd = owner.open_fd("root-file", "ledger.json", _READ_FLAGS, dir_fd=root_fd, work=work)
+    try:
+        raw = read_binding_fd(root_fd, "ledger.json", fd)
+    finally:
+        _close_deferred(owner, "root-file", fd, work)
+    if raw != payload:
+        raise MergeError("ledger re-read differs")
+    try:
+        validate_single_file_binding(str(root), str(root / "single.db"), decode_binding_json(raw), manifest, marker,
+                                     metadata, digest, state="authorized")
+    except RuntimeError as exc:
+        raise MergeError("ledger re-read differs") from exc
+    root_stat = os.lstat(root)
+    opened = os.fstat(root_fd)
+    if ((root_stat.st_dev, root_stat.st_ino) != (opened.st_dev, opened.st_ino)
+            or os.path.realpath(root) != str(root)):
+        raise MergeError("root directory differs after write")
+    return payload
+
+
+def _authorize_observe(root: Path) -> str:
+    """실패 보고용 ledger 상태 관찰. 어떤 읽기 오류도 unreadable로 돌리고 예외를 내지 않는다."""
+    try:
+        state = json.loads((root / "ledger.json").read_text()).get("state")
+    except (OSError, ValueError, AttributeError):
+        return "unreadable"
+    return state if state in ("ready", "authorized") else "unreadable"
+
+
+def _authorize_main(argv: list[str]) -> int:
+    """authorize 하위 명령. ready 게시 root의 대장 state를 authorized로 한 번 올린다(#671 B0)."""
+    parser = argparse.ArgumentParser(prog="merge_sqlite_stores.py authorize",
+                                     description="ready 게시 root의 대장을 authorized로 올린다")
+    parser.add_argument("--root", required=True, type=Path, help="게시 root의 절대 경로")
+    parser.add_argument("--run-kind", required=True, choices=("copy-test", "production"))
+    parser.add_argument("--verification-pass", required=True, type=Path, help="독립 검증 PASS 판정 파일")
+    parser.add_argument("--copy-test-pass", type=Path, help="사본 시험 PASS 파일(production 전용)")
+    parser.add_argument("--copy-test-run-id", help="사본 시험 실행 식별자(copy-test 전용)")
+    parser.add_argument("--apply", action="store_true", help="실제로 쓴다(기본은 점검만)")
+    args = parser.parse_args(argv)
+    if args.run_kind == "copy-test":
+        if args.copy_test_pass is not None:
+            parser.error("--copy-test-pass is not allowed for run kind copy-test")
+        if args.copy_test_run_id is None:
+            parser.error("--copy-test-run-id is required")
+        if not _AUTHORIZE_RUN_ID.fullmatch(args.copy_test_run_id):
+            parser.error("--copy-test-run-id is invalid")
+    else:
+        if args.copy_test_pass is None:
+            parser.error("--copy-test-pass is required for run kind production")
+        if args.copy_test_run_id is not None:
+            parser.error("--copy-test-run-id is not allowed for run kind production")
+    passes = [args.verification_pass] + ([args.copy_test_pass] if args.run_kind == "production" else [])
+    flow: dict[str, Any] = {"write_started": False, "write_error": None, "payload": None}
+    root = args.root
+    try:
+        root = _authorize_root(args.root)
+        evidence = _authorize_evidence(passes, root)
+        lock_identity = _authorize_lock_identity(root)
+        with _publication_owner(root) as (owner, work):
+            try:
+                _authorize_acquire(owner, work, root, lock_identity)
+                root_fd = owner.open_fd("root-dir", root, _DIR_FLAGS, work=work)
+                try:
+                    checked = _authorize_preflight(owner, work, root, root_fd)
+                    if args.apply:
+                        flow["write_started"] = True
+                        try:
+                            flow["payload"] = _authorize_write(owner, work, root, root_fd, checked)
+                        except _AUTHORIZE_ERRORS as exc:
+                            flow["write_error"] = exc
+                finally:
+                    _close_deferred(owner, "root-dir", root_fd, work)
+            finally:
+                owner.defer_root_release = True
+    except _AUTHORIZE_ERRORS as exc:
+        if flow["payload"] is not None:
+            print(f"authorize applied; cleanup failed: {exc}", file=sys.stderr)
+            return 2
+        if flow["write_started"]:
+            first = flow["write_error"] if flow["write_error"] is not None else exc
+            lead = ("authorize write failed; cleanup failed: " + str(exc) + "; first error: "
+                    if flow["write_error"] is not None else "authorize write failed: ")
+            print(f"{lead}{first}; observed ledger state: {_authorize_observe(root)}", file=sys.stderr)
+            return 1
+        print(f"authorize preflight failed: {exc}", file=sys.stderr)
+        return 2
+    if flow["write_error"] is not None:
+        print(f"authorize write failed: {flow['write_error']}; observed ledger state: {_authorize_observe(root)}",
+              file=sys.stderr)
+        return 1
+    summary = (f"kind={args.run_kind} root={root} evidence={','.join(f'{path}:{sha}' for path, sha in evidence)} "
+               f"run_id={args.copy_test_run_id or 'none'}")
+    if flow["payload"] is None:
+        print(f"authorize dry-run ok: {summary}", file=sys.stderr)
+        return 0
+    print(f"authorize applied: {summary} ledger_sha256={hashlib.sha256(flow['payload']).hexdigest()}",
+          file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    if arguments[:1] == ["authorize"]:
+        return _authorize_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--source-dir", required=True, type=Path)
     output = parser.add_mutually_exclusive_group(required=True)
