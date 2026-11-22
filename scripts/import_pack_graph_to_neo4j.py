@@ -27,6 +27,7 @@ from opencrab.common.graph_identity import (
 )
 from opencrab.common.pack_tags import apply_pack_tag
 from opencrab.config import Settings
+from opencrab.stores._single_file import reject_single_root_under
 from opencrab.stores.neo4j_store import Neo4jStore
 
 PACK_ID = "nvidia-nemotron-personas-korea"
@@ -224,6 +225,7 @@ def main() -> int:
     edges_path = stage / "graph/edges.jsonl"
     evidence_path = stage / "evidence/index.jsonl"
     status_path = stage.parent / "neo4j_import_status.json"
+    reject_single_root_under(status_path)
 
     store = Neo4jStore(args.uri, args.user, args.password, database=None)
     try:

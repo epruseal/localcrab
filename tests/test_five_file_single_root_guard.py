@@ -181,7 +181,7 @@ def test_t11_n3_allow_single_root_opens_marked_directory_and_default_rejects(tmp
     assert _snapshot(root) == before
 
 
-def test_t11_n4_memory_database_passes_the_guard(tmp_path):
+def test_t11_n4_memory_database_passes_the_guard(tmp_path, monkeypatch):
     """T11-N4: ':memory:'와 DB 경로가 없는 sqlite URL은 root 검사에 걸리지 않는다."""
     from opencrab.stores._single_file import reject_unmanaged_single_file
     from opencrab.stores.sql_store import SQLStore
@@ -189,6 +189,12 @@ def test_t11_n4_memory_database_passes_the_guard(tmp_path):
     assert reject_unmanaged_single_file(":memory:") is None
     store = SQLStore("sqlite://", create_tables=False)
     store.close()
+    # 작업 디렉터리가 단일 root여도 ':memory:'는 파일이 아니므로 첫 줄에서 반환해야 한다.
+    root = _synthetic_root(tmp_path)
+    monkeypatch.chdir(root)
+    before = _snapshot(root)
+    assert reject_unmanaged_single_file(":memory:") is None
+    assert _snapshot(root) == before
 
 
 def test_t11_n5_marker_table_direct_open_keeps_shared_message(tmp_path):
@@ -518,6 +524,157 @@ def test_t11_e17_import_obsidian_vault_rejects_before_lock_and_docs(tmp_path, mo
 
     _expect_rejected_and_unchanged(root, run)
     assert not (root / "write.lock").exists() and not (root / "docs").exists()
+
+
+def test_t11_n6_under_root_check_walks_every_ancestor_of_the_target(tmp_path):
+    """T11-N6: reject_single_root_under는 대상 경로와 그 모든 상위 디렉터리를 abspath와 realpath로 본다."""
+    from opencrab.stores._single_file import reject_single_root_under
+
+    root = _synthetic_root(tmp_path)
+    (root / "inner").mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "out").symlink_to(root / "inner", target_is_directory=True)
+    other = tmp_path / "other" / "deep"
+    other.mkdir(parents=True)
+    before = _snapshot(root)
+    assert reject_single_root_under(other / "file.jsonl") is None
+    assert reject_single_root_under(plain / "file.jsonl") is None
+    for target in (root, root / "a" / "b" / "file.jsonl", plain / "out" / "file.jsonl"):
+        with pytest.raises(RuntimeError, match=re.escape(_msg())):
+            reject_single_root_under(target)
+    assert _snapshot(root) == before
+
+
+# ----------------------------------------------------------------------------------------------
+# 오류: 설계 4판이 유보했던 스크립트 넷(R-B11-12)
+# ----------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag", ["--apply", "--check-guard"], ids=["apply", "check_guard"])
+def test_t11_e18_repair_store_mismatch_rejects_before_write_lock(tmp_path, monkeypatch, flag):
+    """T11-E18: repair_store_mismatch_499의 apply와 --check-guard가 write.lock을 만들기 전에 거부한다."""
+    module = _script("repair_store_mismatch_499")
+    root = _synthetic_root(tmp_path)
+    _env(monkeypatch, root)
+    argv = [
+        "--local-data-dir", str(root),
+        "--run-dir", str(tmp_path / "run"),
+        "--pack-input-root", str(tmp_path / "inputs"),
+        flag,
+    ]  # fmt: skip
+    _expect_rejected_and_unchanged(root, lambda: module.main(argv))
+    assert not (root / "write.lock").exists()
+
+
+@pytest.mark.parametrize("entry", ["apply", "prepare_rollback", "rollback"])
+def test_t11_e19_cleanup_heartbeat_rejects_before_load_and_write_lock(tmp_path, monkeypatch, entry):
+    """T11-E19: cleanup_openclaw_heartbeat_493의 apply, prepare_rollback, rollback이 write.lock 앞에서 거부한다."""
+    module = _script("cleanup_openclaw_heartbeat_493")
+    root = _synthetic_root(tmp_path)
+    _env(monkeypatch, root)
+    run_dir, backup_dir = tmp_path / "run", tmp_path / "backup"
+    calls = {
+        "apply": lambda: module.apply(root, run_dir, "vec", None, backup_dir),
+        "prepare_rollback": lambda: module.prepare_rollback(root, run_dir, backup_dir),
+        "rollback": lambda: module.rollback(root, run_dir, backup_dir),
+    }
+    _expect_rejected_and_unchanged(root, calls[entry])
+    assert not (root / "write.lock").exists()
+
+
+class _ReachedNeo4jError(Exception):
+    """거부 지점을 지나 Neo4j 연결 단계에 닿았다는 표지."""
+
+
+def _reach_neo4j(*args, **kwargs):
+    raise _ReachedNeo4jError
+
+
+@pytest.mark.parametrize("variant", ["a_default_output", "b_explicit_under_root"])
+def test_t11_e20_export_pack_graph_rejects_before_output_mkdir(tmp_path, monkeypatch, variant):
+    """T11-E20: export_pack_graph_from_neo4j가 출력 디렉터리를 만들기 전에 거부한다. 기본 출력과 root 아래 명시 출력이다."""
+    pytest.importorskip("neo4j")
+    module = _script("export_pack_graph_from_neo4j")
+    root = _synthetic_root(tmp_path)
+    _env(monkeypatch, root)
+    argv = ["export_pack_graph_from_neo4j.py"]
+    if variant == "b_explicit_under_root":
+        argv += ["--output", str(root / "deep" / "stage" / "out.jsonl")]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(module, "make_driver", _reach_neo4j)
+    _expect_rejected_and_unchanged(root, module.main)
+    assert not (root / "packs").exists() and not (root / "deep").exists()
+
+
+@pytest.mark.parametrize("variant", ["a_default_stage", "b_explicit_stage_under_root"])
+def test_t11_e22_import_pack_graph_rejects_before_connecting_or_writing_status(tmp_path, monkeypatch, variant):
+    """T11-E22: import_pack_graph_to_neo4j가 Neo4j에 닿기 전에 거부한다. 상태 파일은 stage의 부모에 쓰인다."""
+    module = _script("import_pack_graph_to_neo4j")
+    root = _synthetic_root(tmp_path)
+    _env(monkeypatch, root)
+    argv = ["import_pack_graph_to_neo4j.py"]
+    if variant == "b_explicit_stage_under_root":
+        argv += ["--stage", str(root / "deep" / "stage")]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(module, "Neo4jStore", _reach_neo4j)
+    _expect_rejected_and_unchanged(root, module.main)
+    assert not (root / "packs").exists() and not (root / "deep").exists()
+
+
+@pytest.mark.parametrize("variant", ["a_defaults_via_main", "b_output_root_under_root", "c_local_data_dir_is_root"])
+def test_t11_e21_build_nemotron_rejects_before_stage_mkdir(tmp_path, monkeypatch, variant):
+    """T11-E21: build_nemotron_personas_korea_pack이 stage 디렉터리를 만들기 전에 거부한다."""
+    pytest.importorskip("pyarrow")
+    module = _script("build_nemotron_personas_korea_pack")
+    root = _synthetic_root(tmp_path)
+    _env(monkeypatch, root)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    if variant == "a_defaults_via_main":
+        monkeypatch.setattr(sys, "argv", ["build_nemotron_personas_korea_pack.py"])
+        action = module.main
+    else:
+        out_root, local_dir = (root / "packs" / "x", elsewhere) if variant.startswith("b_") else (elsewhere / "p", root)
+        args = SimpleNamespace(
+            dataset_root=str(tmp_path / "dataset"), output_root=str(out_root), local_data_dir=str(local_dir),
+            reset=False, reset_ingest=False, no_zip=True, progress_every=1, sqlite_batch_nodes=1,
+        )  # fmt: skip
+        action = lambda: module.build(args)  # noqa: E731
+    _expect_rejected_and_unchanged(root, action)
+    assert not (root / "packs").exists()
+    assert not (elsewhere / "p").exists()
+
+
+def test_t11_g9_script_targets_outside_the_root_pass_the_guard(tmp_path, monkeypatch):
+    """T11-G9: LOCAL_DATA_DIR이 단일 root여도 root 밖으로 쓰는 스크립트 출력은 거부되지 않는다(거짓 거부 0).
+
+    export는 root 밖 명시 출력에서 Neo4j 연결 단계에, build는 root 밖 출력과 root 밖 local-data-dir에서
+    parquet 검사 단계에 닿는다. 닿았는지는 각 단계의 고유한 예외로 가린다.
+    """
+    pytest.importorskip("neo4j")
+    pytest.importorskip("pyarrow")
+    export = _script("export_pack_graph_from_neo4j")
+    build = _script("build_nemotron_personas_korea_pack")
+    root = _synthetic_root(tmp_path)
+    _env(monkeypatch, root)
+    before = _snapshot(root)
+    monkeypatch.setattr(sys, "argv", ["export_pack_graph_from_neo4j.py", "--output", str(tmp_path / "o" / "x.jsonl")])
+    monkeypatch.setattr(export, "make_driver", _reach_neo4j)
+    with pytest.raises(_ReachedNeo4jError):
+        export.main()
+    args = SimpleNamespace(
+        dataset_root=str(tmp_path / "dataset"), output_root=str(tmp_path / "p"), local_data_dir=str(tmp_path / "ld"),
+        reset=False, reset_ingest=False, no_zip=True, progress_every=1, sqlite_batch_nodes=1,
+    )  # fmt: skip
+    with pytest.raises(RuntimeError, match="expected 9 parquet shards"):
+        build.build(args)
+    imp = _script("import_pack_graph_to_neo4j")
+    monkeypatch.setattr(sys, "argv", ["import_pack_graph_to_neo4j.py", "--stage", str(tmp_path / "s" / "stage")])
+    monkeypatch.setattr(imp, "Neo4jStore", _reach_neo4j)
+    with pytest.raises(_ReachedNeo4jError):
+        imp.main()
+    assert _snapshot(root) == before
 
 
 # ----------------------------------------------------------------------------------------------

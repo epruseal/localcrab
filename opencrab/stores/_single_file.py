@@ -238,6 +238,23 @@ def reject_single_root(directory: str) -> None:
         raise RuntimeError(f"{_SINGLE_ROOT_MESSAGE}: {directory}")
 
 
+def reject_single_root_under(path: str | os.PathLike[str]) -> None:
+    """``path``가 단일 root이거나 그 아래이면 거부한다.
+
+    출력 경로를 인자로 받는 스크립트가 root 아래에 디렉터리를 만들기 전에 부른다. 대상 경로와 모든 상위
+    디렉터리(abspath와 realpath 둘)에 ``reject_single_root``를 건다. 대상이 아직 없어도 된다. root 밖
+    경로는 통과한다. 상위 디렉터리를 끝까지 보므로 호출 수는 경로 깊이에 비례한다(lstat 두 번씩).
+    """
+    for base in dict.fromkeys((os.path.abspath(path), os.path.realpath(path))):
+        directory = base
+        while True:
+            reject_single_root(directory)
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                break
+            directory = parent
+
+
 def reject_unmanaged_single_file(db_path: str, *, allow_single_root: bool = False) -> None:
     """공유 연결 없이 단일 파일 스키마를 열지 않는다.
 
