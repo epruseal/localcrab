@@ -416,7 +416,16 @@ def _decode_granted(
 class SQLStore:
     """SQLAlchemy adapter supporting PostgreSQL and SQLite."""
 
-    def __init__(self, url: str, *, create_tables: bool = True, shared: Any = None, engine: Any = None, pg_uow: Any = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        create_tables: bool = True,
+        shared: Any = None,
+        engine: Any = None,
+        pg_uow: Any = None,
+        allow_single_root: bool = False,
+    ) -> None:
         if pg_uow is not None and pg_uow.active:
             raise RuntimeError("PG store cannot initialize inside a shared unit")
         if engine is not None:
@@ -444,7 +453,7 @@ class SQLStore:
 
             db_path = make_url(url).database
             if db_path:
-                reject_unmanaged_single_file(db_path)
+                reject_unmanaged_single_file(db_path, allow_single_root=allow_single_root)
         # issue #105 (verifier follow-up): billing.db is meant to hold only
         # billing_events (BillingHooks._ensure_tables() creates that table
         # itself), but SQLStore._connect() unconditionally created the full

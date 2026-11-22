@@ -215,8 +215,37 @@ def _single_marker(uri: str, timeout: float) -> bool:
         return conn.execute(_MARKER_QUERY).fetchone() is not None
 
 
-def reject_unmanaged_single_file(db_path: str) -> None:
+_SINGLE_ROOT_NAMES = ("ledger.json", "single.db")
+_SINGLE_ROOT_MESSAGE = "single SQLite root requires SINGLE_SQLITE_FILE"
+
+
+def reject_single_root(directory: str) -> None:
+    """단일 SQLite root(ledger.json이나 single.db가 있는 디렉터리)이면 거부한다.
+
+    SINGLE_SQLITE_FILE 없이 단일 root를 LOCAL_DATA_DIR로 받은 프로세스가 root에 빈 다섯 파일이나 잠금
+    파일을 만드는 일을 막는다. 두 이름을 lstat으로만 본다(파일을 열거나 만들지 않으므로 곁파일이 생기지
+    않는다). 링크와 디렉터리와 깨진 링크도 있는 것으로 센다. 판정할 수 없으면 거부한다(fail-closed).
+    한계: 호출자가 준 디렉터리 바로 아래만 본다. VECTOR_DB_FILE이 상대 하위 경로이면 그 하위 디렉터리를
+    보므로 root 자체를 가리켜도 잡지 못한다.
+    """
+    for name in _SINGLE_ROOT_NAMES:
+        try:
+            os.lstat(os.path.join(directory, name))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            raise RuntimeError(f"{_SINGLE_ROOT_MESSAGE}: cannot inspect {directory}: {exc.strerror or exc}") from exc
+        raise RuntimeError(f"{_SINGLE_ROOT_MESSAGE}: {directory}")
+
+
+def reject_unmanaged_single_file(db_path: str, *, allow_single_root: bool = False) -> None:
     """공유 연결 없이 단일 파일 스키마를 열지 않는다.
+
+    순서는 ``:memory:`` 통과, 단일 root 검사, 표식 검사다. root 검사가 표식 검사보다 앞서는 이유는 표식
+    검사가 DB 파일을 열어 WAL 옆에 ``-wal``과 ``-shm``을 만들거나 hot journal을 회복할 수 있기 때문이다.
+    root 검사는 lstat만 쓴다. ``allow_single_root``가 거짓이면 DB 파일 부모 디렉터리(abspath와 realpath
+    둘)에 ``reject_single_root``를 건다. 참으로 넘기는 호출은 단일 모드 billing 저장소 하나뿐이다. 그
+    저장소는 root 안 billing.db를 공유 객체 없이 연다.
 
     헤더로 저널 모드를 가른다. WAL 파일은 `_UNMANAGED_WAL_WAIT`만큼 기다리고 읽지 못하면 그 BUSY를 올린다.
     롤백 저널 파일이 잠겨 있으면 잠금 없는 읽기(immutable)로 표식만 판정하고, 헤더를 다시 읽어 여전히
@@ -230,8 +259,15 @@ def reject_unmanaged_single_file(db_path: str) -> None:
     `.partial`에 닿으면 merge가 보존하라고 한 그 파일의 바이트를 바꾼다. 회복 재시도가 BUSY와 LOCKED가
     아닌 코드로 실패하면 호출자는 그 예외를 그대로 받고, HTTP 인증 조회는 503이 아니라 500이다.
     """
+    if db_path == ":memory:":
+        return
+    if not allow_single_root:
+        for directory in dict.fromkeys(
+            (os.path.dirname(os.path.abspath(db_path)), os.path.dirname(os.path.realpath(db_path)))
+        ):
+            reject_single_root(directory)
     path = Path(db_path)
-    if db_path == ":memory:" or not path.is_file():
+    if not path.is_file():
         return
     resolved = path.resolve()
     base = resolved.as_uri() + "?mode=ro"

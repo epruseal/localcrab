@@ -1170,6 +1170,10 @@ def _run(args: argparse.Namespace) -> int:
         or "./opencrab_data"
     )
     local_data_dir = os.path.abspath(local_data_dir)
+    # 단일 SQLite root는 preflight와 백업과 makedirs 앞에서 거부한다(B11).
+    from opencrab.stores._single_file import reject_single_root
+
+    reject_single_root(local_data_dir)
     if not args.dry_run:
         os.makedirs(local_data_dir, exist_ok=True)
 

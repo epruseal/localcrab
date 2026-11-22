@@ -65,7 +65,7 @@ def _write_pair(docs, vec, sid="s1"):
 
 
 def test_direct_sqlite_stores_reject_unmanaged_unified_database(tmp_path):
-    path = tmp_path / "single.db"
+    path = tmp_path / "unified.db"
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT PRIMARY KEY)")
     for factory in (
@@ -2665,7 +2665,8 @@ def test_billing_and_write_lock_reject_active_shared_unit(stores, tmp_path):
     from opencrab.locking import write_lock
 
     _path, shared, _graph, _docs, _vec = stores
-    billing = SQLStore(f"sqlite:///{tmp_path / 'billing.db'}", create_tables=False)
+    # 단일 모드 billing과 같은 호출 형태다. root 안 billing.db는 allow_single_root로 연다(B11).
+    billing = SQLStore(f"sqlite:///{tmp_path / 'billing.db'}", create_tables=False, allow_single_root=True)
     hooks = BillingHooks(billing)
     try:
         with shared.unit_of_work():
@@ -3881,7 +3882,8 @@ def test_source_rejects_hybrid_with_different_vector(stores, tmp_path):
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     create_pack(sql, owner, "p")
-    other = SqliteVecStore(str(tmp_path / "other.db"), embedding_function=_embed, dim=DIM)
+    (tmp_path / "unrelated").mkdir()  # root 밖 디렉터리여야 B11의 root 검사에 걸리지 않는다
+    other = SqliteVecStore(str(tmp_path / "unrelated" / "other.db"), embedding_function=_embed, dim=DIM)
     hybrid = HybridQuery(other, graph, doc_store=docs)
     try:
         with principal_scope(Principal(user_id=owner, is_local=True, disabled=False)):
@@ -3905,7 +3907,8 @@ def test_source_rejects_hybrid_with_different_doc_store(stores, tmp_path):
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     create_pack(sql, owner, "p")
-    other = LocalSQLDocStore(str(tmp_path / "other-doc.db"))
+    (tmp_path / "unrelated").mkdir()  # root 밖 디렉터리여야 B11의 root 검사에 걸리지 않는다
+    other = LocalSQLDocStore(str(tmp_path / "unrelated" / "other-doc.db"))
     hybrid = HybridQuery(vec, graph, doc_store=other)
     try:
         with principal_scope(Principal(user_id=owner, is_local=True, disabled=False)):

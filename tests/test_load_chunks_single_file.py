@@ -304,7 +304,8 @@ def test_chunk_rejects_registry_outside_shared_file(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
     env = _Env("single", tmp_path)
     shared_sql = env.sql
-    env.sql = SQLStore(f"sqlite:///{tmp_path / 'separate.db'}")
+    (tmp_path / "separate").mkdir()  # root 밖 디렉터리여야 B11의 root 검사에 걸리지 않는다
+    env.sql = SQLStore(f"sqlite:///{tmp_path / 'separate' / 'separate.db'}")
     user = create_user(env.sql, "owner", is_local=True)
     create_pack(env.sql, user, PACK)
     env.user_id = user

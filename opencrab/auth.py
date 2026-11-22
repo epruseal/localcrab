@@ -839,7 +839,7 @@ def maybe_bootstrap_on_empty() -> Principal | None:
 
     from opencrab.config import get_settings
     from opencrab.locking import file_lock
-    from opencrab.stores._single_file import reject_single_file_mode
+    from opencrab.stores._single_file import reject_single_file_mode, reject_single_root
     from opencrab.stores.sql_store import SQLStore
 
     settings = get_settings()
@@ -881,6 +881,9 @@ def maybe_bootstrap_on_empty() -> Principal | None:
             "bootstrap never creates directories, only the database inside "
             "one that already exists."
         )
+
+    # SINGLE_SQLITE_FILE 없이 단일 root를 받았으면 bootstrap.lock을 만들기 전에 거부한다(B11).
+    reject_single_root(data_dir)
 
     db_path = Path(data_dir, "opencrab.db")
 

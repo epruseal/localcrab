@@ -20,7 +20,7 @@ HEARTBEAT = "Q: [OpenClaw heartbeat poll] tick"
 
 
 def test_write_connection_refuses_single_database(tmp_path):
-    path = tmp_path / "single.db"
+    path = tmp_path / "unified.db"
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT PRIMARY KEY)")
     with pytest.raises(RuntimeError, match="shared"):

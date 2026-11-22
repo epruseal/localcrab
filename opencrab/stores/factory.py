@@ -287,8 +287,11 @@ def make_vector_store(settings: Settings) -> Any:
         raise ValueError(f"Unknown VECTOR_BACKEND: {backend!r}")
 
     # backend == "chroma"
+    from opencrab.stores._single_file import reject_single_root
     from opencrab.stores.chroma_store import ChromaStore
 
+    # chroma 디렉터리와 chroma.lock은 처음 쓸 때 만들어진다. 단일 root를 받으면 만들기 전에 거부한다(B11).
+    reject_single_root(settings.local_data_dir)
     chroma_path = os.path.join(settings.local_data_dir, "chroma")
 
     if settings.embedding_backend == "openai":
@@ -422,7 +425,10 @@ def make_billing_sql_store(settings: Settings, sql_store: Any) -> Any:
             raise RuntimeError("single SQLite billing requires the bound SQL store")
         from opencrab.stores.sql_store import SQLStore
 
-        return SQLStore(url=f"sqlite:///{os.path.dirname(path)}/billing.db", create_tables=False)
+        # billing.db는 root 안 파일이다. 공유 객체 없이 여는 이 한 호출만 root 검사를 건너뛴다(B11).
+        return SQLStore(
+            url=f"sqlite:///{os.path.dirname(path)}/billing.db", create_tables=False, allow_single_root=True
+        )
 
     if settings.storage_mode in ("docker", "pg"):
         return sql_store

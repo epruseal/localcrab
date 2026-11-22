@@ -576,6 +576,10 @@ def _import_vault_unlocked(vault_root: Path, neo4j_uri: str, neo4j_user: str, ne
 def import_vault(vault_root: Path, neo4j_uri: str, neo4j_user: str, neo4j_password: str, neo4j_database: str, local_data_dir: Path, pack_id: str | None = None) -> dict[str, Any]:
     """Import one vault under the same cross-process write boundary as APIs."""
     from opencrab.auth import principal_scope, require_local_principal
+    from opencrab.stores._single_file import reject_single_root
+
+    # 단일 SQLite root는 write.lock과 docs 디렉터리를 만들기 전에 거부한다(B11).
+    reject_single_root(str(local_data_dir))
 
     # 잠금 밖에서 먼저 수집한다(#190) -- vault 파싱은 순수 파일 읽기이므로 다른
     # 프로세스의 쓰기를 그 시간만큼 막을 이유가 없다. 이 순서는 수정 전 코드와

@@ -1304,8 +1304,10 @@ def backup_data_dir(
 
     Trust boundary: ``dest_dir`` is the location the CALLER chose and is not
     containment-checked (a symlinked ancestor is a normal backup-volume
-    layout). Everything written INSIDE the set is contained against the
-    staging directory this run exclusively created.
+    layout). The one refusal: a single SQLite root (a directory that holds
+    ``ledger.json`` or ``single.db``) is rejected with ``BackupError`` as the
+    data directory and as the destination. Everything written INSIDE the set
+    is contained against the staging directory this run exclusively created.
 
     One artifact can outlive a failure: if the publishing ``os.rename``
     itself fails, the fsynced staging directory stays. That is deliberate --
@@ -1314,6 +1316,7 @@ def backup_data_dir(
     rather than deleting someone else's data.
     """
     from opencrab.locking import write_lock
+    from opencrab.stores._single_file import reject_single_root
 
     data_dir = Path(data_dir)
     # The implicit destination is the data directory's REAL path: a data
@@ -1350,6 +1353,11 @@ def backup_data_dir(
         targets = local_data_dir_inventory(settings)
         if getattr(settings, "single_sqlite_file", ""):
             raise BackupError("단일 SQLite 백업은 저널과 복구 세대 검증이 준비되지 않았다")
+        # SINGLE_SQLITE_FILE 없이 단일 root를 받았으면 write.lock과 staging을 만들기 전에 거부한다(B11).
+        try:
+            reject_single_root(str(data_dir))
+        except RuntimeError as exc:
+            raise BackupError(str(exc)) from exc
         wanted = set(exclude)
         unknown = wanted - {t.label for t in targets}
         if unknown:
@@ -1384,6 +1392,11 @@ def backup_data_dir(
             raise BackupError(f"destination is a symlink, refusing to use it: {dest}")
         if not dest.is_dir():
             raise BackupError(f"destination directory does not exist: {dest}")
+        # 목적지가 단일 root이어도 백업 세트가 root에 생긴다. 이 앞의 점검은 읽기만 한다(B11).
+        try:
+            reject_single_root(str(dest))
+        except RuntimeError as exc:
+            raise BackupError(str(exc)) from exc
         # The destination is NOT containment-checked beyond the symlink refusal
         # above. It is the location the operator chose, and reaching it through a
         # symlinked ancestor (a backup volume mounted that way) is a normal
@@ -1819,7 +1832,7 @@ def _main(argv: list[str] | None = None) -> int:
         help=(
             "where to create the backup set (default: alongside the data itself). "
             "This is taken as the location you chose: it is not containment-checked, "
-            "so a symlinked ancestor is followed."
+            "so a symlinked ancestor is followed. A single SQLite root is refused."
         ),
     )
     parser.add_argument(

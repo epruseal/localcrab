@@ -184,8 +184,11 @@ def main() -> int:
     import sqlite_vec  # noqa: F401 - ensures extension is importable
 
     from opencrab.config import get_settings
+    from opencrab.stores._single_file import reject_single_root
 
     settings = get_settings()
+    # 단일 SQLite root는 chroma 디렉터리와 chroma.lock을 만들기 전에 거부한다(B11).
+    reject_single_root(settings.local_data_dir)
     src_collection = settings.embed_collection  # opencrab_vectors_kure
     db_path = os.path.join(settings.local_data_dir, settings.vector_db_file)
     chroma_path = os.path.join(settings.local_data_dir, "chroma")

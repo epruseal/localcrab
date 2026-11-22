@@ -1593,9 +1593,9 @@ def _spy_releasing(monkeypatch, holder: _Holder) -> None:
 
     real = _single_file.reject_unmanaged_single_file
 
-    def spy(db_path):
+    def spy(db_path, **kwargs):
         try:
-            return real(db_path)
+            return real(db_path, **kwargs)
         finally:
             holder.release.set()
 
@@ -1671,9 +1671,9 @@ def _record_guard(monkeypatch) -> list:
     real = _single_file.reject_unmanaged_single_file
     raised: list = []
 
-    def spy(db_path):
+    def spy(db_path, **kwargs):
         try:
-            return real(db_path)
+            return real(db_path, **kwargs)
         except BaseException as exc:
             raised.append(exc)
             raise
