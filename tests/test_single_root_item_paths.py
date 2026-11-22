@@ -1,6 +1,6 @@
 """#671 B4: 단일 root 안 항목 경로 시험.
 
-설계 8판 8절의 시험 목록이 정본이다. 함수 접두사는 test_t13_다. 합성 root는
+설계 10판 8절의 시험 목록이 정본이다. 함수 접두사는 test_t13_다. 합성 root는
 tests/test_factory_single_file.py의 보조 함수를 재사용하고, packs/는 시험이 authorized root에
 직접 만든다(운영의 항목 이동을 모사한다. authorize 뒤라 이동 순서 규칙을 어기지 않는다).
 제품 코드는 바꾸지 않는다. 이 시험은 코드가 항목 경로를 root 하나에서 만든다는 성질을 고정한다.
@@ -24,10 +24,7 @@ from tests.test_factory_single_file import (  # noqa: F401  (_isolate_single_reg
 from tests.test_factory_single_file import (
     _fresh_single_registry as _isolate_single_registry,  # noqa: F401
 )
-from tests.test_single_mode_auth_lock_order import (
-    _assert_new_names,
-    _listing,
-)
+from tests.test_single_mode_auth_lock_order import _listing
 from tests.test_single_mode_auth_lock_order import (
     fresh_tool_context as _tool_context,  # noqa: F401  (MCP 도구 컨텍스트를 비우는 고정물이다)
 )
@@ -41,18 +38,28 @@ _QUESTION = f"{_TOKEN} {_TOKEN2} {_TAG}"
 _OTHER_ID = "t13-outside-scope"
 _NO_PACK_DELETE = "single SQLite deletion is not yet supported"
 
-# 읽기 경로가 root에 만들면 안 되는 이름과 만들 수 있는 새 이름.
-# 설계 8판의 후보에는 잠금 파일 둘이 없었다. 구현 때 실측으로 packs list(CLI 저장소 열기)가 write.lock을,
-# content_pack_list(MCP 컨텍스트의 billing 저장소)가 billing.db.lock을 만든다는 것이 확인되어
-# 허용 집합에 넣고 금지 집합에서 write.lock을 뺐다(구현 보고에 기록했다). 항목 경로 단언(packs/,
-# delete-pack-*, 옛 다섯 파일, .env)은 그대로다.
+# 읽기 경로가 root에 만들면 안 되는 이름(옛 다섯 파일, 삭제 저널, .env)과, 저장소를 여는 읽기 명령이
+# 만들 수 있는 새 이름(설계 10판 8절 머리 문단). 순수 읽기 함수의 허용 새 이름은 빈 집합이다.
+# 이름마다 근거는 설계 8절에 있다. 이 집합을 손으로 늘리지 않고 설계를 개정한다.
 FORBIDDEN_READ = frozenset(
     {"opencrab.db", "graph.db", "doc_store.db", "vectors.db", "bootstrap.lock",
      "delete-pack-journals", ".env"}
 )
-ALLOWED_READ_NEW = frozenset(
-    {"single.db-wal", "single.db-shm", "billing.db-wal", "billing.db-shm", "write.lock", "billing.db.lock"}
-)
+_OPEN_NEW = frozenset({"write.lock", "single.db-wal", "single.db-shm"})
+ALLOWED_OPEN_NEW = {
+    "packs_list": _OPEN_NEW,
+    "packs_show": _OPEN_NEW,
+    "content_pack_list": _OPEN_NEW | {"billing.db.lock"},
+}
+NO_NEW_NAMES = frozenset()
+
+
+def _assert_names_change(before: set[str], after: set[str], allowed) -> None:
+    """추가된 이름은 allowed의 부분집합이고 지워진 이름은 없다."""
+    extra = (after - before) - set(allowed)
+    assert not extra, f"unexpected new names: {sorted(extra)}"
+    removed = before - after
+    assert not removed, f"removed names: {sorted(removed)}"
 
 
 # ---------------------------------------------------------------------------
@@ -111,22 +118,26 @@ def _content_pack_list(built, **arguments):
         return dispatch_tool("content_pack_list", arguments)
 
 
-def _resolve(built, question: str):
+def _resolve_with(sql, built, question: str):
+    """이미 연 sql 저장소로 resolve_packs를 부른다."""
     from opencrab.auth import principal_scope
     from opencrab.config import get_settings
     from opencrab.pack.read_scope import read_scope
     from opencrab.services.pack_selection import resolve_packs
 
+    principal = _owner(built)
+    with principal_scope(principal):
+        scope = read_scope(sql, principal)
+        return resolve_packs(
+            question, None, True, False, get_settings().local_data_dir,
+            scope=scope, raise_on_error=True, sql=sql, principal=principal,
+        )
+
+
+def _resolve(built, question: str):
     stores = _make_four(_single_settings(built.root))
     try:
-        sql = stores[3]
-        principal = _owner(built)
-        with principal_scope(principal):
-            scope = read_scope(sql, principal)
-            return resolve_packs(
-                question, None, True, False, get_settings().local_data_dir,
-                scope=scope, raise_on_error=True, sql=sql, principal=principal,
-            )
+        return _resolve_with(stores[3], built, question)
     finally:
         _close_all(stores)
 
@@ -250,7 +261,8 @@ def test_t13_e1_packs_absent_is_enrichment_loss_only(tmp_path, monkeypatch):
     assert [pack["pack_id"] for pack in plain["packs"]] == [built.pack_id], plain
     enriched = _content_pack_list(built, query=_TOKEN)
     assert enriched["packs"] == [], enriched
-    _assert_new_names(before, _listing(built.root), ALLOWED_READ_NEW)
+    # 구간은 load_pack_registry 호출부터 두 명령까지다. 추가는 content_pack_list의 허용 집합 안이고 지워진 이름은 없다.
+    _assert_names_change(before, _listing(built.root), ALLOWED_OPEN_NEW["content_pack_list"])
     assert not (built.root / "packs").exists()
 
 
@@ -271,7 +283,8 @@ def test_t13_e2_single_mode_delete_stays_refused(tmp_path, monkeypatch):
         _close_all((graph, docs, vec, sql))
     assert "delete-pack-journals" not in after
     assert not [name for name in after if name.startswith("delete-pack-")], sorted(after)
-    _assert_new_names(before, after, ALLOWED_READ_NEW)
+    # 저장소를 호출 전에 열어 두었으므로 전후 항목 집합은 같다.
+    _assert_names_change(before, after, NO_NEW_NAMES)
 
 
 # ---------------------------------------------------------------------------
@@ -281,26 +294,53 @@ def test_t13_e2_single_mode_delete_stays_refused(tmp_path, monkeypatch):
 
 @pytest.mark.usefixtures("_tool_context")
 @pytest.mark.parametrize("variant", ["packs_present", "packs_absent"])
-def test_t13_g1_read_paths_leave_root_entries_alone(tmp_path, monkeypatch, variant):
-    """T13-G1: 읽기 경로 다섯을 한 root에서 모두 부른 뒤 root 항목 집합이 허용 새 이름 밖에서 전과 같다."""
+def test_t13_g1a_pure_reads_leave_root_entries_alone(tmp_path, monkeypatch, variant):
+    """T13-G1a: 순수 읽기 함수는 root에 새 이름을 만들지 않고 이름을 지우지도 않는다.
+
+    첫 단계는 저장소를 열기 전의 root에서 돈다. 저장소 생성자가 write.lock을 먼저 만들면 순수 함수가
+    write.lock을 잡는 결함이 새 이름으로 보이지 않기 때문이다. 둘째 단계는 저장소를 연 뒤 resolve_packs를 부른다.
+    """
     from opencrab import locking
     from opencrab.config import get_settings
     from opencrab.ontology.pack_registry import get_pack, load_pack_registry
     from opencrab.pack import delete_journal
 
     built = _prepare(tmp_path, monkeypatch, packs=(variant == "packs_present"))
+    # 단계 1: 저장소를 열지 않은 root.
     before = _listing(built.root)
     local_data_dir = get_settings().local_data_dir
     load_pack_registry(local_data_dir)
     get_pack(local_data_dir, built.pack_id)
-    _wide_console(monkeypatch)
-    assert _invoke("packs", "list").exit_code == 0
-    _invoke("packs", "show", built.pack_id)
-    _content_pack_list(built, query=_TOKEN)
-    _resolve(built, _QUESTION)
-    delete_journal.journal_path(locking.lock_data_dir(), "t13-g1")
+    data_dir = locking.lock_data_dir()
+    delete_journal.journal_path(data_dir, "t13-g1a")
+    locking._lock_path(delete_journal.lock_filename("t13-g1a"), data_dir)
     after = _listing(built.root)
-    _assert_new_names(before, after, ALLOWED_READ_NEW)
-    assert not (after & FORBIDDEN_READ), sorted(after & FORBIDDEN_READ)
+    _assert_names_change(before, after, NO_NEW_NAMES)
     if variant == "packs_absent":
         assert "packs" not in after
+    # 단계 2: 저장소 넷을 연 뒤의 resolve_packs.
+    stores = _make_four(_single_settings(built.root))
+    try:
+        opened = _listing(built.root)
+        _resolve_with(stores[3], built, _QUESTION)
+        _assert_names_change(opened, _listing(built.root), NO_NEW_NAMES)
+    finally:
+        _close_all(stores)
+
+
+@pytest.mark.usefixtures("_tool_context")
+@pytest.mark.parametrize("command", ["packs_list", "packs_show", "content_pack_list"])
+def test_t13_g1b_store_opening_reads_create_only_allowed_names(tmp_path, monkeypatch, command):
+    """T13-G1b: 저장소를 여는 읽기 명령은 명령별 허용 이름만 새로 만들고 항목 경로 이름은 만들지 않는다."""
+    built = _prepare(tmp_path, monkeypatch)
+    _wide_console(monkeypatch)
+    before = _listing(built.root)
+    if command == "packs_list":
+        assert _invoke("packs", "list").exit_code == 0
+    elif command == "packs_show":
+        assert _invoke("packs", "show", built.pack_id).exit_code == 0
+    else:
+        _content_pack_list(built, query=_TOKEN)
+    after = _listing(built.root)
+    _assert_names_change(before, after, ALLOWED_OPEN_NEW[command])
+    assert not (after & FORBIDDEN_READ), sorted(after & FORBIDDEN_READ)
