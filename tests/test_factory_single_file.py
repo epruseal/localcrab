@@ -986,7 +986,8 @@ def test_single_vector_ctor_unsafe_collection_closes_unowned_shared(tmp_path, mo
 def test_single_first_call_under_write_lock_is_rejected(tmp_path, monkeypatch, _fresh_single_registry):
     """T-E9(F-21): write.lock을 쥔 스레드의 첫 factory 호출은 수명 잠금 순서 위반으로 거부된다.
 
-    이 거부는 의도된 현재 동작이며 후속(followup_671_factory_write_lock_first_call)이 고친다.
+    이 거부는 factory 직접 호출의 규칙이다. 진입(MCP 쓰기 도구, crabharness 적용)은 hold_single_file로
+    write.lock 앞에서 공유 파일을 열어 이 규칙에 닿지 않는다(#671 B1).
     """
     from opencrab.locking import write_lock
     from opencrab.stores import factory
@@ -1344,10 +1345,11 @@ def test_single_backfill_space_stays_refused(tmp_path, monkeypatch, capsys):
 
 
 def test_single_admin_cli_backfill_pack_id_refusals(tmp_path, monkeypatch):
-    """T-E8(c)(d): 관리 CLI backfill-pack-id는 단일 모드에서 우연히 거부된다. 이 거부를 고정한다.
+    """T-E8(c)(d): 관리 CLI backfill-pack-id는 단일 모드에서 거부된다. 이 거부를 고정한다.
 
     (c) graph.db가 없으면 종료 코드 1이고 graph.db를 만들지 않는다.
-    (d) graph.db가 있으면 write.lock을 쥔 채 첫 factory 호출이 수명 잠금 순서 위반으로 거부되고 graph.db가 그대로다.
+    (d) graph.db가 있으면 write.lock 앞에서 명시 문구(SINGLE_SQLITE_FILE is set)로 종료 코드 1이고 graph.db가
+        그대로다. 옛 파일로 만든 계획을 단일 그래프에 쓰는 오사용을 막는 거부다(#671 D10).
     """
     import hashlib
 
@@ -1367,8 +1369,9 @@ def test_single_admin_cli_backfill_pack_id_refusals(tmp_path, monkeypatch):
     shutil.copy2(tmp_path / "live" / "graph.db", built.root / "graph.db")
     digest = hashlib.sha256((built.root / "graph.db").read_bytes()).hexdigest()
     result = runner.invoke(main, ["packs", "backfill-pack-id", "--apply"])
-    assert isinstance(result.exception, RuntimeError), (result.exit_code, result.output, result.exception)
-    assert "lifetime lock order violated" in str(result.exception)
+    assert result.exit_code == 1, (result.exit_code, result.output, result.exception)
+    assert "SINGLE_SQLITE_FILE is set" in " ".join(result.output.split())
+    assert not (built.root / "write.lock").exists()
     assert hashlib.sha256((built.root / "graph.db").read_bytes()).hexdigest() == digest
 
 

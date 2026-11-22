@@ -706,10 +706,11 @@ def test_t11_e25_crabharness_apply_rejects_before_write_lock(tmp_path, monkeypat
 
 @pytest.mark.parametrize("entry", ["crabharness_apply", "source_fts_orphans_apply"])
 def test_t11_g10_single_mode_still_reaches_write_lock(tmp_path, monkeypatch, _real_crabharness, entry):
-    """T11-G10: 단일 모드에서는 root의 write.lock이 정상 구성원이다. 두 진입이 B11 거부에 막히지 않고 잠금에 닿는다.
+    """T11-G10: 단일 모드에서는 root의 write.lock이 정상 구성원이다.
 
-    crabharness apply와 packs source-fts-orphans --apply는 SINGLE_SQLITE_FILE이 있을 때 거부 지점을 건너뛰어야 한다.
-    write_lock을 가로채 닿았는지 본다.
+    crabharness apply는 SINGLE_SQLITE_FILE이 있을 때 B11 거부 지점을 건너뛰고(hold_single_file 뒤) 잠금에
+    닿는다. write_lock을 가로채 닿았는지 본다. packs source-fts-orphans --apply는 B1~B3 이후 단일 모드에서
+    명시 문구로 write.lock 앞에서 거부한다(#671 D10). 이 경우 잠금에 닿지 않는다.
     """
     import shutil
 
@@ -743,7 +744,11 @@ def test_t11_g10_single_mode_still_reaches_write_lock(tmp_path, monkeypatch, _re
         from opencrab.cli import main
 
         shutil.copy2(tmp_path / "live" / "doc_store.db", built.root / "doc_store.db")
-        CliRunner().invoke(main, ["packs", "source-fts-orphans", "--apply"])
+        result = CliRunner().invoke(main, ["packs", "source-fts-orphans", "--apply"])
+        assert result.exit_code == 1, (result.exit_code, result.output, result.exception)
+        assert "SINGLE_SQLITE_FILE is set" in " ".join(result.output.split())
+        assert not reached
+        return
     assert reached
 
 

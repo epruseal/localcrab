@@ -178,12 +178,33 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _single_mode_requested() -> bool:
+    """True when the environment, the cwd .env or the standard env file sets SINGLE_SQLITE_FILE.
+
+    A fresh Settings() is read on purpose. get_settings() is cached, and calling it before init creates the
+    .env would freeze the settings at their pre-.env values. A broken setting raises here (fail-closed):
+    reading the failure as "not single mode" would let init write the .env first.
+    """
+    from opencrab.config import Settings
+
+    return bool(Settings().single_sqlite_file)
+
+
 @main.command()
 @click.option(
     "--force", is_flag=True, default=False, help="Overwrite existing .env file."
 )
 def init(force: bool) -> None:
     """Create a .env file from .env.example and show startup instructions."""
+    if _single_mode_requested():
+        # init writes a .env into the cwd (the root itself when cwd is the root), then DDL under write.lock
+        # and the user and token rows into the database. A single root takes its users from the merge
+        # input (#671), so the refusal comes before the first write.
+        err_console.print(
+            "[red]init does not support SINGLE_SQLITE_FILE. A single root takes its users from the merge "
+            "input.[/red]"
+        )
+        raise SystemExit(1)
     here = Path.cwd()
     src = here / ".env.example"
     dst = here / ".env"
@@ -1460,10 +1481,17 @@ def packs_backfill_pack_id(
         from opencrab.stores._single_file import reject_single_root
         from opencrab.stores.factory import make_graph_store
 
+        # #671: this command plans from the legacy graph.db and doc_store.db files in the root, but the
+        # factory returns stores on the single file. Applying that plan there would write a plan built from
+        # other data. Single mode refuses before write.lock exists.
+        if cfg.single_sqlite_file:
+            err_console.print(
+                "[red]SINGLE_SQLITE_FILE is set: packs backfill-pack-id writes are not supported in "
+                "single mode yet.[/red]"
+            )
+            raise SystemExit(1)
         # B11: without SINGLE_SQLITE_FILE a single root is refused before the lock exists.
-        # Single mode keeps its own refusal (T-E8 d).
-        if not cfg.single_sqlite_file:
-            reject_single_root(cfg.local_data_dir)
+        reject_single_root(cfg.local_data_dir)
         # #630: hold write.lock from the plan to the close of the store.
         # Another writer then cannot change the graph between the plan and
         # the write, and cannot see this write inside its own hold. The store
@@ -1845,9 +1873,16 @@ def packs_source_fts_orphans(apply_changes: bool) -> None:
     from opencrab.stores._single_file import reject_single_root
     from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
 
+    # #671: same rule as backfill-pack-id. The command reads the legacy doc_store.db in the root, so
+    # single mode refuses before write.lock exists.
+    if cfg.single_sqlite_file:
+        err_console.print(
+            "[red]SINGLE_SQLITE_FILE is set: packs source-fts-orphans writes are not supported in "
+            "single mode yet.[/red]"
+        )
+        raise SystemExit(1)
     # B11: same rule as backfill-pack-id. A single root is refused before write.lock exists.
-    if not cfg.single_sqlite_file:
-        reject_single_root(cfg.local_data_dir)
+    reject_single_root(cfg.local_data_dir)
     # #630 pattern: take write.lock first. The store bootstrap takes the same
     # lock file again on this thread, which file_lock allows. Only the
     # acquisition timeout is converted.

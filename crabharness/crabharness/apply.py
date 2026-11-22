@@ -78,6 +78,7 @@ def apply_promotion_package(
         from opencrab.pack.write_gate import reject_boundary_identity
         from opencrab.stores._single_file import reject_single_root
         from opencrab.stores.factory import (
+            hold_single_file,
             make_billing_sql_store,
             make_doc_store,
             make_graph_store,
@@ -128,10 +129,11 @@ def apply_promotion_package(
     # 별도 파일(billing.db)이라 락 바깥에 그대로 둔다.
     #
     # B11: SINGLE_SQLITE_FILE 없이 단일 root를 받으면 잠금 파일이 생기기 전에 거부한다.
-    # 단일 모드에서는 root의 write.lock이 정상 구성원이므로 건너뛴다.
+    # 단일 모드에서는 root의 write.lock이 정상 구성원이므로 건너뛴다. 대신 hold_single_file이
+    # write.lock 앞에서 결속을 판정하고, 첫 factory 호출이 열린 공유 객체를 재사용하게 한다(#671).
     if not settings.single_sqlite_file:
         reject_single_root(settings.local_data_dir)
-    with write_lock(settings.local_data_dir):
+    with hold_single_file(settings), write_lock(settings.local_data_dir):
         graph = make_graph_store(settings)
         docs = make_doc_store(settings)
         sql = make_sql_store(settings)

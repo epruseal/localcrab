@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import threading
@@ -18,6 +19,8 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from opencrab.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -46,8 +49,33 @@ def _get_pg_engine(url: str) -> Any:
 
 # 단일 SQLite 모드(#671). 경로별 공유 파일 등록부이며 모듈 잠금이 지킨다. 닫힌 객체는 남겨 두고
 # 다음 호출이 새 객체로 바꾼다. 소유자 없는 객체는 호출 쪽이 닫는다(_build_on_single_file).
+#
+# 이 잠금은 등록부 조회와 열기(_open_single_file), 훅을 등록하는 저장소 생성 전체(_build_on_single_file),
+# billing 결속 조회(make_billing_sql_store)를 지킨다. 새 잠금 객체를 만들지 않고 이 잠금으로 같은 공유
+# 파일 위의 저장소 생성을 한 번에 하나씩 직렬화한다. 잠금을 쥔 채 기다릴 수 있는 방향은 아래와 같다.
+#   1. 이 잠금 -> shared.lock: 저장소 생성자의 acquire와 생성 실패 정리.
+#   2. 이 잠금 -> write.lock: create_tables=True 생성자의 DDL.
+#   3. write.lock -> shared.lock: 쓰기 단위(write_lock은 활성 단위 안에서 들어갈 수 없다).
+#   4. write.lock -> 이 잠금: 쓰기 도구의 첫 호출이 write.lock 안에서 컨텍스트를 만들 때.
+#   5. 이 잠금 -> 수명 잠금 flock: 새 공유 파일을 열 때 최대 WRITE_LOCK_TIMEOUT(기본 120초).
+#   6. shared.lock -> 이 잠금: 금지한다. 작업 단위 안의 생성은 이 잠금을 잡기 전에 _refuse_inside_unit이
+#      거부한다. 1번과 맞물리면 시간 제한 없는 교착이 된다.
+# 소유자만 등록하는 hold_single_file은 훅이 없어 직렬화할 이유가 없으므로 이 잠금 밖에서 등록한다. 그래서
+# 레지스트리만 읽는 호출이 다른 스레드의 쓰기 단위를 기다리지 않는다.
 _SINGLE_FILES: dict[str, Any] = {}
 _SINGLE_FILES_LOCK = threading.RLock()
+
+
+def _refuse_inside_unit() -> None:
+    """작업 단위(shared.lock을 쥔 구간) 안의 저장소 생성을 거부한다.
+
+    write_lock과 billing 잠금이 이미 같은 방식으로 거부한다. 이 거부는 _SINGLE_FILES_LOCK을 잡기 전에
+    일어나야 한다. 단위를 쥔 스레드가 이 잠금을 기다리면 위 6번 관계가 서기 때문이다.
+    """
+    from opencrab.stores._single_file import sqlite_unit_active
+
+    if sqlite_unit_active():
+        raise RuntimeError("single SQLite store construction cannot enter an active unit of work")
 
 
 def _single_mode_checks(settings: Settings) -> str:
@@ -78,6 +106,7 @@ def _open_single_file(path: str) -> Any:
     """경로의 열린 공유 객체를 돌려준다. 없으면 만들고 결속을 검증한 뒤 등록한다."""
     from opencrab.stores._single_file import SharedSqliteFile
 
+    _refuse_inside_unit()
     with _SINGLE_FILES_LOCK:
         shared = _SINGLE_FILES.get(path)
         if shared is not None and not shared._closed:
@@ -98,14 +127,19 @@ def _open_single_file(path: str) -> Any:
 
 
 def _build_on_single_file(shared: Any, build: Any) -> Any:
-    """저장소를 만든다. 생성이 실패하고 소유자가 없으면 공유 객체를 닫아 수명 잠금을 푼다."""
-    try:
-        return build()
-    except BaseException:
-        with shared.lock:
-            if not shared._users and not shared._closed:
-                shared.close()
-        raise
+    """저장소를 만든다. 생성이 실패하고 소유자가 없으면 공유 객체를 닫아 수명 잠금을 푼다.
+
+    훅을 등록하는 생성은 _SINGLE_FILES_LOCK 안에서 한 번에 하나씩 일어난다(같은 공유 파일에 두 스레드가
+    동시에 훅을 거는 일을 막는다). 작업 단위 안의 호출은 호출자가 이 잠금 앞에서 이미 거부했다.
+    """
+    with _SINGLE_FILES_LOCK:
+        try:
+            return build()
+        except BaseException:
+            with shared.lock:
+                if not shared._users and not shared._closed:
+                    shared.close()
+            raise
 
 
 def make_graph_store(settings: Settings) -> Any:
@@ -387,6 +421,31 @@ def make_sql_store(settings: Settings) -> Any:
     return SQLStore(url=url, engine=engine)
 
 
+@contextlib.contextmanager
+def hold_single_file(settings: Settings) -> Iterator[None]:
+    """write.lock을 잡기 전에 단일 파일의 결속 결정을 끝내고 블록 동안 공유 객체를 연 채 둔다.
+
+    write.lock을 쥔 스레드의 첫 공유 파일 열기는 수명 잠금 순서 위반으로 거부된다(assert_lifetime_lock_order).
+    write.lock을 factory보다 먼저 잡는 진입(MCP 쓰기 도구, crabharness 적용)은 이 함수 아래에서 잠가
+    첫 factory 호출이 이미 열린 공유 객체를 재사용하게 한다. 결속 검증이 실패하면 write.lock이 생기기
+    전에 거부되므로 미승인 root에 새 파일이 남지 않는다. SINGLE_SQLITE_FILE이 비어 있으면 아무것도 하지 않는다.
+
+    이름 없는 소유자를 훅 없이 등록하므로 acquire의 훅 검사 블록을 지나지 않고, 그래서 레지스트리 잠금 밖에서
+    등록한다. 블록이 끝나면 소유자를 풀고 마지막 소유자이면 공유 객체가 닫힌다.
+    """
+    if not getattr(settings, "single_sqlite_file", ""):
+        yield
+        return
+    path = _single_mode_checks(settings)
+    shared = _open_single_file(path)
+    owner = object()
+    shared.acquire(owner, None)
+    try:
+        yield
+    finally:
+        shared.release(owner)
+
+
 def make_auth_sql_store(settings: Settings) -> Any:
     """인증 조회용 SQL 저장소를 연다. 조회할 것이 없다고 확정되면 None을 돌려준다(비단일 모드만).
 
@@ -405,6 +464,8 @@ def make_auth_sql_store(settings: Settings) -> Any:
     from opencrab.stores.sql_store import SQLStore
 
     if getattr(settings, "single_sqlite_file", ""):
+        # 프로그램 오류는 아래 변환(503)에 가려지지 않게 변환 try 앞에서 거부한다.
+        _refuse_inside_unit()
         try:
             path = _single_mode_checks(settings)
             shared = _open_single_file(path)
@@ -467,6 +528,7 @@ def make_billing_sql_store(settings: Settings, sql_store: Any) -> Any:
     """
     if getattr(settings, "single_sqlite_file", ""):
         # 결속을 마친 열린 SQL 저장소가 아니면 billing 파일을 만들지 않는다. 호출 순서에 기대지 않는다.
+        _refuse_inside_unit()  # _SINGLE_FILES_LOCK을 잡기 전이어야 한다.
         path = settings.single_sqlite_file
         shared = getattr(sql_store, "shared_file", None)
         with _SINGLE_FILES_LOCK:
