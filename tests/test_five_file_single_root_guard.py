@@ -599,11 +599,17 @@ def test_t11_g6_absolute_vector_db_file_into_root_is_rejected(tmp_path, monkeypa
 
 
 def test_t11_g7_default_call_shape_rejects_marked_directory(tmp_path):
-    """T11-G7: allow_single_root를 모르는 기존 호출 형태 SQLStore(url)가 표식 디렉터리에서 거부된다."""
+    """T11-G7: allow_single_root를 모르는 기존 호출 형태가 표식 디렉터리에서 거부된다.
+
+    SQLStore(url)와 검사 함수 reject_unmanaged_single_file(path)(그래프, 문서, 벡터 생성자와 스크립트의
+    호출 형태) 둘이다. 기본값이 False로 고정되어 있어야 두 형태가 모두 거부한다.
+    """
+    from opencrab.stores._single_file import reject_unmanaged_single_file
     from opencrab.stores.sql_store import SQLStore
 
     root = _synthetic_root(tmp_path)
     _expect_rejected_and_unchanged(root, lambda: SQLStore(f"sqlite:///{root / 'x.db'}"))
+    _expect_rejected_and_unchanged(root, lambda: reject_unmanaged_single_file(str(root / "x.db")))
 
 
 @pytest.mark.parametrize("variant", ["a_root_holds_link_out", "b_outside_holds_link_in"])
