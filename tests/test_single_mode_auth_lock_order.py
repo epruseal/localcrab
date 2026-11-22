@@ -231,6 +231,15 @@ def test_t12_n4_http_token_both_shapes(tmp_path, monkeypatch, http_env):
     _assert_auth_clean(built.root, before)
 
 
+def test_t12_n4_authproxy_shape_rejects_missing_and_unknown_bearer(tmp_path, monkeypatch, http_env):
+    """T12-N4: authproxy 모양(쿼리 토큰 허용)에서도 헤더와 토큰이 없는 요청과 모르는 bearer는 401이다."""
+    built = _authorized_with_token(tmp_path, monkeypatch)
+    before = _listing(built.root)
+    assert _post_once(None, allow_query_token=True).status_code == 401
+    assert _post_once(_bearer("t12-unknown"), allow_query_token=True).status_code == 401
+    _assert_auth_clean(built.root, before)
+
+
 # ---------------------------------------------------------------------------
 # 오류
 # ---------------------------------------------------------------------------
