@@ -54,11 +54,13 @@ def _make_set(built, tmp_path, name: str = "bk") -> Path:
     return _backup(built, tmp_path / name).set_dir
 
 
-def _restore(set_dir, settings, *, apply=False):
+def _restore(set_dir, settings, *, apply=None):
+    """apply를 None으로 두면 키워드를 넘기지 않아 함수의 기본값(dry-run)을 시험한다."""
     from opencrab.stores import single_restore as sr
 
     lines: list[str] = []
-    rc = sr.restore_single(set_dir, settings, apply=apply, on_event=lines.append)
+    kwargs = {} if apply is None else {"apply": apply}
+    rc = sr.restore_single(set_dir, settings, on_event=lines.append, **kwargs)
     return rc, "\n".join(lines)
 
 
