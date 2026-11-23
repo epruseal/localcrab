@@ -1233,6 +1233,8 @@ def _single_env(monkeypatch, root: Path) -> None:
     _point_at(monkeypatch, root)
     monkeypatch.setenv("STORAGE_MODE", "local")
     monkeypatch.setenv("SINGLE_SQLITE_FILE", str(root / "single.db"))
+    # 게시 표의 차원과 설정 차원을 맞춘다. 단일 모드는 표와 다른 EMBED_DIM을 거부한다(#671 B7).
+    monkeypatch.setenv("EMBED_DIM", str(_DIM))
     get_settings.cache_clear()
 
 
