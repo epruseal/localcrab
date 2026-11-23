@@ -351,7 +351,7 @@ diff <("<워크트리>/.venv/bin/ruff" check --show-files . 2>&1 | sort) \
 
   반대로 `OPENCRAB_PG_TEST_URL`은 두 실행에서 반드시 같은 값을 쓴다(정본은
   `Makefile`의 `test-pg` 타깃이며 4번을 참고한다). 한쪽만 이 값을 설정하면 그쪽만
-  PG 파리티 테스트를 실행하고 다른 쪽은 전부 skip하므로, 두 집합의 diff가
+  PG 파리티 테스트를 실행하고 다른 쪽은 전부 skip한다. 이때 두 집합의 diff는
   환경 차이를 결함으로 오판정한다.
 
   스모크 시험은 `OPENCRAB_SMOKE_BIN_DIR`이나 `PATH`의 `opencrab`에서 콘솔
