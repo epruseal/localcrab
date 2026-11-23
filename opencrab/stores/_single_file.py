@@ -277,7 +277,9 @@ def reject_unmanaged_single_file(db_path: str, *, allow_single_root: bool = Fals
     같은 오판 가능성이 있다. 게시된 단일 파일은 늘 WAL이라 이 경로에 닿지 않는다.
     hot journal 회복 재시도는 저널 회복이라는 쓰기를 한다. finalize 중에 종료해 hot journal이 남은
     `.partial`에 닿으면 merge가 보존하라고 한 그 파일의 바이트를 바꾼다. 회복 재시도가 BUSY와 LOCKED가
-    아닌 코드로 실패하면 호출자는 그 예외를 그대로 받고, HTTP 인증 조회는 503이 아니라 500이다.
+    아닌 코드로 실패하면 호출자는 그 예외를 그대로 받는다. 다섯 파일 저장소 생성자는 `unmanaged_open_refusal`로
+    부르므로 그 예외를 받지 않고 저장소가 비가용이 된다. 이 함수를 직접 부르는 스크립트와 단일 모드 billing은
+    예외를 그대로 받는다.
     """
     if db_path == ":memory:":
         return
@@ -309,6 +311,20 @@ def reject_unmanaged_single_file(db_path: str, *, allow_single_root: bool = Fals
                 raise exc
     if found:
         raise RuntimeError("single SQLite file requires shared connection")
+
+
+def unmanaged_open_refusal(db_path: str, *, allow_single_root: bool = False) -> BaseException | None:
+    """보호 검사가 판정하지 못한 파일을 열지 않게 하려고 그 예외를 올리지 않고 돌려준다.
+
+    다섯 파일 저장소 생성자가 부른다. 판정 불가(sqlite3.Error와 OSError)이면 그 예외 객체를 돌려주고,
+    저장소는 그 파일을 열지 않은 채 비가용이 된다. 표식이 있거나 단일 root여서 확정한 거부(RuntimeError)는
+    그대로 올린다. 통과하면 None이다. 검사 함수는 모듈 전역 이름으로 부른다(시험이 속성을 바꿔 끼운다).
+    """
+    try:
+        reject_unmanaged_single_file(db_path, allow_single_root=allow_single_root)
+    except (sqlite3.Error, OSError) as exc:
+        return exc
+    return None
 
 
 class RollbackOnlyError(RuntimeError):

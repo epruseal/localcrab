@@ -600,9 +600,10 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
         try:
             store = _auth_store()
         except Exception as exc:  # noqa: BLE001
-            # The unmanaged single-file check (#671) refuses a locked file with a raw sqlite3 BUSY. That is a
-            # store that cannot answer now (503). Anything the code does not classify, such as the single-mode
-            # refusal, propagates as before. This try covers only the store lookup; the verify_token try below
+            # A five-file store that the unmanaged single-file check (#671) could not judge is built unavailable
+            # (no exception here); the lookup below answers 503 for it. This clause still covers the single-mode
+            # open failure that make_auth_sql_store reports with a reason. Anything the code does not classify,
+            # such as the single-mode refusal, propagates as before. This try covers only the store lookup; the verify_token try below
             # keeps its own answer (None, then 401) for an unclassified error.
             reason = token_store_unavailable_reason(exc)
             if reason is None:

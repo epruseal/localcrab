@@ -814,8 +814,10 @@ def _wal_exclusive_lock(db_path: Path):
         conn.close()
 
 
-def test_unmanaged_check_refusal_on_a_locked_wal_token_file_is_503_then_recovers(env, monkeypatch, caplog):
-    """V7 (ii): the check raises a raw BUSY out of ``_auth_store()``; the lookup answers 503, not 500."""
+def test_unmanaged_check_refusal_on_a_locked_wal_token_file_is_503_unavailable_then_recovers(env, monkeypatch, caplog):
+    """V7 (ii): the check cannot judge a locked WAL token file, so the store it builds is unavailable and the lookup
+    answers 503 (reason store-unavailable), not 500. #671 VF1: the earlier raw-BUSY reason store-busy is gone for
+    this path. The store is not cached, so the next request recovers."""
     from opencrab.stores import _single_file
 
     monkeypatch.setattr(_single_file, "_UNMANAGED_WAL_WAIT", 0.3, raising=_STRICT_CONSTS)
@@ -841,7 +843,7 @@ def test_unmanaged_check_refusal_on_a_locked_wal_token_file_is_503_then_recovers
     locked, healed = _run(scenario)
 
     _assert_unavailable(locked)
-    assert any("store-busy" in record.getMessage() for record in caplog.records), caplog.text
+    assert any("store-unavailable" in record.getMessage() for record in caplog.records), caplog.text
     assert healed.status_code == 200, "the refused store was cached or the worker is stuck"
 
 

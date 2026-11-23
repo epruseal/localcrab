@@ -247,6 +247,39 @@ def test_store_flag_unavailable_does_not_gate_the_lookup(env):
     assert _manifest(env, env.headers).status_code == 200
 
 
+def test_refused_store_is_503_busy_then_recovers_after_lock_release(env, monkeypatch):
+    """#671 VF1: a store built while the WAL token file was locked records the refusal and stays unavailable,
+    but its engine still answers. The check runs again on each new connection, so the lookup is a 503
+    store-busy while the lock holds and a 200 after it is released."""
+    import sqlite3
+
+    from opencrab.stores import _single_file
+    from tests.test_mcp_auth_unavailable import _wal_exclusive_lock
+
+    monkeypatch.setattr(_single_file, "_UNMANAGED_WAL_WAIT", 0.3)
+    monkeypatch.setattr(_single_file, "_UNMANAGED_CHECK_TIMEOUT", 0.05)
+    env.sql.close()  # the pool holds no connection while the file changes mode and is locked
+    conn = sqlite3.connect(env.db_path)
+    assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    conn.close()
+    refused = None
+    try:
+        with _wal_exclusive_lock(env.db_path):
+            refused = SQLStore(f"sqlite:///{env.db_path}", create_tables=False)
+            assert refused._open_refusal is not None
+            assert refused.available is False
+            assert refused._engine is not None
+            monkeypatch.setattr(api.app.state.context, "sql", refused)
+            locked = _manifest(env, env.headers)
+        healed = _manifest(env, env.headers)
+    finally:
+        if refused is not None:
+            refused.close()
+
+    _assert_unavailable(locked)
+    assert healed.status_code == 200, healed.text
+
+
 # ---------------------------------------------------------------------------
 # 4 -- the 503 leaves a fixed, bounded trace
 # ---------------------------------------------------------------------------

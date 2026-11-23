@@ -1422,6 +1422,9 @@ _GUARD_TARGETS = [
 _RECOVERY_TARGETS = [
     "guard", "sqlstore", "fwd_sqlite_conn", "fwd_vec_sqlite_conn", "cleanup_rw", "quantization_connect",
 ]
+# 다섯 파일 저장소 생성자는 판정 불가에서 예외를 올리지 않고 비가용이 된다(#671). 나머지는 예외를 그대로 받는다.
+_CTOR_TARGETS = ["sqlstore", "graph", "doc", "vector"]
+_STRICT_TARGETS = [target for target in _GUARD_TARGETS if target not in _CTOR_TARGETS]
 
 
 @pytest.fixture
@@ -1484,6 +1487,22 @@ def _assert_unchanged(path, before, *, same_bytes: bool = True) -> None:
     assert before.names <= after.names, before.names - after.names
     base = Path(path).name
     assert after.names - before.names <= {base + "-wal", base + "-shm", base + "-journal"}
+
+
+def _assert_refused_untouched(path, before, *, same_bytes: bool = True) -> None:
+    """거부된 저장소가 파일을 열지 않았음을 확인한다. `_assert_unchanged` 규칙에 부트스트랩 잠금 이름만 더한다.
+
+    본파일 바이트와 표 이름 목록이 같고 새 이름은 -wal, -shm, -journal과 write.lock과 `<base>.lock`뿐이다.
+    검사 함수는 WAL 파일 옆에 -wal과 -shm을 만들 수 있다. B1 보호는 바이트와 표 목록 단언이 지킨다.
+    """
+    after = _snapshot(path, tables=before.tables is not None)
+    if same_bytes:
+        assert after.sha == before.sha
+    assert after.tables == before.tables
+    assert before.names <= after.names, before.names - after.names
+    base = Path(path).name
+    allowed = {base + "-wal", base + "-shm", base + "-journal", "write.lock", base + ".lock"}
+    assert after.names - before.names <= allowed, after.names - before.names
 
 
 class _Holder:
@@ -1719,11 +1738,11 @@ def test_unmanaged_check_refuses_locked_marker_db(tmp_path, monkeypatch, fast_gu
     _assert_unchanged(path, before)
 
 
-@pytest.mark.parametrize("target", _GUARD_TARGETS)
+@pytest.mark.parametrize("target", _STRICT_TARGETS)
 def test_unmanaged_check_refuses_locked_wal_db(tmp_path, monkeypatch, fast_guard, target):
     """V1w: WAL DB가 잠겨 있으면 판정하지 않고 대기 상수만큼 기다린 뒤 BUSY를 올린다.
 
-    호출자가 받은 예외는 검사 자신의 예외 객체다.
+    호출자가 받은 예외는 검사 자신의 예외 객체다. 다섯 파일 저장소 생성자는 예외 대신 비가용이 된다(V9).
     """
     path = _make_db(tmp_path / "locked.db", "wal", True)
     before = _snapshot(path)
@@ -1745,23 +1764,38 @@ def test_unmanaged_check_refuses_locked_wal_db(tmp_path, monkeypatch, fast_guard
 def test_locked_marker_db_is_not_opened_even_when_lock_is_released_after_the_check(
     tmp_path, monkeypatch, fast_guard, kind
 ):
-    """V2(B1 재현): 검사 직후 잠금이 풀려도 표식 있는 파일에 SQLStore가 스키마를 만들지 않는다."""
+    """V2(B1 재현): 검사 직후 잠금이 풀려도 표식 있는 파일에 SQLStore가 스키마를 만들지 않는다.
+
+    롤백 파일은 표식이 판정되어 예외를 올린다. WAL 파일은 BUSY로 판정하지 못해 저장소가 비가용이 되고
+    파일은 열리지 않는다.
+    """
     from opencrab.stores.sql_store import SQLStore
 
     path = _make_db(tmp_path / "locked.db", kind, True)
     before = _snapshot(path)
     holder = _Holder(path, kind)
     holder.start()
+    store = None
     try:
         _assert_locked(path)
         _spy_releasing(monkeypatch, holder)
-        expected = RuntimeError if kind == "delete" else sqlite3.OperationalError
-        with pytest.raises(expected) as info:
-            SQLStore(f"sqlite:///{path}")
+        if kind == "delete":
+            with pytest.raises(RuntimeError) as info:
+                SQLStore(f"sqlite:///{path}")
+            assert type(info.value) is RuntimeError, type(info.value)
+        else:
+            store = SQLStore(f"sqlite:///{path}")
     finally:
         holder.stop()
-    assert type(info.value) is expected, type(info.value)
-    _assert_unchanged(path, before)
+    if store is not None:
+        try:
+            assert store.available is False
+            assert store._open_refusal is not None
+        finally:
+            store.close()
+        _assert_refused_untouched(path, before)
+    else:
+        _assert_unchanged(path, before)
     assert "users" not in _table_names(path)
 
 
@@ -1774,11 +1808,13 @@ def test_unmanaged_check_undeterminable_is_refused(tmp_path, monkeypatch, fast_g
     """V3(i)~(v): 롤백 DB를 쥐고 있는데 immutable 판정을 믿을 수 없으면 처음 BUSY를 올린다.
 
     행마다 이 시험이 DB와 holder를 새로 만든다(대상끼리 헤더 변조가 새지 않는다). 파일 바이트를 바꾸는 행은
-    holder가 잠금을 쥔 뒤에 바꾼다.
+    holder가 잠금을 쥔 뒤에 바꾼다. 다섯 파일 저장소 생성자 대상은 예외를 올리지 않고 비가용이 되며
+    파일을 열지 않는다(V9).
     """
     path = _make_db(tmp_path / "locked.db", "delete", True)
     readable = row in ("immutable-fails", "toctou")
     raised = _record_guard(monkeypatch)
+    store = None
     with _held(path, "delete"):
         _assert_locked(path)
         if row == "magic-mismatch":
@@ -1800,8 +1836,19 @@ def test_unmanaged_check_undeterminable_is_refused(tmp_path, monkeypatch, fast_g
             _install_shim(monkeypatch, _Sqlite3Shim(on_connect=on_connect))
         elif row == "toctou":
             _install_shim(monkeypatch, _Sqlite3Shim(on_close=lambda database: _poke(path, 18, bytes([2, 2]))))
-        with pytest.raises(sqlite3.OperationalError) as info:
-            _call_target(target, path)
+        if target in _CTOR_TARGETS:
+            store = _call_target(target, path)
+        else:
+            with pytest.raises(sqlite3.OperationalError) as info:
+                _call_target(target, path)
+    if store is not None:
+        try:
+            assert store.available is False
+            assert raised, "the unmanaged check did not raise"
+        finally:
+            _close_result(store)
+        _assert_refused_untouched(path, before, same_bytes=row != "toctou")
+        return
     _assert_guard_exception(info.value, raised)
     assert type(info.value) is sqlite3.OperationalError, type(info.value)
     assert (info.value.sqlite_errorcode & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
@@ -1854,6 +1901,225 @@ def test_unmanaged_check_short_files_without_lock(tmp_path, fast_guard):
             _single_file.reject_unmanaged_single_file(str(short))
         assert not isinstance(info.value, sqlite3.OperationalError)
         assert info.value.sqlite_errorcode == sqlite3.SQLITE_NOTADB
+
+
+# ---------------------------------------------------------------------------
+# V9: 다섯 파일 모드의 판정 불가 파일은 그 저장소만 비가용으로 둔다(#671 VF1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("target", _CTOR_TARGETS)
+def test_five_file_store_with_corrupt_file_is_unavailable_not_raising(tmp_path, fast_guard, target):
+    """T1(C1): 비SQLite 헤더 파일은 저장소 생성자를 뚫지 않고 그 저장소만 비가용으로 둔다. 파일은 열지 않는다."""
+    path = tmp_path / "corrupt.db"
+    path.write_bytes(b"x" * 50)
+    before = _snapshot(path, tables=False)
+    store = _call_target(target, path)
+    try:
+        assert store.available is False
+        if target == "graph":
+            assert store._schema_state == "partial_or_unknown"
+        if target == "sqlstore":
+            assert store._engine is not None
+            assert store._open_refusal is not None
+    finally:
+        _close_result(store)
+    _assert_refused_untouched(path, before)
+
+
+@pytest.mark.parametrize("target", _CTOR_TARGETS)
+@pytest.mark.parametrize("fault", ["cantopen", "oserror"])
+def test_five_file_store_with_unreadable_file_is_unavailable(tmp_path, monkeypatch, fast_guard, target, fault):
+    """T2(C2): 열기와 읽기 실패(BUSY 아닌 OperationalError, OSError)도 그 저장소만 비가용이다. 유효한 파일을 열지 않는다."""
+    import errno
+
+    from opencrab.stores import _single_file
+
+    path = _make_db(tmp_path / "plain.db", "delete", False)
+    before = _snapshot(path)
+    if fault == "cantopen":
+        _install_shim(
+            monkeypatch,
+            _Sqlite3Shim(on_connect=lambda database: (_ for _ in ()).throw(_op_error(sqlite3.SQLITE_CANTOPEN))),
+        )
+    else:
+
+        class _UnreadablePath:
+            def __init__(self, value) -> None:
+                self.value = value
+
+            def is_file(self) -> bool:
+                raise PermissionError(errno.EACCES, "shim: cannot stat")
+
+        # `_single_file`이 보는 Path 이름만 바꾼다(pathlib.Path 전역은 건드리지 않는다).
+        monkeypatch.setattr(_single_file, "Path", _UnreadablePath)
+        with pytest.raises(OSError):
+            _single_file.reject_unmanaged_single_file(str(path))
+    store = _call_target(target, path)
+    try:
+        assert store.available is False
+    finally:
+        _close_result(store)
+    _assert_refused_untouched(path, before)
+
+
+@pytest.mark.parametrize("target", _CTOR_TARGETS)
+def test_five_file_store_with_busy_wal_marker_db_is_unavailable(tmp_path, monkeypatch, fast_guard, target):
+    """T3(C3, B1): 잠긴 표식 WAL 파일은 비가용이다. 검사 직후 잠금이 풀려도 파일을 열지 않아 표가 늘지 않는다."""
+    path = _make_db(tmp_path / "locked.db", "wal", True)
+    before = _snapshot(path)
+    holder = _Holder(path, "wal")
+    holder.start()
+    try:
+        _assert_locked(path)
+        _spy_releasing(monkeypatch, holder)
+        store = _call_target(target, path)
+    finally:
+        holder.stop()
+    try:
+        assert store.available is False
+    finally:
+        _close_result(store)
+    _assert_refused_untouched(path, before)
+    assert "users" not in _table_names(path)
+
+
+_CONTEXT_VICTIMS = {
+    "graph.db": "neo4j",
+    "doc_store.db": "mongo",
+    "vectors.db": "chroma",
+    "opencrab.db": "sql",
+    "billing.db": "billing",
+}
+
+
+@pytest.mark.parametrize("victim", list(_CONTEXT_VICTIMS))
+def test_context_is_built_when_one_five_file_store_is_unavailable(tmp_path, monkeypatch, fast_guard, victim):
+    """T4: 다섯 파일 가운데 하나가 손상돼도 MCP 컨텍스트는 만들어지고 그 저장소만 비가용이다."""
+    import opencrab.mcp.tools as tools_mod
+    from opencrab.config import get_settings
+    from opencrab.stores import factory
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_MODE", "local")
+    monkeypatch.setenv("VECTOR_BACKEND", "sqlite-vec")
+    monkeypatch.setenv("EMBEDDING_BACKEND", "openai")
+    monkeypatch.setenv("EMBED_DIM", str(_DIM))
+    monkeypatch.setenv("WRITE_LOCK_TIMEOUT", "2")
+    monkeypatch.delenv("SINGLE_SQLITE_FILE", raising=False)
+    monkeypatch.setattr(factory, "_make_kure_embedding_function", lambda settings: _hash_embed)
+    get_settings.cache_clear()
+    monkeypatch.setattr(tools_mod, "_context", {})
+    path = tmp_path / victim
+    path.write_bytes(b"x" * 50)
+    try:
+        ctx = tools_mod._get_context()
+        stores = {
+            "neo4j": ctx["neo4j"],
+            "mongo": ctx["mongo"],
+            "chroma": ctx["chroma"],
+            "sql": ctx["sql"],
+            "billing": ctx["billing"]._sql,
+        }
+        for name, store in stores.items():
+            assert store.available is (name != _CONTEXT_VICTIMS[victim]), name
+        assert ctx["billing"].tables_ready is (victim != "billing.db")
+        # 같은 디렉터리의 나머지 저장소는 정상 생성되므로 이름 목록 대신 손상 파일만 본다.
+        assert path.read_bytes() == b"x" * 50
+        assert not any(Path(f"{path}{suffix}").exists() for suffix in ("-wal", "-shm", "-journal"))
+    finally:
+        for store in list(tools_mod._context.values()):
+            close = getattr(store, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+        get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("target", _CTOR_TARGETS)
+@pytest.mark.parametrize("mode", ["delete", "wal"])
+def test_five_file_store_still_refuses_marked_file(tmp_path, fast_guard, target, mode):
+    """T6: 잠금 없는 표식 파일은 판정되어 다섯 파일 생성자 넷이 모두 거부한다. 파일은 그대로다."""
+    path = _make_db(tmp_path / "marked.db", mode, True)
+    before = _snapshot(path)
+    with pytest.raises(RuntimeError, match=_REFUSAL):
+        _call_target(target, path)
+    _assert_unchanged(path, before)
+
+
+def test_single_mode_billing_check_stays_strict(tmp_path, fast_guard):
+    """T7: allow_single_root=True로 만드는 단일 모드 billing은 판정 불가에서 예외를 올리고 listener를 갖지 않는다."""
+    from opencrab.stores.sql_store import SQLStore
+
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"x" * 50)
+    with pytest.raises(sqlite3.DatabaseError):
+        SQLStore(f"sqlite:///{corrupt}", create_tables=False, allow_single_root=True)
+    plain = _make_db(tmp_path / "plain.db", "delete", False)
+    for kwargs in ({}, {"allow_single_root": True}):
+        store = SQLStore(f"sqlite:///{plain}", create_tables=False, **kwargs)
+        try:
+            assert store.available is True
+            assert len(store._engine.dialect.dispatch.do_connect) == 0
+        finally:
+            store.close()
+
+
+def test_refused_marked_billing_file_is_not_written_after_lock_release(tmp_path, monkeypatch, fast_guard):
+    """T9(2판 검증 차단 1): 거부된 SQLStore의 `_engine`을 쓰는 호출자도 잠금이 풀린 뒤 표식 파일에 쓰지 못한다."""
+    from opencrab.billing.hooks import _TABLES_PG, _TABLES_SQLITE, BillingHooks
+    from opencrab.execution._sql import ensure_tables
+    from opencrab.stores.sql_store import SQLStore
+
+    path = _make_db(tmp_path / "billing.db", "wal", True)
+    before = _snapshot(path)
+    holder = _Holder(path, "wal")
+    holder.start()
+    try:
+        _assert_locked(path)
+        _spy_releasing(monkeypatch, holder)
+        store = SQLStore(f"sqlite:///{path}", create_tables=False)
+    finally:
+        holder.stop()
+    try:
+        assert store.available is False
+        assert store._open_refusal is not None
+        assert len(store._engine.dialect.dispatch.do_connect) == 1
+        hooks = BillingHooks(store)
+        assert hooks.tables_ready is False
+        assert hooks.emit("node_write")["ok"] is False
+        assert store.ping() is False
+        with pytest.raises(RuntimeError, match=_REFUSAL):
+            ensure_tables(store, _TABLES_SQLITE, _TABLES_PG, own_file_lock=True)
+    finally:
+        store.close()
+    _assert_refused_untouched(path, before)
+    assert "billing_events" not in _table_names(path)
+
+
+def test_refused_unmarked_billing_file_is_opened_after_lock_release(tmp_path, monkeypatch, fast_guard):
+    """T9 대조군: 표식 없는 파일이면 listener가 연결을 통과시키므로 잠금이 풀린 뒤 billing이 쓴다."""
+    from opencrab.billing.hooks import BillingHooks
+    from opencrab.stores.sql_store import SQLStore
+
+    path = _make_db(tmp_path / "billing.db", "wal", False)
+    holder = _Holder(path, "wal")
+    holder.start()
+    try:
+        _assert_locked(path)
+        # 검사를 즉시 실패시키지 않고 BUSY로 판정 불가를 만든 뒤 잠금을 푼다. 검사 호출마다 잠금을 푼다.
+        _spy_releasing(monkeypatch, holder)
+        store = SQLStore(f"sqlite:///{path}", create_tables=False)
+    finally:
+        holder.stop()
+    try:
+        assert store.available is False
+        hooks = BillingHooks(store)
+        assert hooks.tables_ready is True
+        assert hooks.emit("node_write")["ok"] is True
+    finally:
+        store.close()
+    assert "billing_events" in _table_names(path)
 
 
 def test_published_single_db_is_wal(tmp_path, monkeypatch):

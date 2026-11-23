@@ -446,14 +446,22 @@ class SQLStore:
         self._engine: Any = None
         self._available = False
         self._is_sqlite = url.startswith("sqlite")
+        # #671: 보호 검사가 판정하지 못한 파일의 거부 기록. 있으면 `_connect`가 파일을 열지 않고 비가용이 된다.
+        self._open_refusal: BaseException | None = None
+        self._refusal_db_path: str | None = None
         if self._is_sqlite and shared is None:
             from sqlalchemy.engine import make_url
 
-            from opencrab.stores._single_file import reject_unmanaged_single_file
+            from opencrab.stores._single_file import reject_unmanaged_single_file, unmanaged_open_refusal
 
             db_path = make_url(url).database
             if db_path:
-                reject_unmanaged_single_file(db_path, allow_single_root=allow_single_root)
+                if allow_single_root:
+                    # 단일 모드 billing은 엄격하게 거부한다(예외를 그대로 올린다).
+                    reject_unmanaged_single_file(db_path, allow_single_root=True)
+                else:
+                    self._open_refusal = unmanaged_open_refusal(db_path)
+                    self._refusal_db_path = db_path
         # issue #105 (verifier follow-up): billing.db is meant to hold only
         # billing_events (BillingHooks._ensure_tables() creates that table
         # itself), but SQLStore._connect() unconditionally created the full
@@ -536,6 +544,13 @@ class SQLStore:
             if self._is_sqlite:
                 enable_sqlite_fk(self._engine)
 
+            if self._open_refusal is not None:
+                # 판정하지 못한 파일은 열지 않는다. 엔진은 남긴다(REST 인증이 `_engine`을 직접 쓴다). 이 엔진의
+                # 새 연결마다 검사를 다시 해서 `_engine`을 쓰는 모든 호출자가 표식 있는 파일을 열지 못하게 한다.
+                if self._provided_engine is None:
+                    self._register_refusal_recheck()
+                raise RuntimeError("unmanaged single-file check refused the open") from self._open_refusal
+
             with self._engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
 
@@ -555,6 +570,24 @@ class SQLStore:
         except Exception as exc:
             logger.warning("SQL store unavailable: %s", exc)
             self._available = False
+
+    def _register_refusal_recheck(self) -> None:
+        """거부를 기록한 엔진이 새 DBAPI 연결을 만들기 전에 보호 검사를 다시 부른다(#671).
+
+        표식이 있으면 RuntimeError가 나가 파일을 열지 않는다. 판정 불가이면 sqlite 오류가 나가고, 표식이 없으면
+        연결한다. 풀에 이미 있는 연결의 체크아웃에는 걸리지 않는다. 검사는 모듈 속성으로 부른다.
+        """
+        from sqlalchemy import event
+
+        db_path = self._refusal_db_path
+
+        def _recheck(dialect: Any, conn_rec: Any, cargs: Any, cparams: Any) -> None:
+            from opencrab.stores import _single_file
+
+            _single_file.reject_unmanaged_single_file(db_path)
+            return None
+
+        event.listen(self._engine, "do_connect", _recheck)
 
     def close(self) -> None:
         """Dispose the underlying SQLAlchemy engine's connection pool.
