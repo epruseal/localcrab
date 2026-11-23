@@ -560,6 +560,11 @@ python -m opencrab.stores.backup --verify /backup/path/backup.<세트 식별자>
 있게 쓰는 법, 보장 범위, 복원 절차, 문제 해결을 [docs/live-backup.md](./live-backup.md)에
 모았다. 이 절은 그 요약이다.
 
+단일 SQLite 모드(`SINGLE_SQLITE_FILE`, #671)에서는 같은 CLI가 `backup_single_root`로
+`single.db`와 `billing.db`만 담은 세트를 만들고, 복원은
+`python -m opencrab.stores.single_restore`(기본 dry-run)가 한다. 위 목록과 `backup_data_dir`의
+단일 모드 거부는 그대로다.
+
 `--data-dir`를 생략하면 설정의 `LOCAL_DATA_DIR`을 쓴다. `--to`를 생략하면
 데이터 디렉토리 자신을 백업 목적지로 삼는다. 백업 결과는 원본 파일명을
 그대로 담은 하나의 세트 디렉터리(`backup.{timestamp}.{hex}/`, 예:

@@ -143,7 +143,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 | 캐시 무효화 범위 | `data_version`은 파일 전체의 쓰기에 오른다 | 3단계 측정 후 결정 |
 | `lower` UDF | 그래프 저장소가 등록한 `lower`가 단일 연결에서 다른 저장소에도 보인다. 지금 스키마의 인덱스와 트리거는 `lower`를 쓰지 않는다. `lower` 표현식 인덱스를 만들면 의미가 달라진다 | 새 인덱스 추가 때 점검 |
 | 전원 손실 | WAL과 `synchronous=NORMAL`에서 마지막 commit이 사라질 수 있다. 단일 파일은 한 commit이 원자적이므로 축 사이가 어긋난 상태는 남지 않는다. 다섯 파일은 파일마다 commit이 따로 사라질 수 있다. 시험하지 않았다. 분석만 했다 | 3단계 |
-| 백업 도구 | `backup_data_dir`는 고정 파일 목록을 쓴다. 단일 파일 경로는 목록에 없다 | 4단계 |
+| 백업 도구 | `backup_data_dir`는 고정 파일 목록을 쓰고 단일 모드를 거부한다. 단일 모드 백업은 별도 함수 `backup_single_root`이고 CLI가 `SINGLE_SQLITE_FILE`이 있을 때만 이 함수를 부른다. 복원은 `opencrab.stores.single_restore`다(7.4) | B6에서 구현 |
 | 쓰기 락 직렬화 | 프로세스 사이 쓰기는 지금도 `write.lock`으로 직렬화된다 | 측정으로 판정 |
 
 ## 6. 재현 명령
@@ -178,7 +178,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 ### 7.3 지원하지 않는 기능
 
 - 단일 모드의 사용자 생성: `opencrab init`은 `.env`를 만들기 전에 거부하고, bootstrap-on-empty는 읽기 전용이라 사용자를 만들지 않는다. 단일 root의 사용자와 토큰은 병합 입력에서 온다. 인증 세 경로(stdio와 CLI의 `require_local_principal`, `maybe_bootstrap_on_empty`, HTTP 토큰 조회)는 단일 DB를 읽는다. 열기 실패는 HTTP에서 503과 `Retry-After`다(`tests/test_single_mode_auth_lock_order.py`의 T12-N2, N3, N4, E3, E8).
-- 백업과 backfill: 단일 모드를 거부한다(T-E8 a와 b, 후속 `followup_671_backup_backfill_single`). 운영 전환 중에는 백업을 만들 수 없다.
+- backfill과 `backup_data_dir`의 직접 호출: 단일 모드를 거부한다(T-E8 a와 b, 후속 `followup_671_backup_backfill_single`). `backfill_space`, `migrate_to_local`, `reconcile_doc_graph_nodes`가 단일 모드에서 조용히 백업을 얻지 않게 하려는 거부다. 단일 모드 백업은 CLI `python -m opencrab.stores.backup --to <목적지>`가 `backup_single_root`로 만든다. 세트에는 `single.db`, `billing.db`, `MANIFEST.json`만 들어가고 `--exclude`는 거부된다. 삭제 흔적(`pack_delete_operations` 행이나 `delete-pack-journals` 파일)이 있으면 삭제 저널 단위가 준비될 때까지 거부한다.
 - 관리 CLI: `packs backfill-pack-id --apply`와 `packs source-fts-orphans --apply`는 단일 모드에서 명시 문구로 거부한다(T-E8 c와 d, T12-E5). user와 token 관리 명령은 단일 모드를 모른다(후속 `followup_671_admin_cli_single`).
 - 삭제, fork, 증분 노드 정리: `pack_delete_operations` 표가 있으면 거부한다(T-N7 `test_single_write_gates_stay_fail_closed`와 `test_single_delete_and_fork_gates_stay_fail_closed`). 삭제 저널 단위(후속 `followup_671_delete_journal_unit`)가 이 거부를 풀고, 그때 `test_single_file_delete_reserves_before_external_journal`의 xfail을 지운다.
 - node BM25 색인이 backfill 상태이거나 검색 중 drain이 필요한 경우: 단일 모드에서 진행하지 못하거나 작업 단위 밖에서 쓴다(T-N2가 ready 상태 게시 DB만 허용한다. 후속 `followup_671_bm25_backfill_single`, `followup_671_bm25_drain_single`).
@@ -188,6 +188,19 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 ### 7.4 롤백
 
 순서는 다음 넷이다. 첫째, 서비스를 멈춘다. 둘째, 게시 root를 보존 이름으로 옮긴다. 7.2의 5번에서 root로 옮긴 `packs/`와 저널도 전환 전 디렉터리로 되돌린다. 셋째, `SINGLE_SQLITE_FILE`을 비우고 `LOCAL_DATA_DIR`을 전환 전 데이터 디렉터리로 되돌린다. 두 설정을 함께 바꾼다. 넷째, 서비스를 시작한다. root를 옮기기 전에 설정만 바꾸면 안 된다. `SINGLE_SQLITE_FILE`만 비우고 `LOCAL_DATA_DIR`이 root인 채로 두면 다섯 파일 factory가 root를 거부한다(7.2의 7번). 그 거부는 root를 바꾸지 않으므로 서비스는 뜨지 않고 root에는 빈 파일이 생기지 않는다. 단일 모드에서 쓴 데이터는 이전 파일에 없다. 그러므로 이 롤백은 단일 모드에서 새로 쓰기 전까지만 데이터 손실이 없다. 설정이 비어 있는 경로는 코드를 되돌리지 않아도 이전과 같다(T-N1). authorized 상태는 되돌리는 명령이 없다. 게시 root를 되돌릴 때는 root를 보존 이름으로 옮긴다.
+
+단일 모드에서 쓴 뒤 단일 파일을 롤백 지점으로 되돌릴 때는 복원 명령을 쓴다. 롤백 지점은 `python -m opencrab.stores.backup --to <root 밖 목적지>`가 만든 세트다. 서비스와 임시 인스턴스를 멈추고 `single.db`, `billing.db`와 각 `-wal`, `-shm`의 `fuser` 출력이 0줄인 것을 확인한 뒤 다음을 실행한다.
+
+```bash
+python -m opencrab.stores.single_restore <세트 디렉터리>            # dry-run(기본): 점검과 계획만 출력하고 root를 바꾸지 않는다
+python -m opencrab.stores.single_restore <세트 디렉터리> --apply    # root의 두 파일을 세트로 되돌린다
+```
+
+- 종료 코드: 0 전부 통과, 1 사전 점검 거부(root 그대로), 2 적용 중 오류(중간 상태이므로 사람이 보존 이름을 보고 판단), 3 이전 적용의 잔재 이름 감지(root 그대로).
+- 되돌리기 전에 옛 `single.db`, `billing.db`와 곁파일(`-wal`, `-shm`, `-journal`)을 지우지 않고 `<이름>.restore-saved-<적용 id>`로 남긴다. 임시 복사본은 `<이름>.restore-tmp-<적용 id>`다. 보존 이름이 하나라도 root에 있으면 재복원은 rc 3으로 거부한다. 보존 이름을 확인해 치우거나 옮긴 뒤 다시 실행한다.
+- 교체 순서는 `single.db` 보존 링크를 가장 먼저 걸고 `single.db` rename을 가장 나중에 한다. 그 사이 중단되면 live `single.db`의 링크 수가 2라 factory 경유 열기가 `file must be regular and have one link`로 거부된다. 이 거부는 의도한 닫힌 실패다.
+- 점검(`integrity_check`와 표별 행 수)은 독점 수명 잠금 아래에서 하고 결속 검증은 잠금을 푼 뒤에 한다. 계획 문서의 `quick_check` 순서와 다르다.
+- 복원 도구는 `openclaw-conversations/automation`과 `cursor_state.json`을 건드리지 않는다. 7단계 사본의 되돌림은 운영 절차가 맡는다.
 
 ### 7.5 재현 명령
 

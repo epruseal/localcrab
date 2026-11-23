@@ -133,6 +133,15 @@ systemd-run --user --scope --quiet -p CPUQuota=100% \
 
 복원하기 전 현재 데이터 디렉터리를 이름 바꿔 보존하면 복원이 틀렸을 때 되돌릴 수 있다.
 
+## 단일 SQLite 모드(#671)
+
+`SINGLE_SQLITE_FILE`이 설정된 단일 root에서는 CLI가 다섯 파일 백업 대신 단일 모드 백업(`backup_single_root`)을 만든다. 세트에는 `single.db`, `billing.db`, `MANIFEST.json`만 들어가고 `--list`도 이 둘만 출력한다. `--exclude`는 거부된다. `--data-dir`은 설정의 단일 root와 같아야 하고 목적지(`--to`)는 root 밖이어야 한다.
+
+- `single.db`는 `-wal`의 프레임까지 포함한 일관된 스냅샷이다. 백업은 체크포인트를 하지 않으므로 root의 파일 바이트를 바꾸지 않는다.
+- 매니페스트에 `single_db_recovery` 블록을 기록하고 게시 전에 `verify_backup_set`으로 검증한다. 삭제 흔적이 있으면 삭제 저널 단위가 준비될 때까지 거부한다.
+- 백업은 서비스가 도는 중에도 만들 수 있다. `billing.db`는 `write.lock` 밖에서 쓰이므로 두 파일 사이 정렬은 보장하지 않는다. 롤백 지점으로 쓰는 백업은 서비스를 멈춘 상태에서 만든다.
+- 복원은 `python -m opencrab.stores.single_restore <세트 디렉터리> [--apply]`다. 기본은 dry-run이다. 순서와 보존 이름 규칙은 `docs/issue-671-single-db-conversion.md`의 7.4절에 있다. 위 일반 복원 절차는 단일 root에 쓰지 않는다.
+
 ## 문제 해결
 
 | 증상 | 원인과 조치 |
