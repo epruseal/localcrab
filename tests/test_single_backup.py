@@ -271,6 +271,23 @@ def test_t11_cli_single_branch(tmp_path, monkeypatch, capsys):
     assert Path(payload["set_dir"]).is_dir() and "single_db_recovery" in payload
 
 
+def test_t11c_module_entry_point_and_verify(tmp_path, monkeypatch):
+    """T11c: `python -m opencrab.stores.backup --to`가 하위 프로세스에서 rc 0이고 세트에 대한 --verify도 rc 0이다."""
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    _single_env(monkeypatch, built.root)
+    dest = tmp_path / "bk"
+    dest.mkdir()
+    made = subprocess.run(
+        [sys.executable, "-m", "opencrab.stores.backup", "--to", str(dest)], capture_output=True, text=True
+    )
+    assert made.returncode == 0, made.stderr
+    (set_dir,) = _set_dirs(dest)
+    checked = subprocess.run(
+        [sys.executable, "-m", "opencrab.stores.backup", "--verify", str(set_dir)], capture_output=True, text=True
+    )
+    assert checked.returncode == 0, checked.stderr
+
+
 def test_t11b_function_checks_data_dir(tmp_path, monkeypatch):
     """T11b: 함수 직접 호출도 같은 문구로 거부하고 그 디렉터리에 write.lock이 생기지 않는다."""
     from opencrab.stores import backup as bk
