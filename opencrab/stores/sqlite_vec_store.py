@@ -88,6 +88,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import sqlite3
 import struct
 import threading
@@ -113,6 +114,49 @@ from opencrab.stores._vector_base import (
 from opencrab.stores.chroma_store import _sanitize_metadata
 
 logger = logging.getLogger(__name__)
+
+
+class VectorTableMismatchError(RuntimeError):
+    """설정의 컬렉션 이름이나 차원이 게시 DB의 vec0 표와 다르다(#671 B7).
+
+    ``guard_existing_table=True``인 생성(단일 모드)에서만 난다. 표를 새로 만들지 않고 거부한다.
+    ``reason``은 ``name``(같은 이름이 없고 다른 vec0 표만 있음), ``kind``(같은 이름이 vec0 표가 아님),
+    ``unreadable``(같은 이름의 vec0 표에서 차원을 읽지 못함), ``dim``(차원이 다름) 중 하나다.
+    ``found``는 DB의 vec0 표 이름과 차원(읽지 못하면 ``None``) 쌍의 목록이다.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        table: str,
+        expected_dim: int,
+        found: list[tuple[str, int | None]],
+    ) -> None:
+        self.reason = reason
+        self.table = table
+        self.expected_dim = expected_dim
+        self.found = list(found)
+        listing = ", ".join(f"{name}(차원 {dim})" for name, dim in self.found) or "없음"
+        super().__init__(
+            f"벡터 표가 설정과 다르다(사유 {reason}): 설정 VECTOR_COLLECTION={table!r}, "
+            f"EMBED_DIM={expected_dim}, DB의 vec0 표 {listing}. 표를 새로 만들지 않았다. "
+            "설정을 DB에 맞추거나 DB를 설정에 맞게 다시 게시한다."
+        )
+
+
+def _is_vec0(sql: str | None) -> bool:
+    """sqlite_master의 sql 문장이 vec0 가상 표 정의인지 판정한다. sql이 없는 행(자동 인덱스 등)은 아니다."""
+    if not sql:
+        return False
+    pattern = r"^\s*CREATE\s+VIRTUAL\s+TABLE\b.*?\bUSING\s+vec0\s*\("
+    return re.match(pattern, sql, re.IGNORECASE | re.DOTALL) is not None
+
+
+def _declared_dim(sql: str | None) -> int | None:
+    """vec0 표 정의에서 ``embedding float[N]``의 N을 읽는다. 읽지 못하면 None이다."""
+    match = re.search(r"\bembedding\s+float\s*\[\s*(\d+)\s*\]", sql or "", re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
 
 # vec0 hard-caps the KNN `k` parameter at 4096 (0.1.9). Any query MUST clamp
 # fetch_k to this or it raises OperationalError. Pack constraints are pushed
@@ -203,6 +247,7 @@ class SqliteVecStore(_SqliteConnMixin):
         ann_coarse_k: int = 512,
         *,
         shared: Any = None,
+        guard_existing_table: bool = False,
     ) -> None:
         """
         Parameters
@@ -230,6 +275,10 @@ class SqliteVecStore(_SqliteConnMixin):
         ann_coarse_k:
             Coarse candidate count C for the binary 2-stage path (recall knob;
             higher = closer to exact, slower). Clamped to vec0's k cap (4096).
+        guard_existing_table:
+            #671 B7: True이면 표를 만들기 전에 게시 DB의 vec0 표와 이름 및 차원을 대조하고, 다르면
+            ``VectorTableMismatchError``로 거부한다(빈 표를 조용히 만들지 않는다). 기본 False는 종전 동작이다.
+            factory의 단일 모드만 True를 넘긴다.
         """
         if embedding_function is None:
             raise ValueError("SqliteVecStore requires an embedding_function.")
@@ -242,6 +291,7 @@ class SqliteVecStore(_SqliteConnMixin):
         self._table = collection_name
         self._ann = ann
         self._ann_coarse_k = int(ann_coarse_k)
+        self._guard_existing_table = bool(guard_existing_table)
         # Whether the ACTUAL table schema has the embedding_bit column — set in
         # _init_db from PRAGMA table_info. Drives the write path independently
         # of `ann` (vec0 requires a value for every vector column on INSERT).
@@ -300,6 +350,36 @@ class SqliteVecStore(_SqliteConnMixin):
             ")"
         )
 
+    def _check_existing_table(self, conn: Any) -> None:
+        """게시 DB의 vec0 표와 설정(이름, 차원)을 대조해 다르면 표를 만들기 전에 거부한다(#671 B7).
+
+        읽기만 한다. 판정 순서는 R1(name), R3(kind), R4(unreadable), R2(dim)이다. 같은 이름의 객체도
+        vec0 표도 없는 새 DB는 통과시켜 종전처럼 첫 생성을 한다. 이름은 SQLite 식별자 규칙대로 ASCII 대소문자를
+        구분하지 않고 비교한다.
+        """
+        named = conn.execute(
+            "SELECT name, type, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'view', 'index') AND lower(name) = lower(?)",
+            (self._table,),
+        ).fetchall()
+        found = [
+            (name, _declared_dim(sql))
+            for name, sql in conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'")
+            if _is_vec0(sql)
+        ]
+        if not named:
+            if found:
+                raise VectorTableMismatchError("name", self._table, self._dim, found)
+            return
+        _, kind, sql = named[0]
+        if kind != "table" or not _is_vec0(sql):
+            raise VectorTableMismatchError("kind", self._table, self._dim, found)
+        declared = _declared_dim(sql)
+        if declared is None:
+            raise VectorTableMismatchError("unreadable", self._table, self._dim, found)
+        if declared != self._dim:
+            raise VectorTableMismatchError("dim", self._table, self._dim, found)
+
     def _detect_bit_column(self, conn: Any) -> bool:
         cols = [r[1] for r in conn.execute(f"PRAGMA table_info({self._table})")]
         return "embedding_bit" in cols
@@ -315,6 +395,8 @@ class SqliteVecStore(_SqliteConnMixin):
                 os.makedirs(parent, exist_ok=True)
             with self._bootstrap_lock():
                 conn = self._conn
+                if self._guard_existing_table:
+                    self._check_existing_table(conn)
                 # New/empty DBs get the bit column at CREATE when ann=binary; an
                 # EXISTING float-only table is left untouched (IF NOT EXISTS) — vec0
                 # cannot ALTER TABLE ADD COLUMN, so pre-existing DBs are upgraded by
@@ -342,6 +424,11 @@ class SqliteVecStore(_SqliteConnMixin):
                 self._ann or "off",
                 self._has_bit_column,
             )
+        except VectorTableMismatchError:
+            # #671 B7: 설정과 게시 DB의 표가 다르면 일반 초기화 실패처럼 삼키지 않고 올린다.
+            # 생성자의 바깥 except가 저장소를 닫아 공유 소유자를 푼다.
+            self._available = False
+            raise
         except StoreBootstrapLockTimeoutError:
             # #578: propagate a busy write.lock instead of degrading (see
             # LocalGraphStore._init_db).

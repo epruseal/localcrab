@@ -276,6 +276,7 @@ def make_vector_store(settings: Settings) -> Any:
                     ann=settings.vector_ann,
                     ann_coarse_k=settings.vector_ann_coarse_k,
                     shared=shared,
+                    guard_existing_table=True,
                 )
 
             return _build_on_single_file(shared, build)
