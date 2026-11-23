@@ -456,7 +456,7 @@ opencrab serve
 |----------|--------|------|
 | `VECTOR_BACKEND` | _(미설정 — §2 조건부 규칙)_ | `chroma` \| `sqlite-vec` \| `pgvector` |
 | `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
-| `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명. 단일 모드(`SINGLE_SQLITE_FILE`)에서는 게시 DB의 표와 이름이나 `EMBED_DIM`이 다르면 벡터 저장소 생성을 거부한다(서버는 첫 도구 호출에서 실패한다) |
+| `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명. 단일 모드(`SINGLE_SQLITE_FILE`)에서는 게시 DB의 표와 이름이나 `EMBED_DIM`이 다르면 벡터 저장소 생성을 거부한다(MCP 서버는 첫 도구 호출에서, REST 앱은 기동할 때 실패한다) |
 | `VECTOR_ANN` | _(미설정 = off)_ | `binary` = 전역 검색 2단계 양자화 가속(§4.1, sqlite-vec 전용) |
 | `VECTOR_ANN_COARSE_K` | `512` | binary 2단계 coarse 후보 수 C(recall 튜닝 노브, ≤4096) |
 | `PG_EF_SEARCH` | `500` | pgvector HNSW 쿼리 세션 파라미터 `hnsw.ef_search`(recall/속도 트레이드오프, pgvector 전용) — §4.2 재측정으로 150→500 상향(recall@10 게이트 ≥0.95 확보) |
