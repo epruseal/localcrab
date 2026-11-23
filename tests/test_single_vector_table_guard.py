@@ -166,7 +166,7 @@ def test_t7_name_comparison_ignores_ascii_case(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 직접 생성(T8, T9, T14)
+# 직접 생성(T8, T9, T15~T17, T14)
 # ---------------------------------------------------------------------------
 
 
@@ -194,6 +194,63 @@ def test_t9_first_creation_on_empty_db_is_unchanged(tmp_path):
     guarded_sql = [row for row in _master_snapshot(guarded_db) if row[1] == _TABLE]
     plain_sql = [row for row in _master_snapshot(plain_db) if row[1] == _TABLE]
     assert guarded_sql and guarded_sql == plain_sql
+
+
+def _plain_db(path, statements) -> str:
+    """vec0 표가 없는 합성 파일 DB를 만든다(sqlite3 표준 모듈만 쓴다)."""
+    conn = sqlite3.connect(path)
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+    return str(path)
+
+
+def test_t15_db_without_vec0_table_gets_first_creation(tmp_path):
+    db = _plain_db(
+        tmp_path / "plain.db",
+        ["CREATE TABLE graph_nodes (id TEXT PRIMARY KEY)", "INSERT INTO graph_nodes VALUES ('n1')"],
+    )
+    vec = SqliteVecStore(db, _hash_embed, _DIM, guard_existing_table=True)
+    try:
+        assert vec.available is True
+    finally:
+        vec.close()
+    created = [row for row in _master_snapshot(db) if row[0] == "table" and row[1] == _TABLE]
+    assert len(created) == 1 and "embedding float[4]" in created[0][2]
+    assert _rows(db, "graph_nodes") == 1
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(f"CREATE INDEX {_TABLE} ON t (x)", id="index"),
+        pytest.param(f"CREATE VIEW {_TABLE} AS SELECT x FROM t", id="view"),
+    ],
+)
+def test_t16_same_name_index_or_view_refused(tmp_path, statement):
+    db = _plain_db(tmp_path / "named.db", ["CREATE TABLE t (x TEXT)", statement])
+    before = _master_snapshot(db)
+    with pytest.raises(VectorTableMismatchError) as caught:
+        SqliteVecStore(db, _hash_embed, _DIM, guard_existing_table=True)
+    assert caught.value.reason == "kind"
+    assert _master_snapshot(db) == before
+
+
+def test_t17_same_name_trigger_does_not_block(tmp_path):
+    trigger = f"CREATE TRIGGER {_TABLE} AFTER INSERT ON t BEGIN SELECT 1; END"
+    db = _plain_db(tmp_path / "trigger.db", ["CREATE TABLE t (x TEXT)", trigger])
+    vec = SqliteVecStore(db, _hash_embed, _DIM, guard_existing_table=True)
+    try:
+        assert vec.available is True
+    finally:
+        vec.close()
+    after = _master_snapshot(db)
+    created = [row for row in after if row[0] == "table" and row[1] == _TABLE]
+    assert len(created) == 1 and "embedding float[4]" in created[0][2]
+    assert [row for row in after if row[0] == "trigger" and row[1] == _TABLE]
 
 
 def test_t14_default_keeps_old_behavior_on_single_root(tmp_path, monkeypatch, _fresh_single_registry):  # noqa: F811
