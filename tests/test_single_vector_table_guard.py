@@ -219,7 +219,8 @@ def test_t15_db_without_vec0_table_gets_first_creation(tmp_path):
     finally:
         vec.close()
     created = [row for row in _master_snapshot(db) if row[0] == "table" and row[1] == _TABLE]
-    assert len(created) == 1 and "embedding float[4]" in created[0][2]
+    assert len(created) == 1
+    assert "USING vec0" in created[0][2] and "embedding float[4]" in created[0][2]
     assert _rows(db, "graph_nodes") == 1
 
 
@@ -249,7 +250,8 @@ def test_t17_same_name_trigger_does_not_block(tmp_path):
         vec.close()
     after = _master_snapshot(db)
     created = [row for row in after if row[0] == "table" and row[1] == _TABLE]
-    assert len(created) == 1 and "embedding float[4]" in created[0][2]
+    assert len(created) == 1
+    assert "USING vec0" in created[0][2] and "embedding float[4]" in created[0][2]
     assert [row for row in after if row[0] == "trigger" and row[1] == _TABLE]
 
 

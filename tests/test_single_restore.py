@@ -699,7 +699,8 @@ def _zero_page_that_only_integrity_check_sees(source: Path, target: Path) -> int
     그런 쪽을 뒤에서부터 찾는다. 못 찾으면 시험 세계가 이 시험의 전제를 만족하지 않는 것이다(실패로 알린다).
     """
     data = source.read_bytes()
-    page_size = int.from_bytes(data[16:18], "big") or 65536
+    raw_page_size = int.from_bytes(data[16:18], "big")
+    page_size = 65536 if raw_page_size == 1 else raw_page_size  # 헤더 값 1은 65536바이트다
     probe = target.with_name(target.name + ".probe")
     for page in range(len(data) // page_size, 1, -1):
         damaged = bytearray(data)
