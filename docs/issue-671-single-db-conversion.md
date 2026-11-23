@@ -196,7 +196,7 @@ python -m opencrab.stores.single_restore <세트 디렉터리>            # dry-
 python -m opencrab.stores.single_restore <세트 디렉터리> --apply    # root의 두 파일을 세트로 되돌린다
 ```
 
-- 종료 코드: 0 전부 통과, 1 사전 점검 거부(root 그대로), 2 적용 중 오류(중간 상태이므로 사람이 보존 이름을 보고 판단), 3 이전 적용의 잔재 이름 감지(root 그대로).
+- 종료 코드: 0 전부 통과, 1 사전 점검 거부(root 그대로), 2 적용 중 오류(중간 상태이므로 사람이 보존 이름과 임시 이름을 보고 판단), 3 이전 적용의 잔재 이름 감지(root 그대로).
 - 되돌리기 전에 옛 `single.db`, `billing.db`와 곁파일(`-wal`, `-shm`, `-journal`)을 지우지 않고 `<이름>.restore-saved-<적용 id>`로 남긴다. 임시 복사본은 `<이름>.restore-tmp-<적용 id>`다. 보존 이름이 하나라도 root에 있으면 재복원은 rc 3으로 거부한다. 보존 이름을 확인해 치우거나 옮긴 뒤 다시 실행한다.
 - 교체 순서는 `single.db` 보존 링크를 가장 먼저 걸고 `single.db` rename을 가장 나중에 한다. 그 사이 중단되면 live `single.db`의 링크 수가 2라 factory 경유 열기가 `file must be regular and have one link`로 거부된다. 이 거부는 의도한 닫힌 실패다.
 - 점검(`integrity_check`와 표별 행 수)은 독점 수명 잠금 아래에서 하고 결속 검증은 잠금을 푼 뒤에 한다. 계획 문서의 `quick_check` 순서와 다르다.
