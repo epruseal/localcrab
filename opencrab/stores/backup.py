@@ -187,6 +187,8 @@ _FREE_SPACE_RESERVE = 1 << 30
 
 _UNLOCKED_WRITER_LABELS = frozenset({"billing.db"})
 
+_DATA_DIR_MISMATCH = "data-dir이 설정의 단일 root와 다르다"
+
 
 class BackupError(RuntimeError):
     """The backup did not produce a set that can be trusted."""
@@ -791,6 +793,7 @@ def _write_manifest(
     *,
     set_id: str,
     lock_info: dict[str, Any],
+    recovery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for e in outcome.entries:
@@ -810,6 +813,8 @@ def _write_manifest(
         "entries": entries,
         "files": _manifest_files(staging),
     }
+    if recovery is not None:
+        manifest["single_db_recovery"] = recovery
     fd = os.open(str(staging / MANIFEST_NAME), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=False)
@@ -1528,6 +1533,169 @@ def backup_data_dir(
     return outcome
 
 
+_SINGLE_TARGETS: tuple[BackupTarget, ...] = (
+    BackupTarget("single.db", "single.db", "sqlite", "단일 SQLite 저장소"),
+    BackupTarget("billing.db", "billing.db", "sqlite", "billing_events, 단일 root 안의 별도 파일"),
+)
+
+_DELETE_TRACE_MESSAGE = "삭제 저널 단위(B5)가 준비되지 않은 상태에서 삭제 흔적이 있다"
+
+
+def _require_no_delete_traces(data_dir: Path, staged_single: Path) -> None:
+    """삭제 거부가 유지된다는 전제(설계 A3)를 검증한다. 흔적이 있으면 B5가 필요하므로 거부한다."""
+    journals = data_dir / "delete-pack-journals"
+    if journals.is_symlink() or (journals.exists() and (not journals.is_dir() or any(journals.iterdir()))):
+        raise BackupError(f"{_DELETE_TRACE_MESSAGE}: delete-pack-journals가 비어 있지 않다")
+    conn = sqlite3.connect(staged_single.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    try:
+        try:
+            rows = conn.execute("SELECT count(*) FROM pack_delete_operations").fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            rows = 0
+    finally:
+        conn.close()
+    if rows:
+        raise BackupError(f"{_DELETE_TRACE_MESSAGE}: pack_delete_operations에 행이 있다")
+
+
+def backup_single_root(
+    data_dir: str | Path,
+    dest_dir: str | Path | None,
+    *,
+    settings: Any | None = None,
+    lock_timeout: float | None = None,
+    on_event: Callable[[str], None] | None = None,
+) -> BackupOutcome:
+    """단일 SQLite root의 롤백 지점 세트를 만든다(#671 B6).
+
+    세트에는 single.db, billing.db, MANIFEST.json만 담는다. 매니페스트에 single_db_recovery 블록을
+    쓰고 게시 전에 verify_backup_set으로 검증한다. 순서는 hold_single_file(결속과 공유 수명 잠금),
+    write.lock, 스냅샷 고정이다. 체크포인트는 하지 않는다. 목적지는 root 밖 디렉터리여야 한다.
+    정지 상태는 강제하지 않는다. 파일 사이 정렬은 write.lock을 지키는 쓰기에만 걸린다(billing.db 제외).
+    """
+    from opencrab.locking import write_lock
+    from opencrab.stores._single_file import reject_single_root_under
+    from opencrab.stores.factory import hold_single_file
+
+    data_dir = Path(data_dir)
+    say = _guard_callback(on_event or (lambda _msg: None))
+    timeout = _resolve_timeout(lock_timeout)
+    final: Path | None = None
+    published: Path | None = None
+    try:
+        if settings is None:
+            try:
+                from opencrab.config import get_settings
+
+                settings = get_settings()
+            except Exception as exc:
+                raise BackupError(f"cannot read backup configuration ({exc})") from exc
+        single_file = getattr(settings, "single_sqlite_file", "")
+        if not single_file:
+            raise BackupError("단일 SQLite 설정(SINGLE_SQLITE_FILE)이 없다")
+        if not data_dir.is_dir():
+            raise BackupError(f"data directory does not exist: {data_dir}")
+        if os.path.realpath(data_dir) != os.path.dirname(os.path.realpath(single_file)):
+            raise BackupError(f"{_DATA_DIR_MISMATCH}: {data_dir}")
+        if dest_dir is None:
+            raise BackupError("단일 모드 백업은 root 밖 목적지(--to)가 필요하다")
+        dest = Path(dest_dir)
+        if dest.is_symlink():
+            raise BackupError(f"destination is a symlink, refusing to use it: {dest}")
+        if not dest.is_dir():
+            raise BackupError(f"destination directory does not exist: {dest}")
+        reject_single_root_under(dest)
+        if not _directory_fsync_supported(dest):
+            raise BackupError(f"cannot fsync a directory under {dest}, so a published set could not be made durable")
+        if not (data_dir / "billing.db").is_file():
+            raise BackupError(f"billing.db가 root에 없다: {data_dir}")
+        targets = list(_SINGLE_TARGETS)
+        _require_free_space(dest, data_dir, _estimate_bytes(targets, data_dir), [data_dir])
+
+        with hold_single_file(settings):
+            leftovers = _leftover_stagings(dest)
+            for p in leftovers:
+                say(
+                    "! staging directory left by an earlier run or in use by another backup; "
+                    f"make sure none is using it, then remove it manually: {p}"
+                )
+            set_id = _new_set_id()
+            staging = dest / f"{_STAGING_PREFIX}{set_id}"
+            final = dest / f"{_SET_PREFIX}{set_id}"
+            if final.exists() or final.is_symlink():
+                raise BackupError(f"backup set already exists, refusing to overwrite: {final}")
+            pins = _SnapshotPins(min(_SNAPSHOT_OPEN_TIMEOUT, timeout))
+            jobs: list[_Job] = []
+            staging_owned = False
+            wait_started = time.monotonic()
+            try:
+                with write_lock(str(data_dir), timeout=timeout):
+                    acquired = time.monotonic()
+                    acquired_at = datetime.now(UTC)
+                    os.mkdir(staging, 0o700)
+                    staging_owned = True
+                    outcome = _run_targets(targets, data_dir, staging, final, say, timeout, pins=pins, jobs=jobs)
+                released = time.monotonic()
+                lock_info = {
+                    "wait_seconds": round(acquired - wait_started, 3),
+                    "held_seconds": round(released - acquired, 3),
+                    "acquired_at": acquired_at.isoformat(timespec="milliseconds"),
+                    "released_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+                }
+                _finish_jobs(jobs, pins, staging, say, timeout)
+                _require_no_delete_traces(data_dir, staging / "single.db")
+                recovery = {
+                    "backup_id": secrets.token_hex(16),
+                    "database": "single.db",
+                    "billing": "billing.db",
+                    "journals": {},
+                    "operations": [],
+                }
+                outcome.manifest = _write_manifest(
+                    staging, outcome, set_id=set_id, lock_info=lock_info, recovery=recovery
+                )
+                verify_backup_set(staging)
+                shutil.copymode(data_dir, staging)
+                _fsync_tree(staging)
+            except BaseException:
+                pins.close_all()
+                if staging_owned:
+                    shutil.rmtree(staging, ignore_errors=True)
+                raise
+            _publish(staging, final)
+            published = final
+            for entry in outcome.entries:
+                if entry.destination is not None:
+                    entry.destination = final / entry.destination.relative_to(staging)
+            outcome.set_dir = final
+            outcome.leftover_stagings = leftovers
+            try:
+                _fsync_path(dest)
+            except OSError as exc:
+                raise BackupDurabilityError(
+                    f"backup set {final} was published but the destination directory could not be "
+                    f"flushed ({exc}); its durability across a power loss is unknown",
+                    final,
+                ) from exc
+        sizes = ", ".join(f"{e.label}={e.destination.stat().st_size}" for e in outcome.entries if e.destination)
+        say(f"backup set {final.name}: {sizes}; single_db_recovery 블록을 기록하고 verify_backup_set을 통과했다")
+        say(
+            "write.lock 블록 안에서 포착했다. 파일 사이 정렬은 write.lock을 지키는 쓰기에만 걸린다"
+            "(billing.db는 제외). 서비스 정지 확인은 운영 절차의 몫이다."
+        )
+    except _CallbackError as cf:
+        raise cf.exc
+    except (BackupError, TimeoutError):
+        raise
+    except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
+        if isinstance(exc, (sqlite3.Error, OSError)):
+            raise BackupError(_describe_failure(data_dir, final, published, exc)) from exc
+        raise BackupError(str(exc)) from exc
+    return outcome
+
+
 def _describe_failure(
     data_dir: Path, final: Path | None, published: Path | None, exc: BaseException
 ) -> str:
@@ -1811,6 +1979,17 @@ def _directory_note(target: BackupTarget, destination: Path, source: Path) -> st
 # ---------------------------------------------------------------------------
 
 
+def _single_mode_settings() -> Any | None:
+    """단일 SQLite 설정이면 그 settings를, 아니거나 읽지 못하면 None을 돌려준다."""
+    try:
+        from opencrab.config import get_settings
+
+        settings = get_settings()
+    except Exception:
+        return None
+    return settings if getattr(settings, "single_sqlite_file", "") else None
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m opencrab.stores.backup",
@@ -1906,7 +2085,7 @@ def _main(argv: list[str] | None = None) -> int:
         # printed a traceback instead of the reason. local_data_dir_inventory
         # raises BackupError for that case on its own.
         try:
-            targets = local_data_dir_inventory(settings)
+            targets = list(_SINGLE_TARGETS) if _single_mode_settings() is not None else local_data_dir_inventory(settings)
         except BackupError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
@@ -1932,17 +2111,31 @@ def _main(argv: list[str] | None = None) -> int:
     # With --json, stdout carries only the final object; progress goes to stderr.
     progress_stream = sys.stderr if args.json else None
 
+    single_settings = settings if getattr(settings, "single_sqlite_file", "") else _single_mode_settings()
+    if single_settings is not None and args.exclude:
+        print("ERROR: 단일 모드 백업은 --exclude를 지원하지 않는다", file=sys.stderr)
+        return 1
+
     try:
         # flush=True so a closed stdout fails HERE, inside the callback, not
         # silently at interpreter exit with a bare exit code.
-        outcome = backup_data_dir(
-            data_dir,
-            args.to,
-            settings=settings,
-            lock_timeout=args.lock_timeout,
-            exclude=args.exclude,
-            on_event=lambda m: print(m, file=progress_stream, flush=True),
-        )
+        if single_settings is not None:
+            outcome = backup_single_root(
+                data_dir,
+                args.to,
+                settings=single_settings,
+                lock_timeout=args.lock_timeout,
+                on_event=lambda m: print(m, file=progress_stream, flush=True),
+            )
+        else:
+            outcome = backup_data_dir(
+                data_dir,
+                args.to,
+                settings=settings,
+                lock_timeout=args.lock_timeout,
+                exclude=args.exclude,
+                on_event=lambda m: print(m, file=progress_stream, flush=True),
+            )
         if args.json:
             print(json.dumps({"set_dir": str(outcome.set_dir), **outcome.manifest}), flush=True)
     except BackupDurabilityError as exc:
