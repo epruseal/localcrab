@@ -1572,7 +1572,8 @@ def backup_single_root(
 
     세트에는 single.db, billing.db, MANIFEST.json만 담는다. 매니페스트에 single_db_recovery 블록을
     쓰고 게시 전에 verify_backup_set으로 검증한다. 순서는 hold_single_file(결속과 공유 수명 잠금),
-    write.lock, 스냅샷 고정이다. 체크포인트는 하지 않는다. 목적지는 root 밖 디렉터리여야 한다.
+    write.lock, 스냅샷 고정이다. 체크포인트를 명령하지 않는다. 백업 연결이 마지막 연결이면 닫을 때 SQLite가
+    체크포인트한다. 목적지는 root 밖 디렉터리여야 한다.
     정지 상태는 강제하지 않는다. 파일 사이 정렬은 write.lock을 지키는 쓰기에만 걸린다(billing.db 제외).
     """
     from opencrab.locking import write_lock

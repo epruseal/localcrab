@@ -337,6 +337,24 @@ def test_t13_backup_does_not_checkpoint_the_live_file(tmp_path, monkeypatch):
         live.close()
 
 
+def test_t13b_last_connection_close_checkpoints_the_root(tmp_path, monkeypatch):
+    """T13b: 열린 연결이 없는 충돌 상태 root에서는 백업 연결의 닫기 체크포인트가 -wal을 지우고 바이트를 바꾼다.
+
+    docs/live-backup.md의 문장을 T13(다른 연결이 열려 있으면 바이트 불변)과 함께 고정한다. 표별 행 수는 같다.
+    """
+    import hashlib
+
+    built = _authorized_and_pointed(tmp_path, monkeypatch)
+    _leave_wal_frames(built.root)
+    wal = built.root / "single.db-wal"
+    assert wal.exists() and wal.stat().st_size > 0
+    before_sha = hashlib.sha256((built.root / "single.db").read_bytes()).hexdigest()
+    outcome = _backup(built, tmp_path / "bk")
+    assert not wal.exists() or wal.stat().st_size == 0
+    assert hashlib.sha256((built.root / "single.db").read_bytes()).hexdigest() != before_sha
+    assert _plain_table_counts(built.root / "single.db") == _set_counts(outcome.set_dir, "single.db")
+
+
 def test_t14_missing_billing_refused(tmp_path, monkeypatch):
     """T14: billing.db가 없으면 거부한다."""
     from opencrab.stores import backup as bk

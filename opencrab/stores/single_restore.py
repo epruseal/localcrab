@@ -20,7 +20,8 @@
 옛 파일과 곁파일은 지우지 않고 ".restore-saved-<id>" 이름으로 남긴다. 서비스 정지와 fuser 확인은 운영 절차의
 몫이다. 코드는 factory 경유 열람자의 부재만 독점 수명 잠금으로 확인한다.
 
-종료 코드: 0 전부 통과, 1 사전 점검 거부(root 그대로), 2 적용 중 오류, 3 이전 적용 잔재 감지(root 그대로).
+종료 코드: 0 전부 통과, 1 사전 점검 거부와 잠금 획득 거부(root 그대로), 2 적용 중 오류(root가 바뀌었을 수 있다),
+3 이전 적용 잔재 감지(root 그대로).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import shutil
 import sqlite3
 import sys
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -104,12 +106,17 @@ def _table_counts(path: Path) -> dict[str, int]:
         conn.close()
 
 
-def _integrity_ok(path: Path) -> bool:
-    conn = sqlite3.connect(_immutable_uri(path), uri=True)
+def _integrity_problem(path: Path) -> str | None:
+    """immutable integrity_check. 통과하면 None, 아니면 원인 문자열을 돌려준다(손상 쪽은 DatabaseError를 올린다)."""
     try:
-        return [row[0] for row in conn.execute("PRAGMA integrity_check")] == ["ok"]
-    finally:
-        conn.close()
+        conn = sqlite3.connect(_immutable_uri(path), uri=True)
+        try:
+            rows = [row[0] for row in conn.execute("PRAGMA integrity_check")]
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
+        return str(exc)
+    return None if rows == ["ok"] else "; ".join(rows[:3])
 
 
 def _read_manifest(set_dir: Path) -> dict[str, Any]:
@@ -226,8 +233,10 @@ def _check_replaced(root: Path, baseline: dict[str, dict[str, int]]) -> list[str
     problems: list[str] = []
     for name, expected in baseline.items():
         path = root / name
-        if not _integrity_ok(path):
-            problems.append(f"{name}: integrity_check 실패")
+        reason = _integrity_problem(path)
+        if reason is not None:
+            problems.append(f"{name}: integrity_check 실패({reason})")
+            continue
         counts = _table_counts(path)
         if counts != expected:
             diff = sorted(t for t in set(counts) | set(expected) if counts.get(t) != expected.get(t))
@@ -235,9 +244,10 @@ def _check_replaced(root: Path, baseline: dict[str, dict[str, int]]) -> list[str
     return problems
 
 
-def _saved_names_present(plan: _Plan) -> list[str]:
-    suffix = f".restore-saved-{plan.restore_id}"
-    return sorted(n for n in os.listdir(plan.root) if n.endswith(suffix))
+def _names_of_this_apply(plan: _Plan) -> list[str]:
+    """이 적용 id의 보존 이름과 임시 이름. 사람이 확인해 치울 대상이다."""
+    suffixes = (f".restore-saved-{plan.restore_id}", f".restore-tmp-{plan.restore_id}")
+    return sorted(n for n in os.listdir(plan.root) if n.endswith(suffixes))
 
 
 def _swap_files(plan: _Plan) -> None:
@@ -266,11 +276,11 @@ def _replace_under_locks(plan: _Plan, say: Callable[[str], None]) -> int:
         problems = _check_replaced(plan.root, plan.baseline)  # S8
     except Exception as exc:
         say(f"오류: 교체 도중 실패했다: {exc}")
-        say("중간 상태다. 보존 이름과 임시 이름을 사람이 확인한다: " + ", ".join(_saved_names_present(plan)))
+        say("중간 상태다. 이 적용의 보존 이름과 임시 이름을 사람이 확인한다: " + ", ".join(_names_of_this_apply(plan)))
         return RC_FAILED
     if problems:
         say("복원 파일이 세트와 다르다: " + "; ".join(problems))
-        say("변경은 되돌리지 않았다. 보존 이름을 보고 사람이 판단한다: " + ", ".join(_saved_names_present(plan)))
+        say("변경은 되돌리지 않았다. 이 적용의 보존 이름과 임시 이름을 보고 사람이 판단한다: " + ", ".join(_names_of_this_apply(plan)))
         return RC_FAILED
     return RC_OK
 
@@ -295,20 +305,32 @@ def _apply(plan: _Plan, settings: Any, say: Callable[[str], None]) -> int:
     except TimeoutError as exc:
         say(f"거부: 수명 잠금을 쥔 프로세스가 있다. 서비스와 임시 인스턴스를 멈춘 뒤 다시 한다: {exc}")
         return RC_REFUSED
+    except (OSError, RuntimeError) as exc:
+        say(f"거부: 수명 잠금을 얻지 못했다(root는 그대로다): {exc}")
+        return RC_REFUSED
     try:
         try:
-            with write_lock(root, timeout=_WRITE_LOCK_TIMEOUT):
+            with ExitStack() as stack:
+                # 획득만 try로 감싼다. 본문과 해제의 오류는 root가 바뀐 뒤일 수 있어 아래 바깥 except가 rc 2로 낸다.
+                try:
+                    stack.enter_context(write_lock(root, timeout=_WRITE_LOCK_TIMEOUT))
+                except (OSError, RuntimeError) as exc:
+                    say(f"거부: write.lock을 잡지 못했다(root는 그대로다): {exc}")
+                    return RC_REFUSED
                 rc = _replace_under_locks(plan, say)  # S2~S8
-        except TimeoutError as exc:
-            say(f"거부: write.lock을 잡지 못했다: {exc}")
-            return RC_REFUSED
+        except (OSError, RuntimeError) as exc:
+            say(
+                f"오류: write.lock 구간에서 실패했다. root가 바뀌었을 수 있다. "
+                f"적용 id {plan.restore_id}의 보존 이름과 임시 이름을 확인한다: {exc}"
+            )
+            return RC_FAILED
     finally:
         release_file_lock(lifetime)  # S9
     if rc != RC_OK:
         return rc
     rc = _verify_binding(settings, say)  # S10
     if rc == RC_OK:
-        say("복원 완료: 결속 검증을 통과했다. 보존 이름은 사람이 확인한 뒤 치운다: " + ", ".join(_saved_names_present(plan)))
+        say("복원 완료: 결속 검증을 통과했다. 보존 이름은 사람이 확인한 뒤 치운다: " + ", ".join(_names_of_this_apply(plan)))
     return rc
 
 
@@ -352,7 +374,13 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"ERROR: 설정을 읽지 못했다: {exc}", file=sys.stderr)
         return RC_REFUSED
-    return restore_single(args.set_dir, settings, apply=args.apply)
+    try:
+        return restore_single(args.set_dir, settings, apply=args.apply)
+    except Exception as exc:
+        # 예상하지 못한 예외가 미처리 종료 코드 1(거부)로 읽히지 않게 한다. KeyboardInterrupt와 SystemExit은 덮지 않는다.
+        message = f"ERROR: 예상하지 못한 실패다(apply={args.apply}). apply=True면 root가 바뀌었을 수 있다: {exc}"
+        print(message, file=sys.stderr)
+        return RC_FAILED
 
 
 if __name__ == "__main__":  # pragma: no cover - 하위 프로세스 시험에서 실행한다

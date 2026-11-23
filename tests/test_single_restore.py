@@ -1,6 +1,6 @@
 """#671 B6: 단일 모드 복원(opencrab.stores.single_restore) 시험.
 
-설계 5판 9절의 T20~T37이 정본이다. 합성 root는 tests/test_factory_single_file.py의 보조 함수를
+설계 6판 9절의 T20~T41이 정본이다. 합성 root는 tests/test_factory_single_file.py의 보조 함수를
 재사용한다. 모든 시험은 합성 데이터만 쓰고 라이브 경로를 쓰지 않는다.
 """
 from __future__ import annotations
@@ -429,6 +429,12 @@ def test_t29_interruption_points(tmp_path, monkeypatch, single_registry, point):
     assert rc == 2, out
     assert _locks_free(root), "S9: 오류 뒤에도 두 잠금이 풀렸다"
     assert _open_entries(single_registry) == []
+    # V-B6-5: rc 2 출력이 이 적용의 보존 이름과 임시 이름을 전부 말한다(사람이 치우지 않으면 재실행이 rc 3으로 막힌다).
+    names_now = _saved(root) + _temps(root)
+    if point != "after_s6":
+        assert _temps(root), "임시 이름이 남은 지점에서 이름 단언이 실제로 임시 이름을 본다"
+    for name in names_now:
+        assert name in out, (name, out)
 
     live = root / "single.db"
     saved = _saved(root)
@@ -597,7 +603,7 @@ def test_t36_checks_run_under_the_exclusive_lock(tmp_path, monkeypatch):
 
 
 def test_cli_main_dry_run_then_apply(tmp_path, monkeypatch, capsys):
-    """CLI: python -m opencrab.stores.single_restore는 기본 dry-run이고 --apply만 root를 바꾼다."""
+    """CLI main(): 기본은 dry-run이고 --apply만 root를 바꾼다(프로세스 안 호출. 하위 프로세스 진입점은 T40)."""
     from opencrab.stores import single_restore as sr
     from tests.test_factory_single_file import _single_env
 
@@ -615,10 +621,194 @@ def test_cli_main_dry_run_then_apply(tmp_path, monkeypatch, capsys):
 
 
 def test_t37_no_open_shared_object_remains(tmp_path, monkeypatch, single_registry):  # noqa: F811
-    """T37: S10이 이 프로세스에서 실행되었고(레지스트리에 root 항목이 있다) 열린 공유 객체는 남지 않는다."""
+    """T37: 복원 전에 레지스트리를 비우고, S10이 키를 다시 만들었음(이 프로세스에서 실행됨)과 열린 공유 객체 부재를 본다."""
     built, settings = _world(tmp_path, monkeypatch)
     set_dir = _make_set(built, tmp_path)
+    # _make_set의 백업이 같은 키를 이미 등록한다. 비우지 않으면 아래 키 단언이 복원 전부터 참이라 S10을 증명하지 못한다.
+    single_registry.clear()
+    key = str(built.root / "single.db")
+    assert key not in single_registry
     rc, out = _restore(set_dir, settings, apply=True)
     assert rc == 0, out
-    assert str(built.root / "single.db") in single_registry
+    assert key in single_registry
     assert _open_entries(single_registry) == []
+
+
+@pytest.mark.parametrize("variant", ["lifetime_hardlink", "write_lock_hardlink", "shared_upgrade", "body_raises"])
+def test_t38_lock_acquisition_errors_and_body_errors(tmp_path, monkeypatch, variant):
+    """T38: 잠금 획득의 OSError, RuntimeError는 rc 1 거부(root 그대로)다. write.lock 구간 본문의 오류는 rc 2다.
+
+    body_raises는 "root는 그대로다"를 말하면 안 된다. 그 시점에는 교체가 이미 일어났다(B1).
+    """
+    from opencrab.stores import single_restore as sr
+
+    built, settings = _world(tmp_path, monkeypatch)
+    root = built.root
+    set_dir = _make_set(built, tmp_path)
+    _add_rows(root)
+    before = _snapshot(root)
+    alias = tmp_path / "lock-alias"
+    held = None
+    try:
+        if variant == "lifetime_hardlink":
+            lock = root / "single.db.lifetime.lock"
+            assert lock.exists()
+            os.link(lock, alias)
+        elif variant == "write_lock_hardlink":
+            lock = root / "write.lock"
+            if not lock.exists():
+                lock.write_bytes(b"")
+            os.link(lock, alias)
+        elif variant == "shared_upgrade":
+            from opencrab.locking import acquire_file_lock
+
+            held = acquire_file_lock("single.db.lifetime.lock", str(root), shared=True, timeout=0)
+        else:
+            monkeypatch.setattr(sr, "_check_replaced", lambda root_arg, baseline: ["x"])
+
+            def listing_fails(plan):
+                raise OSError(errno.EIO, "injected listing failure")
+
+            monkeypatch.setattr(sr, "_names_of_this_apply", listing_fails)
+        rc, out = _restore(set_dir, settings, apply=True)
+    finally:
+        if held is not None:
+            from opencrab.locking import release_file_lock
+
+            release_file_lock(held)
+    if variant == "body_raises":
+        assert rc == 2, out
+        assert "(root는 그대로다)" not in out
+        assert "root가 바뀌었을 수 있다" in out
+        assert _saved(root), "교체가 실제로 일어난 뒤의 오류다"
+        assert _exclusive_lock_attempt(root).returncode == 0, "S9: 수명 잠금이 풀렸다"
+        return
+    assert rc == 1, out
+    assert "거부" in out
+    expected = "write.lock을 잡지 못했다(root는 그대로다)" if variant == "write_lock_hardlink" else "수명 잠금을 얻지 못했다"
+    assert expected in out
+    assert _snapshot(root) == before
+    assert _saved(root) == [] and _temps(root) == []
+    if variant == "write_lock_hardlink":
+        assert _exclusive_lock_attempt(root).returncode == 0, "S1에서 쥔 수명 잠금이 finally에서 풀렸다"
+
+
+def _zero_page_that_only_integrity_check_sees(source: Path, target: Path) -> int:
+    """source의 사본을 target에 쓴다. 한 쪽을 0으로 채워 표별 행 수는 읽히는데 integrity_check는 실패하게 한다.
+
+    그런 쪽을 뒤에서부터 찾는다. 못 찾으면 시험 세계가 이 시험의 전제를 만족하지 않는 것이다(실패로 알린다).
+    """
+    data = source.read_bytes()
+    page_size = int.from_bytes(data[16:18], "big") or 65536
+    probe = target.with_name(target.name + ".probe")
+    for page in range(len(data) // page_size, 1, -1):
+        damaged = bytearray(data)
+        damaged[(page - 1) * page_size : page * page_size] = bytes(page_size)
+        probe.write_bytes(bytes(damaged))
+        uri = probe.resolve().as_uri() + "?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            try:
+                names = [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+                        "AND sql NOT LIKE 'CREATE VIRTUAL%'"
+                    )
+                ]
+                for name in names:
+                    conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()
+            except sqlite3.DatabaseError:
+                continue
+            try:
+                broken = [r[0] for r in conn.execute("PRAGMA integrity_check")] != ["ok"]
+            except sqlite3.DatabaseError:
+                broken = True
+        finally:
+            conn.close()
+        if broken:
+            probe.replace(target)
+            return page
+    probe.unlink(missing_ok=True)
+    pytest.fail("행 수는 읽히고 integrity_check만 실패하는 쪽이 없다")
+
+
+def test_t39_post_check_reports_integrity_failure(tmp_path, monkeypatch):
+    """T39: S8의 integrity_check 실패는 \"integrity_check 실패\" 문구와 rc 2다. 행 수 대조만으로는 손상을 못 잡는다."""
+    from opencrab.stores import single_restore as sr
+
+    built, settings = _world(tmp_path, monkeypatch)
+    set_dir = _make_set(built, tmp_path)
+    damaged = _set_copy(set_dir, tmp_path, "zeroed")
+    _zero_page_that_only_integrity_check_sees(set_dir / "single.db", damaged / "single.db")
+    _rewrite_manifest_hashes(damaged)
+    monkeypatch.setattr(sr, "verify_backup_set", lambda path: None)  # P2를 우회해 S8까지 보낸다
+    rc, out = _restore(damaged, settings, apply=True)
+    assert rc == 2, out
+    assert "복원 파일이 세트와 다르다" in out
+    assert "integrity_check 실패" in out
+
+
+def test_t40_module_entry_point_subprocess(tmp_path, monkeypatch):
+    """T40: python -m opencrab.stores.single_restore를 하위 프로세스로 부른다(dry-run, 잠금 거부, 적용)."""
+    from tests.test_factory_single_file import _single_env
+
+    built, _settings = _world(tmp_path, monkeypatch)
+    _single_env(monkeypatch, built.root)
+    set_dir = _make_set(built, tmp_path)
+    at_backup = {n: _plain_table_counts(set_dir / n) for n in ("single.db", "billing.db")}
+    _add_rows(built.root)
+
+    def cli(*args):
+        return subprocess.run(
+            [sys.executable, "-m", "opencrab.stores.single_restore", str(set_dir), *args],
+            capture_output=True,
+            text=True,
+        )
+
+    before = _snapshot(built.root)
+    dry = cli()
+    assert dry.returncode == 0, dry.stderr
+    assert "dry-run" in dry.stdout
+    assert _snapshot(built.root) == before
+    alias = tmp_path / "lock-alias"
+    os.link(built.root / "single.db.lifetime.lock", alias)
+    try:
+        refused = cli("--apply")
+    finally:
+        alias.unlink()
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "Traceback" not in refused.stderr
+    assert "거부" in refused.stdout
+    assert _snapshot(built.root) == before
+    applied = cli("--apply")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert "복원 완료" in applied.stdout
+    for name in ("single.db", "billing.db"):
+        assert _live_counts(built.root / name) == at_backup[name]
+    assert len(_saved(built.root)) == 2
+
+
+def test_t41_main_converts_an_unexpected_failure(tmp_path, monkeypatch, capsys):
+    """T41: restore_single 밖으로 나온 예외(여기서는 S9 해제 실패)는 CLI에서 rc 2와 apply 여부 문구가 된다."""
+    from opencrab.locking import release_file_lock as real_release
+    from opencrab.stores import single_restore as sr
+    from tests.test_factory_single_file import _single_env
+
+    built, _settings = _world(tmp_path, monkeypatch)
+    _single_env(monkeypatch, built.root)
+    set_dir = _make_set(built, tmp_path)
+    at_backup = {n: _plain_table_counts(set_dir / n) for n in ("single.db", "billing.db")}
+    _add_rows(built.root)
+
+    def failing_release(handle):
+        real_release(handle)  # 잠금은 풀리고 예외만 올라온다
+        raise OSError(errno.EIO, "injected release failure")
+
+    monkeypatch.setattr(sr, "release_file_lock", failing_release)
+    rc = sr.main([str(set_dir), "--apply"])
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "예상하지 못한 실패" in err and "apply=True" in err and "root가 바뀌었을 수 있다" in err
+    for name in ("single.db", "billing.db"):
+        assert _live_counts(built.root / name) == at_backup[name]
