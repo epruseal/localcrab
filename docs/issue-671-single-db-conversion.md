@@ -171,9 +171,9 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 2. 대장, manifest, marker, metadata 행이 서로 맞아야 한다. 어긋나면 거부된다(T-E2).
 3. `STORAGE_MODE=local`이고 sqlite-vec 벡터 백엔드이며 `SINGLE_SQLITE_FILE`이 root 안 `single.db`의 절대 경로여야 한다(T-E3 `test_single_rejects_bad_settings`).
 4. 설정의 `LOCAL_DATA_DIR`과 환경변수 `LOCAL_DATA_DIR`이 모두 root와 같아야 한다. `write.lock`과 `billing.db.lock`과 삭제 저널 디렉터리가 root 아래에 놓이기 때문이다(T-E3).
-5. 이전 데이터 디렉터리의 `packs/`와 삭제 저널을 root로 옮기는 절차는 아직 없다(후속 `followup_671_switch_data_dir_move`).
+5. 이전 데이터 디렉터리의 `packs/`, `openclaw-conversations/`, `datasets/` 세 항목을 root로 옮기는 절차는 8.6에 있다. 삭제 저널은 옮기지 않고 옛 디렉터리에 둔다.
 6. 단일 모드에서 `write.lock`을 쥔 스레드가 factory를 직접 처음 부르면 수명 잠금 순서 위반으로 거부된다(T-E9 `test_single_first_call_under_write_lock_is_rejected`). `write.lock`을 factory보다 먼저 잡는 진입인 MCP 쓰기 도구와 `crabharness` 적용은 `hold_single_file`이 `write.lock` 앞에서 공유 파일을 열고 결속을 판정한다. 그래서 첫 쓰기 호출이 서고 미승인 root는 `write.lock`이 생기기 전에 거부된다(`tests/test_single_mode_auth_lock_order.py`의 T12-N6, N7, E1, G1).
-7. `SINGLE_SQLITE_FILE` 없이 단일 root(`ledger.json`이나 `single.db`가 있는 디렉터리)를 `LOCAL_DATA_DIR`로 받은 프로세스는, root에 파일을 만들거나 DB를 열기 전에 거부된다. 거부 지점은 다섯 파일 factory와 직접 생성자, chroma 분기, bootstrap-on-empty, 백업(데이터 디렉터리와 목적지 둘 다), `migrate_chroma_to_sqlite_vec.py`, `migrate_to_local.py`, `import_obsidian_vault.py`, 그리고 `LOCAL_DATA_DIR`을 필수 인자나 기본값으로 받아 root 아래에 쓰거나 `write.lock`을 잡는 스크립트 여섯(`repair_store_mismatch_499.py`, `cleanup_openclaw_heartbeat_493.py`, `export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`, `backfill_space.py`)과 CLI 명령 둘(`packs backfill-pack-id --apply`, `packs source-fts-orphans --apply`), `crabharness`의 승격 적용(`apply_promotion_package`)이다. `crabharness` 적용은 `SINGLE_SQLITE_FILE`이 없을 때만 이 거부를 지난다. 단일 모드에서는 root의 `write.lock`이 정상 구성원이고, `hold_single_file`이 `write.lock` 앞에서 결속을 판정한다. 두 CLI 명령은 단일 모드에서 `SINGLE_SQLITE_FILE is set` 문구로 `write.lock` 앞에서 거부한다. 두 명령은 root 안의 옛 `graph.db`와 `doc_store.db`로 계획을 만드는데, 단일 모드의 factory는 단일 파일 위의 저장소를 돌려주므로 그 계획을 단일 그래프에 쓰는 오사용이 되기 때문이다(T12-E5). query, ingest, serve stdio는 단일 모드에서 인증을 단일 DB로 통과한다. 거부된 경우 root는 바뀌지 않는다. 출력 경로를 명시해야 쓰는 스크립트와 읽기 전용 스크립트는 root 아래에 쓰지 않으므로 이 거부와 무관하다(전수 판정은 설계 문서 6.2와 6.3). 그래서 롤백은 root를 치운 뒤에 환경 설정을 고친다(7.4). 팩토리와 생성자 경로의 검사는 열려는 DB 파일의 바로 위 디렉터리만 보고, 출력 경로를 기본값으로 받는 세 스크립트(`export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`)는 그 경로의 모든 상위 디렉터리를 본다. 거부 사유는 `single SQLite root requires SINGLE_SQLITE_FILE`이다(`tests/test_five_file_single_root_guard.py`). 이 거부와 root 불변은 게시한 이름만 있는 root에 대한 약속이다. 옛 DB 파일이 섞인 혼합 root에서는 읽기 전용 경로가 거부 없이 `-wal`과 `-shm`을 만들 수 있다. 대상은 `packs backfill-pack-id`와 `packs source-fts-orphans`의 dry-run, 그리고 `mode=ro`로 여는 스크립트다. 그 보호는 이 단위의 범위 밖이다(설계 문서 BR11과 U-B11-7). 운영 런북은 옛 데이터를 `.pre671`로 옮긴 뒤 root를 게시하므로 운영 root는 혼합이 되지 않는다.
+7. `SINGLE_SQLITE_FILE` 없이 단일 root(`ledger.json`이나 `single.db`가 있는 디렉터리)를 `LOCAL_DATA_DIR`로 받은 프로세스는, root에 파일을 만들거나 DB를 열기 전에 거부된다. 거부 지점은 다섯 파일 factory와 직접 생성자, chroma 분기, bootstrap-on-empty, 백업(데이터 디렉터리와 목적지 둘 다), `migrate_chroma_to_sqlite_vec.py`, `migrate_to_local.py`, `import_obsidian_vault.py`, 그리고 `LOCAL_DATA_DIR`을 필수 인자나 기본값으로 받아 root 아래에 쓰거나 `write.lock`을 잡는 스크립트 여섯(`repair_store_mismatch_499.py`, `cleanup_openclaw_heartbeat_493.py`, `export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`, `backfill_space.py`)과 CLI 명령 둘(`packs backfill-pack-id --apply`, `packs source-fts-orphans --apply`), `crabharness`의 승격 적용(`apply_promotion_package`)이다. `crabharness` 적용은 `SINGLE_SQLITE_FILE`이 없을 때만 이 거부를 지난다. 단일 모드에서는 root의 `write.lock`이 정상 구성원이고, `hold_single_file`이 `write.lock` 앞에서 결속을 판정한다. 두 CLI 명령은 단일 모드에서 `SINGLE_SQLITE_FILE is set` 문구로 `write.lock` 앞에서 거부한다. root에 옛 `graph.db`나 `doc_store.db`가 없으면 두 명령은 그 거부보다 먼저 `graph.db not found`나 `doc_store.db not found`로 끝난다. 이때도 root는 바뀌지 않는다. 두 명령은 root 안의 옛 `graph.db`와 `doc_store.db`로 계획을 만드는데, 단일 모드의 factory는 단일 파일 위의 저장소를 돌려주므로 그 계획을 단일 그래프에 쓰는 오사용이 되기 때문이다(T12-E5). query, ingest, serve stdio는 단일 모드에서 인증을 단일 DB로 통과한다. `crabharness` CLI의 `promotion-apply`는 `SINGLE_SQLITE_FILE`이 없는 단일 root에서 인증 단계(`require_local_principal`)가 먼저 `No local user is bootstrapped` 오류로 끝나고 root는 바뀌지 않는다. 쓰기 거부는 라이브러리 호출자(`apply_promotion_package`)를 막는다. 거부된 경우 root는 바뀌지 않는다. 출력 경로를 명시해야 쓰는 스크립트와 읽기 전용 스크립트는 root 아래에 쓰지 않으므로 이 거부와 무관하다(인자 처리는 각 스크립트가 정하고 `tests/test_five_file_single_root_guard.py`가 거부 지점을 고정한다). 그래서 롤백은 root를 치운 뒤에 환경 설정을 고친다(7.4). 팩토리와 생성자 경로의 검사는 열려는 DB 파일의 바로 위 디렉터리만 보고, 출력 경로를 기본값으로 받는 세 스크립트(`export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`)는 그 경로의 모든 상위 디렉터리를 본다. 거부 사유는 `single SQLite root requires SINGLE_SQLITE_FILE`이다(`tests/test_five_file_single_root_guard.py`). 이 거부와 root 불변은 옛 DB 파일(`graph.db`, `doc_store.db` 등)이 없는 root에 대한 약속이다. 옛 DB 파일이 섞인 혼합 root에서는 읽기 전용 경로가 거부 없이 `-wal`과 `-shm`을 만들 수 있다. 대상은 `packs backfill-pack-id`와 `packs source-fts-orphans`의 dry-run, 그리고 `mode=ro`로 여는 스크립트다. 그 보호는 이 단위의 범위 밖이다(같은 시험 파일의 `test_t11_e10_mixed_directory_with_wal_graph_db_gets_no_sidecars`는 표식 검사 경로 하나가 곁파일을 만들지 않음만 고정한다. 나머지 읽기 전용 경로의 곁파일 생성은 시험으로 고정되지 않았다). 운영 런북(8.6)은 옛 데이터 디렉터리를 root 밖의 `.pre671` 이름 디렉터리로 두고 root에는 세 항목만 옮기므로 운영 root에는 옛 DB 파일이 없다. 이 상태는 재인입 서비스가 옛 `graph.db`에 직접 연결하지 않을 때만 유지되며 그 대응은 별도 변경이다.
 
 ### 7.3 지원하지 않는 기능
 
@@ -187,7 +187,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 
 ### 7.4 롤백
 
-순서는 다음 넷이다. 첫째, 서비스를 멈춘다. 둘째, 게시 root를 보존 이름으로 옮긴다. 7.2의 5번에서 root로 옮긴 `packs/`와 저널도 전환 전 디렉터리로 되돌린다. 셋째, `SINGLE_SQLITE_FILE`을 비우고 `LOCAL_DATA_DIR`을 전환 전 데이터 디렉터리로 되돌린다. 두 설정을 함께 바꾼다. 넷째, 서비스를 시작한다. root를 옮기기 전에 설정만 바꾸면 안 된다. `SINGLE_SQLITE_FILE`만 비우고 `LOCAL_DATA_DIR`이 root인 채로 두면 다섯 파일 factory가 root를 거부한다(7.2의 7번). 그 거부는 root를 바꾸지 않으므로 서비스는 뜨지 않고 root에는 빈 파일이 생기지 않는다. 단일 모드에서 쓴 데이터는 이전 파일에 없다. 그러므로 이 롤백은 단일 모드에서 새로 쓰기 전까지만 데이터 손실이 없다. 설정이 비어 있는 경로는 코드를 되돌리지 않아도 이전과 같다(T-N1). authorized 상태는 되돌리는 명령이 없다. 게시 root를 되돌릴 때는 root를 보존 이름으로 옮긴다.
+순서는 다음 넷이다. 첫째, 서비스를 멈춘다. 둘째, 8.6에서 root로 옮긴 세 항목을 전환 전 디렉터리로 되돌리고 게시 root를 보존 이름으로 옮긴다. `<root>.intent.json`과 `<root>.lifetime.lock`도 같은 접미사의 보존 이름으로 옮긴다. intent가 남으면 다음 게시가 `publication artifacts already exist`로 거부된다. 순서의 정본은 8.6의 롤백 항목이다. 셋째, `SINGLE_SQLITE_FILE`을 비운다. 8.6처럼 전환 전 디렉터리를 원래 이름으로 되돌렸으면 `LOCAL_DATA_DIR` 값은 바꾸지 않는다. 되돌리지 않았으면 `LOCAL_DATA_DIR`을 전환 전 데이터 디렉터리로 바꾼다. 넷째, 서비스를 시작한다. root를 옮기기 전에 설정만 바꾸면 안 된다. `SINGLE_SQLITE_FILE`만 비우고 `LOCAL_DATA_DIR`이 root인 채로 두면 다섯 파일 factory가 root를 거부한다(7.2의 7번). 그 거부는 root를 바꾸지 않으므로 서비스는 뜨지 않고 root에는 빈 파일이 생기지 않는다. 단일 모드에서 쓴 데이터는 이전 파일에 없다. 그러므로 이 롤백은 단일 모드에서 새로 쓰기 전까지만 데이터 손실이 없다. 설정이 비어 있는 경로는 코드를 되돌리지 않아도 이전과 같다(T-N1). authorized 상태는 되돌리는 명령이 없다. 게시 root를 되돌릴 때는 root를 보존 이름으로 옮긴다.
 
 단일 모드에서 쓴 뒤 단일 파일을 롤백 지점으로 되돌릴 때는 복원 명령을 쓴다. 롤백 지점은 `python -m opencrab.stores.backup --to <root 밖 목적지>`가 만든 세트다. 서비스와 임시 인스턴스를 멈추고 `single.db`, `billing.db`와 각 `-wal`, `-shm`의 `fuser` 출력이 0줄인 것을 확인한 뒤 다음을 실행한다.
 
@@ -196,8 +196,8 @@ python -m opencrab.stores.single_restore <세트 디렉터리>            # dry-
 python -m opencrab.stores.single_restore <세트 디렉터리> --apply    # root의 두 파일을 세트로 되돌린다
 ```
 
-- 종료 코드: 0 전부 통과, 1 사전 점검 거부(root 그대로), 2 적용 중 오류(중간 상태이므로 사람이 보존 이름과 임시 이름을 보고 판단), 3 이전 적용의 잔재 이름 감지(root 그대로).
-- 되돌리기 전에 옛 `single.db`, `billing.db`와 곁파일(`-wal`, `-shm`, `-journal`)을 지우지 않고 `<이름>.restore-saved-<적용 id>`로 남긴다. 임시 복사본은 `<이름>.restore-tmp-<적용 id>`다. 보존 이름이 하나라도 root에 있으면 재복원은 rc 3으로 거부한다. 보존 이름을 확인해 치우거나 옮긴 뒤 다시 실행한다.
+- 종료 코드: 0은 전부 통과다. 1은 보존 링크를 거는 단계 앞의 거부다(설정 읽기, 사전 점검, 수명 잠금, `write.lock`, 임시 복사). root의 두 파일은 그대로다. 임시 복사가 실패한 뒤 임시 이름 정리까지 실패한 드문 경우에만 `.restore-tmp-*` 이름이 남는다(#692). 2는 root가 바뀌었을 수 있는 오류다. 교체 중 오류, 교체 뒤 점검(무결성과 행 수) 불일치, `write.lock` 구간의 예외, 교체 뒤 결속 검증 실패, 예상하지 못한 실패가 여기에 든다. 사람이 보존 이름과 임시 이름을 보고 판단한다. 3은 이전 적용이 남긴 `.restore-tmp-*`나 `.restore-saved-*` 이름을 root에서 발견한 거부이고 root는 그대로다.
+- 되돌리기 전에 옛 `single.db`, `billing.db`와 곁파일(`-wal`, `-shm`, `-journal`)을 지우지 않고 `<이름>.restore-saved-<적용 id>`로 남긴다. 임시 복사본은 `<이름>.restore-tmp-<적용 id>`다. 보존 이름이나 임시 이름이 하나라도 root에 있으면 재복원은 rc 3으로 거부한다. 그 이름을 확인해 치우거나 옮긴 뒤 다시 실행한다.
 - 교체 순서는 `single.db` 보존 링크를 가장 먼저 걸고 `single.db` rename을 가장 나중에 한다. 그 사이 중단되면 live `single.db`의 링크 수가 2라 factory 경유 열기가 `file must be regular and have one link`로 거부된다. 이 거부는 의도한 닫힌 실패다.
 - 점검(`integrity_check`와 표별 행 수)은 독점 수명 잠금 아래에서 하고 결속 검증은 잠금을 푼 뒤에 한다. 계획 문서의 `quick_check` 순서와 다르다.
 - 복원 도구는 `openclaw-conversations/automation`과 `cursor_state.json`을 건드리지 않는다. 7단계 사본의 되돌림은 운영 절차가 맡는다.
@@ -207,3 +207,112 @@ python -m opencrab.stores.single_restore <세트 디렉터리> --apply    # root
 - factory 단일 모드 시험: `python -m pytest tests/test_factory_single_file.py tests/test_factory_storage_modes.py`.
 - authorize 하위 명령 시험: `python -m pytest tests/test_authorize_single_root.py`.
 - 이 절의 문서 점검: 저장소 루트에서 `rg -nP` 패턴으로 머신 경로와 커밋 해시를 찾아 0건(종료 코드 1)임을 확인한다.
+- 8절의 문서 점검: 같은 `rg -nP` 명령을 8절 범위에도 적용해 0건(종료 코드 1)임을 확인한다.
+
+## 8. 게시 중단 복구와 전환 런북
+
+이 절은 운영자가 따르는 절차다. 7절은 코드 동작과 시험 근거를 적고 8절은 사람이 하는 일을 적는다. 모든 경로의 `<root 부모>`와 `<root 이름>`은 실제 값으로 바꿔 쓴다. 한 줄에 단순 명령 하나만 실행한다.
+
+### 8.1 산출물 이름과 잠금
+
+게시 도구가 만들고 지우는 이름은 다음과 같다.
+
+| 이름 | 위치 | 만드는 때 | 사라지는 때 |
+|---|---|---|---|
+| `<세트 이름>.source.lifetime.lock` | 원본 세트의 상위 디렉터리 | 운영자가 게시 전에 만든다 | 운영자가 지운다 |
+| `<root>.lifetime.lock` | root의 부모 | 게시 도구가 잠글 때 만든다 | 남는다(다음 게시가 다시 잠근다) |
+| `<root>.intent.json`과 `<root>.intent.json.tmp` | root의 부모 | 게시 도구가 만든다(state는 preparing, publishing, ready 순서) | 게시가 실패하면 남는다 |
+| `<root>.staging` | root의 부모 | 게시 도구가 만든다 | 이름이 root로 바뀐다 |
+| `<root>` | root의 부모 | staging이 이름을 바꿔 생긴다 | 롤백에서 보존 이름으로 옮긴다 |
+| `ledger.json.tmp` | root 안 | `authorize`가 ledger를 바꿀 때 만든다 | rename으로 사라진다. authorize가 죽으면 남는다 |
+| `billing.db`, `ledger.json`, `manifest.json`, `marker.json`, `single.db`, `single.db.lifetime.lock` | root 안 | 게시 도구가 만든다(여섯 이름이 게시한 파일 전부다) | root와 함께 움직인다 |
+
+### 8.2 게시 준비
+
+1. 원본 세트를 검증한다. 이 명령은 병합 원본 세트(다섯 파일 형식)에만 쓴다. 종료 코드 0과 `OK` 줄이 나와야 한다.
+
+```bash
+python -m opencrab.stores.backup --verify <세트 디렉터리>
+```
+
+2. 원본 잠금 파일을 만든다. 파일은 비어 있는 일반 파일이고 링크 수가 1이어야 한다. 병합 도구는 이 파일을 만들지 않고 읽기 전용으로 열어 공유 잠금만 건다. 아래 명령은 파일이 이미 있으면 덮어쓰지 않고 `cannot overwrite existing file`과 rc 1로 멈춘다.
+
+```bash
+bash -c 'set -o noclobber; : > <세트 상위 디렉터리>/<세트 이름>.source.lifetime.lock'
+stat -c '%F %s %h' <세트 상위 디렉터리>/<세트 이름>.source.lifetime.lock
+```
+
+`stat` 출력은 `regular empty file 0 1`이어야 한다.
+
+3. 증거 파일을 만든다. 만드는 코드는 없으므로 운영자가 쓴다. 키는 13개다: `version`, `snapshot_id`, `source_manifest_sha256`, `preparer_id`, `frozen_from`, `frozen_until`, `writer_stopped`, `billing_same_snapshot`, `packs_observation`, `backup_at`, `packs_checked_at`, `capture_from`, `capture_until`. 값의 관계는 다음과 같다.
+   - `version`은 1이다. `snapshot_id`는 세트 `MANIFEST.json`의 `set_id`와 같다. `source_manifest_sha256`은 `MANIFEST.json` 바이트의 sha256이다.
+   - `frozen_from` <= `capture_from` <= `capture_until` <= `frozen_until`이고 `packs_checked_at`은 `frozen_from`과 `frozen_until` 사이다.
+   - `backup_at`은 `MANIFEST.json`의 `created_at`과 같고 `capture_until`은 `created_at`에 1초를 더한 시각보다 앞선다.
+   - 시각은 모두 UTC다. `writer_stopped`와 `billing_same_snapshot`은 true이고 `packs_observation`은 `"absent"`다.
+4. 증거 경로 규칙: authorize의 증거 인자(`--verification-pass`, `--copy-test-pass`)는 절대 경로로 쓰고 경로에 쉼표를 넣지 않는다. `authorize applied` 줄은 경로를 쉼표로 이어 찍으므로 쉼표가 있으면 실행 기록과의 대조가 갈라진다.
+5. 병합 도구를 `--apply` 없이 먼저 돌려 계획을 본다. `--apply`가 없으면 계획 모드이고 이 모드는 정상이어도 `publication mode is not ready`와 rc 2로 끝난다.
+
+### 8.3 정상 완료 상태
+
+`ledger authorized`와 `intent ready`의 조합이 정상 완료 상태다. 런타임이 root를 연 뒤에는 병합 도구의 `authorize` 재실행이 `root file set differs`로 거부되는 것이 정상이다. 열기 경로에 따라 `single.db-wal`과 `single.db-shm`이 생겨 root의 항목 집합이 달라지기 때문이다. 이 상태를 재실행으로 확인하지 않는다.
+
+factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/stores/_sqlite_base.py`, `opencrab/stores/sql_store.py`와 일부 스크립트). 이 경로는 `mode=ro`로 열어도 `-wal`과 `-shm` 곁파일을 만들 수 있다.
+
+### 8.4 게시 중단 복구
+
+정본 절차는 하나다. 남은 산출물을 보존 이름으로 옮기고 병합을 처음부터 다시 돌린다. 보존 이름은 `<이름>.aborted-<UTC 시각>`이고 한 번의 복구에서 네 이름 모두 같은 접미사를 쓴다. 접미사는 운영자가 한 번 정해 이후 명령에 그대로 적는다.
+
+1. 바깥 잠금 확인. 바깥 잠금은 게시 도구만 잡고 런타임은 잡지 않는다. 안쪽 잠금은 런타임이 공유로 쥔다. 먼저 `ls -d <root 부모>/<root 이름>.lifetime.lock`을 실행한다. 파일이 없으면 flock을 실행하지 않는다(flock이 빈 잠금 파일을 만든다). 잠금 파일이 없는데 다른 산출물이 있으면 멈추고 담당자에게 알린다. 파일이 있으면 `flock -n <root 부모>/<root 이름>.lifetime.lock true`를 실행한다. rc 0이면 게시 도구가 살아 있지 않다. rc 1이면 다른 게시 도구가 잠금을 쥔 것이므로 기다리고 아무것도 옮기지 않는다. 잠금 파일이 없고 `<root>`, `<root>.staging`, `<root>.intent.json`, `<root>.intent.json.tmp`도 모두 없으면 옮길 것이 없으므로 5단계로 간다.
+2. 읽기 전용 상태 읽기. `ls -d`로 `<root>`, `<root>.staging`, `<root>.intent.json`, `<root>.intent.json.tmp`의 존재를 적는다. root가 있으면 `ls -A <root>`로 `ledger.json.tmp`의 존재를 적는다. 존재하는 intent와 root의 `ledger.json`은 `cat`으로 읽어 state 값을 적는다. 파일을 열어 고치지 않는다.
+3. 분기. root 안에 `ledger.json.tmp`가 있고 root ledger가 ready이며 intent가 ready이면 authorize가 중간에 죽은 것이다. 이때는 4로 가지 않고 8.5를 따른다. `<root>`, `<root>.staging`, `<root>.intent.json`, `<root>.intent.json.tmp`가 모두 없으면 옮길 것이 없으므로 5단계로 간다. 그 밖에서: root ledger가 authorized이고 intent가 ready이면 8.3의 정상 상태이므로 끝낸다. root ledger가 ready이고 intent가 ready이면 게시는 끝났으므로 authorize 단계(7.2의 1번)로 간다. 그 밖(`<root>.staging`이 있음, root ledger가 staged, intent가 preparing이나 publishing, intent tmp가 있음)은 4로 간다. ledger나 intent가 읽히지 않거나 state 값이 알려진 값이 아니거나 authorized인데 intent가 ready가 아닌 경우는 멈추고 읽은 내용을 담당자에게 알린다.
+4. 보존 이름으로 옮기기. 존재하는 것만 같은 접미사로 이 순서로 옮긴다: root, staging, intent, intent tmp. 옮기기 전에 각 이름마다 두 가지를 확인한다. 하나, `stat -c %d`로 원본과 대상의 부모 장치 번호가 같다. 둘, `ls -d <보존 이름>`이 0줄이다(`mv -T`는 같은 이름의 빈 디렉터리 위로 조용히 덮어쓰므로 이 확인이 필요하다). 1단계의 `flock -n`은 확인 뒤 잠금을 곧바로 푼다. 그래서 복구하는 동안에는 병합과 authorize를 실행하지 않는다. 각 이동은 `flock -n <root 부모>/<root 이름>.lifetime.lock mv -T <원래 이름> <보존 이름>` 한 줄로 실행해 바깥 잠금을 쥔 채 옮긴다. 이 명령이 rc 1이면 다른 게시 도구가 잠금을 쥔 것이므로 멈춘다. stderr에 `mv:` 메시지가 있으면 잠금이 아니라 mv의 실패이므로 메시지를 읽고 멈춘다. rc가 0이 아니면 이유와 관계없이 멈춘다. root 안의 `ledger.json.tmp`는 root와 함께 옮겨진다. `<root>.lifetime.lock`은 옮기지 않는다. 다음 게시가 그 파일을 다시 잠근다.
+5. 원본 세트 확인. 8.2의 검증 명령을 다시 돌려 통과를 본다. 원본 세트와 증거 파일은 게시가 읽기 전용으로만 열었으므로 바뀌지 않았어야 한다.
+6. 같은 인자로 병합을 처음부터 다시 돌린다(계획 모드 확인 뒤 `--apply --verify`). 부분 재개는 없다.
+7. 끝난 뒤 root ledger ready와 intent ready를 확인하고 authorize 단계로 간다. 보존 이름은 자동으로 지우지 않는다. 지울 때는 원본 세트와 증거 파일이 남아 있어 다시 만들 수 있음을 확인하고 담당자의 승인을 받는다. 디스크 여유 하한에 걸려 재실행이 거부되면 보존 staging부터 승인을 받아 지운다.
+
+게시 도구의 종료 코드는 다음과 같다.
+
+- rc 0 `publication ready`: 7단계로 간다.
+- rc 1 `publication staging failed:` 또는 `publication publish failed:`: 중간 산출물이 남는다. 1단계부터 따른다.
+- rc 2: 두 갈래다. `publication preflight failed:`이면 root는 만들어지지 않았다. 다만 intent를 쓴 뒤의 실패(여유 공간 부족, staging 생성 실패)는 `<root>.intent.json`(state preparing)과 `<root>.staging`을 남길 수 있다. 그래서 rc와 메시지에 관계없이 1단계부터 따른다. 메시지 없이 traceback으로 끝난 rc 1도 같다. 계획 모드(`--apply` 없음)는 정상이어도 `publication mode is not ready`와 rc 2로 끝난다.
+- rc 2 `publication ready; cleanup failed` 또는 `publication ready; post-ready source check failed`: root는 이미 유효하다. 재실행하지 않고 메시지의 원인만 처리한다.
+
+### 8.5 authorize 중단 복구
+
+8.2의 4번 규칙대로 증거 경로는 절대 경로이고 쉼표가 없어야 한다. `authorize`가 죽었을 때는 `ledger.json`을 읽어 아래 표로 판단한다. 요약하면 ledger가 authorized면 완료다. ready면 `ledger.json.tmp`를 지우고 다시 실행한다. `ledger.json.tmp`는 `ledger.json`이 ready임을 읽은 뒤에만 지운다.
+
+| 죽은 지점 | root ledger | `ledger.json.tmp` | 다음 실행 결과 | 조치 |
+|---|---|---|---|---|
+| 점검 중 | ready | 없음 | 정상 실행 | 없음 |
+| 임시 파일을 만든 뒤 쓰기 전 | ready | 빈 파일 | `root file set differs`로 거부 | ledger가 ready임을 확인하고 임시 파일을 지운 뒤 다시 실행 |
+| 임시 파일 fsync 뒤 rename 전 | ready | 완전한 새 본문 | `root file set differs`로 거부 | 위와 같다 |
+| rename 뒤 디렉터리 fsync 전 | authorized(페이지 캐시) | 없음 | 재부팅하지 않았으면 `ledger state differs`로 거부. 재부팅했으면 ready나 authorized 중 하나 | ledger를 읽어 확인한다. authorized면 완료. ready면 다시 실행 |
+| 디렉터리 fsync 뒤 재읽기 전 | authorized | 없음 | `ledger state differs`로 거부 | 완료로 본다. factory 열기로 확인 |
+| 쓰기 실패 rc 1 (`not performed` 또는 쓰기 실패) | ready | 남음(부분 또는 완전) | `root file set differs`로 거부 | 출력의 observed ledger state가 ready임을 확인하고 임시 파일을 지운 뒤 다시 실행 |
+| 쓰기 실패 rc 1 (`took effect`) | authorized | 없음 | `ledger state differs`로 거부 | 완료로 본다. observed ledger state가 authorized임을 확인하고 factory 열기로 확인 |
+| 디렉터리 교체 감지 rc 1 | 옮겨진 원래 디렉터리의 ledger는 authorized. 현재 이름의 디렉터리는 그대로 | 없음 | observed 값은 현재 이름의 디렉터리 기준 | 두 디렉터리를 확인하고 정본 root를 정한 뒤 다시 실행 |
+| 완료(런타임이 root를 열기 전) | authorized | 없음 | `ledger state differs`로 거부 | 없음 |
+| 완료(런타임이 root를 연 뒤) | authorized | 없음 | `root file set differs`로 거부(`single.db-wal`과 `single.db-shm`이 생겨 항목 집합이 달라진다. 런타임이 정상 종료해 곁파일이 사라지면 `ledger state differs`) | 정상 상태다. 재실행으로 확인하지 않는다 |
+
+어느 지점에서도 `ledger.json`은 옛 본문 전체이거나 새 본문 전체다. 부분 본문은 임시 파일에만 생긴다.
+
+### 8.6 옛 데이터 이동과 롤백
+
+이 소절은 서비스를 멈춘 구간에서 옛 데이터 디렉터리의 세 항목을 게시 root로 옮기고 되돌리는 절차다. 옛 데이터 디렉터리를 root 밖에서 `<이름>.pre671`이라는 이름으로 두는 것이 이 운영 절차의 약속이다. 저장소 코드는 이 이름을 쓰지 않는다. 이동 대상은 `packs/`, `openclaw-conversations/`, `datasets/` 셋이다. 삭제 저널은 옛 디렉터리에 둔다. 아래 항목에 팩 이름, 건수, 머신 경로는 적지 않는다.
+
+- P1 이동 순서. 병합 게시(ready), authorize, 항목 이동, `SINGLE_SQLITE_FILE` 설정, 읽기 검증 순이다. 이동이 authorize 앞이면 `root file set differs`로 거부된다.
+- P2 같은 파일시스템 확인과 이동 방법. 이동 직전에 옛 디렉터리와 root의 장치 번호를 `stat -c %d`로 비교한다. 같으면 `mv -T`로 옮긴다. 같은 장치의 `mv`는 rename 하나이므로 원자적이다. 다르면 중단한다. 다른 장치의 `mv`는 복사 뒤 삭제로 바뀌어 원자성과 정지 시간 계산이 깨진다. 이동 대상 이름이 root에 이미 있으면 `ls -d`로 확인해 덮어쓰지 않고 중단한다. `mv -T`는 같은 이름의 빈 디렉터리 위로 조용히 덮어쓰므로 이 확인이 필요하다.
+- P3 이동 전 서비스 정지 확인. 재인입 서비스와 타이머가 inactive인지 `systemctl --user is-active`로 확인한다. 활성이면 이동하지 않는다. 한 항목씩 옮기고 항목마다 이동 뒤 목록을 기록한다.
+- P4 이동 전후 기록. 이동 전에 각 이동 항목의 파일 목록(상대 경로와 크기)과 `packs/` 파일의 sha256 목록을 남긴다. 이동 뒤 같은 명령을 root에서 돌려 두 기록이 같음을 확인한다. rename은 내용을 바꾸지 않으므로 어긋나면 다른 프로세스가 건드린 것이고 중단한다.
+- P5 읽기 검증. 루프백 임시 인스턴스에서 `content_pack_list`와 `packs list`가 이동 전 `packs/` manifest의 팩 목록을 포함하는지 본다. 기준은 SQL `packs` 행이 있고 읽기 범위 안인 manifest 팩이다. 기준 집합의 누락이 0인지를 보고 건수를 기준으로 삼지 않는다.
+- P6 서비스 시작 전 디렉터리 확인. 재인입 단위의 표준 출력 경로의 부모(`root/openclaw-conversations/automation`)가 있는지 확인한다. 없으면 단위가 시작하지 못할 수 있다. 시작 명령 앞에서 늘 확인한다.
+- P7 롤백 순서(쓰기 개방 전). 서비스 정지 상태를 확인한다. 세 항목을 root에서 옛 디렉터리로 되돌린다(P2와 같은 확인). 디렉터리 이름을 맞바꾼다. `<root>.intent.json`과 `<root>.lifetime.lock`을 같은 접미사의 보존 이름으로 옮긴다. 모든 rename은 대상 이름이 이미 있으면 중단한다. root 잠금 파일(`<root>.lifetime.lock`)이 없으면 중단한다. 설정 출처에서 `SINGLE_SQLITE_FILE` 줄을 지우고 서비스 프로세스 환경에 그 값이 없음을 확인한다. 롤백 접미사는 `.saved-<UTC 시각>` 하나이며 root, intent, 잠금 파일 셋에 같은 값을 쓴다. 쓰기 개방 뒤 다섯 파일로 돌아갈 때는 7.4의 복원 명령으로 롤백 지점을 되돌린다.
+- P8 외부 경로 확인. 이동 항목 셋 밖의 기본 경로를 고정 문자열로 쓰는 외부 스크립트가 있는지 grep으로 다시 확인한다. 새로 나온 경로가 있으면 이동 대상에 넣을지 정한 뒤에 이동한다.
+- P9 경로 조건 확인. 기본 경로와 그 부모의 `realpath`가 자기 자신과 같은지, 기본 경로가 마운트 지점이 아닌지 확인한다(`findmnt -n <경로>`가 출력을 내지 않아야 한다). 마운트 지점이면 그 디렉터리를 rename할 수 없다. 사본 시험 전에 한 번, 전환 당일에 한 번 더 한다. 다르면 게시가 거부되므로 시작하지 않는다.
+- P10 `build_nemotron_personas_korea_pack.py`의 기능 제한. 이 스크립트는 단일 모드에서 쓸 수 없다. 단일 root를 가리키면 거부되고 root 밖 데이터 디렉터리로 돌리면 다섯 파일 구조의 별도 작업이라 운영 root에 반영되지 않는다. 이 스크립트가 만든 stage 산출물만 P3의 방법으로 `root/packs/`에 옮길 수 있다.
+
+기본 출력 경로가 `packs/` 아래인 오프라인 스크립트 셋(`export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`)은 단일 root 안에서 거부가 유지된다. 이 스크립트 셋을 스위치 뒤에 다시 쓰려면 root 밖 경로로 실행하고 완성된 산출물만 옮긴다.
+
+### 8.7 설정 순서
+
+환경 설정은 root를 치운 뒤에 고친다. api와 gateway 서비스 유닛의 `EnvironmentFile` 줄을 주석 처리하고 재시작하는 롤백은 금지한다. root를 둔 채 그렇게 하면 다섯 파일 factory가 root를 거부해 서비스가 뜨지 않는다(7.2의 7번). 단일 모드에서는 사용자를 만들지 않으며 사용자와 토큰은 병합 입력에서 온다(7.3의 첫 항목).

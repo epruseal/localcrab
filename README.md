@@ -345,7 +345,7 @@ Chroma의 "다중 프로세스 동시 쓰기 불가"(자작 flock 층)를 제거
 |----------|--------|------|
 | `VECTOR_BACKEND` | _(미설정 — 위 조건부 규칙으로 결정)_ | `chroma` \| `sqlite-vec` \| `pgvector` |
 | `VECTOR_DB_FILE` | `vectors.db` | sqlite-vec 벡터 DB 파일명(`LOCAL_DATA_DIR` 하위) |
-| `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명 |
+| `VECTOR_COLLECTION` | `vectors_kure` | sqlite-vec vec0 테이블명. 단일 모드(`SINGLE_SQLITE_FILE`)에서는 게시 DB의 vec0 표 이름이나 `EMBED_DIM`이 다르면 벡터 저장소 생성을 거부한다(`docs/vector-backends.md`) |
 | `VECTOR_ANN` | _(미설정 = off)_ | `binary` = 전역 검색 2단계 양자화 가속(sqlite-vec 전용) |
 | `VECTOR_ANN_COARSE_K` | `512` | binary 2단계 coarse 후보 수(recall 튜닝) |
 | `PG_EF_SEARCH` | `500` | pgvector HNSW 쿼리 세션 파라미터(recall/속도 트레이드오프, pgvector 전용) |
