@@ -200,7 +200,7 @@ python -m opencrab.stores.single_restore <세트 디렉터리> --apply    # root
 - 되돌리기 전에 옛 `single.db`, `billing.db`와 곁파일(`-wal`, `-shm`, `-journal`)을 지우지 않고 `<이름>.restore-saved-<적용 id>`로 남긴다. 임시 복사본은 `<이름>.restore-tmp-<적용 id>`다. 보존 이름이나 임시 이름이 하나라도 root에 있으면 재복원은 rc 3으로 거부한다. 그 이름을 확인해 치우거나 옮긴 뒤 다시 실행한다.
 - 교체 순서는 `single.db` 보존 링크를 가장 먼저 걸고 `single.db` rename을 가장 나중에 한다. 그 사이 중단되면 live `single.db`의 링크 수가 2라 factory 경유 열기가 `file must be regular and have one link`로 거부된다. 이 거부는 의도한 닫힌 실패다.
 - 점검(`integrity_check`와 표별 행 수)은 독점 수명 잠금 아래에서 하고 결속 검증은 잠금을 푼 뒤에 한다. 계획 문서의 `quick_check` 순서와 다르다.
-- 복원 도구는 `openclaw-conversations/automation`과 `cursor_state.json`을 건드리지 않는다. 7단계 사본의 되돌림은 운영 절차가 맡는다.
+- 복원 도구는 `openclaw-conversations/automation`과 `cursor_state.json`을 건드리지 않는다. 8.6 P7의 롤백 지점 사본의 되돌림은 운영 절차가 맡는다.
 
 ### 7.5 재현 명령
 
@@ -215,16 +215,17 @@ python -m opencrab.stores.single_restore <세트 디렉터리> --apply    # root
 
 ### 8.1 산출물 이름과 잠금
 
-게시 도구가 만들고 지우는 이름은 다음과 같다.
+게시 단계에 쓰는 이름은 다음과 같다.
 
 | 이름 | 위치 | 만드는 때 | 사라지는 때 |
 |---|---|---|---|
 | `<세트 이름>.source.lifetime.lock` | 원본 세트의 상위 디렉터리 | 운영자가 게시 전에 만든다 | 운영자가 지운다 |
 | `<root>.lifetime.lock` | root의 부모 | 게시 도구가 잠글 때 만든다 | 남는다(다음 게시가 다시 잠근다) |
-| `<root>.intent.json`과 `<root>.intent.json.tmp` | root의 부모 | 게시 도구가 만든다(state는 preparing, publishing, ready 순서) | 게시가 실패하면 남는다 |
+| `<root>.intent.json` | root의 부모 | 게시 도구가 만든다(state는 preparing, publishing, ready 순서) | 게시 도구는 지우지 않는다. 게시가 끝나면 ready로 남고 실패하면 그때의 state로 남는다. 8.4 복구와 8.6 롤백에서 보존 이름으로 옮긴다 |
+| `<root>.intent.json.tmp` | root의 부모 | 게시 도구가 intent를 publishing이나 ready로 바꿀 때 만든다 | rename으로 사라진다. 그 사이에 게시 도구가 죽거나 쓰기가 실패하면 남는다 |
 | `<root>.staging` | root의 부모 | 게시 도구가 만든다 | 이름이 root로 바뀐다 |
 | `<root>` | root의 부모 | staging이 이름을 바꿔 생긴다 | 롤백에서 보존 이름으로 옮긴다 |
-| `ledger.json.tmp` | root 안 | `authorize`가 ledger를 바꿀 때 만든다 | rename으로 사라진다. authorize가 죽으면 남는다 |
+| `ledger.json.tmp` | root 안 | 게시 도구가 ledger를 ready로 바꿀 때와 `authorize`가 ledger를 authorized로 바꿀 때 만든다 | rename으로 사라진다. 그 사이에 게시 도구나 authorize가 죽거나 쓰기가 실패하면 남는다 |
 | `billing.db`, `ledger.json`, `manifest.json`, `marker.json`, `single.db`, `single.db.lifetime.lock` | root 안 | 게시 도구가 만든다(여섯 이름이 게시한 파일 전부다) | root와 함께 움직인다 |
 
 ### 8.2 게시 준비
@@ -274,7 +275,7 @@ factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/sto
 
 - rc 0 `publication ready`: 7단계로 간다.
 - rc 1 `publication staging failed:` 또는 `publication publish failed:`: 중간 산출물이 남는다. 1단계부터 따른다.
-- rc 2: 두 갈래다. `publication preflight failed:`이면 root는 만들어지지 않았다. 다만 intent를 쓴 뒤의 실패(여유 공간 부족, staging 생성 실패)는 `<root>.intent.json`(state preparing)과 `<root>.staging`을 남길 수 있다. 그래서 rc와 메시지에 관계없이 1단계부터 따른다. 메시지 없이 traceback으로 끝난 rc 1도 같다. 계획 모드(`--apply` 없음)는 정상이어도 `publication mode is not ready`와 rc 2로 끝난다.
+- rc 2: 두 갈래다. `publication preflight failed:` 앞에 `publication publish failed:` 줄이 없으면 root는 만들어지지 않았다. 그 줄이 먼저 있으면 게시 단계가 실패한 뒤 원본 파일이나 원본 잠금의 재확인 또는 정리가 실패한 것이고 root가 남았을 수 있다. 다만 intent를 쓴 뒤의 실패(여유 공간 부족, staging 생성 실패)는 `<root>.intent.json`(state preparing)과 `<root>.staging`을 남길 수 있다. 그래서 rc와 메시지에 관계없이 1단계부터 따른다. 메시지 없이 traceback으로 끝난 rc 1도 같다. 계획 모드(`--apply` 없음)는 정상이어도 `publication mode is not ready`와 rc 2로 끝난다.
 - rc 2 `publication ready; cleanup failed` 또는 `publication ready; post-ready source check failed`: root는 이미 유효하다. 재실행하지 않고 메시지의 원인만 처리한다.
 
 ### 8.5 authorize 중단 복구
@@ -300,13 +301,13 @@ factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/sto
 
 이 소절은 서비스를 멈춘 구간에서 옛 데이터 디렉터리의 세 항목을 게시 root로 옮기고 되돌리는 절차다. 옛 데이터 디렉터리를 root 밖에서 `<이름>.pre671`이라는 이름으로 두는 것이 이 운영 절차의 약속이다. 저장소 코드는 이 이름을 쓰지 않는다. 이동 대상은 `packs/`, `openclaw-conversations/`, `datasets/` 셋이다. 삭제 저널은 옛 디렉터리에 둔다. 아래 항목에 팩 이름, 건수, 머신 경로는 적지 않는다.
 
-- P1 이동 순서. 병합 게시(ready), authorize, 항목 이동, `SINGLE_SQLITE_FILE` 설정, 읽기 검증 순이다. 이동이 authorize 앞이면 `root file set differs`로 거부된다.
+- P1 이동 순서. 병합 게시(ready), authorize, 항목 이동, `SINGLE_SQLITE_FILE` 설정, 읽기 검증, 롤백 지점 기록, 쓰기 개방 순이다. 롤백 지점 기록은 7.4의 롤백 지점 세트와 P7의 `openclaw-conversations/automation` 사본을 같은 시점에 만드는 일이다. 이동이 authorize 앞이면 `root file set differs`로 거부된다.
 - P2 같은 파일시스템 확인과 이동 방법. 이동 직전에 옛 디렉터리와 root의 장치 번호를 `stat -c %d`로 비교한다. 같으면 `mv -T`로 옮긴다. 같은 장치의 `mv`는 rename 하나이므로 원자적이다. 다르면 중단한다. 다른 장치의 `mv`는 복사 뒤 삭제로 바뀌어 원자성과 정지 시간 계산이 깨진다. 이동 대상 이름이 root에 이미 있으면 `ls -d`로 확인해 덮어쓰지 않고 중단한다. `mv -T`는 같은 이름의 빈 디렉터리 위로 조용히 덮어쓰므로 이 확인이 필요하다.
 - P3 이동 전 서비스 정지 확인. 재인입 서비스와 타이머가 inactive인지 `systemctl --user is-active`로 확인한다. 활성이면 이동하지 않는다. 한 항목씩 옮기고 항목마다 이동 뒤 목록을 기록한다.
 - P4 이동 전후 기록. 이동 전에 각 이동 항목의 파일 목록(상대 경로와 크기)과 `packs/` 파일의 sha256 목록을 남긴다. 이동 뒤 같은 명령을 root에서 돌려 두 기록이 같음을 확인한다. rename은 내용을 바꾸지 않으므로 어긋나면 다른 프로세스가 건드린 것이고 중단한다.
 - P5 읽기 검증. 루프백 임시 인스턴스에서 `content_pack_list`와 `packs list`가 이동 전 `packs/` manifest의 팩 목록을 포함하는지 본다. 기준은 SQL `packs` 행이 있고 읽기 범위 안인 manifest 팩이다. 기준 집합의 누락이 0인지를 보고 건수를 기준으로 삼지 않는다. `content_pack_list`의 query로 manifest 키워드에만 있는 단어를 검색해 그 팩이 돌아오는지도 본다.
 - P6 서비스 시작 전 디렉터리 확인. 재인입 단위의 표준 출력 경로의 부모(`root/openclaw-conversations/automation`)가 있는지 확인한다. 없으면 단위가 시작하지 못할 수 있다. 시작 명령 앞에서 늘 확인한다.
-- P7 롤백 순서(쓰기 개방 전). 서비스 정지 상태를 확인한다. 세 항목을 root에서 옛 디렉터리로 되돌린다(P2와 같은 확인). 디렉터리 이름을 맞바꾼다. `<root>.intent.json`과 `<root>.lifetime.lock`을 같은 접미사의 보존 이름으로 옮긴다. 모든 rename은 대상 이름이 이미 있으면 중단한다. root 잠금 파일(`<root>.lifetime.lock`)이 없으면 중단한다. 설정 출처에서 `SINGLE_SQLITE_FILE` 줄을 지우고 서비스 프로세스 환경에 그 값이 없음을 확인한다. 롤백 접미사는 `.saved-<UTC 시각>` 하나이며 root, intent, 잠금 파일 셋에 같은 값을 쓴다. 쓰기 개방 뒤 다섯 파일로 돌아갈 때는 7.4의 복원 명령으로 롤백 지점을 되돌린다.
+- P7 롤백 순서. 서비스 정지 상태를 확인한다. 세 항목을 root에서 옛 디렉터리로 되돌린다(P2와 같은 확인). 디렉터리 이름을 맞바꾼다. `<root>.intent.json`과 `<root>.lifetime.lock`을 같은 접미사의 보존 이름으로 옮긴다. 모든 rename은 대상 이름이 이미 있으면 중단한다. root 잠금 파일(`<root>.lifetime.lock`)이 없으면 중단한다. 설정 출처에서 `SINGLE_SQLITE_FILE` 줄을 지우고 서비스 프로세스 환경에 그 값이 없음을 확인한다. 롤백 접미사는 `.saved-<UTC 시각>` 하나이며 root, intent, 잠금 파일 셋과 쓰기 개방 뒤에 옮기는 `openclaw-conversations/automation`에 같은 값을 쓴다. 쓰기 개방 직전에 7.4의 롤백 지점 세트를 만들 때 같은 시점에 `openclaw-conversations/automation`(`cursor_state.json`이 그 안에 있다)의 사본을 root 밖에 떠 둔다. 쓰기 개방 뒤 다섯 파일로 돌아갈 때는 위 순서에 더해 옛 디렉터리로 되돌린 `openclaw-conversations/automation`을 그 사본으로 바꾼다. 이 단계를 빼면 커서가 앞서 있어 재인입이 롤백 지점 뒤의 메시지를 건너뛴다. 쓰기 개방 뒤의 MCP 쓰기는 다섯 파일에 없으므로 사라진다. 단일 모드에 남아 롤백 지점으로 되돌릴 때는 7.4의 복원 명령을 쓰고 같은 사본을 함께 되돌린다. 사본으로 바꿀 때는 먼저 지금의 `openclaw-conversations/automation`을 같은 롤백 접미사의 보존 이름으로 옮기고 그다음 사본을 그 자리로 옮긴다. 이 두 이동도 P2와 같은 확인을 하고 대상 이름이 이미 있으면 중단한다. 다섯 파일로 돌아갈 때는 이 교체를 디렉터리 이름을 맞바꾸기 전에 한다. 사본은 root와 같은 파일시스템에 둔다.
 - P8 외부 경로 확인. 이동 항목 셋 밖의 기본 경로를 고정 문자열로 쓰는 외부 스크립트가 있는지 grep으로 다시 확인한다. 새로 나온 경로가 있으면 이동 대상에 넣을지 정한 뒤에 이동한다.
 - P9 경로 조건 확인. 기본 경로와 그 부모의 `realpath`가 자기 자신과 같은지, 기본 경로가 마운트 지점이 아닌지 확인한다(`findmnt -n <경로>`가 출력을 내지 않아야 한다). 마운트 지점이면 그 디렉터리를 rename할 수 없다. 사본 시험 전에 한 번, 전환 당일에 한 번 더 한다. 다르면 게시가 거부되므로 시작하지 않는다.
 - P10 `build_nemotron_personas_korea_pack.py`의 기능 제한. 이 스크립트는 단일 모드에서 쓸 수 없다. 단일 root를 가리키면 거부되고 root 밖 데이터 디렉터리로 돌리면 다섯 파일 구조의 별도 작업이라 운영 root에 반영되지 않는다. 이 스크립트가 만든 stage 산출물만 P3의 방법으로 `root/packs/`에 옮길 수 있다.
