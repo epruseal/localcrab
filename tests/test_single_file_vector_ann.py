@@ -140,6 +140,25 @@ def test_query_leaves_no_open_transaction_even_after_an_exception(env, monkeypat
     assert vec.query("synthetic document 1 topic 1")
 
 
+def test_exception_after_begin_in_open_snapshot_leaves_no_open_transaction(env, monkeypatch):
+    """BEGIN가 끝난 뒤 `_open_snapshot`이 실패해도 롤백이 돌아 다음 쓰기 구간이 막히지 않는다."""
+    path, shared, vec, make = env
+    conn = shared.connection()
+
+    def begin_then_fail():
+        conn.execute("BEGIN")
+        raise RuntimeError("injected after BEGIN")
+
+    monkeypatch.setattr(vec, "_open_snapshot", begin_then_fail)
+    with pytest.raises(RuntimeError, match="injected after BEGIN"):
+        vec.query("synthetic document 1 topic 1")
+    assert not conn.in_transaction
+    monkeypatch.undo()
+    with shared.unit_of_work():
+        pass
+    assert vec.query("synthetic document 1 topic 1")
+
+
 def test_large_scope_uses_one_global_knn_inside_the_snapshot(tmp_path, monkeypatch):
     from opencrab.stores import sqlite_vec_store
 

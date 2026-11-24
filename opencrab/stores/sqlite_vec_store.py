@@ -817,8 +817,9 @@ class SqliteVecStore(_SqliteConnMixin):
 
         if snapshot_opened:
             conn = self._conn
-            self._open_snapshot()
             try:
+                # Inside the try so that an exception after BEGIN still reaches the rollback below.
+                self._open_snapshot()
                 rows = self._select_query_mode(
                     qvec, pack_values, predicate, fetch_k, n_results,
                     pack_scope=pack_scope, allow_ann=True,

@@ -348,7 +348,7 @@ factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/sto
 
 A. 스냅숏을 먼저 정하고 fallback을 그 결과에 묶는다. `query()`가 맨 앞에서 `snapshot_opened`를 정한다(공유 모드이고 연결이 트랜잭션 밖이면 참). 조건 `self._shared is None`을 `(self._shared is None or snapshot_opened)`로 바꾼다. 팩이 32개를 넘으면 `pack_values`를 비우고 `pack_only`를 거짓으로 두며 `pack_scope`를 세운다. 이 두 값의 결합은 기존 주석이 요구하는 그대로다.
 
-B. 쓰기 구간 밖 공유 모드 읽기를 한 스냅숏으로 감싼다. `snapshot_opened`가 참이면 `query()`가 `_open_snapshot()`(`BEGIN`)을 열고 `finally`에서 `rollback()`한다. 스냅숏 안에서 캐시 신선도 판정과 빌드, 후보 후필터, 정밀 재계산이 돈다. 최종 `predicate`는 메모리에 가져온 행에 적용한다. `_open_snapshot()`은 시험이 스냅숏 없는 음성 대조를 만들 이음매이다.
+B. 쓰기 구간 밖 공유 모드 읽기를 한 스냅숏으로 감싼다. `snapshot_opened`가 참이면 `query()`가 `try` 안에서 `_open_snapshot()`(`BEGIN`)을 열고 `finally`에서 `rollback()`한다. 열기를 `try` 밖에 두면 `BEGIN` 뒤 예외가 롤백을 건너뛰어 그 스레드 연결에 트랜잭션이 남고 다음 `unit_of_work`가 거부된다. 스냅숏 안에서 캐시 신선도 판정과 빌드, 후보 후필터, 정밀 재계산이 돈다. 최종 `predicate`는 메모리에 가져온 행에 적용한다. `_open_snapshot()`은 시험이 스냅숏 없는 음성 대조를 만들 이음매이다.
 
 C. `_select_query_mode()`가 `allow_ann`을 받는다. `query()`는 `allow_ann = (self._shared is None) or snapshot_opened`로 넘긴다. 다섯 파일 모드는 그대로이다.
 
@@ -389,7 +389,7 @@ F. 다섯 파일 모드는 `_select_query_mode`의 서명, 무효화 헬퍼, 설
 
 ### 9.6 시험
 
-- `tests/test_single_file_vector_ann.py`: 팩 삭제 도우미의 commit 뒤 무효화(단일 파일은 구간 안 유지와 구간 뒤 비움, 다섯 파일은 즉시), 대규모 범위 질의가 범위 밖 팩과 공간을 돌려주지 않음(ann 꺼짐과 binary, 공간 필터 있음과 없음)과 항등 후보 필터 아래에서도 같음, 트랜잭션 안 대규모 범위의 팩별 질의, 빈 표 질의와 전부 지운 뒤 질의, 스냅숏 고정과 음성 대조(`_open_snapshot`을 끈 쪽은 삭제를 본다), 예외 뒤 열린 트랜잭션 없음, 대규모 범위의 전역 KNN 한 번, 쓰기 구간 밖 ANN 사용과 안 불사용, 단일 모드와 다섯 파일 모드의 동등성, 낡은 후보 제거(I4), 접근 제어 predicate, 상위 rowid 삭제와 외부 삽입의 재빌드와 비벡터 commit의 비재빌드, 제자리 메타 갱신, commit 뒤 무효화와 롤백, 빌드가 commit을 가로지름, 웜 경로의 `epoch` 순서, 비교와 설치의 같은 임계 구역, 대기 스레드, `load.py` 헬퍼 가드.
+- `tests/test_single_file_vector_ann.py`: 팩 삭제 도우미의 commit 뒤 무효화(단일 파일은 구간 안 유지와 구간 뒤 비움, 다섯 파일은 즉시), 대규모 범위 질의가 범위 밖 팩과 공간을 돌려주지 않음(ann 꺼짐과 binary, 공간 필터 있음과 없음)과 항등 후보 필터 아래에서도 같음, 트랜잭션 안 대규모 범위의 팩별 질의, 빈 표 질의와 전부 지운 뒤 질의, 스냅숏 고정과 음성 대조(`_open_snapshot`을 끈 쪽은 삭제를 본다), 예외 뒤 열린 트랜잭션 없음(스냅숏 안의 예외와 `BEGIN` 뒤 열기 실패 둘), 대규모 범위의 전역 KNN 한 번, 쓰기 구간 밖 ANN 사용과 안 불사용, 단일 모드와 다섯 파일 모드의 동등성, 낡은 후보 제거(I4), 접근 제어 predicate, 상위 rowid 삭제와 외부 삽입의 재빌드와 비벡터 commit의 비재빌드, 제자리 메타 갱신, commit 뒤 무효화와 롤백, 빌드가 commit을 가로지름, 웜 경로의 `epoch` 순서, 비교와 설치의 같은 임계 구역, 대기 스레드, `load.py` 헬퍼 가드.
 - `tests/test_single_file_store.py`: 옛 시험 둘(`..._queries_each_partition_in_one_snapshot`, `..._never_uses_ann_cache`)은 위 파일의 대체 시험으로 옮겼다. 단일 파일 삭제 적용 시험이 commit 뒤 무효화(`epoch` 상승)와 실패 때의 무변화를 단언한다. 새 시험 하나(`stores_ann` 픽스처)는 무효화 호출 뒤에 실패를 주입해 롤백 때 캐시와 `epoch`가 그대로임을 단언한다.
 - 변이 확인: 폐기용 checkout에서 변이를 하나씩 적용해 시험 묶음(위 두 파일과 `tests/test_pack_load.py`)을 돌렸다. 치환 전 문자열이 대상 파일에 정확히 한 번 나오는지 먼저 확인했다. 사망한 변이는 스냅숏 끔, `allow_ann` 항상 거짓, 트랜잭션 안 ANN 허용, commit 앞 무효화, 설치 때 `epoch` 비교 제거, `epoch` 증가 제거, `epoch`를 잠금 안에서 읽기, 대기 스레드의 `epoch` 재확인 제거, 비교와 설치 분리, `max(rowid)` 비교 제거, 단일 파일 삭제 자리의 헬퍼 호출 제거와 즉시 비움, sql 분기 팩 삭제의 헬퍼 호출 제거, 헬퍼의 즉시 비움, `pack_scope`가 있을 때 최종 후필터 건너뛰기, 트랜잭션 안의 대규모 범위 fallback, 빈 캐시 가드 제거다. 항등 `_filter_candidates_by_pack`은 생존한다. 최종 후필터가 접근을 정하므로 그 후보 필터는 접근 결함이 아니라 회수율과 속도의 장치이기 때문이다. 삽입 계열과 `reset_collection`의 무효화를 지운 변이는 `max(rowid)`가 변화를 잡아 결과가 같으므로 실행하지 않았고 시험을 더하지 않았다.
 
