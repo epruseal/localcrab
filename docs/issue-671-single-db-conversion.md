@@ -80,8 +80,8 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 
 #### 3.3 캐시 무효화
 
-- BM25 posting 캐시와 ANN 캐시는 `PRAGMA data_version`으로 신선도를 본다. 단일 파일에서는 graph, vector, registry 어느 쓰기에도 이 값이 오른다. 캐시가 더 자주 무효가 된다. 비용은 기록 문서의 `vecgraph` 쓰기 실행에서 본다.
-- ANN 캐시 무효화 시점은 현재 commit 앞이다. 다른 스레드가 commit 전 스냅숏으로 캐시를 다시 만들 수 있다. 3단계에서 commit 뒤 무효화 훅으로 옮긴다. 기본값(`ann=""`)에는 해당 없다.
+- BM25 posting 캐시는 `PRAGMA data_version`으로 신선도를 본다. 단일 파일에서는 graph, vector, registry 어느 쓰기에도 이 값이 오르므로 캐시가 더 자주 무효가 된다. 비용은 기록 문서의 `vecgraph` 쓰기 실행에서 본다. ANN 캐시는 `data_version`이 바뀌어도 벡터 표의 `max(rowid)`가 같으면 유지한다(9.3 D).
+- ANN 캐시 무효화는 commit 뒤로 옮겼다. 쓰기 구간 안의 쓰기는 `after_commit` 콜백으로 캐시를 비우고 세대를 올리며, 세대 비교가 빌드 중 commit이 남기는 낡은 캐시의 설치를 막는다(9.3 E).
 
 - 받아들임 기준(주체마다):
   - 시험 DB의 초기 행을 0으로 두고 doc 쓰기, vector 쓰기, graph 쓰기 각각에 예외를 주입한다. 단일 파일에서는 실패한 건이 어느 축에도 남지 않는다.
@@ -140,7 +140,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 | registry 연결 공유 | SQLAlchemy `creator` 주입과 pysqlite의 `BEGIN` 처리 | 2단계 선행 프로브 |
 | `snapshot_path` 구간 안 호출 | 구간 안 호출은 별도 연결을 열어 교착 위험. 시제품은 계약만 문서화했다 | 2단계에서 `RuntimeError` 거부 |
 | 락 시간 | 구간이 쓰기 락을 쥔 시간만큼 다른 쓰기 연결이 기다린다. 기록 문서의 쓰기 중 읽기 절에 측정값이 있다 | 3단계 임베딩 위치 결정 |
-| 캐시 무효화 범위 | `data_version`은 파일 전체의 쓰기에 오른다 | 3단계 측정 후 결정 |
+| 캐시 무효화 범위 | `data_version`은 파일 전체의 쓰기에 오른다. ANN 캐시는 벡터 `max(rowid)`로 걸러 영향이 없다 | BM25 캐시는 3단계 측정 후 결정, ANN 캐시는 9절 |
 | `lower` UDF | 그래프 저장소가 등록한 `lower`가 단일 연결에서 다른 저장소에도 보인다. 지금 스키마의 인덱스와 트리거는 `lower`를 쓰지 않는다. `lower` 표현식 인덱스를 만들면 의미가 달라진다 | 새 인덱스 추가 때 점검 |
 | 전원 손실 | WAL과 `synchronous=NORMAL`에서 마지막 commit이 사라질 수 있다. 단일 파일은 한 commit이 원자적이므로 축 사이가 어긋난 상태는 남지 않는다. 다섯 파일은 파일마다 commit이 따로 사라질 수 있다. 시험하지 않았다. 분석만 했다 | 3단계 |
 | 백업 도구 | `backup_data_dir`는 고정 파일 목록을 쓰고 단일 모드를 거부한다. 단일 모드 백업은 별도 함수 `backup_single_root`이고 CLI가 `SINGLE_SQLITE_FILE`이 있을 때만 이 함수를 부른다. 복원은 `opencrab.stores.single_restore`다(7.4) | B6에서 구현 |
@@ -321,3 +321,82 @@ factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/sto
 ### 8.7 설정 순서
 
 환경 설정은 root를 치운 뒤에 고친다. api와 gateway 서비스 유닛의 `EnvironmentFile` 줄을 주석 처리하고 재시작하는 롤백은 금지한다. root를 둔 채 그렇게 하면 다섯 파일 factory가 root를 거부해 서비스가 뜨지 않는다(7.2의 7번). 단일 모드에서는 사용자를 만들지 않으며 사용자와 토큰은 병합 입력에서 온다(7.3의 첫 항목).
+
+## 9. 단일 모드 벡터 질의 경로: 한 스냅숏과 ANN 캐시
+
+단일 파일 모드의 벡터 질의가 다섯 파일 모드보다 늦었다. 이 절은 원인과 수리 설계, 불변식, 시험을 적는다. 구현은 `opencrab/stores/sqlite_vec_store.py`와 `opencrab/pack/load.py`에 있다.
+
+### 9.1 문제
+
+운영 DB 사본에서 같은 질의 목록을 같은 heavy-run 틀(주소 공간 2 GiB, nice 19, ionice 3)로 옛 코드(다섯 파일, A)와 단일 모드(C)에서 재었다. 절대값은 제약 아래의 값이므로 비율로만 읽는다. 중앙값은 C가 A의 약 4배, p95는 약 3배였다. 공간 필터가 붙은 질의는 약 10배 늦었다. 벡터 다리만 재면 같은 비율이다.
+
+원인은 `SqliteVecStore`의 공유 모드 조건 둘이다. `git log -S'self._shared is None and pack_values' -- opencrab/stores/sqlite_vec_store.py`(조건 1)와 `git log -S'self._shared is None and self._ann' -- opencrab/stores/sqlite_vec_store.py`(조건 2)가 같은 커밋을 낸다.
+
+1. `query()`의 대규모 범위 fallback이 `self._shared is None`일 때만 켜진다. 읽을 수 있는 팩이 `_PACK_KNN_MAX`(32)를 넘어도 공유 모드는 팩별 KNN을 직렬로 돈다.
+2. `_select_query_mode()`의 binary ANN 경로도 `self._shared is None`일 때만 켜진다. 운영 설정은 `VECTOR_ANN=binary`이므로 단일 모드는 ANN 캐시를 쓰지 못했다.
+
+두 조건의 목적은 한 질의가 한 스냅숏을 보게 하는 것이다. 지연 비용을 검토한 기록은 없다.
+
+### 9.2 불변식
+
+- I1. 단일 모드에서 쓰기 구간 밖의 질의는 모든 벡터 읽기를 한 읽기 스냅숏 안에서 한다. 질의 도중 다른 연결이 commit해도 그 질의가 읽는 행은 변하지 않는다. I1은 읽는 행에만 걸린다. 후보를 만드는 ANN 캐시는 질의 스냅숏과 다른 시점일 수 있고, 그 경우 후보에서 빠진 행은 결과에 나오지 않을 수 있다.
+- I2. 쓰기 구간 밖 읽기 경로는 다섯 파일 모드와 같은 검색 알고리즘(대규모 범위 fallback, binary ANN, 같은 캐시 신선도 규칙)을 쓴다.
+- I3. 이미 열린 트랜잭션 안(쓰기 구간 `unit_of_work`이나 합류 트랜잭션)의 질의는 종전과 같다. ANN 캐시를 읽지 않고 만들지 않으며 미커밋 벡터를 본다.
+- I4. 접근 제어는 최종 후필터가 정한다. 후필터는 스냅숏 안에서 읽어 온 행의 메타데이터에 적용한다. ANN 캐시는 후보를 만들 뿐 접근 판정을 하지 않는다.
+
+### 9.3 설계
+
+A. 스냅숏을 먼저 정하고 fallback을 그 결과에 묶는다. `query()`가 맨 앞에서 `snapshot_opened`를 정한다(공유 모드이고 연결이 트랜잭션 밖이면 참). 조건 `self._shared is None`을 `(self._shared is None or snapshot_opened)`로 바꾼다. 팩이 32개를 넘으면 `pack_values`를 비우고 `pack_only`를 거짓으로 두며 `pack_scope`를 세운다. 이 두 값의 결합은 기존 주석이 요구하는 그대로다.
+
+B. 쓰기 구간 밖 공유 모드 읽기를 한 스냅숏으로 감싼다. `snapshot_opened`가 참이면 `query()`가 `_open_snapshot()`(`BEGIN`)을 열고 `finally`에서 `rollback()`한다. 스냅숏 안에서 캐시 신선도 판정과 빌드, 후보 후필터, 정밀 재계산이 돈다. 최종 `predicate`는 메모리에 가져온 행에 적용한다. `_open_snapshot()`은 시험이 스냅숏 없는 음성 대조를 만들 이음매이다.
+
+C. `_select_query_mode()`가 `allow_ann`을 받는다. `query()`는 `allow_ann = (self._shared is None) or snapshot_opened`로 넘긴다. 다섯 파일 모드는 그대로이다.
+
+D. ANN 캐시 신선도는 다섯 파일 모드의 규칙을 바꾸지 않는다. `_get_ann_cache`는 `_ann_cache_fresh`를 잠금 밖과 안에서 부르고, 매 호출이 연결의 `data_version`을 기록한다. 첫 호출에서 `data_version`이 바뀌었으면 거짓이다. 둘째 호출은 `data_version`이 기록값과 같으므로 벡터 표 `_rowids`의 `max(rowid)`가 캐시의 값과 같은지만 본다. 단일 모드에서는 질의가 스냅숏 안에서 `data_version`을 읽으므로 두 호출의 값이 같다. 그래서 그래프, 문서, 레지스트리 쓰기가 `data_version`을 올려도 벡터 `max(rowid)`가 그대로면 캐시를 유지한다. 벡터 삽입은 `max(rowid)`를 올려 다음 질의가 재빌드한다.
+- 알려진 한계(기존 동작): 가장 큰 rowid가 아닌 행만 지운 삭제는 `max(rowid)`가 그대로라 캐시가 낡은 채 남을 수 있다. 낡은 id는 정밀 재계산이 건너뛰므로(I4) 영향은 재현율이다. 다섯 파일 모드에도 있으며 #706이 추적한다.
+- 재빌드는 스냅숏 안의 연결로 한다. 스냅숏 밖에서 빌드하면 읽는 사이 쓰기가 끼어 id와 벡터가 어긋날 수 있다.
+- 오래된 스냅숏 가드는 두지 않는다. 최상위 rowid를 지운 뒤 모든 질의가 정확 KNN으로 내려가는 회귀를 만든다.
+- 이 변경이 단일 모드에 ANN 캐시를 처음 연다. 콜드 첫 질의는 다섯 파일 모드와 같은 빌드 비용을 치른다.
+
+벡터 표를 바꾸는 쓰기 경로는 `grep -rnE '(DELETE FROM|INSERT INTO|INSERT OR [A-Z]+ INTO|UPDATE) *(\{[^}]*(table|collection|_table)[^}]*\}|vectors_kure)' opencrab scripts apps`로 찾았다. 삽입은 새 rowid를 만든다. 삭제는 삭제만 있는 변경이라 위 한계에 든다. 제자리 UPDATE는 메타데이터만 바꾸는 `_vec_meta_update`와 `scripts/backfill_space.py`뿐이며 반례가 아니다. 캐시가 `ids`, `bits`, `q8`, `scale`만 담고, 반환 행은 정밀 재계산이 스냅숏 안 점조회로 읽기 때문이다. 임베딩을 제자리로 바꾸는 문장이 생기면 이 가정을 다시 본다.
+
+E. 캐시 무효화를 commit 뒤로 옮긴다. 쓰기 메서드 다섯 곳이 `with self._tx()` 다음 줄에서 캐시를 비우던 자리는 단일 모드에서 commit 앞이었다. 다른 스레드가 그 사이에 재빌드하면 commit 전 스냅숏으로 캐시가 다시 서고, 삭제만 있는 commit이면 낡은 캐시가 남는다.
+- 헬퍼 `_invalidate_ann_after_write()`가 그 자리를 대신한다. 쓰기 구간 안이면 `after_commit` 콜백으로 commit 뒤에 `_drop_ann_cache()`(`_ann_cache = None`과 `_ann_epoch += 1`, `_ann_epoch_lock` 안)를 실행한다. 롤백과 commit 실패에서는 콜백이 호출되지 않아 캐시가 그대로이다. 쓰기 구간 밖이면 즉시 실행한다. 본문은 멱등이라 콜백 중복 방지 플래그를 두지 않는다.
+- 빌드는 오래 걸려 commit을 가로지를 수 있다. 가로지른 빌드가 commit 전 스냅숏의 캐시를 콜백 뒤에 설치하면 낡은 캐시가 되살아난다. `_get_ann_cache`는 첫 줄에서 `epoch`를 읽는다. 스냅숏은 그 뒤 첫 DB 읽기(`_ann_cache_fresh`의 `PRAGMA data_version` 또는 `_build_ann_cache`)에서 고정된다. 설치는 `_ann_epoch_lock` 안에서 `epoch`를 비교하고 같을 때만 한다. 비교와 설치가 한 임계 구역이라 비교 직후 콜백이 끼는 틈이 없다. `query()`의 `BEGIN`과 `_get_ann_cache` 첫 줄 사이에는 DB 읽기가 없다는 것이 이 순서의 전제이다.
+- 대기 스레드는 `_ann_cache_lock`을 얻은 직후 (1) 신선한 캐시가 있으면 쓰고, (2) 없고 `epoch`가 달라졌으면 빌드하지 않고 `None`을 돌려주어 정확 KNN으로 가며, (3) 그러지 않으면 빌드한다. (2)가 없으면 대기 스레드마다 설치가 거부될 빌드를 차례로 돈다. commit 뒤 새 연결이 연결별 `data_version` 때문에 각자 재빌드하는 중복은 다섯 파일 모드에서 상속한 동작이며 #707이 추적한다.
+- 락 순서는 `_ann_cache_lock`에서 `_ann_epoch_lock`으로 한 방향이다. 콜백은 `shared.lock`을 놓은 뒤 `_ann_epoch_lock`만 잡는다. 질의 경로는 `shared.lock`을 잡지 않는다.
+- `opencrab/pack/load.py`의 직접 DELETE 두 곳이 같은 헬퍼를 부른다. 단일 파일 삭제 적용은 기존 commit 앞 무효화를 헬퍼 호출로 바꾸고, 지울 벡터가 있을 때만 부른다. sql 분기 팩 삭제는 commit 블록과 삭제 수 확인 뒤에 부른다. 헬퍼가 없는 시험 대역은 `getattr` 가드로 건너뛴다. 이 호출은 다섯 파일 모드에서도 돌아 같은 프로세스의 캐시를 비운다.
+
+F. 다섯 파일 모드는 `_select_query_mode`의 서명, 무효화 헬퍼, 설치 때의 `epoch` 비교, 팩 삭제 뒤 헬퍼 호출을 빼고 바뀌지 않는다. 다섯 파일 모드의 공간 필터가 벡터를 놓치는 문제는 #705가 맡는다.
+
+### 9.4 기대 결과와 승인된 차이
+
+- 쓰기 구간 밖 단일 모드 벡터 다리가 다섯 파일 모드와 같은 알고리즘이 된다. 사본 시험의 질의 목록에서 단일 모드와 옛 코드가 달랐던 결과가 같아져야 한다.
+- 운영 설정은 `ann=binary`이다. `ann=""`인 단일 모드는 팩 33개 이상 범위에서 팩별 정확 KNN 대신 전역 KNN(k=4096)과 후필터를 쓴다. 다섯 파일 모드와 같은 알고리즘이며 재현율이 종전과 다를 수 있다.
+- 공간 필터 질의 하나는 종전 단일 모드보다 적게 돌려준다. 원인은 `_select_query_mode`가 잔여 predicate가 있어도 `pack_scope`가 있으면 ANN을 허용하는 조건이며 다섯 파일 모드와 같다. 이 결함은 #705가 다룬다.
+- `schema_pack_list`는 이 수정과 무관하다. 코드 검사가 코드 체크아웃의 `types/<t>.yaml`을 보므로 이름공간 구성 차이이다.
+
+### 9.5 게이트
+
+구현을 막는 게이트는 다섯 개이다.
+1. 지연: 질의 목록의 중앙값과 p95와 호출별 웜 중앙값과 콜드 빌드 시간이 A의 1.2배 이하이다.
+2. 사본 시험의 질의 목록 결과가 `schema_pack_list`를 뺀 전부 같다.
+3. 전체 시험 묶음을 시험 id별로 대사한다.
+4. 스냅숏 불변식 시험과 그 음성 대조가 통과한다.
+5. 같은 프로세스의 쓰기 스레드가 있을 때 질의가 잘못된 결과를 내지 않는다.
+
+그 밖의 항목(WAL 크기, 메모리, 재빌드 횟수 상한, 변이 검증 등)은 측정할 수 있으면 기록하고 막지 않는다. 지연 측정은 같은 heavy-run 틀에서 A와 C를 교대로 3회 이상 잰다.
+
+### 9.6 시험
+
+- `tests/test_single_file_vector_ann.py`: 스냅숏 고정과 음성 대조(`_open_snapshot`을 끈 쪽은 삭제를 본다), 예외 뒤 열린 트랜잭션 없음, 대규모 범위의 전역 KNN 한 번, 쓰기 구간 밖 ANN 사용과 안 불사용, 단일 모드와 다섯 파일 모드의 동등성, 낡은 후보 제거(I4), 접근 제어 predicate, 상위 rowid 삭제와 외부 삽입의 재빌드와 비벡터 commit의 비재빌드, 제자리 메타 갱신, commit 뒤 무효화와 롤백, 빌드가 commit을 가로지름, 웜 경로의 `epoch` 순서, 비교와 설치의 같은 임계 구역, 대기 스레드, `load.py` 헬퍼 가드.
+- `tests/test_single_file_store.py`: 옛 시험 둘(`..._queries_each_partition_in_one_snapshot`, `..._never_uses_ann_cache`)은 위 파일의 대체 시험으로 옮겼다. 단일 파일 삭제 적용 시험이 commit 뒤 무효화(`epoch` 상승)와 실패 때의 무변화를 단언한다.
+- 변이 확인: 스냅숏 끔, `allow_ann` 항상 거짓, 트랜잭션 안 ANN 허용, commit 앞 무효화, 설치 때 `epoch` 비교 제거, `epoch` 증가 제거, `epoch`를 잠금 안에서 읽기, 대기 스레드의 `epoch` 재확인 제거, 비교와 설치 분리, `max(rowid)` 비교 제거, `load.py` 헬퍼 호출 제거를 하나씩 적용해 새 시험이 각각 실패하는 것을 확인했다.
+
+### 9.7 위험과 미해결
+
+- 가장 큰 rowid가 아닌 행만 지운 삭제가 캐시를 낡게 두는 한계는 다른 프로세스의 쓰기와 오프라인 스크립트에서 남는다. 운영의 2-instance 서빙에서는 한 인스턴스의 팩 삭제가 다른 인스턴스의 캐시를 낡게 둔다. 영향은 재현율이며 다음 벡터 삽입이나 재시작이 바로잡는다. #706이 추적한다.
+- commit 뒤 대기 스레드의 재빌드 중복은 다섯 파일 모드에서 상속했다. #707이 추적한다.
+- 쓰기 간격이 빌드 시간보다 짧으면 설치가 거부되는 대기 질의가 전역 정확 KNN 경로로 간다. 같은 부하의 A와 비교해 잰다.
+- 콜드 첫 질의, 빌드 중 읽기 스냅숏이 붙잡는 WAL, 캐시 메모리는 측정으로 확인한다. 빌드를 스냅숏 밖에서 하는 대안은 일관된 빌드를 보장하지 못해 택하지 않는다.
+- 되돌리기: 코드 변경이므로 `git revert`로 종전 동작에 돌아간다. 데이터 형식은 바꾸지 않는다.
