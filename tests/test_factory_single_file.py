@@ -2122,6 +2122,63 @@ def test_refused_unmarked_billing_file_is_opened_after_lock_release(tmp_path, mo
     assert "billing_events" in _table_names(path)
 
 
+def _build_refused_with_relative_url(tmp_path, monkeypatch, *, marker_in_a: bool):
+    """디렉터리 a의 상대 URL로 거부 저장소를 만든다. 생성 때 a의 파일은 잠겨 있고, 만든 뒤 잠금을 풀고 b로 옮긴다."""
+    from opencrab.stores.sql_store import SQLStore
+
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    a_dir.mkdir()
+    b_dir.mkdir()
+    a_path = _make_db(a_dir / "opencrab.db", "wal", marker_in_a)
+    monkeypatch.chdir(a_dir)
+    holder = _Holder(a_path, "wal")
+    holder.start()
+    try:
+        _assert_locked(a_path)
+        _spy_releasing(monkeypatch, holder)
+        store = SQLStore("sqlite:///opencrab.db", create_tables=False)
+    finally:
+        holder.stop()
+    assert store._open_refusal is not None
+    assert len(store._engine.dialect.dispatch.do_connect) == 1
+    return store, a_path, b_dir
+
+
+def test_refused_store_rechecks_the_engine_file_after_chdir_marked(tmp_path, monkeypatch, fast_guard):
+    """T10(s3): 표식 WAL 파일을 상대 URL로 열다 거부된 저장소는 디렉터리를 옮긴 뒤에도 엔진이 여는 파일을 검사한다.
+
+    등록 때 경로를 절대 경로로 고정하지 않으면 옮긴 디렉터리의 상대 경로(표식 없는 빈 곳)를 검사해 표식 파일에 연결한다.
+    """
+    store, a_path, b_dir = _build_refused_with_relative_url(tmp_path, monkeypatch, marker_in_a=True)
+    before = _snapshot(a_path)
+    monkeypatch.chdir(b_dir)
+    try:
+        with pytest.raises(RuntimeError, match=_REFUSAL):
+            store._engine.connect()
+    finally:
+        store.close()
+    _assert_refused_untouched(a_path, before)
+    assert "pack_delete_operations" in _table_names(a_path)
+
+
+def test_refused_store_rechecks_the_engine_file_after_chdir_unmarked(tmp_path, monkeypatch, fast_guard):
+    """T10(s4): 표식 없는 파일을 상대 URL로 열다 거부된 저장소는 디렉터리를 옮겨도 엔진이 여는 파일을 검사한다.
+
+    옮긴 디렉터리에 표식 있는 같은 이름 파일이 있어도 그 파일을 검사해 잘못 거부하지 않는다.
+    """
+    store, a_path, b_dir = _build_refused_with_relative_url(tmp_path, monkeypatch, marker_in_a=False)
+    b_path = _make_db(b_dir / "opencrab.db", "wal", True)
+    b_before = _snapshot(b_path)
+    monkeypatch.chdir(b_dir)
+    try:
+        with store._engine.connect() as conn:
+            assert conn.exec_driver_sql("SELECT 1").scalar() == 1
+    finally:
+        store.close()
+    _assert_unchanged(b_path, b_before)
+
+
 def test_published_single_db_is_wal(tmp_path, monkeypatch):
     """V4: 게시된 단일 파일은 WAL(헤더 2, 2)이고 -wal 파일이 없으며 표식 표가 보인다.
 
