@@ -452,7 +452,10 @@ class SQLStore:
         if self._is_sqlite and shared is None:
             from sqlalchemy.engine import make_url
 
-            from opencrab.stores._single_file import reject_unmanaged_single_file, unmanaged_open_refusal
+            from opencrab.stores._single_file import (
+                reject_unmanaged_single_file,
+                unmanaged_open_refusal,
+            )
 
             db_path = make_url(url).database
             if db_path:
@@ -579,7 +582,8 @@ class SQLStore:
         """
         from sqlalchemy import event
 
-        db_path = self._refusal_db_path
+        # 엔진 생성 때의 절대 경로로 고정해, 뒤의 chdir이 있어도 검사 대상이 엔진이 여는 파일과 같게 한다.
+        db_path = os.path.abspath(self._refusal_db_path) if self._refusal_db_path else None
 
         def _recheck(dialect: Any, conn_rec: Any, cargs: Any, cparams: Any) -> None:
             from opencrab.stores import _single_file

@@ -464,9 +464,9 @@ def token_store_unavailable_reason(exc: BaseException) -> str | None:
     if isinstance(exc, PoolTimeoutError):
         return "store-unavailable"
     if isinstance(exc, sqlite3.OperationalError):
-        # A raw driver error reaches here from a caller of the unmanaged single-file check (#671) that does not
-        # build a five-file store: the five-file store constructors record the refusal instead of raising it. Only
-        # a lock is "store-busy"; the local import below named the SQLAlchemy class.
+        # No caller in opencrab/ or apps/ passes a raw driver error now (#671). SQLAlchemy wraps the error that
+        # the do_connect listener raises, and the wrapped error takes the branch below. This branch stays for a
+        # raw sqlite3 error that comes from outside SQLAlchemy. Only a lock is "store-busy".
         from opencrab.stores._single_file import sqlite_busy_or_locked
 
         return "store-busy" if sqlite_busy_or_locked(exc) else None

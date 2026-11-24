@@ -247,7 +247,7 @@ def test_store_flag_unavailable_does_not_gate_the_lookup(env):
     assert _manifest(env, env.headers).status_code == 200
 
 
-def test_refused_store_is_503_busy_then_recovers_after_lock_release(env, monkeypatch):
+def test_refused_store_is_503_busy_then_recovers_after_lock_release(env, monkeypatch, caplog):
     """#671 VF1: a store built while the WAL token file was locked records the refusal and stays unavailable,
     but its engine still answers. The check runs again on each new connection, so the lookup is a 503
     store-busy while the lock holds and a 200 after it is released."""
@@ -270,13 +270,16 @@ def test_refused_store_is_503_busy_then_recovers_after_lock_release(env, monkeyp
             assert refused.available is False
             assert refused._engine is not None
             monkeypatch.setattr(api.app.state.context, "sql", refused)
-            locked = _manifest(env, env.headers)
+            with caplog.at_level(logging.WARNING, logger="opencrab.api"):
+                locked = _manifest(env, env.headers)
         healed = _manifest(env, env.headers)
     finally:
         if refused is not None:
             refused.close()
 
     _assert_unavailable(locked)
+    lines = [r for r in caplog.records if r.name == "opencrab.api" and r.levelno == logging.WARNING]
+    assert any("store-busy" in r.getMessage() for r in lines), caplog.text
     assert healed.status_code == 200, healed.text
 
 
