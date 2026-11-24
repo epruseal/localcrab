@@ -300,6 +300,11 @@ class SqliteVecStore(_SqliteConnMixin):
         # query; invalidated by this store's writes and by freshness checks.
         self._ann_cache: _AnnCache | None = None
         self._ann_cache_lock = threading.Lock()
+        # Invalidation generation (issue #671). Bumped under `_ann_epoch_lock` by every
+        # post-commit invalidation; a build installs its cache only if the generation it
+        # read before its snapshot is unchanged. Leaf lock: no other lock is taken inside.
+        self._ann_epoch = 0
+        self._ann_epoch_lock = threading.Lock()
         self._conn_dv: dict[int, int] = {}
         self._available = False
         self._init_conn_state(db_path, shared)
@@ -536,7 +541,7 @@ class SqliteVecStore(_SqliteConnMixin):
                         raise RuntimeError("vector owner is not validated")
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
                 conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
-        self._ann_cache = None  # in-process write → invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write → invalidate ANN cache
         return ids
 
     def upsert_texts(
@@ -657,7 +662,7 @@ class SqliteVecStore(_SqliteConnMixin):
                             "this write"
                         ) from exc
                     raise
-        self._ann_cache = None  # in-process write → invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write → invalidate ANN cache
         return ids
 
     def _slot_owners(self, conn, ids: list[str]) -> dict[str, str]:
@@ -701,7 +706,7 @@ class SqliteVecStore(_SqliteConnMixin):
                         raise RuntimeError("vector owner is not validated")
             for _id in ids:
                 conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
-        self._ann_cache = None  # in-process write → invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write → invalidate ANN cache
 
     def reset_collection(self) -> None:
         """Empty the collection (destructive). Uses DELETE (not DROP+CREATE) so
@@ -722,7 +727,7 @@ class SqliteVecStore(_SqliteConnMixin):
             # clear all rows atomically
             conn.execute(self._create_table_sql(with_bit=self._has_bit_column))
             conn.execute(f"DELETE FROM {self._table}")
-        self._ann_cache = None  # in-process write → invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write → invalidate ANN cache
         logger.info("SqliteVecStore: table '%s' reset.", self._table)
 
     # ------------------------------------------------------------------
@@ -774,8 +779,17 @@ class SqliteVecStore(_SqliteConnMixin):
         # makes the `if predicate is None or pack_only:` check below take
         # the ELSE branch, which sets `fetch_k = _VEC0_K_MAX` (4096) — a
         # bounded, approximate, but non-empty candidate pool.
+        # Single-file mode (#671): outside a unit of work every vector read of this query runs
+        # in one read snapshot (BEGIN ... rollback below). Decided first because the
+        # large-scope fallback and ANN use depend on it. Inside an open transaction the query
+        # behaves as before: per-pack exact KNN, no ANN cache (I3).
+        snapshot_opened = self._shared is not None and not self._conn.in_transaction
         pack_scope: frozenset[str] | None = None
-        if self._shared is None and pack_values is not None and len(pack_values) > _PACK_KNN_MAX:
+        if (
+            (self._shared is None or snapshot_opened)
+            and pack_values is not None
+            and len(pack_values) > _PACK_KNN_MAX
+        ):
             pack_scope = frozenset(pack_values)
             pack_values = None
             pack_only = False
@@ -801,18 +815,21 @@ class SqliteVecStore(_SqliteConnMixin):
         else:
             fetch_k = _VEC0_K_MAX
 
-        if self._shared is not None and pack_values and not self._conn.in_transaction:
+        if snapshot_opened:
             conn = self._conn
-            conn.execute("BEGIN")
+            self._open_snapshot()
             try:
                 rows = self._select_query_mode(
-                    qvec, pack_values, predicate, fetch_k, n_results, pack_scope=pack_scope
+                    qvec, pack_values, predicate, fetch_k, n_results,
+                    pack_scope=pack_scope, allow_ann=True,
                 )
             finally:
                 conn.rollback()
         else:
+            # Five-file mode, or single-file mode inside an open transaction (no ANN there).
             rows = self._select_query_mode(
-                qvec, pack_values, predicate, fetch_k, n_results, pack_scope=pack_scope
+                qvec, pack_values, predicate, fetch_k, n_results,
+                pack_scope=pack_scope, allow_ann=self._shared is None,
             )
 
         hits: list[dict[str, Any]] = []
@@ -823,6 +840,12 @@ class SqliteVecStore(_SqliteConnMixin):
             if len(hits) >= n_results:
                 break
         return hits
+
+    def _open_snapshot(self) -> None:
+        """Open the read snapshot of one query (deferred BEGIN: the first read pins it).
+
+        A seam so tests can build a no-snapshot negative control."""
+        self._conn.execute("BEGIN")
 
     def _knn(
         self, qvec: list[float], k: int, pack: str | None
@@ -859,6 +882,7 @@ class SqliteVecStore(_SqliteConnMixin):
         n_results: int,
         *,
         pack_scope: frozenset[str] | None = None,
+        allow_ann: bool,
     ) -> list[dict[str, Any]]:
         """Pick which KNN strategy serves this query, and run it.
 
@@ -892,7 +916,10 @@ class SqliteVecStore(_SqliteConnMixin):
                 rows.extend(self._knn(qvec, fetch_k, pack=pk))
             rows.sort(key=lambda r: r["distance"])
             return rows
-        if self._shared is None and self._ann == "binary" and self._has_bit_column and (
+        # `allow_ann` (#671): five-file mode, or single-file mode inside the query's own read
+        # snapshot. `_get_ann_cache` reads the invalidation epoch as its first statement and
+        # relies on nothing between that snapshot's BEGIN and it reading the database.
+        if allow_ann and self._ann == "binary" and self._has_bit_column and (
             predicate is None or pack_scope is not None
         ):
             rows_ann = self._knn_bit_rerank(
@@ -1010,7 +1037,28 @@ class SqliteVecStore(_SqliteConnMixin):
         return _AnnCache(ids=ids, bits=bits, q8=q8, scale=scale,
                          max_rowid=max_rowid)
 
+    def _invalidate_ann_after_write(self) -> None:
+        """Drop the ANN cache after a vector write, once the write is committed.
+
+        In a single-file unit of work the commit happens later, so the drop runs as a
+        post-commit callback (not called on rollback). Dropping before the commit would let a
+        concurrent query rebuild the cache from the pre-commit snapshot and keep it.
+        """
+        shared = self._shared
+        if shared is not None and shared.in_unit_of_work:
+            shared.after_commit(self._drop_ann_cache)
+        else:
+            self._drop_ann_cache()
+
+    def _drop_ann_cache(self) -> None:
+        with self._ann_epoch_lock:
+            self._ann_cache = None
+            self._ann_epoch += 1
+
     def _get_ann_cache(self) -> _AnnCache | None:
+        # The epoch must be read before any database read of this query's snapshot:
+        # `_ann_cache_fresh` (cache present) or `_build_ann_cache` (cache absent) pins it.
+        epoch = self._ann_epoch
         cache = self._ann_cache
         if cache is not None and self._ann_cache_fresh(cache):
             return cache
@@ -1018,9 +1066,15 @@ class SqliteVecStore(_SqliteConnMixin):
             cache = self._ann_cache
             if cache is not None and self._ann_cache_fresh(cache):
                 return cache
+            if self._ann_epoch != epoch:
+                # A commit invalidated the cache after this query's snapshot was pinned. A build
+                # here would use the stale snapshot: take the exact path instead.
+                return None
             t0 = time.perf_counter()
             cache = self._build_ann_cache()
-            self._ann_cache = cache
+            with self._ann_epoch_lock:
+                if self._ann_epoch == epoch:
+                    self._ann_cache = cache
             if cache is not None:
                 logger.info(
                     "SqliteVecStore: ANN cache built — %d vectors in %.1fs",
@@ -1268,7 +1322,7 @@ class SqliteVecStore(_SqliteConnMixin):
                         record["id"], record["document"], meta, record["embedding"]
                     ),
                 )
-        self._ann_cache = None  # in-process write -> invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write -> invalidate ANN cache
         return [record["id"] for record in clean]
 
     def verify_recovery_row(self, node_id: str) -> bool:

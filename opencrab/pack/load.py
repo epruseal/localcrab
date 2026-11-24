@@ -585,6 +585,13 @@ def _safe_str(obj) -> str:
     return s
 
 
+def _invalidate_vec_ann(vec) -> None:
+    """벡터 저장소의 ANN 캐시를 commit 뒤에 비운다(#671). 헬퍼가 없는 시험 대역은 건너뛴다."""
+    hook = getattr(vec, "_invalidate_ann_after_write", None)
+    if callable(hook):
+        hook()
+
+
 def _confirmed_rowcount(rc) -> int | None:
     """드라이버가 **실제로 센 삭제 행 수**일 때만 그 값, 아니면 `None`(미확인).
 
@@ -1285,6 +1292,7 @@ def _delete_pack_vectors(
             if shared is None or not shared.in_unit_of_work:
                 handle.commit()
             chunk_vec_del = _confirmed_rowcount(rc)                # R2
+            _invalidate_vec_ann(vec)
             if chunk_vec_del is None:
                 vec_confirmed = False
                 # 미확인은 **보이는** 실패여야 한다 — 요약의 "미확인"만으로는
@@ -1785,7 +1793,8 @@ def _apply_single_file_delete(shared, sql, principal, pack_name, journal, graph,
             raise RuntimeError("pack deletion left owned records")
         result = [len(scope["doc_extras"]) + len(scope["nodes"]), len(scope["sources"]), len(scope["vectors"])]
         evidence = _single_file_delete_evidence(journal["operation_id"], journal["incarnation"], result, scope)
-        vec._ann_cache = None
+        if scope["vectors"]:
+            _invalidate_vec_ann(vec)
         changed = conn.execute(
             "UPDATE pack_delete_operations SET state='committed', result_json=?, evidence_json=? "
             "WHERE operation_id=? AND pack_id=? AND incarnation=? AND state='pending'",

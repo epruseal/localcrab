@@ -635,26 +635,6 @@ def test_checked_sqlstore_releases_lifetime_lock_on_close(tmp_path):
     release_file_lock(lock)
 
 
-def test_shared_large_pack_scope_queries_each_partition_in_one_snapshot(stores, monkeypatch):
-    from opencrab.stores import sqlite_vec_store
-
-    _path, shared, _graph, _docs, vec = stores
-    vec.upsert_texts(["one", "two"], [{"pack_id": "p"}, {"pack_id": "q"}], ["a", "b"])
-    monkeypatch.setattr(sqlite_vec_store, "_PACK_KNN_MAX", 1)
-    calls = []
-    original = vec._knn
-
-    def recorded(qvec, k, pack):
-        calls.append((pack, vec._conn.in_transaction))
-        return original(qvec, k, pack)
-
-    monkeypatch.setattr(vec, "_knn", recorded)
-    hits = vec.query("one", n_results=2, where={"pack_id": {"$in": ["p", "q"]}})
-    assert {hit["id"] for hit in hits} == {"a", "b"}
-    assert calls == [("p", True), ("q", True)]
-    assert not shared.connection().in_transaction
-
-
 def test_shared_pack_search_keeps_snapshot_across_writer_commit(stores, monkeypatch):
     path, _shared, _graph, _docs, vec = stores
     vec.upsert_texts(["one", "two"], [{"pack_id": "p"}, {"pack_id": "q"}], ["a", "b"])
@@ -688,19 +668,6 @@ def test_shared_query_in_transaction_sees_temporary_vector_then_rolls_back(store
             assert [hit["id"] for hit in vec.query("temporary", where={"pack_id": "p"})] == ["temporary"]
             raise RuntimeError("abort")
     assert vec.query("temporary", where={"pack_id": "p"}) == []
-
-
-def test_shared_vector_query_never_uses_ann_cache(stores, monkeypatch):
-    path, shared, graph, docs, vec = stores
-    vec.upsert_texts(["text"], [{"pack_id": "p"}], ["s1"])
-    vec._ann = "binary"
-    vec._has_bit_column = True
-
-    def fail(*_args, **_kwargs):
-        raise AssertionError("shared query used ANN cache")
-
-    monkeypatch.setattr(vec, "_knn_bit_rerank", fail)
-    assert [row["id"] for row in vec.query("text")] == ["s1"]
 
 
 def test_vector_metadata_helper_rejects_owner_change(stores):
@@ -1624,6 +1591,7 @@ def test_single_file_delete_apply_is_atomic(stores, fail, monkeypatch):
     conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT PRIMARY KEY, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
     conn.commit()
     principal = Principal(user_id=owner, is_local=True, disabled=False)
+    epoch = vec._ann_epoch
     try:
         journal = _start_single_file_delete(shared, sql, principal, "p", os.path.dirname(path))
         if fail:
@@ -1632,12 +1600,14 @@ def test_single_file_delete_apply_is_atomic(stores, fail, monkeypatch):
             monkeypatch.setattr("opencrab.pack.load._single_file_delete_evidence", fail_delete)
             with pytest.raises(RuntimeError, match="injected"):
                 _apply_single_file_delete(shared, sql, principal, "p", journal, graph, docs, vec)
+            assert vec._ann_epoch == epoch
             assert _counts(path) == (1, 1, 1)
             assert conn.execute("SELECT count(*) FROM doc_source_integrity").fetchone()[0] == 1
             assert conn.execute("SELECT state FROM pack_delete_operations").fetchone()[0] == "pending"
             assert conn.execute("SELECT count(*) FROM ontology_nodes").fetchone()[0] == 1
         else:
             assert _apply_single_file_delete(shared, sql, principal, "p", journal, graph, docs, vec) == (1, 1, 1)
+            assert vec._ann_epoch == epoch + 1  # the ANN cache was dropped after the commit
             assert _counts(path) == (0, 0, 0)
             assert conn.execute("SELECT count(*) FROM doc_source_integrity").fetchone()[0] == 0
             assert conn.execute("SELECT state FROM pack_delete_operations").fetchone()[0] == "committed"
