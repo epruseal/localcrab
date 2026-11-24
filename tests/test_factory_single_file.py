@@ -2123,7 +2123,10 @@ def test_refused_unmarked_billing_file_is_opened_after_lock_release(tmp_path, mo
 
 
 def _build_refused_with_relative_url(tmp_path, monkeypatch, *, marker_in_a: bool):
-    """디렉터리 a의 상대 URL로 거부 저장소를 만든다. 생성 때 a의 파일은 잠겨 있고, 만든 뒤 잠금을 풀고 b로 옮긴다."""
+    """디렉터리 a의 상대 URL로 거부 저장소를 만든다. 생성 때 a의 파일은 잠겨 있고, 만든 뒤 잠금을 푼다.
+
+    이 함수는 cwd를 a에 남긴 채 돌아온다. b로 옮기는 일은 호출하는 시험이 한다.
+    """
     from opencrab.stores.sql_store import SQLStore
 
     a_dir = tmp_path / "a"
@@ -2174,6 +2177,8 @@ def test_refused_store_rechecks_the_engine_file_after_chdir_unmarked(tmp_path, m
     try:
         with store._engine.connect() as conn:
             assert conn.exec_driver_sql("SELECT 1").scalar() == 1
+            main_file = conn.exec_driver_sql("PRAGMA database_list").fetchall()[0][2]
+            assert os.path.realpath(main_file) == os.path.realpath(a_path)
     finally:
         store.close()
     _assert_unchanged(b_path, b_before)
