@@ -1571,13 +1571,11 @@ def test_delete_reservation_survives_journal_failure(stores, monkeypatch, tmp_pa
         sql.close()
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_single_file_delete_apply_is_atomic(stores, fail, monkeypatch):
+def _prepare_delete_apply(path, shared, graph, docs, vec):
+    """삭제 적용 시험의 공통 준비: 사용자, 팩 p, 노드, 출처, 벡터, incarnation 열, 작업 표."""
     from opencrab.auth import Principal, create_user
-    from opencrab.pack.load import _apply_single_file_delete, _start_single_file_delete
     from opencrab.pack.ownership import create_pack
 
-    path, shared, graph, docs, vec = stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     create_pack(sql, owner, "p")
@@ -1591,6 +1589,32 @@ def test_single_file_delete_apply_is_atomic(stores, fail, monkeypatch):
     conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT PRIMARY KEY, pack_id TEXT, incarnation TEXT, state TEXT, result_json TEXT, evidence_json TEXT)")
     conn.commit()
     principal = Principal(user_id=owner, is_local=True, disabled=False)
+    return sql, principal, conn
+
+
+@pytest.fixture
+def stores_ann(tmp_path, monkeypatch):
+    """`stores`와 같지만 벡터 저장소가 `ann="binary"`다(비트 묶음 조건 때문에 차원은 8의 배수)."""
+    from _vec_helpers import MockEF
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    path = str(tmp_path / "single.db")
+    shared = SharedSqliteFile(path)
+    graph = LocalGraphStore(path, shared=shared)
+    docs = LocalSQLDocStore(path, shared=shared)
+    vec = SqliteVecStore(path, embedding_function=MockEF(32), dim=32, ann="binary", shared=shared)
+    assert vec.available and vec._has_bit_column
+    yield path, shared, graph, docs, vec
+    for store in (graph, docs, vec):
+        store.close()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_single_file_delete_apply_is_atomic(stores, fail, monkeypatch):
+    from opencrab.pack.load import _apply_single_file_delete, _start_single_file_delete
+
+    path, shared, graph, docs, vec = stores
+    sql, principal, conn = _prepare_delete_apply(path, shared, graph, docs, vec)
     epoch = vec._ann_epoch
     try:
         journal = _start_single_file_delete(shared, sql, principal, "p", os.path.dirname(path))
@@ -1612,6 +1636,34 @@ def test_single_file_delete_apply_is_atomic(stores, fail, monkeypatch):
             assert conn.execute("SELECT count(*) FROM doc_source_integrity").fetchone()[0] == 0
             assert conn.execute("SELECT state FROM pack_delete_operations").fetchone()[0] == "committed"
             assert conn.execute("SELECT count(*) FROM ontology_nodes").fetchone()[0] == 1
+    finally:
+        sql.close()
+
+
+def test_single_file_delete_failure_after_the_cache_drop_keeps_the_cache(stores_ann, monkeypatch):
+    """무효화 호출 뒤에 실패하면 commit이 없으므로 캐시와 epoch가 그대로다(commit 앞 무효화를 잡는다)."""
+    import opencrab.pack.load as load
+
+    path, shared, graph, docs, vec = stores_ann
+    sql, principal, conn = _prepare_delete_apply(path, shared, graph, docs, vec)
+    assert vec.query("text")
+    assert vec._ann_cache is not None
+    epoch = vec._ann_epoch
+    original = load._invalidate_vec_ann
+
+    def invalidate_then_fail(target):
+        original(target)
+        raise RuntimeError("injected after helper")
+
+    try:
+        journal = load._start_single_file_delete(shared, sql, principal, "p", os.path.dirname(path))
+        monkeypatch.setattr(load, "_invalidate_vec_ann", invalidate_then_fail)
+        with pytest.raises(RuntimeError, match="injected after helper"):
+            load._apply_single_file_delete(shared, sql, principal, "p", journal, graph, docs, vec)
+        assert vec._ann_epoch == epoch
+        assert vec._ann_cache is not None
+        assert _counts(path) == (1, 1, 1)
+        assert conn.execute("SELECT state FROM pack_delete_operations").fetchone()[0] == "pending"
     finally:
         sql.close()
 

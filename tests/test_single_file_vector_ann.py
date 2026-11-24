@@ -439,3 +439,148 @@ def test_load_helper_skips_doubles_without_the_hook_and_drops_after_commit(env):
         _invalidate_vec_ann(vec)
         assert vec._ann_cache is not None
     assert vec._ann_cache is None
+
+
+# ---------------------------------------------------------------------------
+# r2: 팩 삭제 무효화, 대규모 범위의 최종 predicate, 트랜잭션 안 대규모 범위, 빈 표
+# ---------------------------------------------------------------------------
+
+SCOPE = ["A", "B"]
+
+
+def _load_mixed(store):
+    """팩 A, B, C와 공간 s1, s2가 섞인 행. A와 B에 두 공간이 모두 있다."""
+    store.upsert_texts(
+        texts=[f"synthetic document {i} topic {i % 7}" for i in range(N)],
+        metadatas=[
+            {"pack_id": PACKS[i % 3], "space": ("s1", "s2")[(i // 3) % 2]} for i in range(N)
+        ],
+        ids=list(IDS),
+    )
+
+
+@pytest.fixture(params=["single", "five"])
+def mixed(request, tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    path = str(tmp_path / f"{request.param}.db")
+    shared = SharedSqliteFile(path) if request.param == "single" else None
+    store = _open(path, shared)
+    _load_mixed(store)
+    yield request.param, shared, store
+    store.close()
+
+
+def _scope_where(spaces=None):
+    from opencrab.ontology.query import _build_chroma_where
+
+    return _build_chroma_where(spaces=spaces, pack_ids=SCOPE)
+
+
+def test_delete_pack_vectors_drops_the_cache_after_commit(mixed):
+    from opencrab.pack.load import _delete_pack_vectors
+
+    kind, shared, vec = mixed
+    assert vec.query("synthetic document 1 topic 1")
+    assert vec._ann_cache is not None
+    epoch = vec._ann_epoch
+    if shared is None:
+        count, _kind, confirmed = _delete_pack_vectors("A", vec, True)
+        assert confirmed and count > 0
+        assert vec._ann_cache is None and vec._ann_epoch == epoch + 1
+        return
+    with shared.unit_of_work():
+        count, _kind, confirmed = _delete_pack_vectors("A", vec, True)
+        assert confirmed and count > 0
+        assert vec._ann_cache is not None and vec._ann_epoch == epoch
+    assert vec._ann_cache is None and vec._ann_epoch == epoch + 1
+    assert all(hit["metadata"]["pack_id"] != "A" for hit in vec.query("synthetic document 1 topic 1", n_results=N))
+
+
+@pytest.mark.parametrize("ann", ["", "binary"])
+@pytest.mark.parametrize("spaces", [None, ["s1"]])
+def test_large_scope_never_returns_rows_outside_the_requested_scope(
+    tmp_path, monkeypatch, ann, spaces
+):
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("opencrab.stores.sqlite_vec_store._PACK_KNN_MAX", 1)
+    path = str(tmp_path / "single.db")
+    shared = SharedSqliteFile(path)
+    vec = SqliteVecStore(path, embedding_function=MockEF(DIM), dim=DIM, ann=ann, shared=shared)
+    try:
+        _load_mixed(vec)
+        assert {h["metadata"]["pack_id"] for h in vec.query("synthetic document 3 topic 3", n_results=N)} == set(PACKS)
+        hits = vec.query("synthetic document 3 topic 3", n_results=N, where=_scope_where(spaces))
+        assert hits
+        assert {h["metadata"]["pack_id"] for h in hits} <= set(SCOPE)
+        if spaces:
+            assert {h["metadata"]["space"] for h in hits} == set(spaces)
+        if ann == "binary":
+            assert vec._ann_cache is not None  # the ANN path served the query
+    finally:
+        vec.close()
+
+
+def test_identity_candidate_filter_still_returns_only_scoped_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("opencrab.stores.sqlite_vec_store._PACK_KNN_MAX", 1)
+    path = str(tmp_path / "single.db")
+    shared = SharedSqliteFile(path)
+    vec = _open(path, shared)
+    called = []
+
+    def identity(cand, cache, pack_scope):
+        called.append(1)
+        return cand
+
+    try:
+        _load_mixed(vec)
+        monkeypatch.setattr(vec, "_filter_candidates_by_pack", identity)
+        hits = vec.query("synthetic document 3 topic 3", n_results=N, where=_scope_where(["s1"]))
+        assert called
+        assert hits
+        assert {h["metadata"]["pack_id"] for h in hits} <= set(SCOPE)
+        assert {h["metadata"]["space"] for h in hits} == {"s1"}
+    finally:
+        vec.close()
+
+
+def test_large_scope_inside_a_transaction_queries_each_pack(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("opencrab.stores.sqlite_vec_store._PACK_KNN_MAX", 1)
+    path = str(tmp_path / "single.db")
+    shared = SharedSqliteFile(path)
+    vec = _open(path, shared)
+    try:
+        _load_mixed(vec)
+        packs_seen = []
+        original = vec._knn
+
+        def recording(qvec, k, pack):
+            packs_seen.append(pack)
+            return original(qvec, k, pack)
+
+        monkeypatch.setattr(vec, "_knn", recording)
+        build = _counter(monkeypatch, vec, "_build_ann_cache")
+        with shared.unit_of_work():
+            hits = vec.query("synthetic document 3 topic 3", n_results=N, where=_scope_where())
+        assert sorted(packs_seen) == sorted(SCOPE)
+        assert not build
+        assert hits and {h["metadata"]["pack_id"] for h in hits} <= set(SCOPE)
+    finally:
+        vec.close()
+
+
+@pytest.mark.parametrize("single", [True, False])
+def test_empty_table_query_returns_nothing_before_and_after_deleting_everything(tmp_path, monkeypatch, single):
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    path = str(tmp_path / "empty.db")
+    vec = _open(path, SharedSqliteFile(path) if single else None)
+    try:
+        assert vec.query("synthetic document 1 topic 1") == []
+        _load(vec)
+        assert vec.query("synthetic document 1 topic 1")
+        assert vec._ann_cache is not None
+        vec.delete(IDS)
+        assert vec.query("synthetic document 1 topic 1") == []
+    finally:
+        vec.close()
