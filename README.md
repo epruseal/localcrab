@@ -163,7 +163,7 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 >
 > 헤더와 쿼리 토큰이 함께 오면 **헤더가 결정한다.** 헤더가 있는데 무효면 쿼리로 폴백하지 않고 401 이다 — 폴백하면 쓰레기 헤더를 붙여 `--allow-query-token` 제한을 우회할 수 있다.
 >
-> 브라우저에 직접 노출하는 배포는 `OPENCRAB_CORS_ORIGINS` 로 **Origin 허용 목록을 명시**한다. 비워 두면 교차 출처 접근이 차단된다(wildcard 로 열리지 않는다).
+> `/mcp`는 `Origin` 헤더가 있는 요청을 loopback 출처이거나 `MCP_ALLOWED_ORIGINS`에 적힌 출처일 때만 받는다. 브라우저에 직접 노출하는 배포는 `MCP_ALLOWED_ORIGINS`에 `http(s)://host[:port]` 형태 항목을 쉼표로 이어 **허용 목록을 명시**한다(경로, 쿼리, `null`, 빈 항목은 기동을 거부한다). 설정하지 않으면 loopback 출처만 통과한다. REST 앱(`apps/api`)의 CORS는 별개이며 `OPENCRAB_CORS_ORIGINS`로 정한다([기타 환경변수](#기타-환경변수)).
 
 > **uvicorn 단일 워커**로 실행된다(serve가 강제). 원래 chroma PersistentClient 단일 프로세스 제약 때문이었고, `VECTOR_BACKEND=sqlite-vec`(SQLite WAL)에서는 하드 제약이 아니나 프로세스별 in-memory BM25/임베딩 유지를 위해 1로 둔다. `/mcp` 의 POST·GET·DELETE 모두 인증을 요구한다(`/healthz` 는 예외).
 
@@ -189,7 +189,7 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab assemble-pack-v1 <dir>` | 스테이징 디렉토리에서 Pack v1 ZIP 조립 (`--output`과 `--pack-id` 필수, `--title`) |
 | `opencrab packs list` | `<LOCAL_DATA_DIR>/packs/` 아래에서 찾은 팩 목록 |
 | `opencrab packs show <pack_id>` | 팩 매니페스트 상세 |
-| `opencrab packs backfill-pack-id` | 노드와 엣지에 `pack_id` 역보충 (기본 dry-run, `--apply`로 적용, `--assume-pack-id`) |
+| `opencrab packs backfill-pack-id` | 노드와 엣지에 `pack_id` 역보충 (기본 dry-run, `--dry-run/--no-dry-run`, `--apply`로 적용, `--assume-pack-id`) |
 | `opencrab packs reindex-bm25` | BM25 캐시 강제 재구성 |
 | `opencrab packs bm25-index status\|backfill\|verify\|drop` | 영속 노드 BM25 색인 관리([issue-541](./docs/issue-541-db-bm25.md)) |
 | `opencrab packs source-fts-orphans` | `doc_sources` 행이 없는 소스 FTS 행을 보고하고 `--apply`로 지움([issue-642](./docs/issue-642-source-fts-lookup.md)) |
@@ -243,7 +243,7 @@ python -m opencrab.stores.backup --verify <백업경로>/backup.<세트 식별�
 | **하니스** | `harness_promotion_apply` | CrabHarness PromotionPackage 적용 (`dry_run` 지원) |
 | **디스커버리** | `tool_search` | 도구 카탈로그 부분 문자열 검색 — catalog fingerprint 포함, 실행 권한은 부여하지 않음 (#135) |
 
-> ReBAC/identity/promotion_promote/billing_get_usage 등 MCP 툴은 실사용 이력이 없어 죽은 코드로 삭제됐습니다(git history에 보존, 필요 시 복원). `opencrab/mcp/tools.py`는 더 이상 존재하지 않으며, 핸들러는 `opencrab/mcp/tools/`(graph.py/query.py/pack.py/schema.py/harness.py/catalog.py) 아래로 물리 분할됐습니다. 참고로 과금 자체(`opencrab.billing.hooks.BillingHooks`, `billing_events` 테이블)는 별개로 계속 살아 있고 `ontology_add_node`/`ontology_add_edge`/`pack_create`/`pack_ingest`/`harness_promotion_apply`에서 배선되어 있습니다 — 삭제된 것은 `billing_get_usage` 같은 조회용 MCP 툴 노출뿐입니다.
+> ReBAC/identity/promotion_promote/billing_get_usage 등 MCP 툴은 실사용 이력이 없어 죽은 코드로 삭제됐습니다(git history에 보존, 필요 시 복원). `opencrab/mcp/tools.py`는 더 이상 존재하지 않으며, 핸들러는 `opencrab/mcp/tools/`(graph.py/query.py/pack.py/schema.py/harness.py/catalog.py) 아래로 물리 분할됐습니다. 참고로 과금 자체(`opencrab.billing.hooks.BillingHooks`, `billing_events` 테이블)는 별개로 계속 살아 있고 `ontology_add_node`/`ontology_add_edge`/`ontology_query`/`pack_create`/`pack_ingest`/`harness_promotion_apply`에서 배선되어 있습니다. 삭제된 것은 `billing_get_usage` 같은 조회용 MCP 툴 노출뿐입니다.
 
 > **사용자별 노출 (#150).** 위 표는 로컬 principal(stdio/CLI) 기준입니다. 원격(토큰 인증) principal은 `schema_pack_install` / `schema_pack_uninstall` / `harness_promotion_apply`(관리 등급, 호스트 파일시스템 또는 팩 경계 밖 쓰기) 3개가 `tools/list`에서 빠지고 `tools/call`로 직접 호출해도 거부됩니다. 등급은 `users.role` 컬럼이 아니라 `Principal.is_local`에서 유도합니다 — 로컬 사용자는 어차피 그 파일들을 직접 편집할 수 있는 주체라 나눌 실익이 있는 경계가 로컬 대 원격이기 때문입니다. 원격 관리자가 둘 이상 필요해지면 그때 역할 컬럼을 도입합니다. 자세한 내용은 `opencrab/mcp/tools/_registry.py`의 `AccessTier`/`allowed_access_tiers`를 참고하세요.
 
@@ -413,7 +413,7 @@ opencrab serve
 | `LOCALCRAB_ENV_FILE` | `~/.openclaw/localcrab-kure.env` | 표준 환경 파일 경로. 현재 디렉터리 `.env`가 이 파일을 덮는다 |
 | `WRITE_LOCK_TIMEOUT` | `120.0` | 이름 있는 파일 잠금(`write.lock` 포함)을 얻으려고 기다리는 상한(초). 호출자가 대기 시간을 정하지 않을 때의 기본값이다 |
 | `CHROMA_LOCK_TIMEOUT` | `30.0` | 로컬 Chroma 클라이언트를 여는 `chroma.lock` 공유 잠금의 대기 상한(초). 넘으면 거부한다 |
-| `LOG_LEVEL` | `INFO` | `opencrab serve --transport http`의 로그 수준 |
+| `LOG_LEVEL` | `INFO` | `opencrab serve --transport http`와 REST 앱의 로그 수준 |
 | `MCP_HTTP_HOST` | `127.0.0.1` | `serve --transport http`의 기본 바인드 주소(`--host`가 덮는다) |
 | `MCP_HTTP_PORT` | `8765` | `serve --transport http`의 기본 포트(`--port`가 덮는다) |
 | `MCP_SERVER_NAME` | `opencrab` | MCP `serverInfo`에 보이는 서버 이름 |
@@ -421,6 +421,22 @@ opencrab serve
 | `NEO4J_USER`, `NEO4J_PASSWORD` | `neo4j`, `opencrab` | docker 모드 Neo4j 계정 |
 | `MONGODB_DB` | `opencrab` | docker 모드 MongoDB 데이터베이스 이름 |
 | `CHROMA_COLLECTION` | `opencrab_vectors` | `EMBEDDING_BACKEND=local`일 때 쓰는 Chroma 컬렉션 이름 |
+| `NEO4J_URI` | `bolt://localhost:7687` | docker 모드 Neo4j 접속 주소 |
+| `NEO4J_DATABASE` | _(비어 있음 = 서버 기본 데이터베이스)_ | docker 모드 Neo4j 데이터베이스 이름 |
+| `MONGODB_URI` | `mongodb://root:opencrab@localhost:27017` | docker 모드 MongoDB 접속 문자열 |
+| `CHROMA_HOST`, `CHROMA_PORT` | `localhost`, `8000` | docker 모드 Chroma HTTP 서버 |
+| `MCP_PROTOCOL_VERSIONS` | _(비어 있음 = 내장 버전 전부)_ | `/mcp`가 받을 프로토콜 버전을 내장 집합의 부분집합으로 제한한다(쉼표 구분). 모르는 버전은 기동을 거부한다. [docs/mcp-protocol-compat.md](docs/mcp-protocol-compat.md) |
+| `MCP_ALLOWED_ORIGINS` | _(비어 있음 = loopback 출처만)_ | `/mcp` Origin 검사의 허용 목록(`http(s)://host[:port]`, 쉼표 구분). 형식이 틀리면 기동을 거부한다 |
+| `OPENCRAB_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | REST 앱(`apps/api`)의 CORS 허용 출처(쉼표 구분). 빈 값으로 두면 교차 출처 접근을 모두 막는다(wildcard로 열리지 않는다) |
+| `OPENCRAB_BOOTSTRAP_ON_EMPTY` | _(꺼짐)_ | `1`이면 stdio MCP 서버가 로컬 사용자가 없을 때 시작하면서 자동으로 만든다. `STORAGE_MODE=local`과 명시한 `LOCAL_DATA_DIR`가 필요하다. 비어 있거나 `0`은 꺼짐이고 그 밖의 값은 기동을 거부한다. 단일 파일 배치에서는 사용자를 만들지 않는다 |
+| `OPENCRAB_TIER` | `free` | REST 앱의 등급(`free` \| `pro` \| `api`, 그 밖의 값은 `free`). `free`는 벡터와 소스 수에 상한을 둔다 |
+| `PORT` | `8001` | `python -m apps.api.main`으로 띄운 REST 앱의 포트(`0.0.0.0`에 바인드한다. 루프백만 열려면 `uvicorn --host 127.0.0.1`을 쓴다) |
+| `JSONL_SHARD_LIMIT` | `41943040` (40 MiB) | Pack JSONL 샤드 하나의 바이트 상한 |
+| `EMBED_WINDOW_CHARS` | `9000` | 임베딩 입력이 이 글자 수를 넘으면 윈도우로 나눠 임베딩한 뒤 평균 풀링한다 |
+| `OPENCRAB_BM25_DB_INDEX` | `1` | `0`이면 영속 노드 BM25 색인을 쓰지 않는다([issue-541](./docs/issue-541-db-bm25.md)) |
+| `OPENCRAB_BM25_PRUNE` | `1` | `0`이면 BM25 상위 k 가지치기를 끈다 |
+| `PACK_OUT_ROOT` | _(없음)_ | 팩 빌드 라이브러리(`opencrab.pack.build.Pack`)의 출력 루트. `out_root` 인자가 우선하고, 둘 다 없으면 `ValueError`로 거부한다 |
+| `PACK_LIB_STRICT` | _(꺼짐)_ | `1`이면 팩 빌드 검증(`Pack.validate`)이 grammar 위반과 끊어진 참조에서 예외를 낸다. 꺼져 있으면 경고와 요약만 출력한다 |
 | `ANTHROPIC_API_KEY` | _(없음)_ | `opencrab extract`의 `--api-key` 미지정 시 폴백(Claude 모델 호출용) |
 | `OPENCRAB_BM25_NODE_LIMIT` | `50000` | BM25 인덱스가 doc 스토어에서 로드하는 노드 상한(인덱스 빌드 시간·메모리 제한). 상세: [ARCHITECTURE.md §6](./docs/ARCHITECTURE.md) |
 | `OPENCRAB_BM25_DEBOUNCE` | `1.5` | BM25 백그라운드 재빌드 디바운스(초) — 연속 ingest를 1회 재빌드로 합침. 상세: [ARCHITECTURE.md](./docs/ARCHITECTURE.md) |
@@ -586,8 +602,12 @@ server/           배포 진입점 어댑터(`server.api:app`이 `apps.api.main`
 tests/            시험
 crabharness/
   crabharness/    미션 플래너, 런타임, 검증, 프로모션 패키지 빌더
-  codex_workers/  크롤러·수집기 플러그인 워커
+  codex_workers/  크롤러, 수집기 플러그인 워커
+  configs/        정책과 소스 예제 설정(`policy.example.yaml`, `sources.example.yaml`)
+  docs/           계획 문서(`plans/`)
   missions/       예제 미션
+  schemas/        미션, 증거 번들, 위임 작업, 프로모션 패키지, 검증 보고서의 JSON 스키마
+  worker_runtime/ 워커가 쓰는 Node 런타임(`package.json`, Playwright)
 docs/             아키텍처, 팩 형식, 관계 문서, 마이그레이션
 ```
 

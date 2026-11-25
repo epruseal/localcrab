@@ -389,9 +389,10 @@ factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/sto
 
 ```bash
 <PY> <REPO>/scripts/check_read_endpoints.py <GW_PORT_운영> mcp --token-env <토큰 변수> --save-expected <기준 팩 목록 파일>
+wc -l <기준 팩 목록 파일>
 ```
 
-- 합격: `RESULT: PASS`와 rc 0이다. 파일이 이미 있으면 도구가 거부한다. 이 파일은 팩 id 목록이므로 저장소에 올리지 않는다.
+- 합격: `RESULT: PASS`와 rc 0이다. 저장된 파일이 비어 있지 않다(`wc -l <기준 팩 목록 파일>`이 1 이상). 파일이 이미 있으면 도구가 거부한다. 이 파일은 팩 id 목록이므로 저장소에 올리지 않는다.
 
 ```bash
 mkdir -p <RUN>
@@ -596,7 +597,7 @@ ls -ld <ROOT>/openclaw-conversations/automation
 
 #### 6단계 읽기 검증 (단위는 멈춘 채, 임시 인스턴스만)
 
-임시 인스턴스는 운영 단위와 같은 환경으로 띄운다. 운영 단위의 `Environment`와 `WorkingDirectory`를 `systemctl --user show -p Environment -p WorkingDirectory <단위>`로 읽는다. 출력에 값이 들어 있으므로 키 이름만 확인하고 값은 기록하지 않는다. 사본 시험에서 어긋난 곳은 세 군데였다.
+임시 인스턴스는 운영 단위와 같은 환경으로 띄운다. 운영 단위의 `Environment`와 `WorkingDirectory`를 `systemctl --user show -p Environment -p WorkingDirectory <단위>`로 읽는다. 출력에 값이 들어 있으므로 키 이름만 확인하고 값은 기록하지 않는다. 아래 세 항목이 어긋나면 임시 인스턴스가 운영 단위와 다르게 동작한다.
 
 - `STORAGE_MODE=local`이 빠지면 임시 인스턴스가 다른 모드로 뜬다.
 - `PATH`가 다르면 GGUF 폴백 같은 선택 기능이 다르게 동작한다.
@@ -648,7 +649,7 @@ env -C <DATA_PARENT>/automation.rollback-copy find . -type f -exec sha256sum {} 
 env -C <ROOT>/packs find . -type f -exec sha256sum {} + > <RUN>/7-packs-sha.txt
 ```
 
-- 합격: 점유 0. 장치 번호가 같다. 백업과 `--verify`가 rc 0이고 세트가 `<ROOT>` 밖에 있으며 `single.db`, `billing.db`, `MANIFEST.json`만 든다. 두 sha256 목록이 경로 접두어를 빼고 같다. 롤백 세트 경로와 사본 경로를 `<RUN>`에 적는다. 롤백은 `packs`를 복원하지 않는다.
+- 합격: 점유 0. 장치 번호가 같다. 백업과 `--verify`가 rc 0이고 세트가 `<ROOT>` 밖에 있으며 `single.db`, `billing.db`, `MANIFEST.json`만 든다. 두 sha256 목록(상대 경로 기준)이 경로와 해시 모두 같다. 롤백 세트 경로와 사본 경로를 `<RUN>`에 적는다. 롤백은 `packs`를 복원하지 않는다.
 - 실패: 쓰기를 열지 않는다. 갈래 B.
 
 #### 8단계 쓰기 개방
@@ -700,6 +701,8 @@ systemctl --user is-enabled <TIMER_REINGEST>
 8.8의 사본 시험은 운영 데이터의 일관된 사본을 별도 `<DATA_PARENT>` 아래 `<ROOT>`로 두고 이 표를 같은 순서로 돌린다. 운영 데이터는 사본을 만들 때만 읽는다. 운영 단위와 운영 환경 파일은 쓰지 않는다. 다른 점은 다음과 같다.
 
 - 단위와 환경: 1단계와 8단계의 단위(`<UNIT_FRONT>`, `<UNIT_PROXY>`, `<UNIT_GW>`, `<UNIT_API>`, `<UNIT_REINGEST>`)와 `<TIMER_REINGEST>`는 사본용 임시 이름의 단위로 바꿔 쓰고 `<ENVFILE>`도 사본용 파일을 쓴다. 운영 단위는 멈추지 않고 시작 차단 파일도 두지 않는다. `<T0>`는 사본에 쓰는 주체가 없음을 확인한 시각이다.
+- 코드와 가상환경: 사본 시험은 운영 체크아웃과 운영 가상환경을 건드리지 않는다. `<REPO>`와 `<PY>`를 사본용 별도 체크아웃과 별도 가상환경의 값으로 바꿔 쓰고, 1b는 그 체크아웃과 가상환경에만 한다. 운영 `<REPO>`의 `git merge`와 운영 가상환경의 `pip install`은 돌리지 않는다.
+- 기준 팩 목록: 0단계의 `--save-expected`를 운영 게이트웨이에 돌리지 않는다. 그 질의는 운영 `billing.db`에 행을 쓰고, 사본과 다른 시각의 팩 집합을 기준으로 삼는다. 전환 전 다섯 파일 상태의 사본 `<ROOT>` 위에 6단계 방식으로 임시 게이트웨이를 띄우고 그 포트를 `<GW_PORT_운영>` 자리에 넣어 한 번 돌린 뒤 그 게이트웨이를 멈춘다. 질의가 쓴 billing 행은 사본에만 남는다.
 - 0단계: `<PASS2>`는 사본 시험이 끝난 뒤에야 생긴다. `sha256sum <PASS2>` 줄을 빼고 `<PASS1>` 해시 하나만 적는다. 해시 둘 기준은 운영 실행에만 건다.
 - 4단계: 아래 두 명령으로 authorize한다. `--copy-test-pass`는 copy-test에서 거부된다. 합격은 첫 명령의 `authorize dry-run ok`, 둘째 명령의 `authorize applied` 줄에 찍힌 `run_id=<COPY_RUN_ID>`와 증거 해시 하나(0단계의 `<PASS1>` 해시), ledger state `authorized`, intent state `ready`다.
 
@@ -717,7 +720,14 @@ systemctl --user is-enabled <TIMER_REINGEST>
 - 갈래 B, 쓰기 개방 전 롤백: 임시 단위가 inactive인지 확인하고 1단계의 정지 확인을 다시 한다. 8.6 P7의 순서(이동 항목 되돌리기, 이름 맞바꾸기, intent와 잠금 파일 보존, 설정 줄 지우기)를 따른다. 설정 줄은 `sed -i '/^SINGLE_SQLITE_FILE=/d' <ENVFILE>`로 지우고 `grep -c`가 0인지 확인한다. 모든 `mv -T` 앞에서 장치 번호가 같고 대상 이름이 없음을 확인한다. 마지막에 시작 차단 파일 제거(`rm <RT>/<단위>.d/block.conf`, `rmdir`, `daemon-reload`. 갈래 A와 같다), 단위 시작, 타이머 enable, 환경의 `SINGLE_SQLITE_FILE` 출현 0을 확인한다.
 - 갈래 C, 병합이나 authorize의 비정상 종료: 8.4(게시)와 8.5(authorize)를 따른다. 다시 돌릴지 다섯 파일로 돌아갈지는 사람이 정해 기록한다.
 - 갈래 D, 쓰기 개방 뒤 롤백: 1단계의 정지를 그대로 한다(타이머 stop과 disable, 단위 stop, 시작 차단 파일). 합격 기준도 그대로 확인하되 `fuser` 대상은 `<ROOT>/single.db`, `<ROOT>/billing.db`와 각 `-wal`, `-shm`이다. 정지를 확인한 뒤 둘 중 하나로 간다. 개방 뒤의 MCP 쓰기는 두 경우 모두 롤백 지점 뒤 것이 사라진다. 대화 메시지는 커서를 되돌렸으므로 델타 적재가 다시 처리한다.
-  - D1 단일 파일로 되돌린다: `<PY> -m opencrab.stores.single_restore <DATA_PARENT>/backups/rollback-point/<롤백 세트 이름>`(dry-run)을 읽고 `--apply`를 붙여 돌린다. 그다음 `automation` 사본을 교체한다. 교체는 이동 두 번이다. 각 이동 앞에서 두 경로의 장치 번호가 같고 대상 이름이 없음을 확인한다(8.6 P2). 먼저 `<ROOT>/openclaw-conversations/automation`을 `<DATA_PARENT>/automation.saved-<UTC 시각>`으로 `mv -T`하고, 이어서 `<DATA_PARENT>/automation.rollback-copy`를 원래 자리로 `mv -T`한다(8.6 P7의 "사본을 그 자리로 옮긴다"). 사본은 이 이동으로 소비되며, 7단계의 sha256 대조가 사본이 롤백 지점 때의 `automation`과 같음을 이미 확인했다. 마지막으로 시작 차단 파일 제거와 `daemon-reload`, 8단계 순서의 단위 시작, 9단계의 읽기 검증, 타이머 enable을 한다. 합격: `--apply`가 rc 0과 `결속 검증을 통과했다`를 내고, 복원한 `automation`의 `cursor_state.json`이 사본과 같으며, 읽기 검증이 `RESULT: PASS`이고, 각 `MainPID`의 환경에 `SINGLE_SQLITE_FILE`이 1건 있다.
+  - D1 단일 파일로 되돌린다: 7단계와 같은 설정을 주입해 두 번 돌린다. 먼저 dry-run으로 계획을 읽는다. 그다음 `--apply`를 붙인다. 두 명령 모두 셸의 설정 출처에 `SINGLE_SQLITE_FILE`이 없으면 거부된다. 앞에 `<HEAVY>`가 필요하면 7단계의 백업 명령처럼 붙인다.
+
+    ```bash
+    env SINGLE_SQLITE_FILE=<ROOT>/single.db LOCAL_DATA_DIR=<ROOT> <PY> -m opencrab.stores.single_restore <DATA_PARENT>/backups/rollback-point/<롤백 세트 이름>
+    env SINGLE_SQLITE_FILE=<ROOT>/single.db LOCAL_DATA_DIR=<ROOT> <PY> -m opencrab.stores.single_restore <DATA_PARENT>/backups/rollback-point/<롤백 세트 이름> --apply
+    ```
+
+    그다음 `automation` 사본을 교체한다. 교체는 이동 두 번이다. 각 이동 앞에서 두 경로의 장치 번호가 같고 대상 이름이 없음을 확인한다(8.6 P2). 먼저 `<ROOT>/openclaw-conversations/automation`을 `<DATA_PARENT>/automation.saved-<UTC 시각>`으로 `mv -T`하고, 이어서 `<DATA_PARENT>/automation.rollback-copy`를 원래 자리로 `mv -T`한다(8.6 P7의 "사본을 그 자리로 옮긴다"). 사본은 이 이동으로 소비되며, 7단계의 sha256 대조가 사본이 롤백 지점 때의 `automation`과 같음을 이미 확인했다. 마지막으로 시작 차단 파일 제거와 `daemon-reload`, 8단계 순서의 단위 시작, 9단계의 읽기 검증, 타이머 enable을 한다. 합격: `--apply`가 rc 0과 `결속 검증을 통과했다`를 내고, 복원한 `automation`의 `cursor_state.json`이 사본과 같으며, 읽기 검증이 `RESULT: PASS`이고, 각 `MainPID`의 환경에 `SINGLE_SQLITE_FILE`이 1건 있다.
   - D2 다섯 파일로 돌아간다: 갈래 B의 순서(이동 항목을 `<OLD>`로 되돌리기, 이름 맞바꾸기, intent와 잠금 파일 보존, 설정 줄 지우기)를 따르되 `automation` 교체를 이름 맞바꾸기 앞에 한다(8.6 P7). 항목을 `<OLD>`로 되돌린 직후 `<OLD>/openclaw-conversations/automation`을 D1과 같은 이동 두 번으로 사본으로 바꾼다. 갈래 B가 끝나는 단위 시작과 타이머 enable은 이 교체 뒤에 한다. 합격: 읽기 검증이 `RESULT: PASS`이고 각 `MainPID`의 환경에 `SINGLE_SQLITE_FILE`이 없다.
 - 갈래 E, 단계 중단 공통: 다음 단계로 가지 않는다. 원인을 고쳐 그 단계를 다시 할지 갈래 A나 B로 갈지 정해 결정과 다시 판정할 시각을 기록한다.
 

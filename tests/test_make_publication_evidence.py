@@ -62,6 +62,7 @@ def test_evidence_from_real_backup_passes_publication_merge(backup_set, tmp_path
     assert set(evidence) == KEYS
     manifest = json.loads((backup_set / "MANIFEST.json").read_text())
     assert evidence["snapshot_id"] == manifest["set_id"]
+    assert evidence["capture_from"] == manifest["lock"]["acquired_at"]
     assert evidence["capture_until"] == manifest["lock"]["released_at"]
     (backup_set.parent / (backup_set.name + ".source.lifetime.lock")).touch()
     root = tmp_path / "published"
@@ -218,6 +219,21 @@ def test_frozen_from_inside_lock_interval_is_rejected(backup_set, tmp_path):
     inside = (start + (end - start) / 2).isoformat()
     out = tmp_path / "evidence.json"
     assert tool.main(_args(backup_set, out, frozen_from=inside, packs_checked_at=inside)) == 2
+    assert not out.exists()
+
+
+def test_frozen_from_inside_long_lock_interval_is_rejected(backup_set, tmp_path):
+    # 실제 백업은 잠금 구간이 몇 초에서 몇 분이다. 구간 시작은 manifest 시각이 아니라 잠금 시작이어야 한다.
+    manifest = json.loads((backup_set / "MANIFEST.json").read_text())
+    created = _stamp(manifest["created_at"])
+    manifest["lock"]["acquired_at"] = (created - timedelta(seconds=120)).isoformat()
+    manifest["lock"]["released_at"] = (created + timedelta(milliseconds=500)).isoformat()
+    (backup_set / "MANIFEST.json").write_text(json.dumps(manifest))
+    inside = (created - timedelta(seconds=30)).isoformat()
+    out = tmp_path / "evidence.json"
+    args = [str(backup_set), "--out", str(out), "--preparer-id", "tester", "--frozen-from", inside,
+            "--packs-checked-at", inside, "--frozen-until", (created + timedelta(seconds=5)).isoformat()]
+    assert tool.main(args) == 2
     assert not out.exists()
 
 
