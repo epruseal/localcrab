@@ -113,6 +113,10 @@ def main(argv: list[str] | None = None) -> int:
         wanted, skipped = _read_manifest(args.set_dir, _db_names())
         if not args.dest_dir.parent.is_dir():
             raise _UsageError("대상 디렉터리의 상위 디렉터리가 없다")
+        set_real = Path(os.path.realpath(args.set_dir))
+        dest_real = Path(os.path.realpath(args.dest_dir.parent)) / args.dest_dir.name
+        if dest_real == set_real or set_real in dest_real.parents:
+            raise _UsageError("대상 디렉터리는 백업 세트 디렉터리 안에 둘 수 없다(세트를 바꾸지 않는다)")
         try:
             os.mkdir(args.dest_dir, 0o700)
         except FileExistsError as exc:

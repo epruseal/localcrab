@@ -176,3 +176,26 @@ def test_capture_end_must_stay_inside_backup_second(backup_set, tmp_path, releas
             "--frozen-until", (created + timedelta(seconds=5)).isoformat()]
     assert tool.main(args) == rc
     assert out.exists() == (rc == 0)
+
+
+def test_write_failure_removes_own_partial_and_exits_2(backup_set, tmp_path, monkeypatch):
+    out = tmp_path / "evidence.json"
+
+    def boom(_fd):
+        raise OSError(27, "File too large")
+
+    monkeypatch.setattr(tool.os, "fsync", boom)
+    assert tool.main(_args(backup_set, out)) == 2
+    monkeypatch.undo()
+    assert not (tmp_path / "evidence.json.partial").exists()
+    assert not out.exists()
+    # 같은 경로로 다시 실행하면 합격한다.
+    assert tool.main(_args(backup_set, out)) == 0
+
+
+def test_foreign_partial_file_is_left_alone(backup_set, tmp_path):
+    out = tmp_path / "evidence.json"
+    foreign = tmp_path / "evidence.json.partial"
+    foreign.write_text("someone else")
+    assert tool.main(_args(backup_set, out)) == 2
+    assert foreign.read_text() == "someone else"

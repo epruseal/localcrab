@@ -88,14 +88,17 @@ def main(argv: list[str] | None = None) -> int:
         merge._publication_evidence(manifest_raw, evidence_raw)
         # 임시 파일에 쓰고 링크해서 도중 실패가 부분 파일을 남기지 않게 하고 기존 파일을 덮어쓰지 않는다.
         partial = args.out.with_name(args.out.name + ".partial")
-        with open(partial, "xb") as handle:
-            handle.write(evidence_raw)
-            handle.flush()
-            os.fsync(handle.fileno())
+        created = False
         try:
+            with open(partial, "xb") as handle:
+                created = True  # 이 실행이 만든 파일만 지운다(남의 .partial은 건드리지 않는다).
+                handle.write(evidence_raw)
+                handle.flush()
+                os.fsync(handle.fileno())
             os.link(partial, args.out)
         finally:
-            os.unlink(partial)
+            if created:
+                os.unlink(partial)
     except (OSError, ValueError, RuntimeError) as exc:
         # MergeError와 decode_binding_json의 오류는 RuntimeError, JSON 오류는 ValueError다.
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)

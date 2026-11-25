@@ -20,11 +20,11 @@ mcp 형태는 `_meta` 없는 단순 `tools/call` 요청(레거시 경로)을 보
 mcp 형태는 `POST /mcp`로 `ontology_query`(토큰 있음, 없음)와 `content_pack_list`를 부른다.
 api 형태는 `GET /api/packs`(토큰 있음, 없음), `GET /api/status`, `POST /api/query`를 부른다.
 출력은 HTTP 상태, 결과 건수, isError, 팩 id 목록, 기대 집합과의 두 차집합이다.
-`--save-expected`는 팩 id 목록을 한 줄에 하나씩 파일에 쓴다(덮어쓰지 않는다).
+`--save-expected`는 합격한 실행에서만 팩 id 목록을 한 줄에 하나씩 파일에 쓴다(덮어쓰지 않는다).
 `--expected`는 그런 파일을 읽어 대조한다. 기대에 있고 응답에 없는 id가 하나라도 있으면 실패다.
 
 종료 코드: 0 합격. 1 검사 실패(토큰 질의가 200이 아니거나 isError, 무토큰 질의가 401이 아님, 기대 대비 누락).
-2 사용법이나 설정 오류.
+2 사용법이나 설정 오류(토큰의 제어 문자, `--expected` 파일 읽기 실패, `--save-expected`의 상위 디렉터리 없음이나 쓰기 실패 포함).
 """
 
 from __future__ import annotations
@@ -61,6 +61,9 @@ def _is_loopback(host: str) -> bool:
 
 def _bearer(value: str) -> str:
     value = value.strip()
+    # 제어 문자와 비ASCII 문자는 http.client가 예외 메시지에 헤더 값을 넣는 길이다. 네트워크 호출 전에 거부한다.
+    if not value.isascii() or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError("토큰에 제어 문자나 비ASCII 문자가 있다")
     return value if value.lower().startswith("bearer ") else "Bearer " + value
 
 
@@ -137,8 +140,10 @@ def _check_mcp(base: str, auth: str) -> tuple[bool, list[str] | None]:
     query = _mcp_tool(base, "ontology_query", {"question": "direct", "limit": 10, "offset": 0}, 1, auth)
     inner = query["inner"] if isinstance(query["inner"], dict) else {}
     print("ontology_query token: http", query["http"], "isError", query["isError"],
-          "results", len(inner.get("results", [])) if inner else None, "error_key", "error" in inner)
-    ok &= query["http"] == 200 and not query["isError"] and "error" not in inner
+          "results", len(inner["results"]) if isinstance(inner.get("results"), list) else None,
+          "error_key", "error" in inner)
+    ok &= (query["http"] == 200 and not query["isError"] and "error" not in inner
+           and isinstance(inner.get("results"), list))
     anonymous = _mcp_tool(base, "ontology_query", {"question": "direct", "limit": 10, "offset": 0}, 2, None)
     print("ontology_query no_token: http", anonymous["http"])
     ok &= anonymous["http"] == 401
@@ -167,10 +172,18 @@ def _check_api(base: str, auth: str) -> tuple[bool, list[str] | None]:
     ok &= status == 200
     code, raw = _call(base, "POST", "/api/query", {"question": "direct", "limit": 10}, auth)
     payload = _parse(raw) if code == 200 else None
-    print("POST /api/query token: http", code,
-          "results", len(payload.get("results", [])) if isinstance(payload, dict) else None)
-    ok &= code == 200
+    results = payload.get("results") if isinstance(payload, dict) else None
+    print("POST /api/query token: http", code, "results", len(results) if isinstance(results, list) else None)
+    ok &= code == 200 and isinstance(results, list)
     return ok, _pack_ids(rows) if isinstance(rows, list) else None
+
+
+def _read_expected(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"--expected 파일을 읽지 못했다: {type(exc).__name__}") from exc
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def run(base: str, shape: str, auth: str, *, expected: Path | None, save_expected: Path | None) -> int:
@@ -179,12 +192,20 @@ def run(base: str, shape: str, auth: str, *, expected: Path | None, save_expecte
         print("pack_ids: 없음(팩 목록 응답을 읽지 못했다)")
         return 1
     print(f"pack_ids ({len(ids)}):", " ".join(ids))
-    if save_expected is not None:
-        with open(save_expected, "x", encoding="utf-8") as handle:
-            handle.write("\n".join(ids) + "\n")
+    if save_expected is not None and ok:
+        try:
+            with open(save_expected, "x", encoding="utf-8") as handle:
+                handle.write("\n".join(ids) + "\n")
+        except OSError as exc:
+            print(f"ERROR: 기대 목록을 쓰지 못했다: {type(exc).__name__}", file=sys.stderr)
+            return 2
         print("expected saved:", save_expected)
     if expected is not None:
-        wanted = [line.strip() for line in expected.read_text(encoding="utf-8").splitlines() if line.strip()]
+        try:
+            wanted = _read_expected(expected)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
         missing = sorted(set(wanted) - set(ids))
         extra = sorted(set(ids) - set(wanted))
         print("expected_minus_got:", missing)
@@ -213,10 +234,13 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("포트 범위가 맞지 않다")
         if not _is_loopback(args.host) and not args.allow_remote:
             raise ValueError("루프백이 아닌 호스트는 --allow-remote 없이 거부한다")
-        if args.expected is not None and not args.expected.is_file():
-            raise ValueError("--expected 파일이 없다")
-        if args.save_expected is not None and args.save_expected.exists():
-            raise ValueError("--save-expected 파일이 이미 있다")
+        if args.expected is not None:
+            _read_expected(args.expected)  # 네트워크 호출 전에 읽고 디코드해 본다.
+        if args.save_expected is not None:
+            if args.save_expected.exists():
+                raise ValueError("--save-expected 파일이 이미 있다")
+            if not args.save_expected.parent.is_dir():
+                raise ValueError("--save-expected의 상위 디렉터리가 없다")
         auth = _read_token(args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

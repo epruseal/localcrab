@@ -41,7 +41,7 @@
 grep -rnI --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=tests -e '"version"' -e '^version' -e '__version__' -e 'version=' -e 'mcp_server_version' pyproject.toml opencrab/__init__.py opencrab/config.py apps/api/main.py packaging/agent-plugin/src/plugin.json
 ```
 
-위 다섯 파일의 값이 모두 같아야 한다. `uv.lock`의 `opencrab` 항목, `.env.example`과 `opencrab/cli.py`의 `MCP_SERVER_VERSION` 예시도 같은 값으로 맞춘다. 별도 npm 패키지(`crabharness/package.json`, `apps/web/package.json`)는 자기 버전을 따로 갖는다. 태그는 `v<버전>` 형식이고 머지 커밋에 붙인다(`docs/agent-plugin-release-policy.md`의 수동 릴리스 절차).
+위 다섯 파일의 값이 모두 같아야 한다. `uv.lock`의 `opencrab` 항목, `.env.example`과 `opencrab/cli.py`의 `MCP_SERVER_VERSION` 예시도 같은 값으로 맞춘다. 별도 패키지(`crabharness/pyproject.toml`, `crabharness/package.json`, `crabharness/worker_runtime/package.json`, `apps/web/package.json`)는 자기 버전을 따로 갖는다. 태그는 `v<버전>` 형식이고 머지 커밋에 붙인다(`docs/agent-plugin-release-policy.md`의 수동 릴리스 절차).
 
 ## 2. 버전과 저장소 배치
 
@@ -144,17 +144,17 @@ python scripts/migrate_chroma_to_sqlite_vec.py
 `STORAGE_MODE=pg`로 가기 위해 로컬 SQLite의 데이터를 PostgreSQL로 복사한다. 스크립트는 원본 SQLite에 쓰는 문을 보내지 않는다. 연결을 읽기 전용으로 열지는 않으므로 WAL 모드 파일에는 곁파일(`-wal`, `-shm`)이 생길 수 있다.
 
 - 한계: 그래프 저장소(`graph.db`)는 이 스크립트로 옮기지 못한다. 그래프 적용은 자격 검증 전까지 거부되고(`graph apply is fixture-only`) `--dry-run`만 된다. 지원하는 범위는 `--only doc,sql,vector`다. 그래프를 옮겨야 하는 운영에는 이 절차를 쓰지 않는다.
-- 사전 조건: 새 PostgreSQL 데이터베이스(pgvector 확장을 쓸 수 있다)와 접속 문자열. `pip install ".[pg]"`. 백업이 있다. 대상에 소스가 모르는 `users`와 `api_tokens` 행이 있으면 거부된다(`--allow-target-only-auth`로 허용). 소스에 이 이관이 복사하지 않는 SQLStore 표가 있으면 거부된다(`--allow-unmigrated`로 허용하고 요약에 제외 목록이 나온다).
+- 사전 조건: 새 PostgreSQL 데이터베이스(pgvector 확장을 쓸 수 있다)와 그 접속 문자열을 담은 `POSTGRES_URL` 설정. `pip install ".[pg]"`. 백업이 있다. 대상에 소스가 모르는 `users`와 `api_tokens` 행이 있으면 거부된다(`--allow-target-only-auth`로 허용). 소스에 이 이관이 복사하지 않는 SQLStore 표가 있으면 거부된다(`--allow-unmigrated`로 허용하고 요약에 제외 목록이 나온다).
 - 정지 범위: 이관 중 원본 SQLite에 쓰는 프로세스를 멈춘다. 복사 도중 원본이 바뀌면 사본이 일관되지 않으므로 쓰기 주체를 멈추는 것이 전제다.
 
 ```bash
 pip install ".[pg]"
-python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --only doc,sql,vector --dry-run
-python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --only doc,sql,vector --verify
+python scripts/migrate_sqlite_to_pg.py --only doc,sql,vector --dry-run
+python scripts/migrate_sqlite_to_pg.py --only doc,sql,vector --verify
 ```
 
-- 옵션: `--data-dir`와 `--graph-db`, `--doc-db`, `--sql-db`, `--vector-db`는 원본 경로를 바꾼다. `--pg-schema`는 문서 대상 스키마다. `--vector-src-table`과 `--vector-dst-table`은 벡터 표 이름이다. `--batch`와 `--limit`은 복사 단위와 시험용 상한이다.
-- 검증: `--verify`가 표마다 `source`와 `pg` 건수와 `missing_keys`를 비교하고 `RESULT: PASS`를 낸다. 같은 명령을 한 번 더 돌리면 건수가 같은 표는 건너뛴다. 서비스를 `STORAGE_MODE=pg POSTGRES_URL=<접속 문자열>`로 시작하고 읽기 검증 도구가 `RESULT: PASS`를 낸다.
+- 옵션: `--data-dir`와 `--graph-db`, `--doc-db`, `--sql-db`, `--vector-db`는 원본 경로를 바꾼다. `--pg-schema`는 그래프와 문서 대상 스키마다. 접속 문자열은 `POSTGRES_URL` 설정(환경변수나 환경 파일)에서 읽는다. `--pg-url`로 명령줄에 쓰면 프로세스 목록에 노출되므로 쓰지 않는다. `--vector-src-table`과 `--vector-dst-table`은 벡터 표 이름이다. `--batch`와 `--limit`은 복사 단위와 시험용 상한이다.
+- 검증: `--verify`가 표마다 `source`와 `pg` 건수와 `missing_keys`를 비교하고 `RESULT: PASS`를 낸다. 다시 돌리는 동작은 표마다 다르다(스크립트 docstring의 IDEMPOTENCY 절이 정본이다). 자연 키가 있는 SQL 표는 건수가 같아도 건너뛰지 않고 매번 모든 행을 upsert한다. 그래서 서비스가 PostgreSQL에 쓴 뒤에 다시 돌리면 대상 행이 원본 값으로 덮인다. 서비스가 PostgreSQL을 쓰기 시작한 뒤에는 이 스크립트를 다시 돌리지 않는다. `doc_nodes`, `audit_log`, 벡터는 건수가 같고 0보다 크면 건너뛰고, `doc_sources`는 건너뛰지 않는다. 서비스를 `STORAGE_MODE=pg POSTGRES_URL=<접속 문자열>`로 시작하고 읽기 검증 도구가 `RESULT: PASS`를 낸다.
 - 롤백: `STORAGE_MODE=local`로 되돌리고 서비스를 다시 시작한다. 원본 SQLite 파일은 바뀌지 않았다. PostgreSQL에만 쓴 데이터는 SQLite에 없다. 대상 데이터베이스는 필요하면 통째로 지운다.
 
 ## 8. docker 모드에서 local 모드로

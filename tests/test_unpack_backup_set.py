@@ -172,3 +172,34 @@ def test_empty_db_file_is_copied(fake_set, tmp_path):
     dest = tmp_path / "out"
     assert tool.main([str(fake_set), str(dest)]) == 0
     assert (dest / "billing.db").read_bytes() == b""
+
+
+@pytest.mark.parametrize("where", ["direct", "nested", "via_symlink"])
+def test_destination_inside_the_set_is_rejected_and_set_stays_clean(fake_set, tmp_path, where):
+    before = sorted(p.name for p in fake_set.rglob("*"))
+    if where == "direct":
+        dest = fake_set / "out"
+    elif where == "nested":
+        dest = fake_set / "delete-pack-journals" / "out"
+    else:
+        alias = tmp_path / "alias"
+        alias.symlink_to(fake_set, target_is_directory=True)
+        dest = alias / "out"
+    assert tool.main([str(fake_set), str(dest)]) == 2
+    assert sorted(p.name for p in fake_set.rglob("*")) == before
+
+
+def test_copy_that_differs_on_reread_is_removed_and_exits_1(fake_set, tmp_path, monkeypatch):
+    real_os = tool.os
+
+    class FlippingOs:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def write(self, fd, data):
+            return real_os.write(fd, bytes([data[0] ^ 1]) + bytes(data[1:]))
+
+    monkeypatch.setattr(tool, "os", FlippingOs())
+    dest = tmp_path / "out"
+    assert tool.main([str(fake_set), str(dest)]) == 1
+    assert not dest.exists()

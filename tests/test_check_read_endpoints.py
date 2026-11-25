@@ -32,6 +32,13 @@ class Fake:
         self.anonymous_status = 401
         self.token_status = 200
         self.tool_is_error = False
+        self.is_error_tool = None  # 이 도구만 isError 참을 돌려준다.
+        self.rpc_error_tool = None  # 이 도구만 JSON-RPC 오류 봉투를 돌려준다.
+        self.error_beside_result = False  # 정상 result 옆에 error 봉투도 싣는다.
+        self.status_code = 200  # GET /api/status
+        self.query_code = 200  # POST /api/query
+        self.query_body = {"results": [1, 2]}
+        self.mcp_query_inner = {"results": [1]}
         self.legacy_error_tool = None  # 이 도구는 200과 {"error": ...} 본문을 돌려준다(isError 키 없음).
         self.rpc_error = False
         self.sse = False
@@ -84,7 +91,7 @@ def _handler(fake: Fake):
             if self.path == "/api/packs":
                 self._send(200, {"packs": [{"pack_id": p} for p in fake.packs]})
             elif self.path == "/api/status":
-                self._send(200, {"ok": True})
+                self._send(fake.status_code, {"ok": True})
             else:
                 self._send(404, {})
 
@@ -94,10 +101,10 @@ def _handler(fake: Fake):
             if not self._auth():
                 return
             if self.path == "/api/query":
-                self._send(200, {"results": [1, 2]})
+                self._send(fake.query_code, fake.query_body)
                 return
             name = body["params"]["name"]
-            if fake.rpc_error:
+            if fake.rpc_error or name == fake.rpc_error_tool:
                 self._send(200, {"jsonrpc": "2.0", "id": body["id"], "error": {"code": -32000, "message": "x"}})
                 return
             if name == fake.legacy_error_tool:
@@ -105,11 +112,13 @@ def _handler(fake: Fake):
                 self._send(200, {"jsonrpc": "2.0", "id": body["id"],
                                  "result": {"content": [{"type": "text", "text": text}]}})
                 return
-            inner = ({"results": [1]} if name == "ontology_query"
+            inner = (fake.mcp_query_inner if name == "ontology_query"
                      else {"packs": [{"pack_id": p} for p in fake.packs]})
             result = {"content": [{"type": "text", "text": json.dumps(inner)}],
-                      "isError": fake.tool_is_error}
+                      "isError": fake.tool_is_error or name == fake.is_error_tool}
             message = {"jsonrpc": "2.0", "id": body["id"], "result": result}
+            if fake.error_beside_result:
+                message["error"] = {"code": -32000, "message": "x"}
             if fake.sse:
                 self._send(200, text="event: message\ndata: " + json.dumps(message) + "\n\n")
             else:
@@ -320,3 +329,100 @@ def test_bad_port_is_a_usage_error():
 
 def test_missing_expected_file_is_a_usage_error(server, tmp_path):
     assert _run(server, "api", "--expected", str(tmp_path / "none.txt")) == 2
+
+
+@pytest.mark.parametrize("tool_name", ["ontology_query", "content_pack_list"])
+def test_tool_error_flag_on_one_tool_is_a_failure(server, capsys, tool_name):
+    server.is_error_tool = tool_name
+    assert _run(server, "mcp") == 1
+    _assert_no_leak(capsys)
+
+
+@pytest.mark.parametrize("tool_name", ["ontology_query", "content_pack_list"])
+def test_json_rpc_error_on_one_tool_is_a_failure(server, capsys, tool_name):
+    server.rpc_error_tool = tool_name
+    assert _run(server, "mcp") == 1
+    _assert_no_leak(capsys)
+
+
+def test_api_status_not_ok_is_a_failure(server, capsys):
+    server.status_code = 503
+    assert _run(server, "api") == 1
+    _assert_no_leak(capsys)
+
+
+def test_api_query_not_ok_is_a_failure(server, capsys):
+    server.query_code = 500
+    assert _run(server, "api") == 1
+    _assert_no_leak(capsys)
+
+
+@pytest.mark.parametrize("body", [{"nothing": 1}, {"results": "x"}, []])
+def test_api_query_without_results_list_is_a_failure(server, capsys, body):
+    server.query_body = body
+    assert _run(server, "api") == 1
+    _assert_no_leak(capsys)
+
+
+@pytest.mark.parametrize("inner", [{"nothing": 1}, {"results": None}])
+def test_mcp_query_without_results_list_is_a_failure(server, capsys, inner):
+    server.mcp_query_inner = inner
+    assert _run(server, "mcp") == 1
+    _assert_no_leak(capsys)
+
+
+def test_exception_text_with_the_token_never_reaches_output(server, monkeypatch, capsys):
+    class Leaky:
+        def open(self, request, timeout=None):
+            raise RuntimeError("boom " + request.get_header("Authorization"))
+
+    monkeypatch.setattr(tool, "_OPENER", Leaky())
+    assert _run(server, "api") == 1
+    out = _assert_no_leak(capsys)
+    assert "ERR:RuntimeError" not in out or TOKEN not in out
+
+
+@pytest.mark.parametrize("bad", ["abc\r\nX-Injected: 1", "abc\ndef", "tok\x01en", "t\u00f6ken"])
+def test_token_with_control_or_non_ascii_chars_is_a_usage_error(server, monkeypatch, capsys, bad):
+    monkeypatch.setenv("TEST_READ_TOKEN", bad)
+    assert _run(server, "api") == 2
+    assert server.requests == []
+    captured = capsys.readouterr()
+    assert "Injected" not in captured.out + captured.err
+
+
+def test_save_expected_parent_missing_is_a_usage_error_before_any_request(server, tmp_path):
+    assert _run(server, "api", "--save-expected", str(tmp_path / "nodir" / "x.txt")) == 2
+    assert server.requests == []
+
+
+def test_non_utf8_expected_file_is_a_usage_error_before_any_request(server, tmp_path):
+    bad = tmp_path / "expected.txt"
+    bad.write_bytes(b"\xff\xfe\x00")
+    assert _run(server, "api", "--expected", str(bad)) == 2
+    assert server.requests == []
+
+
+def test_save_expected_write_failure_is_a_usage_error(server, tmp_path, monkeypatch):
+    real_open = open
+
+    def refuse(path, mode="r", *args, **kwargs):
+        if "x" in mode:
+            raise PermissionError("denied")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", refuse)
+    assert _run(server, "api", "--save-expected", str(tmp_path / "saved.txt")) == 2
+
+
+def test_failed_run_does_not_save_expected(server, tmp_path):
+    server.status_code = 503
+    saved = tmp_path / "saved.txt"
+    assert _run(server, "api", "--save-expected", str(saved)) == 1
+    assert not saved.exists()
+
+
+def test_json_rpc_error_beside_a_valid_result_is_a_failure(server, capsys):
+    server.error_beside_result = True
+    assert _run(server, "mcp") == 1
+    _assert_no_leak(capsys)

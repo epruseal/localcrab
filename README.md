@@ -181,10 +181,10 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab status` | 모든 스토어 연결 상태 확인 |
 | `opencrab ingest <path>` | 파일을 벡터·문서 스토어에 인제스트 (`--recursive`, `--extension`(기본 `.txt,.md,.py`), `--pack-id`). 파일 1건 이상 실패 시 종료 코드 3 |
 | `opencrab extract <path>` | LLM으로 노드·엣지 추출 후 그래프에 적재 (`--recursive`, `--extension`(기본 `.md,.txt,.py`), `--model`, `--dry-run`, `--api-key`, `--pack-id`). 파일 1건 이상 실패 시 종료 코드 3 |
-| `opencrab query "<질문>"` | 하이브리드 검색 (`--spaces`, `--limit`, `--offset`, `--pack-id`, `--auto-pack`, `--show-pack`/`--hide-pack`, `--json-output`, `--json-envelope`) |
+| `opencrab query "<질문>"` | 하이브리드 검색 (`--spaces`, `--limit`, `--offset`, `--pack-id`, `--auto-pack`, `--show-pack`/`--hide-pack`, `--include-unpackaged`(무시됨, #147), `--json-output`, `--json-envelope`) |
 | `opencrab manifest` | MetaOntology 전체 문법 출력 (`--json-output`) |
-| `opencrab ocr <path>` | 이미지/문서 OCR (easyocr/tesseract/metadata 백엔드)[^media] |
-| `opencrab image-context <path>` | 이미지 CLIP 스타일 증거 컨텍스트 빌드[^media] |
+| `opencrab ocr <path>` | 이미지/문서 OCR (easyocr/tesseract/metadata 백엔드, `--backend`, `--lang`, `-o/--output`)[^media] |
+| `opencrab image-context <path>` | 이미지 CLIP 스타일 증거 컨텍스트 빌드 (`--backend`, `--model-name`, `-o/--output`)[^media] |
 | `opencrab export-neo4j-pack` | 그래프 스냅샷을 OpenCrab Pack v1 JSONL로 내보내기 (`--output` 필수, `--pack-id`, `--node-limit`, `--edge-limit`) |
 | `opencrab assemble-pack-v1 <dir>` | 스테이징 디렉토리에서 Pack v1 ZIP 조립 (`--output`과 `--pack-id` 필수, `--title`) |
 | `opencrab packs list` | `<LOCAL_DATA_DIR>/packs/` 아래에서 찾은 팩 목록 |

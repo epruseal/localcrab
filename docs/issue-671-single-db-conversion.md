@@ -357,13 +357,23 @@ factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/sto
 | `<REPO>` | localcrab 체크아웃 경로 |
 | `<PY>` | 운영 가상환경의 python |
 | `<ENVFILE>` | 서비스 단위가 읽는 환경 파일. 값은 열지 않고 키 이름만 읽는다 |
-| `<UNIT_FRONT>`, `<UNIT_PROXY>`, `<UNIT_GW>`, `<UNIT_API>` | 외부 노출, 인증 프록시, MCP 게이트웨이, REST 앱 단위 |
+| `<UNIT_FRONT>`, `<UNIT_PROXY>`, `<UNIT_GW>`, `<UNIT_API>` | 외부 노출, 인증 프록시, MCP 게이트웨이, REST 앱 단위. 이름에 `.service`를 붙인다(차단 디렉터리 `<RT>/<단위>.d`의 이름이 된다) |
 | `<UNIT_REINGEST>`, `<TIMER_REINGEST>` | 대화 재인입 서비스와 타이머(없으면 이 줄을 건너뛴다) |
 | `<SETA>`, `<SETC>` | 2단계의 첫 백업 세트와 병합 원본 세트 디렉터리 이름 |
 | `<T0>`, `<T1>`, `<T2>` | 증거 파일의 `frozen_from`, `packs_checked_at`, `frozen_until`(UTC 오프셋 명시) |
 | `<PASS1>`, `<PASS2>` | 독립 검증 PASS와 사본 시험 PASS의 절대 경로(8.8) |
 | `<TMP>` | 병합이 임시 파일을 쓸 디렉터리(`<DATA_PARENT>/sqlite-tmp`). root와 같은 파일시스템이고 tmpfs가 아니다 |
 | `<RT>` | systemd 사용자 런타임 단위 디렉터리(`$XDG_RUNTIME_DIR/systemd/user`). 1단계의 시작 차단 파일을 둔다 |
+| `<TMP_GW>`, `<TMP_PROXY>`, `<TMP_API>` | 6단계 임시 단위 이름. 운영 단위와 다른 이름이다 |
+| `<GW_PORT>`, `<PROXY_PORT>`, `<API_PORT>`, `<GW_PORT_운영>` | 임시 게이트웨이, 임시 프록시, 임시 REST 앱의 루프백 포트와 운영 게이트웨이 포트. 임시 포트는 운영이 쓰지 않는 값이다 |
+| `<토큰 변수>` | 읽기 검증 도구에 넘길 토큰이 든 환경변수 이름. 값은 명령줄에 쓰지 않는다 |
+| `<기준 팩 목록 파일>` | 0단계에서 서비스가 도는 동안 `--save-expected`로 만든 팩 id 목록 파일. 저장소에 올리지 않는다 |
+| `<홈 디렉터리>`, `<운영 단위와 같은 PATH>` | 임시 게이트웨이의 `WorkingDirectory`와 `PATH`. 운영 단위의 값을 `systemctl --user show`로 읽어 쓴다 |
+| `<ROOT 이름>`, `<세트 이름>` | `<ROOT>`의 마지막 경로 이름(intent 파일은 `<DATA_PARENT>/<ROOT 이름>.intent.json`), 병합 원본 세트 이름 |
+| `<대상 커밋>`, `<롤백 세트 이름>` | 1b에서 배포할 커밋, 7단계 백업이 낸 세트 디렉터리 이름 |
+| `<게이트웨이 MainPID>` | 8단계에서 `show -p MainPID --value`로 읽은 값. 프록시와 REST 앱은 각 단위의 값이다 |
+| `<DATA 경로 문자열>`, `<외부 스크립트 디렉터리>` | 5단계에서 외부 스크립트가 기본 경로를 고정 문자열로 쓰는지 찾을 때의 경로 문자열과 스크립트 디렉터리 |
+| `<단위>` | 갈래 A에서 차단 파일을 지울 단위(`<UNIT_FRONT>`, `<UNIT_PROXY>`, `<UNIT_GW>`, `<UNIT_API>` 중 하나) |
 | `<RUN>` | 실행 기록 디렉터리. 데이터 디렉터리 밖에 둔다 |
 | `<HEAVY>` | 무거운 실행을 한 번에 하나씩 돌리는 래퍼(없으면 빈 값). 운영 장치의 메모리 상한을 지킨다 |
 
@@ -407,10 +417,10 @@ df -B1 --output=avail <DATA_PARENT>
 - 합격: 다섯 파일이 일반 파일이고 링크 수가 1이다. 장치 번호가 같다. `realpath`가 자기 자신이다. `findmnt`가 `<ROOT>`와 `<DATA_PARENT>`에 출력을 내지 않는다(마운트 지점이면 rename이 안 된다. 8.6 P9). `<DATA_PARENT>`의 파일시스템 종류가 tmpfs가 아니다(`<TMP>`는 3단계에서 `<DATA_PARENT>` 아래에 만든다). `ledger.json`, `single.db`, `<OLD>`가 없다. `ls -A <ROOT>`의 최상위 이름이 8.6의 이동 대상 세 항목과 다섯 DB, 곁파일, 잠금과 삭제 저널, 백업 세트 같은 알려진 이름뿐이다. 모르는 이름이 있으면 처리 방법을 정한 뒤 시작한다. 디스크 여유가 `5.3 * S + 30 GiB` 이상이다(`S`는 다섯 DB 주파일 크기의 합이다).
 - 실패: 정지하지 않는다.
 
-각 서비스 단위가 읽는 환경도 확인한다. 값은 읽지 않고 키 이름만 센다.
+각 서비스 단위가 읽는 환경도 확인한다. `show -p Environment` 출력에는 값이 들어 있다. 키 이름만 읽고 값은 `<RUN>`이나 보고에 옮기지 않는다.
 
 ```bash
-systemctl --user show -p EnvironmentFiles -p Environment -p WorkingDirectory <UNIT_GW>
+systemctl --user show -p EnvironmentFiles -p Environment -p WorkingDirectory <UNIT_FRONT> <UNIT_PROXY> <UNIT_GW> <UNIT_API> <UNIT_REINGEST>
 grep -c '^LOCAL_DATA_DIR=' <ENVFILE>
 grep -c '^SINGLE_SQLITE_FILE=' <ENVFILE>
 ```
@@ -434,18 +444,19 @@ systemctl --user stop <UNIT_PROXY>
 systemctl --user stop <UNIT_GW>
 systemctl --user stop <UNIT_API>
 systemctl --user stop <UNIT_REINGEST>
-mkdir -p <RT>/<UNIT_FRONT>.d <RT>/<UNIT_PROXY>.d <RT>/<UNIT_GW>.d
+mkdir -p <RT>/<UNIT_FRONT>.d <RT>/<UNIT_PROXY>.d <RT>/<UNIT_GW>.d <RT>/<UNIT_API>.d
 printf '[Service]\nExecStartPre=/bin/false\n' > <RT>/<UNIT_FRONT>.d/block.conf
 printf '[Service]\nExecStartPre=/bin/false\n' > <RT>/<UNIT_PROXY>.d/block.conf
 printf '[Service]\nExecStartPre=/bin/false\n' > <RT>/<UNIT_GW>.d/block.conf
+printf '[Service]\nExecStartPre=/bin/false\n' > <RT>/<UNIT_API>.d/block.conf
 systemctl --user daemon-reload
-systemctl --user show -p DropInPaths <UNIT_FRONT> <UNIT_PROXY> <UNIT_GW>
+systemctl --user show -p DropInPaths <UNIT_FRONT> <UNIT_PROXY> <UNIT_GW> <UNIT_API>
 systemctl --user show -p ActiveState -p MainPID <UNIT_FRONT> <UNIT_PROXY> <UNIT_GW> <UNIT_API> <UNIT_REINGEST>
 fuser -v <ROOT>/opencrab.db <ROOT>/graph.db <ROOT>/doc_store.db <ROOT>/vectors.db <ROOT>/billing.db
 date -u +%Y-%m-%dT%H:%M:%S+00:00
 ```
 
-- 합격: 셋 모두 `DropInPaths`에 `block.conf`가 보인다(시작 차단). 단위 파일이 `~/.config/systemd/user`에 있으면 `mask --runtime`은 효과가 없다. 그 디렉터리가 런타임 디렉터리보다 우선해 `LoadState`가 `loaded`로 남고, `mask`는 `already exists`로 거부된다. 그래서 런타임 drop-in으로 `start`를 실패시킨다. 이 차단 파일은 런타임 디렉터리에 있어 재부팅하면 사라진다. 모든 단위가 inactive이고 `MainPID`가 0이다. `fuser` 표준 출력에 PID가 없다(`-wal`과 `-shm`이 있으면 같은 방식으로 본다). 마지막 줄의 값이 `<T0>`이다.
+- 합격: 넷 모두 `DropInPaths`에 `block.conf`가 보인다(시작 차단). 단위 파일이 `~/.config/systemd/user`에 있으면 `mask --runtime`은 효과가 없다. 그 디렉터리가 런타임 디렉터리보다 우선해 `LoadState`가 `loaded`로 남고, `mask`는 `already exists`로 거부된다. 그래서 런타임 drop-in으로 `start`를 실패시킨다. 이 차단 파일은 런타임 디렉터리에 있어 재부팅하면 사라진다. 모든 단위가 inactive이고 `MainPID`가 0이다. `fuser` 표준 출력에 PID가 없다(`-wal`과 `-shm`이 있으면 같은 방식으로 본다). 마지막 줄의 값이 `<T0>`이다.
 - 실패: 1b로 가지 않는다. 남은 단위와 점유 프로세스를 처리하고 이 단계를 다시 한다. 코드나 데이터를 바꾸기 전이므로 서비스를 다시 켜고 끝낼 수 있다.
 
 #### 1b 코드 배포 (정지 뒤)
@@ -459,7 +470,7 @@ git -C <REPO> rev-parse HEAD
 <PY> -m pip show opencrab
 ```
 
-- 합격: `HEAD`가 대상 커밋이다. 마지막 `python -c` 출력이 `True`다. `pip show`의 `Version`이 `pyproject.toml`의 버전과 같다(editable 설치는 재설치 전까지 설치 메타데이터의 버전이 옛 값으로 남는다. `opencrab --version`과 `pip show`는 그 메타데이터를 읽고 `opencrab.__version__`은 소스를 읽는다. 9장 `docs/migrations.md`의 확인 명령 참고).
+- 합격: `HEAD`가 대상 커밋이다. 마지막 `python -c` 출력이 `True`다. `pip show`의 `Version`이 `pyproject.toml`의 버전과 같다(editable 설치는 재설치 전까지 설치 메타데이터의 버전이 옛 값으로 남는다. `opencrab --version`과 `pip show`는 그 메타데이터를 읽고 `opencrab.__version__`은 소스를 읽는다. `docs/migrations.md` 10절의 확인 명령 참고).
 - 실패: 갈래 A.
 
 저장소 밖에서 이 저장소를 부르는 운영 스크립트(예: 재인입 스크립트)가 있으면 이 시점에 같은 방식으로 배포하고 대상 커밋의 해시로 대조한다. 실패하면 갈래 A.
@@ -525,7 +536,7 @@ ls -A <ROOT>
 ```
 
 - 합격: rc 0이고 마지막 줄이 `publication ready`다. `--verify` 출력에 `{"verify": "counts", "mismatch": 0}` 줄과 `"vec_mismatch": 0`을 담은 `{"verify": "fts_vec", ...}` 줄이 모두 있다. `<ROOT>` 안 이름이 정확히 `billing.db`, `ledger.json`, `manifest.json`, `marker.json`, `single.db`, `single.db.lifetime.lock`이다. 경과 시간을 기록한다.
-- 실패: rc가 0이 아니면 먼저 경과 시간, `MemoryError`, rc 128 초과(신호)를 보고 상한 종료인지 가른다. 메모리 부족 거부(래퍼의 rc 75)는 병합을 시작하지 않은 것이므로 갈래 E다. 그 밖의 실패는 갈래 C.
+- 실패: rc가 0이 아니면 먼저 경과 시간, `MemoryError`, rc 128 초과(신호)를 보고 상한 종료인지 가른다. 메모리 부족 거부(`<HEAVY>` 래퍼가 내는 rc 75. 래퍼가 없으면 이 경우는 없다)는 병합을 시작하지 않은 것이므로 갈래 E다. 그 밖의 실패는 갈래 C.
 
 #### 4단계 authorize
 
@@ -559,7 +570,7 @@ diff <RUN>/5-before-list.txt <RUN>/5-after-list.txt
 find <ROOT>/packs -type f -exec sha256sum {} + > <RUN>/5-packs-sha-after.txt
 ```
 
-- 합격: 서비스와 타이머가 inactive다. 장치 번호가 같고 세 `ls -d`가 `No such file`이다. `diff`가 0줄이다. 두 sha 목록이 같다(경로 접두어 `<OLD>`와 `<ROOT>`를 빼고 정렬해 비교한다. 접두어가 달라 그대로는 같지 않다). 없는 항목은 건너뛴다(그 항목은 이 운영 환경에 없다). 하나라도 어긋나면 옮기지 않고 갈래 E.
+- 합격: 서비스와 타이머가 inactive다. 장치 번호가 같고 세 `ls -d`가 `No such file`이다. `diff`가 0줄이다. 두 sha 목록이 같다(경로 접두어 `<OLD>`와 `<ROOT>`를 빼고 정렬해 비교한다. 접두어가 달라 그대로는 같지 않다. 8.6 P3은 항목마다 이동 뒤 목록을 요구하지만 이 표는 세 항목을 모두 옮긴 뒤 한 번 비교한다. 어긋나면 항목별로 목록을 다시 만들어 어느 항목인지 가른다). 없는 항목은 건너뛴다(그 항목은 이 운영 환경에 없다). 하나라도 어긋나면 옮기지 않고 갈래 E.
 - 외부 스크립트가 기본 데이터 경로를 고정 문자열로 쓰는지 `grep -rn '<DATA 경로 문자열>' <외부 스크립트 디렉터리>`로 확인한다(8.6 P8).
 
 ```bash
@@ -574,7 +585,7 @@ ls -ld <ROOT>/openclaw-conversations/automation
 
 #### 6단계 읽기 검증 (단위는 멈춘 채, 임시 인스턴스만)
 
-임시 인스턴스는 운영 단위와 같은 환경으로 띄운다. 운영 단위의 `Environment`와 `WorkingDirectory`를 `systemctl --user show -p Environment -p WorkingDirectory <단위>`로 읽고 키 이름만 확인한다. 값은 기록하지 않는다. 사본 시험에서 어긋난 곳은 세 군데였다.
+임시 인스턴스는 운영 단위와 같은 환경으로 띄운다. 운영 단위의 `Environment`와 `WorkingDirectory`를 `systemctl --user show -p Environment -p WorkingDirectory <단위>`로 읽는다. 출력에 값이 들어 있으므로 키 이름만 확인하고 값은 기록하지 않는다. 사본 시험에서 어긋난 곳은 세 군데였다.
 
 - `STORAGE_MODE=local`이 빠지면 임시 인스턴스가 다른 모드로 뜬다.
 - `PATH`가 다르면 GGUF 폴백 같은 선택 기능이 다르게 동작한다.
@@ -588,9 +599,20 @@ systemd-run --user --unit=<TMP_GW> --collect -p EnvironmentFile=<ENVFILE> -p Env
 systemctl --user stop <TMP_GW>
 ```
 
-- 합격: `RESULT: PASS`와 rc 0이다. `ontology_query`의 토큰 요청이 200이고 `isError`가 거짓이며 본문에 `error` 키가 없다. 무토큰 요청이 401이다. `content_pack_list`가 200이고 `expected_minus_got`가 `[]`이다. `got_minus_expected`는 읽고 기록한다. 출력에 토큰이나 헤더 값이 없다.
-- 기준 팩 목록 파일은 전환 전 운영 인스턴스에 같은 도구를 `--save-expected <파일>`로 돌려 만든다(0단계 앞의 서비스 중 읽기 질의). 이 파일은 팩 id 목록이므로 저장소에 올리지 않는다.
-- 인증 프록시 형태는 같은 명령을 `<PROXY_PORT>`로 돌린다. REST 앱 형태는 `<PY> -m apps.api.main`을 `-p Environment=PORT=<API_PORT>`로 띄우고 `check_read_endpoints.py <API_PORT> api ...`를 돌린다. 토큰은 환경변수로 넘기고 명령줄에 쓰지 않는다(`--client-config <파일> --server <이름>`도 쓸 수 있다).
+REST 앱 형태는 같은 환경으로 아래처럼 띄운다. `python -m apps.api.main`은 모든 인터페이스(0.0.0.0)에 바인드하므로 쓰지 않는다. `WorkingDirectory`는 운영 REST 단위의 값(저장소 디렉터리)과 같게 둔다.
+
+```bash
+systemd-run --user --unit=<TMP_API> --collect -p EnvironmentFile=<ENVFILE> -p Environment=STORAGE_MODE=local -p Environment=PATH=<운영 단위와 같은 PATH> -p WorkingDirectory=<REPO> <PY> -m uvicorn apps.api.main:app --host 127.0.0.1 --port <API_PORT>
+<PY> <REPO>/scripts/check_read_endpoints.py <API_PORT> api --token-env <토큰 변수> --expected <기준 팩 목록 파일>
+systemctl --user stop <TMP_API>
+```
+
+인증 프록시 형태는 운영 프록시 단위의 시작 명령을 `systemctl --user show -p ExecStart <UNIT_PROXY>`로 읽고(값에 비밀이 있으면 옮기지 않는다), 같은 명령을 `--host 127.0.0.1 --port <PROXY_PORT>`와 `<TMP_PROXY>` 이름으로 띄운다. 검사는 게이트웨이와 같은 `mcp` 형태로 `<PROXY_PORT>`에 돌린다.
+
+- 합격: `RESULT: PASS`와 rc 0이다. `ontology_query`의 토큰 요청이 200이고 `isError`가 거짓이며 본문에 `error` 키가 없고 `results` 목록이 있다. 무토큰 요청이 401이다. `content_pack_list`가 200이고 `expected_minus_got`가 `[]`이다. `got_minus_expected`는 읽고 기록한다. 출력에 토큰이나 헤더 값이 없다.
+- 기준 팩 목록 파일은 전환 전 운영 인스턴스에 같은 도구를 `--save-expected <기준 팩 목록 파일>`로 돌려 만든다(0단계 앞의 서비스 중 읽기 질의). 이 파일은 팩 id 목록이므로 저장소에 올리지 않는다.
+- 토큰은 환경변수로 넘기고 명령줄에 쓰지 않는다(`--client-config <클라이언트 설정 파일> --server <이름>`도 쓸 수 있다).
+- P5가 요구하는 나머지 두 검사는 사람이 한다. `opencrab packs list`(환경은 같은 `<ENVFILE>`)가 `<LOCAL_DATA_DIR>/packs/`의 manifest 팩을 모두 보이는지 보고, `content_pack_list`의 query로 manifest 키워드에만 있는 단어를 검색해 그 팩이 돌아오는지 본다. 운영에 manifest 팩이 있을 때만 해당한다.
 - 도구가 보내는 질의에 `ontology_query`와 `POST /api/query`가 있다. 이 둘은 팩 데이터를 바꾸지 않지만 billing 행과 질의 이벤트를 쓴다. 7단계의 롤백 지점 백업이 그 행을 포함하도록 6단계 임시 인스턴스를 먼저 멈춘다.
 
 ```bash
@@ -625,23 +647,25 @@ fuser -v <ROOT>/single.db <ROOT>/billing.db
 rm <RT>/<UNIT_FRONT>.d/block.conf
 rm <RT>/<UNIT_PROXY>.d/block.conf
 rm <RT>/<UNIT_GW>.d/block.conf
-rmdir <RT>/<UNIT_FRONT>.d <RT>/<UNIT_PROXY>.d <RT>/<UNIT_GW>.d
+rm <RT>/<UNIT_API>.d/block.conf
+rmdir <RT>/<UNIT_FRONT>.d <RT>/<UNIT_PROXY>.d <RT>/<UNIT_GW>.d <RT>/<UNIT_API>.d
 systemctl --user daemon-reload
 systemctl --user start <UNIT_GW>
 systemctl --user start <UNIT_PROXY>
 systemctl --user start <UNIT_API>
 systemctl --user start <UNIT_FRONT>
-systemctl --user show -p ActiveState -p MainPID -p NRestarts <UNIT_GW> <UNIT_PROXY> <UNIT_API>
+systemctl --user show -p ActiveState -p MainPID -p NRestarts <UNIT_GW> <UNIT_PROXY> <UNIT_API> <UNIT_FRONT>
 systemctl --user show -p MainPID --value <UNIT_GW>
-tr '\0' '\n' < /proc/<게이트웨이 MainPID>/environ | grep -c '^SINGLE_SQLITE_FILE='
+grep -z -c '^SINGLE_SQLITE_FILE=' /proc/<게이트웨이 MainPID>/environ
 ```
 
-- 합격: 임시 단위 inactive, 점유 0. 세 단위가 active이고 `MainPID`가 정지 전과 다르며 `NRestarts`가 0이다. 단위마다 `grep -c`가 1이다(프록시와 REST 앱도 같은 명령을 각 `MainPID`로 돌린다). 재인입 타이머는 아직 `enable`하지 않는다.
+- 합격: 임시 단위 inactive, 점유 0. 네 단위가 active이고 `MainPID`가 0이 아니며 `NRestarts`가 0이다. 단위마다 `grep -z -c`가 1이다(프록시와 REST 앱도 같은 명령을 각 `MainPID`로 돌린다. `-z`는 환경 파일의 NUL 구분 항목을 한 줄씩 읽는다). 재인입 타이머는 아직 `enable`하지 않는다.
 - 실패: 재인입 타이머를 stop하고 disable한 뒤 갈래 D를 시작할지 정한다.
 
 #### 9단계 개방 직후 확인
 
 ```bash
+ls -ld <ROOT>/openclaw-conversations/automation
 <PY> <REPO>/scripts/check_read_endpoints.py <GW_PORT_운영> mcp --token-env <토큰 변수> --expected <기준 팩 목록 파일>
 systemctl --user start <UNIT_REINGEST>
 systemctl --user is-active <UNIT_REINGEST>
@@ -661,10 +685,12 @@ systemctl --user is-enabled <TIMER_REINGEST>
 
 #### 롤백 갈래
 
-- 갈래 A, 정지 뒤 1b나 1c 실패: 데이터를 건드리지 않았다. 체크아웃을 0단계에 적은 커밋으로 `git reset --keep`하고 `rev-parse HEAD`로 확인한다. 저장소 밖 스크립트를 되돌린다. 1단계의 시작 차단 파일을 지우고(`rm <RT>/<단위>.d/block.conf`, `rmdir`, `daemon-reload`) 단위와 재인입 타이머를 켠다. `systemctl --user enable --now <TIMER_REINGEST>`.
+- 갈래 A, 정지 뒤 1b 실패: 데이터를 건드리지 않았다. 체크아웃을 0단계에 적은 커밋으로 `git reset --keep`하고 `rev-parse HEAD`로 확인한다. 이어서 `<PY> -m pip install -e <REPO> --no-deps`를 다시 돌리고 `pip show opencrab`의 `Version`이 되돌린 체크아웃의 `pyproject.toml` 버전과 같은지 확인한다(설치 메타데이터가 1b의 새 버전으로 남지 않게 한다). 저장소 밖 스크립트를 되돌린다. 1단계의 시작 차단 파일을 지우고(`rm <RT>/<단위>.d/block.conf`, `rmdir`, `daemon-reload`) 단위와 재인입 타이머를 켠다. `systemctl --user enable --now <TIMER_REINGEST>`.
 - 갈래 B, 쓰기 개방 전 롤백: 임시 단위가 inactive인지 확인하고 1단계의 정지 확인을 다시 한다. 8.6 P7의 순서(이동 항목 되돌리기, 이름 맞바꾸기, intent와 잠금 파일 보존, 설정 줄 지우기)를 따른다. 설정 줄은 `sed -i '/^SINGLE_SQLITE_FILE=/d' <ENVFILE>`로 지우고 `grep -c`가 0인지 확인한다. 모든 `mv -T` 앞에서 장치 번호가 같고 대상 이름이 없음을 확인한다. 마지막에 시작 차단 파일 제거, 단위 시작, 타이머 enable, 환경의 `SINGLE_SQLITE_FILE` 출현 0을 확인한다.
 - 갈래 C, 병합이나 authorize의 비정상 종료: 8.4(게시)와 8.5(authorize)를 따른다. 다시 돌릴지 다섯 파일로 돌아갈지는 사람이 정해 기록한다.
-- 갈래 D, 쓰기 개방 뒤 롤백: 1단계 정지를 그대로 한다. 단일 파일로 되돌리려면 7.4의 `single_restore`(dry-run 뒤 `--apply`)와 `automation` 사본 교체를 한다. 다섯 파일로 돌아가려면 갈래 B를 그대로 하고 `automation` 교체를 반드시 한다. 개방 뒤의 MCP 쓰기는 다섯 파일에 없으므로 사라진다. 대화 메시지는 커서를 되돌렸으므로 델타 적재가 다시 처리한다.
+- 갈래 D, 쓰기 개방 뒤 롤백: 1단계의 정지를 그대로 한다(타이머 stop과 disable, 단위 stop, 시작 차단 파일). 합격 기준도 그대로 확인하되 `fuser` 대상은 `<ROOT>/single.db`, `<ROOT>/billing.db`와 각 `-wal`, `-shm`이다. 정지를 확인한 뒤 둘 중 하나로 간다. 개방 뒤의 MCP 쓰기는 두 경우 모두 롤백 지점 뒤 것이 사라진다. 대화 메시지는 커서를 되돌렸으므로 델타 적재가 다시 처리한다.
+  - D1 단일 파일로 되돌린다: `<PY> -m opencrab.stores.single_restore <DATA_PARENT>/backups/rollback-point/<롤백 세트 이름>`(dry-run)을 읽고 `--apply`를 붙여 돌린다. 그다음 `automation` 사본을 교체한다. 교체 앞에서 `<ROOT>/openclaw-conversations/automation`과 `<DATA_PARENT>`의 장치 번호가 같고 `<DATA_PARENT>/automation.saved-<UTC 시각>`이 없음을 확인한다. 현재 디렉터리를 그 이름으로 `mv -T`하고 `<DATA_PARENT>/automation.rollback-copy`를 `cp -a`로 원래 자리에 둔다. 마지막으로 시작 차단 파일 제거와 `daemon-reload`, 8단계 순서의 단위 시작, 9단계의 읽기 검증, 타이머 enable을 한다. 합격: `--apply`가 rc 0과 `결속 검증을 통과했다`를 내고, 복원한 `automation`의 `cursor_state.json`이 사본과 같으며, 읽기 검증이 `RESULT: PASS`이고, 각 `MainPID`의 환경에 `SINGLE_SQLITE_FILE`이 1건 있다.
+  - D2 다섯 파일로 돌아간다: 갈래 B의 순서(이동 항목을 `<OLD>`로 되돌리기, 이름 맞바꾸기, intent와 잠금 파일 보존, 설정 줄 지우기)를 따르되 `automation` 교체를 이름 맞바꾸기 앞에 한다(8.6 P7). 항목을 `<OLD>`로 되돌린 직후 `<OLD>/openclaw-conversations/automation`을 D1과 같은 방법으로 사본으로 바꾼다. 갈래 B가 끝나는 단위 시작과 타이머 enable은 이 교체 뒤에 한다. 합격: 읽기 검증이 `RESULT: PASS`이고 각 `MainPID`의 환경에 `SINGLE_SQLITE_FILE`이 없다.
 - 갈래 E, 단계 중단 공통: 다음 단계로 가지 않는다. 원인을 고쳐 그 단계를 다시 할지 갈래 A나 B로 갈지 정해 결정과 다시 판정할 시각을 기록한다.
 
 #### 합성 데이터 전 과정 확인
@@ -674,7 +700,9 @@ systemctl --user is-enabled <TIMER_REINGEST>
 - 합성 데이터는 `opencrab init`과 임시 인스턴스의 `pack_create` 호출로 만들었다. 임베딩 서버는 결정적 벡터를 돌려주는 시험용 대역이다.
 - 서비스는 임시 이름의 사용자 유닛과 운영이 쓰지 않는 루프백 포트로 띄웠다. 운영 데이터와 운영 단위는 읽지도 쓰지도 않았다.
 - 모든 명령은 격리한 `HOME`, `LOCALCRAB_ENV_FILE`, `LOCAL_DATA_DIR` 아래에서 돌렸다. 병합과 백업은 무거운 실행 래퍼로 하나씩 돌렸다.
-- 갈래 D의 단일 파일 복원은 쓰기 개방 뒤 쓰기를 만든 상태에서 한 번 돌려 합격 기준을 확인했다. 다섯 파일 복귀는 개방 뒤 상태에서 갈래 B의 순서와 `automation` 교체를 함께 돌려 확인했다. 개방 전만의 갈래 B를 따로 돌리지는 않았다.
+- 갈래 D1은 쓰기 개방 뒤 쓰기를 만든 상태에서 한 번 돌려 합격 기준을 확인했다. D2는 개방 뒤 상태에서 갈래 B의 순서와 `automation` 교체를 함께 돌려 확인했다. 개방 전만의 갈래 B와 갈래 A는 따로 돌리지 않았다.
+- 시작 차단 파일은 합성 확인에서 `<UNIT_FRONT>`, `<UNIT_PROXY>`, `<UNIT_GW>` 셋으로 확인했다. `<UNIT_API>` 추가는 같은 명령의 반복이다.
+- REST 임시 인스턴스는 `uvicorn ... --host 127.0.0.1` 형태로 읽기 검증 `RESULT: PASS`를 확인했다. 인증 프록시 형태와 6단계의 `packs list`, manifest 키워드 검색은 합성 환경에 대응물이 없어 돌리지 못했다(프록시는 단위 대역이고 합성 팩에 manifest가 없다).
 - 재인입 서비스는 성공 메시지만 내는 대역으로 확인했다. 9단계의 재인입 이벤트(`graph_import_delta`, `doc_nodes_sync`) 판정은 이 확인으로 검증하지 못했다.
 - 확인 기록의 위치와 단계별 결과는 PR 본문에 있다.
 

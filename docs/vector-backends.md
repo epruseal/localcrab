@@ -435,7 +435,7 @@ opencrab serve
   않으므로 WAL 모드 파일에는 곁파일이 생길 수 있다. 이 스크립트에는 `--backup-to`
   옵션이 없다. 이관 전 백업은 `python -m opencrab.stores.backup --to <경로>`로 한다.
   `--verify`로 이관 후 행수 대조.
-- 멱등 — 이미 이관된 테이블(행수 일치)은 재실행 시 스킵.
+- 재실행 — 표마다 다르다. 자연 키가 있는 SQL 표는 행수가 같아도 매번 upsert하고, 벡터와 `doc_nodes`는 행수가 같으면 건너뛴다. 상세는 [마이그레이션 7절](./migrations.md#7-sqlite에서-postgresql로).
 
 ### sqlite-vec → Chroma 롤백
 
