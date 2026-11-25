@@ -310,7 +310,7 @@ def _write_default_env(path: Path) -> None:
 LOCAL_DATA_DIR={default_data_dir}
 CHROMA_COLLECTION=opencrab_vectors
 MCP_SERVER_NAME=localcrab
-MCP_SERVER_VERSION=0.1.0-localcrab
+MCP_SERVER_VERSION=1.0.0-localcrab
 LOG_LEVEL=INFO
 """
     path.write_text(content)

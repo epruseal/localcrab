@@ -404,7 +404,10 @@ Raspberry Pi 5급 자원 제한 환경에서 확인된 제약이다. 값은 그 
 
 ### Chroma → sqlite-vec 전환
 
+전체 절차(사전 조건, 정지 범위, 명령, 검증, 롤백)는 [마이그레이션 문서의 6절](./migrations.md#6-chroma에서-sqlite-vec로)이 정본이다.
+
 ```bash
+python scripts/migrate_chroma_to_sqlite_vec.py --dry-run
 python scripts/migrate_chroma_to_sqlite_vec.py   # 기존 chroma 컬렉션 → vectors.db, 원본 1:1 이관(재임베딩 없음)
 export EMBEDDING_BACKEND=openai VECTOR_BACKEND=sqlite-vec
 opencrab serve
@@ -415,18 +418,23 @@ opencrab serve
 
 ### SQLite(local/kuzu) → PG-unified (`STORAGE_MODE=pg`) 전환
 
+전체 절차는 [마이그레이션 문서의 7절](./migrations.md#7-sqlite에서-postgresql로)이 정본이다.
+그래프 저장소는 이 스크립트로 옮기지 못한다(그래프 적용은 자격 검증 전까지 거부된다).
+
 ```bash
 pip install ".[pg]"
-python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --dry-run   # 계획 확인
-python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --verify   # 4스토어 1:1 이관 + 행수 검증
+python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --only doc,sql,vector --dry-run   # 계획 확인
+python scripts/migrate_sqlite_to_pg.py --pg-url "$POSTGRES_URL" --only doc,sql,vector --verify   # 3스토어 1:1 이관 + 행수 검증
 export STORAGE_MODE=pg POSTGRES_URL=postgresql://...
 opencrab serve
 ```
 
 - **재임베딩 불필요** — sqlite-vec 표준이 이미 KURE(1024d)이므로 `vectors.db`의 raw
   float 벡터를 `vec_to_json`으로 읽어 그대로 pgvector에 복사한다.
-- 원본 SQLite 파일은 **읽기 전용으로만 접근**(마이그레이션 스크립트가 절대 쓰지 않음) —
-  `--backup-to` 없이도 원본 무변경이 보장된다. `--verify`로 이관 후 행수 대조.
+- 스크립트는 원본 SQLite에 쓰는 문을 보내지 않는다. 연결을 읽기 전용으로 열지는
+  않으므로 WAL 모드 파일에는 곁파일이 생길 수 있다. 이 스크립트에는 `--backup-to`
+  옵션이 없다. 이관 전 백업은 `python -m opencrab.stores.backup --to <경로>`로 한다.
+  `--verify`로 이관 후 행수 대조.
 - 멱등 — 이미 이관된 테이블(행수 일치)은 재실행 시 스킵.
 
 ### sqlite-vec → Chroma 롤백
