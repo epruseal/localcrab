@@ -60,7 +60,14 @@ from opencrab.pack.write_gate import (
     source_identity_conflict,
     stamp,
 )
+from opencrab.stores._pg_uow import common_pg_uow
+from opencrab.stores._single_file import (
+    PackWriteRejectedError,
+    RollbackOnlyError,
+    is_single_file,
+)
 from opencrab.stores._source_integrity import SourceCopyState, source_copy_context
+from opencrab.stores.sql_store import shared_write_unit
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +266,8 @@ def write_source(
     write_vector: bool = True,
     write_graph: bool = True,
     source_copy_state: SourceCopyState | None = None,
+    _atomic_inner: bool = False,
+    _precomputed_vectors: Any = None,
 ) -> dict[str, Any]:
     """Write one source's graph node, doc row and vector under one ownership stamp.
 
@@ -364,6 +373,70 @@ def write_source(
         origin=origin,
     )
 
+    required = [sql, graph, docs]
+    if vector is not None:
+        required.append(vector)
+    pg_uow = common_pg_uow(*required)
+    if not _atomic_inner and (pg_uow is not None or is_single_file(*required)):
+        shared = sql.shared_file
+        incarnation = shared.pack_incarnation(pack_id) if shared is not None else None
+        if write_vector and getattr(hybrid, "_chroma", None) is not vector:
+            raise RuntimeError("hybrid vector differs from shared vector store")
+        if write_vector and getattr(hybrid, "_doc_store", None) is not docs:
+            raise RuntimeError("hybrid doc store differs from shared doc store")
+        active = pg_uow.active if pg_uow is not None else shared.in_unit_of_work
+        if active and write_vector and vector is not None:
+            raise RuntimeError("source vector must be prepared before the shared unit")
+        prepared = None
+        if write_vector and vector is not None and vector.available:
+            try:
+                prepared = vector.prepare_upsert_vectors([text])
+            except Exception as exc:
+                logger.warning("Source embedding preparation failed: %s", exc, exc_info=True)
+                return {"source_id": source_id, "metadata": meta, "stores": {
+                    "graph": "error: rolled back", "docs": "error: rolled back",
+                    "sql": "error: rolled back", "documents": "error: rolled back",
+                    "chromadb": f"error: {type(exc).__name__}",
+                }}
+        output = None
+        try:
+            manager = pg_uow.unit_of_work() if pg_uow is not None else shared_write_unit(sql)
+            with manager:
+                if incarnation is not None:
+                    shared.validate_pack_writes({pack_id: incarnation})
+                output = write_source(
+                    sql, hybrid, docs, vector, graph=graph, text=text, source_id=source_id,
+                    metadata=metadata, pack_id=pack_id, origin=origin, fork_copy=fork_copy,
+                    write_vector=write_vector, write_graph=write_graph,
+                    source_copy_state=source_copy_state, _atomic_inner=True,
+                    _precomputed_vectors=prepared,
+                )
+                statuses = output["stores"]
+                from opencrab.ontology.builder import store_write_succeeded
+
+                skipped_graph = statuses.get("graph") in (_GRAPH_SKIPPED_FORK, _GRAPH_SKIPPED_LONG_ID)
+                mandatory = ["documents"]
+                if not skipped_graph:
+                    mandatory.extend(("graph", "docs", "sql"))
+                if write_vector and vector is not None:
+                    mandatory.append("chromadb")
+                if any(not store_write_succeeded(statuses, key) for key in mandatory):
+                    (pg_uow if pg_uow is not None else shared).mark_rollback_only()
+                    _mark_source_rolled_back(statuses)
+                    output.pop("vector_id", None)
+        except PackWriteRejectedError:
+            return {"source_id": source_id, "metadata": meta, "stores": {
+                "graph": "error: rolled back", "docs": "error: rolled back",
+                "sql": "error: rolled back", "documents": "error: rolled back",
+                "chromadb": "error: rolled back",
+            }}
+        except RollbackOnlyError:
+            if output is None:
+                raise
+            _mark_source_rolled_back(output["stores"])
+            output.pop("vector_id", None)
+        return output
+
     receipt: dict[str, Any] = {"source_id": source_id, "metadata": meta, "stores": {}}
 
     # --- graph leg (#74), FIRST ---------------------------------------------
@@ -426,7 +499,13 @@ def write_source(
     # the doc row above and the vector below deliberately share one dict: the
     # two must not drift apart.
     try:
-        vector_result = hybrid.ingest(text=text, source_id=source_id, metadata=meta)
+        if _atomic_inner and _precomputed_vectors is not None:
+            vector_result = hybrid.ingest(
+                text=text, source_id=source_id, metadata=meta,
+                _precomputed_vectors=_precomputed_vectors,
+            )
+        else:
+            vector_result = hybrid.ingest(text=text, source_id=source_id, metadata=meta)
     except Exception as exc:  # noqa: BLE001 -- store failure, reported (#158)
         # #168: same rationale as the doc-store catch above.
         logger.warning(
@@ -439,6 +518,14 @@ def write_source(
     if "vector_id" in vector_result:
         receipt["vector_id"] = vector_result["vector_id"]
     return receipt
+
+
+def _mark_source_rolled_back(statuses: dict[str, Any]) -> None:
+    from opencrab.ontology.builder import store_write_succeeded
+
+    for key, status in statuses.items():
+        if store_write_succeeded({key: status}, key):
+            statuses[key] = "error: rolled back"
 
 
 def preflight_source_write(

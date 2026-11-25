@@ -56,6 +56,30 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import _migration_tables as mt  # noqa: E402
 import migrate_sqlite_to_pg as fwd  # noqa: E402
 
+
+@pytest.mark.parametrize("opener", [fwd._sqlite_conn, fwd._vec_sqlite_conn])
+def test_forward_reader_refuses_unmanaged_single_database(tmp_path, opener):
+    path = tmp_path / "unified.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT PRIMARY KEY)")
+    with pytest.raises(RuntimeError, match="shared"):
+        opener(str(path))
+
+
+def test_reverse_writer_refuses_unmanaged_single_database(tmp_path):
+    import logging
+
+    import migrate_to_local as rev
+
+    path = tmp_path / "unified.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT PRIMARY KEY)")
+    with pytest.raises(RuntimeError, match="shared"):
+        rev.migrate_sql("postgresql://invalid/db", str(path), logging.getLogger(__name__))
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == [("pack_delete_operations",)]
+
+
 # ---------------------------------------------------------------------------
 # Fixtures: throwaway SQLite files under tmp_path only -- never touches any
 # real data dir.

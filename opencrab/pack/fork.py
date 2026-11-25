@@ -589,6 +589,14 @@ def fork_pack(
             "hint": "the owner has not published this pack with visibility=public-fork",
         }
 
+    from opencrab.stores._single_file import is_single_file
+
+    if is_single_file(sql, graph, docs, vector):
+        marker = sql.shared_file.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            return {"error": "single SQLite fork is not yet supported"}
     try:
         return _fork_pack_inner(
             sql, graph, docs, vector, hybrid, builder,

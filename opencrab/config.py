@@ -77,7 +77,7 @@ def expand_user_path(value: str) -> str:
 # 원시 문자열은 그 함수 자신의 불변식(어떤 정규화도 금지, expanduser 포함)에
 # 따라 이 목록과 무관하게 별도로 취급된다 — 이 필드 목록은 Settings 모델 값에만
 # 적용되고 그 함수는 os.environ 을 직접 읽으므로 서로 간섭하지 않는다.
-_PATH_LIKE_FIELDS = ("local_data_dir", "local_gguf_path")
+_PATH_LIKE_FIELDS = ("local_data_dir", "local_gguf_path", "single_sqlite_file")
 
 
 class Settings(BaseSettings):
@@ -115,6 +115,7 @@ class Settings(BaseSettings):
         default="local", alias="STORAGE_MODE"
     )
     local_data_dir: str = Field(default_factory=_default_local_data_dir, alias="LOCAL_DATA_DIR")
+    single_sqlite_file: str = Field(default="", alias="SINGLE_SQLITE_FILE")
 
     # ------------------------------------------------------------------
     # Neo4j (docker mode only)

@@ -142,10 +142,19 @@ def _write_lock(purpose: str | None = None):
     written into write.lock, and from there into a timeout error's message
     for the next waiter. Omit it and the record still carries pid and
     acquisition time, just no purpose text.
-    """
-    from opencrab.locking import write_lock
 
-    with write_lock(_lock_data_dir(), purpose=purpose):
+    Single SQLite mode (#671): the binding decision comes BEFORE write.lock.
+    ``hold_single_file`` opens and validates the shared file first, so the
+    first factory call inside this lock reuses the open object instead of
+    meeting the lifetime-lock order rule, and a refused (unauthorized) root
+    leaves no write.lock behind. It does nothing when SINGLE_SQLITE_FILE is
+    empty.
+    """
+    from opencrab.config import get_settings
+    from opencrab.locking import write_lock
+    from opencrab.stores.factory import hold_single_file
+
+    with hold_single_file(get_settings()), write_lock(_lock_data_dir(), purpose=purpose):
         yield
 
 

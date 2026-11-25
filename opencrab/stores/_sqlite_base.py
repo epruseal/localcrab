@@ -59,6 +59,8 @@ class _SqliteConnMixin:
     _all_conns: list[Any]
     _lock: threading.Lock
     _shared: Any = None  # #671: 공유 파일 객체(기본 없음)
+    # #671: 보호 검사가 판정하지 못한 파일의 거부 기록. 있으면 `_new_conn`이 파일을 열지 않고 거부한다.
+    _open_refusal: BaseException | None = None
 
     # 이슈 #94: SQLite 의 자동 체크포인트(PASSIVE)는 임계를 넘긴 커밋마다 다시
     # 시도되지만, 성공해도 WAL 파일을 0으로 되감지(TRUNCATE) 않는다 — 프레임
@@ -86,6 +88,11 @@ class _SqliteConnMixin:
         ``shared``(``opencrab.stores._single_file.SharedSqliteFile``)가 있으면 스레드별 연결과
         쓰기 락과 연결 목록을 그 객체의 것으로 바꿔 같은 파일을 쓰는 저장소들이 나눠 쓴다.
         """
+        if shared is None:
+            from opencrab.stores._single_file import unmanaged_open_refusal
+
+            # 단일 파일로 확정한 거부는 올린다. 판정 불가는 기록만 하고 `_init_db`의 비가용 경로가 받게 한다.
+            self._open_refusal = unmanaged_open_refusal(db_path)
         self._db_path = db_path
         self._shared = shared
         # 쓰기 직렬화 락: 스레드별 커넥션이 같은 WAL 파일에 동시에 쓰면 SQLITE_BUSY가
@@ -122,6 +129,9 @@ class _SqliteConnMixin:
         백업 경로는 온라인 백업 API로 WAL을 통과해 읽으므로 이 사이드카 파일들을
         백업에 함께 복사해서는 안 된다. 자세한 내용은 opencrab/stores/backup.py 참고.
         """
+        if self._open_refusal is not None:
+            # 보호 검사가 판정하지 못한 파일은 열지 않는다. 올릴 때마다 새 예외를 만든다(스레드 간 traceback 공유 방지).
+            raise RuntimeError("unmanaged single-file check refused the open") from self._open_refusal
         if self._shared is not None:
             # 공유 파일: 연결 생성과 모든 저장소의 설정 훅 적용을 공유 객체가 맡는다.
             return self._shared.new_conn()
@@ -138,6 +148,8 @@ class _SqliteConnMixin:
     def _conn(self) -> sqlite3.Connection | None:
         """현재 스레드의 커넥션(없으면 생성). 기존 메서드들이 self._conn.X 형태로
         그대로 쓰도록 property로 노출한다."""
+        if self._shared is not None:
+            return self._shared.connection()
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = self._new_conn()
@@ -172,7 +184,19 @@ class _SqliteConnMixin:
         rollback 을 시도하고, 호출자에게는 쓰기 자체가 실패한 것처럼 보인다.
         """
         shared = self._shared
+        if shared is not None and not shared.in_unit_of_work:
+            marker = shared.connection().execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                raise RuntimeError("single SQLite write requires a guarded unit of work")
         if shared is not None and shared.in_unit_of_work:
+            marker = shared.connection().execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None and not getattr(shared._uow, "validated_packs", {}):
+                shared.mark_rollback_only()
+                raise RuntimeError("single SQLite write requires a validated pack")
             # #671: ``unit_of_work()`` 안이면 이미 쓰기 락과 BEGIN IMMEDIATE를 쥐고 있다.
             # 합류 구간(SAVEPOINT)으로 감싸 안쪽 실패만 되돌리고, commit과 체크포인트는 바깥 구간이 맡는다.
             if immediate and exclusive:

@@ -93,11 +93,19 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         self._bm25_cache: _ncache.PostingCache | None = None
         self._bm25_token: _ncache.TokenSource | None = None
         self._init_conn_state(db_path, shared)
-        self._init_db()
-        if self.supports_node_bm25 and _ncache.enabled():
-            # Opened now, not at the first query, so that a replaced database file is seen.
-            self._bm25_token = _ncache.TokenSource(self._db_path, self._new_conn)
-            self._bm25_cache = _ncache.PostingCache()
+        try:
+            self._init_db()
+            if self.supports_node_bm25 and _ncache.enabled():
+                # Opened now, not at the first query, so that a replaced database file is seen.
+                self._bm25_token = _ncache.TokenSource(self._db_path, self._new_conn)
+                self._bm25_cache = _ncache.PostingCache()
+        except BaseException as exc:
+            # _init_db와 캐시 생성의 실패가 생성자 밖으로 나가면 등록한 공유 소유자를
+            # 풀지 않아 수명 잠금이 남는다(#671). 잠금 시간 초과는 _init_db가 이미 닫고
+            # 올렸으므로 다시 닫지 않는다(#578).
+            if not isinstance(exc, StoreBootstrapLockTimeoutError):
+                self.close()
+            raise
 
     def close(self) -> None:
         # #667: ``close`` also runs from inside ``_init_db`` (bootstrap lock timeout), before
@@ -144,6 +152,13 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                 except Exception as exc:
                     logger.warning("LocalSQLDocStore init failed: %s", exc)
                     self._available = False
+                    return
+                if self._shared_guarded():
+                    # #671: 게시 DB는 pack_delete_operations를 가져 작업 단위 밖 _tx()가 거부된다.
+                    # 아래 쓰기 초기화는 그 거부를 삼켜 FTS와 node BM25를 조용히 끈다. 이 경우에는
+                    # 쓰기 없이 객체 존재와 형식만 읽어 두 값을 정한다.
+                    self._fts_ok = self._read_only_fts_ok(conn)
+                    self._node_bm25_ok = self._read_only_node_bm25_ok(conn)
                     return
                 # FTS5 키워드 색인(선택) — 빌드에 FTS5 모듈이 없으면 graceful 비활성.
                 # 본문(doc_sources.text)을 한+영 unicode61 토크나이저로 색인 → 약어·표준번호·영어
@@ -214,6 +229,62 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             logger.warning("node BM25 index unavailable (graceful): %s", exc)
             self._node_bm25_ok = False
 
+    def _shared_guarded(self) -> bool:
+        """공유 모드이고 pack_delete_operations 표가 있는지. ``_tx()``의 보호와 같은 질의다."""
+        if self._shared is None:
+            return False
+        return self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone() is not None
+
+    def _read_only_fts_ok(self, conn: Any) -> bool:
+        """쓰기 없이 doc FTS 객체 존재와 배치를 확인한다(#671). 색인 생성과 백필은 하지 않는다."""
+        try:
+            present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+            if not {_sfts.FTS, _sfts.CONTENT, _sfts.INDEX} <= present or not _sfts.layout_ok(conn):
+                logger.warning("FTS5 keyword index unavailable (read-only check): objects missing or layout differs")
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001 -- graceful off, same as the write path
+            logger.warning("FTS5 keyword index unavailable (read-only check): %s", exc)
+            return False
+
+    def _read_only_node_bm25_ok(self, conn: Any) -> bool:
+        """쓰기 없이 node BM25 객체 존재, 형식, ready 정합을 확인한다(#671).
+
+        쓰기 모드의 ``ensure_schema``는 형식이나 정합이 어긋나면 색인을 비우고 backfill로
+        되돌린다. 그것은 쓰기이므로 여기서는 하지 않고 기능을 끈다. state가 backfill이면 참이다.
+        """
+        from opencrab.ontology.bm25 import max_text_chars_setting
+
+        try:
+            present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+            required = {
+                _nbm.META, _nbm.STATS, _nbm.DOCS, _nbm.PENDING, _nbm.FTS, _nbm.VROW, _nbm.VINST,
+                *_nbm.TRIGGERS,
+            }
+            if not required <= present:
+                logger.warning("node BM25 index unavailable (read-only check): objects missing")
+                return False
+            meta = _nbm._meta(conn)
+            if (
+                meta.get("format") != _nbm.FORMAT
+                or _nbm._decode_chars(meta.get("max_text_chars")) != max_text_chars_setting()
+            ):
+                logger.warning("node BM25 index unavailable (read-only check): format or MAX_NODE_CHARS differs")
+                return False
+            if meta.get("state") == _nbm.STATE_READY:
+                if conn.execute(f"SELECT 1 FROM {_nbm.PENDING} LIMIT 1").fetchone() is None:
+                    rows = conn.execute("SELECT COUNT(*) FROM doc_nodes").fetchone()[0]
+                    indexed = conn.execute(f"SELECT doc_count FROM {_nbm.STATS} WHERE id=1").fetchone()
+                    if indexed is None or int(indexed[0]) != int(rows):
+                        logger.warning("node BM25 index unavailable (read-only check): row count differs")
+                        return False
+            return True
+        except Exception as exc:  # noqa: BLE001 -- graceful off, same as the write path
+            logger.warning("node BM25 index unavailable (read-only check): %s", exc)
+            return False
+
     # ------------------------------------------------------------------
     # Availability / lifecycle
     # ------------------------------------------------------------------
@@ -256,11 +327,30 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         return self._conn.execute(sql, params).fetchone()
 
     def _exec_write(self, sql: str, params: dict[str, Any]) -> int:
+        if self._shared is not None:
+            marker = self._shared.connection().execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                if self._shared.in_unit_of_work:
+                    self._shared.mark_rollback_only()
+                raise RuntimeError("unscoped document SQL write is not supported")
         with self._tx() as conn:
             cur = conn.execute(sql, params)
             return cur.rowcount
 
     def _exec_write_many(self, statements: list[tuple[str, dict[str, Any]]]) -> list[int]:
+        if self._shared is not None:
+            marker = self._shared.connection().execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                if self._shared.in_unit_of_work:
+                    self._shared.mark_rollback_only()
+                raise RuntimeError("unscoped document SQL write is not supported")
+        return self._exec_scoped_write_many(statements)
+
+    def _exec_scoped_write_many(self, statements: list[tuple[str, dict[str, Any]]]) -> list[int]:
         with self._tx() as conn:
             return [conn.execute(sql, params).rowcount for sql, params in statements]
 
@@ -408,6 +498,8 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         return _nbm.status(self._conn)
 
     def node_bm25_verify(self) -> dict[str, Any]:
+        if self._shared is not None and self._shared.in_unit_of_work:
+            raise RuntimeError("BM25 verification cannot run inside a shared unit of work")
         conn = self._conn
         conn.execute("BEGIN")
         try:
@@ -424,6 +516,78 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
     # Source ingestion — override to keep the FTS5 shadow table in sync
     # ------------------------------------------------------------------
 
+    def log_event(self, event_type: str, subject_id: str | None, details: dict[str, Any]) -> str:
+        if self._shared is None:
+            return super().log_event(event_type, subject_id, details)
+        self._require_available()
+        import contextlib
+        import os
+        import uuid
+        from datetime import UTC, datetime
+
+        from opencrab.stores._json import dump_props
+
+        event_id = str(uuid.uuid4())
+        from opencrab.locking import write_lock
+
+        transaction = self._shared.joined_tx() if self._shared.in_unit_of_work else self._shared.unit_of_work()
+        lock = contextlib.nullcontext() if self._shared.in_unit_of_work else write_lock(
+            os.path.dirname(self._shared.db_path)
+        )
+        with lock, transaction as conn:
+            conn.execute(
+                "INSERT INTO audit_log (event_id, event_type, subject_id, details, timestamp) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event_id, event_type, subject_id, dump_props(details), datetime.now(UTC).isoformat()),
+            )
+        return event_id
+
+    def upsert_node_doc(self, space: str, node_type: str, node_id: str, properties: dict[str, Any]) -> str:
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                validated = self._shared._uow.validated_packs
+                owners = [properties.get("pack_id") if isinstance(properties, dict) else None]
+                row = conn.execute(
+                    "SELECT properties FROM doc_nodes WHERE space=? AND node_id=?", (space, node_id)
+                ).fetchone()
+                if row is not None:
+                    import json
+
+                    try:
+                        owners.append(json.loads(row[0]).get("pack_id"))
+                    except (TypeError, ValueError, AttributeError):
+                        owners.append(None)
+                if any(not isinstance(owner, str) or owner not in validated for owner in owners):
+                    self._shared.mark_rollback_only()
+                    raise RuntimeError("node document owner is not validated")
+        return super().upsert_node_doc(space, node_type, node_id, properties)
+
+    def delete_node_doc(self, space: str, node_id: str) -> bool:
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                import json
+
+                row = conn.execute(
+                    "SELECT properties FROM doc_nodes WHERE space=? AND node_id=?", (space, node_id)
+                ).fetchone()
+                if row is not None:
+                    try:
+                        owner = json.loads(row[0]).get("pack_id")
+                    except (TypeError, ValueError, AttributeError):
+                        owner = None
+                    if not isinstance(owner, str) or owner not in self._shared._uow.validated_packs:
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("node document owner is not validated")
+        return super().delete_node_doc(space, node_id)
+
     def _write_source_state(
         self,
         source_id: str,
@@ -432,6 +596,29 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         source_integrity: dict[str, str | int],
     ) -> str:
         """Write source state and the FTS shadow entry in one transaction."""
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                validated = self._shared._uow.validated_packs
+                owner = metadata.get("pack_id")
+                row = conn.execute("SELECT metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchone()
+                if not isinstance(owner, str) or owner not in validated:
+                    self._shared.mark_rollback_only()
+                    raise RuntimeError("source owner is not validated")
+                if row is not None:
+                    import json
+
+                    try:
+                        old = json.loads(row[0])
+                        old_owner = old.get("pack_id") or old.get("source")
+                    except (TypeError, ValueError, AttributeError):
+                        old_owner = None
+                    if not isinstance(old_owner, str) or old_owner not in validated:
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("existing source owner is not validated")
         source_params, integrity_params = self._source_write_params(
             source_id, text, metadata, source_integrity
         )
@@ -449,7 +636,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                     ),
                 ]
             )
-        self._exec_write_many(statements)
+        self._exec_scoped_write_many(statements)
         return source_id
 
     def upsert_source(
@@ -463,9 +650,52 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             return self.write_source_original(source_id, text, metadata)
         return self.write_source_copy(source_id, text, metadata, state)
 
+    def rewrite_source_metadata(self, source_id, metadata, source_state):
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                import json
+
+                row = conn.execute("SELECT metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchone()
+                try:
+                    previous = json.loads(row[0]) if row is not None else None
+                    old_owner = previous.get("pack_id") or previous.get("source")
+                    new_owner = metadata.get("pack_id")
+                except (TypeError, ValueError, AttributeError):
+                    old_owner = new_owner = None
+                validated = self._shared._uow.validated_packs
+                if any(not isinstance(owner, str) or owner not in validated for owner in (old_owner, new_owner)):
+                    self._shared.mark_rollback_only()
+                    raise RuntimeError("source owner is not validated")
+        return super().rewrite_source_metadata(source_id, metadata, source_state)
+
     def delete_sources_with_state(self, source_ids: list[str]) -> int:
         if not source_ids:
             return 0
+        if self._shared is not None and self._shared.in_unit_of_work:
+            conn = self._shared.connection()
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                import json
+
+                validated = self._shared._uow.validated_packs
+                for source_id in source_ids:
+                    row = conn.execute("SELECT metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchone()
+                    if row is None:
+                        continue
+                    try:
+                        metadata = json.loads(row[0])
+                        owner = metadata.get("pack_id") or metadata.get("source")
+                    except (TypeError, ValueError, AttributeError):
+                        owner = None
+                    if not isinstance(owner, str) or owner not in validated:
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("source owner is not validated")
         placeholders = ", ".join(f":sid_{index}" for index in range(len(source_ids)))
         params = {f"sid_{index}": source_id for index, source_id in enumerate(source_ids)}
         statements = [
@@ -481,7 +711,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         ]
         if self._fts_ok:
             statements.append((_sfts.delete_sql(f"IN ({placeholders})"), params))
-        return self._exec_write_many(statements)[0]
+        return self._exec_scoped_write_many(statements)[0]
 
     def source_fts_report(self) -> dict[str, Any]:
         """#642: counts of the source FTS rows from one read snapshot."""

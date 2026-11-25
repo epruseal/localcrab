@@ -414,28 +414,52 @@ def pooled(runs: list[dict], kind: str) -> list[float]:
 
 
 def cmd_judge(args: argparse.Namespace) -> int:
-    s_runs, f1_runs = load_runs(args.s), load_runs(args.f1)
-    f2_runs = load_runs(args.f2) if args.f2 else []
-    verdict: dict = {"mode": "judge", "kinds": {}, "a_a_independent_copy": bool(f2_runs)}
+    for paths in (args.s, args.f1, args.f2 or []):
+        resolved = [Path(path).resolve() for path in paths]
+        if len(resolved) != len(set(resolved)):
+            raise ValueError("각 회차는 서로 다른 파일이어야 한다")
+    s_runs = [r for r in load_runs(args.s) if not r.get("noisy")]
+    f1_runs = [r for r in load_runs(args.f1) if not r.get("noisy")]
+    f2_requested = bool(args.f2)
+    f2_runs = [r for r in load_runs(args.f2) if not r.get("noisy")] if f2_requested else []
+    verdict: dict = {"mode": "judge", "kinds": {}, "a_a_independent_copy": f2_requested}
     for kind in KINDS:
-        s_ms, f1_ms = sorted(pooled(s_runs, kind)), sorted(pooled(f1_runs, kind))
-        if not s_ms or not f1_ms:
+        s_valid = [r for r in s_runs if r["raw"].get(kind)]
+        f1_valid = [r for r in f1_runs if r["raw"].get(kind)]
+        f2_valid = [r for r in f2_runs if r["raw"].get(kind)]
+        if not s_valid or not f1_valid:
             verdict["kinds"][kind] = {"status": "미측정"}
             continue
-        # 결과 일치 단언: S와 F1의 지문이 같아야 한다(한도에 걸린 그래프 질의는 크기만).
+        if len(s_valid) < 2 or len(f1_valid) < 2 or (f2_requested and len(f2_valid) < 2):
+            verdict["kinds"][kind] = {"status": "미결(유효 회차 부족)"}
+            continue
+        s_ms, f1_ms = sorted(pooled(s_valid, kind)), sorted(pooled(f1_valid, kind))
+        # 한도에 걸린 그래프 질의는 모든 회차에서 결과 크기를 비교한다.
+        all_runs = s_valid + f1_valid + (f2_valid if f2_requested else [])
+        fingerprints = [r["fingerprints"].get(kind, {}) for r in all_runs]
+        keys = set().union(*(set(fp) for fp in fingerprints))
+        if not keys:
+            verdict["kinds"][kind] = {"status": "무효(결과 지문 없음)"}
+            continue
         mismatches = []
-        for key, (fp, size, limit_hit) in s_runs[0]["fingerprints"].get(kind, {}).items():
-            fp1, size1, limit1 = f1_runs[0]["fingerprints"].get(kind, {}).get(key, [None, None, None])
-            same = size == size1 if (limit_hit or limit1) else (fp, size) == (fp1, size1)
+        for key in keys:
+            values = [fp.get(key) for fp in fingerprints]
+            if any(value is None for value in values):
+                mismatches.append(key)
+                continue
+            if any(value[2] for value in values):
+                same = len({value[1] for value in values}) == 1
+            else:
+                same = len({(value[0], value[1]) for value in values}) == 1
             if not same:
                 mismatches.append(key)
         if mismatches:
-            verdict["kinds"][kind] = {"status": "무효(결과 불일치)", "samples": mismatches[:5]}
+            verdict["kinds"][kind] = {"status": "무효(결과 불일치)", "samples": sorted(mismatches)[:5]}
             continue
         n = min(len(s_ms), len(f1_ms))
         use_p95 = n >= 100
-        if f2_runs:
-            f2_ms = sorted(pooled(f2_runs, kind))
+        if f2_requested:
+            f2_ms = sorted(pooled(f2_valid, kind))
             band50 = max(0.10, abs(statistics.median(f1_ms) - statistics.median(f2_ms)) / statistics.median(f1_ms))
             band95 = max(0.15, abs(pct(f1_ms, 0.95) - pct(f2_ms, 0.95)) / pct(f1_ms, 0.95))
             lower_bound = False
@@ -444,7 +468,7 @@ def cmd_judge(args: argparse.Namespace) -> int:
             def spread(q: float) -> float:
                 base = pct(f1_ms, q) if q != 0.5 else statistics.median(f1_ms)
                 devs = []
-                for r in f1_runs:
+                for r in f1_valid:
                     xs = sorted(r["raw"][kind])
                     v = pct(xs, q) if q != 0.5 else statistics.median(xs)
                     devs.append(abs(v - base) / base)

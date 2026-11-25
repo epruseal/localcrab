@@ -31,6 +31,22 @@ PK_INPUT = ["ctl1", "p1a", "p1b", "p2a", "p2b", "p3a", "pp", "x6", "x7", "z8", "
 P3_CONTROLS = ("x6", "x7", "z8", "z8b")
 
 
+def test_registry_delete_refuses_shared_single_database(tmp_path):
+    from types import SimpleNamespace
+
+    from opencrab.stores._single_file import SharedSqliteFile
+    from opencrab.stores.sql_store import SQLStore
+
+    path = tmp_path / "single.db"
+    shared = SharedSqliteFile(str(path))
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    try:
+        with pytest.raises(RuntimeError, match="guarded"):
+            rp._registry_delete(SimpleNamespace(sql=sql), "DELETE FROM ontology_nodes", {})
+    finally:
+        sql.close()
+
+
 def _open_stores(root: Path) -> rp.Stores:
     from opencrab.stores.local_graph_store import LocalGraphStore
     from opencrab.stores.local_sql_doc_store import LocalSQLDocStore

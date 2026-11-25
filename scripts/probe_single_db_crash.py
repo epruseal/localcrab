@@ -85,7 +85,8 @@ def child(args: argparse.Namespace) -> int:
     kw = {"shared": shared} if shared is not None else {}
     docs = LocalSQLDocStore(str(doc_path), **kw)
     vec = SqliteVecStore(str(vec_path), embedding_function=_embed, dim=DIM, **kw)
-    sql = SQLStore(f"sqlite:///{d / 'opencrab.db'}")
+    sql_path = doc_path if shared is not None else d / "opencrab.db"
+    sql = SQLStore(f"sqlite:///{sql_path}", **kw)
     user_id = create_user(sql, "crash-owner", is_local=True)
     create_pack(sql, user_id, PACK)
 

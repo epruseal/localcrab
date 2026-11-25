@@ -80,8 +80,8 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 
 #### 3.3 캐시 무효화
 
-- BM25 posting 캐시와 ANN 캐시는 `PRAGMA data_version`으로 신선도를 본다. 단일 파일에서는 graph, vector, registry 어느 쓰기에도 이 값이 오른다. 캐시가 더 자주 무효가 된다. 비용은 기록 문서의 `vecgraph` 쓰기 실행에서 본다.
-- ANN 캐시 무효화 시점은 현재 commit 앞이다. 다른 스레드가 commit 전 스냅숏으로 캐시를 다시 만들 수 있다. 3단계에서 commit 뒤 무효화 훅으로 옮긴다. 기본값(`ann=""`)에는 해당 없다.
+- BM25 posting 캐시는 `PRAGMA data_version`으로 신선도를 본다. 단일 파일에서는 graph, vector, registry 어느 쓰기에도 이 값이 오르므로 캐시가 더 자주 무효가 된다. 비용은 기록 문서의 `vecgraph` 쓰기 실행에서 본다. ANN 캐시는 `data_version`이 바뀌어도 벡터 표의 `max(rowid)`가 같으면 유지한다(9.3 D).
+- ANN 캐시 무효화는 commit 뒤로 옮겼다. 쓰기 구간 안의 쓰기는 `after_commit` 콜백으로 캐시를 비우고 세대를 올리며, 세대 비교가 빌드 중 commit이 남기는 낡은 캐시의 설치를 막는다(9.3 E).
 
 - 받아들임 기준(주체마다):
   - 시험 DB의 초기 행을 0으로 두고 doc 쓰기, vector 쓰기, graph 쓰기 각각에 예외를 주입한다. 단일 파일에서는 실패한 건이 어느 축에도 남지 않는다.
@@ -99,7 +99,7 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
   1. `write.lock`을 잡고 서비스를 정지한다(서비스 매니저로 정지한다).
   2. 다섯 파일 전체를 백업한다. 백업 사본으로 복구 시험을 먼저 한다.
   3. 병합 도구를 계획 모드로 돌려 이름 충돌과 쪽 크기를 확인한다.
-  4. 병합 도구를 `--apply --verify`로 돌린다. 출력은 `.partial`로 만들어지고 검증을 통과해야 게시된다. 게시는 파일 fsync, `os.replace`, 디렉터리 fsync 순서다(복사 중에는 `synchronous=OFF`이므로 게시 전 fsync가 내용 내구성을 보장한다). 전원 손실 내구성 자체는 이번 측정에서 시험하지 않았다.
+  4. 병합 도구를 `--apply --verify`로 돌린다. 출력은 `.partial`로 만들어지고 검증을 통과해야 게시된다. 게시는 파일 fsync, `os.link`로 새 이름 연결과 `.partial` 제거, 디렉터리 fsync 순서이며 기존 대상은 덮어쓰지 않는다. 복사 중에는 `synchronous=OFF`이므로 게시 전 fsync가 내용 내구성을 보장한다. 전원 손실 내구성 자체는 이번 측정에서 시험하지 않았다.
   5. 게시 전후에 실데이터 질의를 한다(아래 받아들임 기준).
   6. 설정에 단일 파일 경로를 넣고 서비스를 시작한다. 원본 다섯 파일은 보존 기간 동안 건드리지 않는다.
 - billing: `billing_events`와 `idx_billing_tenant`가 registry와 이름이 겹친다. billing은 #105의 격리 사유도 있어 기본 결정은 분리 유지다. 합치려면 한쪽 테이블 이름을 바꾸고 `BillingHooks`의 이름을 함께 바꾸는 변경이 필요하다. 기록 문서의 billing 판정이 "병합 가능"일 때만 이 변경을 이 단계에 넣는다.
@@ -140,10 +140,10 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 | registry 연결 공유 | SQLAlchemy `creator` 주입과 pysqlite의 `BEGIN` 처리 | 2단계 선행 프로브 |
 | `snapshot_path` 구간 안 호출 | 구간 안 호출은 별도 연결을 열어 교착 위험. 시제품은 계약만 문서화했다 | 2단계에서 `RuntimeError` 거부 |
 | 락 시간 | 구간이 쓰기 락을 쥔 시간만큼 다른 쓰기 연결이 기다린다. 기록 문서의 쓰기 중 읽기 절에 측정값이 있다 | 3단계 임베딩 위치 결정 |
-| 캐시 무효화 범위 | `data_version`은 파일 전체의 쓰기에 오른다 | 3단계 측정 후 결정 |
+| 캐시 무효화 범위 | `data_version`은 파일 전체의 쓰기에 오른다. ANN 캐시는 벡터 `max(rowid)`로 걸러 영향이 없다 | BM25 캐시는 3단계 측정 후 결정, ANN 캐시는 9절 |
 | `lower` UDF | 그래프 저장소가 등록한 `lower`가 단일 연결에서 다른 저장소에도 보인다. 지금 스키마의 인덱스와 트리거는 `lower`를 쓰지 않는다. `lower` 표현식 인덱스를 만들면 의미가 달라진다 | 새 인덱스 추가 때 점검 |
 | 전원 손실 | WAL과 `synchronous=NORMAL`에서 마지막 commit이 사라질 수 있다. 단일 파일은 한 commit이 원자적이므로 축 사이가 어긋난 상태는 남지 않는다. 다섯 파일은 파일마다 commit이 따로 사라질 수 있다. 시험하지 않았다. 분석만 했다 | 3단계 |
-| 백업 도구 | `backup_data_dir`는 고정 파일 목록을 쓴다. 단일 파일 경로는 목록에 없다 | 4단계 |
+| 백업 도구 | `backup_data_dir`는 고정 파일 목록을 쓰고 단일 모드를 거부한다. 단일 모드 백업은 별도 함수 `backup_single_root`이고 CLI가 `SINGLE_SQLITE_FILE`이 있을 때만 이 함수를 부른다. 복원은 `opencrab.stores.single_restore`다(7.4) | B6에서 구현 |
 | 쓰기 락 직렬화 | 프로세스 사이 쓰기는 지금도 `write.lock`으로 직렬화된다 | 측정으로 판정 |
 
 ## 6. 재현 명령
@@ -153,3 +153,250 @@ Settings와 factory 연결은 시제품에 넣지 않았다. 3단계에서 넣�
 - 예외 주입 시험: `python -m pytest tests/test_load_chunks_single_file.py`.
 - 공유 연결 시험: `python -m pytest tests/test_single_file_store.py`.
 - 측정 도구: `python scripts/bench_single_db.py <samples|latency|judge|concurrent|maintenance> --help`.
+
+## 7. factory 연결과 전환 전제
+
+단계 3.1의 factory 연결을 구현한 상태를 적는다. 이 절의 항목은 모두 시험 이름이나 후속 항목 이름을 하나 이상 가리킨다. 시험은 `tests/test_factory_single_file.py`에 있고 괄호 안은 설계 시험 번호다. 각 시험의 설명 문장이 설계 시험 번호로 시작하므로 번호로 찾을 수 있다.
+
+### 7.1 동작
+
+- `SINGLE_SQLITE_FILE`이 비어 있으면 모든 factory가 다중 파일 구조를 그대로 만든다(T-N1 `test_single_setting_empty_uses_multi_file_paths`).
+- 설정이 있으면 graph, doc, vector, sql factory가 한 `SharedSqliteFile`을 나눠 쓴다. 객체는 경로별 등록부가 하나만 만들고 결속 검증(대장, manifest, marker, metadata 행)을 거친 뒤 등록한다(T-N2 `test_single_four_stores_share_one_file`, T-N4, T-N5, T-G1).
+- billing factory는 등록부에 결속된 열린 SQL 저장소가 있을 때만 root의 `billing.db`를 연다(T-N3, T-E11).
+- 대장 state가 authorized가 아니면 DB를 열기 전에 거부한다. root에 `-wal`과 `-shm`이 생기지 않는다(T-E1, T-G3).
+
+### 7.2 전환 전제
+
+1. 게시된 root의 대장 state가 authorized여야 한다. ready나 staged는 거부된다(T-E1). 게시 도구는 대장을 ready까지만 올린다. 병합 도구의 `authorize` 하위 명령이 ready를 authorized로 한 번 올린다. 사본 시험은 `python scripts/merge_sqlite_stores.py authorize --root <게시 root> --run-kind copy-test --verification-pass <독립 검증 PASS 파일> --copy-test-run-id <식별자> --apply`로, 운영은 `--run-kind production --verification-pass <독립 검증 PASS 파일> --copy-test-pass <사본 시험 PASS 파일> --apply`로 실행한다. `--apply`가 없으면 점검만 하고 root를 바꾸지 않는다. 이 명령은 PASS 파일의 존재와 형태만 본다. 성공하면 사본 시험 실행은 독립 검증 PASS 파일 하나의 sha256을, 운영 실행은 두 PASS 파일의 sha256을 stderr의 `authorize applied` 줄에 찍는다. 그 값을 실행 기록과 대조하는 일은 호출자의 몫이다.
+2. 대장, manifest, marker, metadata 행이 서로 맞아야 한다. 어긋나면 거부된다(T-E2).
+3. `STORAGE_MODE=local`이고 sqlite-vec 벡터 백엔드이며 `SINGLE_SQLITE_FILE`이 root 안 `single.db`의 절대 경로여야 한다(T-E3 `test_single_rejects_bad_settings`).
+4. 설정의 `LOCAL_DATA_DIR`과 환경변수 `LOCAL_DATA_DIR`이 모두 root와 같아야 한다. `write.lock`과 `billing.db.lock`과 삭제 저널 디렉터리가 root 아래에 놓이기 때문이다(T-E3).
+5. 이전 데이터 디렉터리의 `packs/`, `openclaw-conversations/`, `datasets/` 세 항목을 root로 옮기는 절차는 8.6에 있다. 삭제 저널은 옮기지 않고 옛 디렉터리에 둔다.
+6. 단일 모드에서 `write.lock`을 쥔 스레드가 factory를 직접 처음 부르면 수명 잠금 순서 위반으로 거부된다(T-E9 `test_single_first_call_under_write_lock_is_rejected`). `write.lock`을 factory보다 먼저 잡는 진입인 MCP 쓰기 도구와 `crabharness` 적용은 `hold_single_file`이 `write.lock` 앞에서 공유 파일을 열고 결속을 판정한다. 그래서 첫 쓰기 호출이 서고 미승인 root는 `write.lock`이 생기기 전에 거부된다(`tests/test_single_mode_auth_lock_order.py`의 T12-N6, N7, E1, G1).
+7. `SINGLE_SQLITE_FILE` 없이 단일 root(`ledger.json`이나 `single.db`가 있는 디렉터리)를 `LOCAL_DATA_DIR`로 받은 프로세스는, root에 파일을 만들거나 DB를 열기 전에 거부된다. 거부 지점은 다섯 파일 factory와 직접 생성자, chroma 분기, bootstrap-on-empty, 백업(데이터 디렉터리와 목적지 둘 다), `migrate_chroma_to_sqlite_vec.py`, `migrate_to_local.py`, `import_obsidian_vault.py`, 그리고 `LOCAL_DATA_DIR`을 필수 인자나 기본값으로 받아 root 아래에 쓰거나 `write.lock`을 잡는 스크립트 여섯(`repair_store_mismatch_499.py`, `cleanup_openclaw_heartbeat_493.py`, `export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`, `backfill_space.py`)과 CLI 명령 둘(`packs backfill-pack-id --apply`, `packs source-fts-orphans --apply`), `crabharness`의 승격 적용(`apply_promotion_package`)이다. `crabharness` 적용은 `SINGLE_SQLITE_FILE`이 없을 때만 이 거부를 지난다. 단일 모드에서는 root의 `write.lock`이 정상 구성원이다. `hold_single_file`이 `write.lock` 앞에서 결속을 판정한다. 두 CLI 명령은 단일 모드에서 `SINGLE_SQLITE_FILE is set` 문구로 `write.lock` 앞에서 거부한다. root에 옛 `graph.db`나 `doc_store.db`가 없으면 두 명령은 그 거부보다 먼저 `graph.db not found`나 `doc_store.db not found`로 끝난다. 이때도 root는 바뀌지 않는다. 두 명령은 root 안의 옛 `graph.db`와 `doc_store.db`로 계획을 만든다. 단일 모드의 factory는 단일 파일 위의 저장소를 돌려준다. 그 계획을 실행하면 계획을 단일 그래프에 쓰게 된다. `SINGLE_SQLITE_FILE is set` 거부는 그 오사용을 막는다(T12-E5). query, ingest, serve stdio는 단일 모드에서 인증을 단일 DB로 통과한다. `crabharness` CLI의 `promotion-apply`는 `SINGLE_SQLITE_FILE`이 없는 단일 root에서 인증 단계(`require_local_principal`)가 먼저 `No local user is bootstrapped` 오류로 끝나고 root는 바뀌지 않는다. 쓰기 거부는 라이브러리 호출자(`apply_promotion_package`)를 막는다. 거부된 경우 root는 바뀌지 않는다. 출력 경로를 명시해야 쓰는 스크립트와 읽기 전용 스크립트는 root 아래에 쓰지 않으므로 이 거부와 무관하다(인자 처리는 각 스크립트가 정하고 `tests/test_five_file_single_root_guard.py`가 거부 지점을 고정한다). 그래서 롤백은 root를 치운 뒤에 환경 설정을 고친다(7.4). 팩토리와 생성자 경로의 검사는 열려는 DB 파일의 바로 위 디렉터리만 본다. 출력 경로를 기본값으로 받는 세 스크립트(`export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`)는 그 경로의 모든 상위 디렉터리를 본다. 거부 사유는 `single SQLite root requires SINGLE_SQLITE_FILE`이다(`tests/test_five_file_single_root_guard.py`). 이 거부와 root 불변은 옛 DB 파일(`graph.db`, `doc_store.db` 등)이 없는 root에 대한 약속이다. 옛 DB 파일이 섞인 혼합 root에서는 읽기 전용 경로가 거부 없이 `-wal`과 `-shm`을 만들 수 있다. 대상은 `packs backfill-pack-id`와 `packs source-fts-orphans`의 dry-run, 그리고 `mode=ro`로 여는 스크립트다. 그 보호는 이 단위의 범위 밖이다(같은 시험 파일의 `test_t11_e10_mixed_directory_with_wal_graph_db_gets_no_sidecars`는 표식 검사 경로 하나가 곁파일을 만들지 않음만 고정한다. 나머지 읽기 전용 경로의 곁파일 생성은 시험으로 고정되지 않았다). 운영 런북(8.6)은 옛 데이터 디렉터리를 root 밖의 `.pre671` 이름 디렉터리로 두고 root에는 세 항목만 옮기므로 운영 root에는 옛 DB 파일이 없다. 이 상태는 재인입 서비스가 옛 `graph.db`에 직접 연결하지 않을 때만 유지되며 그 대응은 별도 변경이다.
+
+### 7.3 지원하지 않는 기능
+
+- 단일 모드의 사용자 생성: `opencrab init`은 `.env`를 만들기 전에 거부한다. bootstrap-on-empty는 읽기 전용이라 사용자를 만들지 않는다. 단일 root의 사용자와 토큰은 병합 입력에서 온다. 인증 세 경로(stdio와 CLI의 `require_local_principal`, `maybe_bootstrap_on_empty`, HTTP 토큰 조회)는 단일 DB를 읽는다. 열기 실패는 HTTP에서 503과 `Retry-After`다(`tests/test_single_mode_auth_lock_order.py`의 T12-N2, N3, N4, E3, E8).
+- backfill과 `backup_data_dir`의 직접 호출: 단일 모드를 거부한다(T-E8 a와 b, 후속 `followup_671_backup_backfill_single`). `backfill_space`, `migrate_to_local`, `reconcile_doc_graph_nodes`가 단일 모드에서 조용히 백업을 얻지 않게 하려는 거부다. 단일 모드 백업은 CLI `python -m opencrab.stores.backup --to <목적지>`가 `backup_single_root`로 만든다. 세트에는 `single.db`, `billing.db`, `MANIFEST.json`만 들어가고 `--exclude`는 거부된다. 삭제 흔적(`pack_delete_operations` 행이나 `delete-pack-journals` 파일)이 있으면 삭제 저널 단위가 준비될 때까지 거부한다.
+- 관리 CLI: `packs backfill-pack-id --apply`와 `packs source-fts-orphans --apply`는 단일 모드에서 명시 문구로 거부한다(T-E8 c와 d, T12-E5). user와 token 관리 명령은 단일 모드를 모른다(후속 `followup_671_admin_cli_single`).
+- 삭제, fork, 증분 노드 정리: `pack_delete_operations` 표가 있으면 거부한다(T-N7 `test_single_write_gates_stay_fail_closed`와 `test_single_delete_and_fork_gates_stay_fail_closed`). 삭제 저널 단위(후속 `followup_671_delete_journal_unit`)가 이 거부를 푼다. 그때 `test_single_file_delete_reserves_before_external_journal`의 xfail을 지운다.
+- node BM25 색인이 backfill 상태이거나 검색 중 drain이 필요한 경우: 단일 모드에서 진행하지 못하거나 작업 단위 밖에서 쓴다(T-N2가 ready 상태 게시 DB만 허용한다. 후속 `followup_671_bm25_backfill_single`, `followup_671_bm25_drain_single`).
+- 공유 객체 없이 단일 파일을 여는 경로: 보호 검사(`reject_unmanaged_single_file`)가 표식 표가 있으면 거부한다. 다른 연결이 파일을 잠가 읽지 못해도 파일 헤더로 저널 모드를 가려 판정하거나 거부한다. WAL 파일은 기존 연결과 같은 대기 뒤에도 읽지 못하면 BUSY를 올린다. 롤백 저널 파일은 잠금 없는 읽기로 표식만 판정한다. 판정할 수 없으면 거부한다. 롤백 DB에 hot journal이 남았으면 rw 연결로 저널을 회복한 뒤 판정한다. 이 예외를 그대로 받는 곳은 검사 함수를 직접 부르는 스크립트와 단일 모드 billing이다. 다섯 파일 저장소 생성자(graph, doc, vector, SQL)는 판정할 수 없으면 예외를 올리지 않고 파일을 열지 않은 채 그 저장소만 비가용으로 둔다. 표식이 있거나 단일 root여서 확정한 거부는 생성자도 그대로 올린다. 비가용 저장소를 만들 때 write.lock과 billing의 own-file 잠금은 main과 같이 생길 수 있다. 본파일 바이트와 표는 바뀌지 않고, WAL 파일에서는 검사가 `-wal`과 `-shm`을 만들 수 있다(main도 연결로 만든다). 거부된 SQL 저장소는 `_engine`을 가지며 새 연결 때마다 검사를 다시 하므로, 잠금이 풀린 뒤에도 표식 있는 파일에는 쓰지 않는다(시험 `test_unmanaged_check_refuses_locked_marker_db`, `test_unmanaged_check_refuses_locked_wal_db`, `test_locked_marker_db_is_not_opened_even_when_lock_is_released_after_the_check`, `test_unmanaged_check_undeterminable_is_refused`, `test_unmanaged_check_recovers_hot_journal_rollback_db`, `test_five_file_store_with_busy_wal_marker_db_is_unavailable`, `test_refused_marked_billing_file_is_not_written_after_lock_release`, `test_context_is_built_when_one_five_file_store_is_unavailable`). 잔여 위험은 일곱이다. 첫째, 롤백 파일의 잠금 없는 읽기(immutable)는 merge 부분 파일이면 틀린 결과를 낼 수 있다(후속 `followup_671_partial_marker_order`). 게시된 단일 파일은 늘 WAL이라 이 경로에 닿지 않는다(`test_published_single_db_is_wal`). 둘째, 관리 밖에서 단일 파일 사본을 롤백 모드로 바꾼 파일에도 같은 오판 가능성이 있다. 이 사본은 게시 보장 밖이다. 셋째, 롤백 DB가 스키마를 바꾸는 중에 잠겨 있으면 잠금 없는 읽기가 틀린 결과를 낼 수 있다. 넷째, 저널을 회복하는 창에서 잠금 없는 읽기가 틀린 결과를 낼 수 있다. 판정 뒤 헤더를 다시 읽어 모드 전환은 막지만 이 창은 막지 못한다. 다섯째, hot journal 회복 재시도는 저널 회복이라는 쓰기를 한다. finalize 중에 종료해 hot journal이 남은 `.partial`에 이 재시도가 닿으면 merge가 보존하라고 한 `.partial`의 바이트를 바꾼다. 여섯째, 회복 재시도가 BUSY와 LOCKED가 아닌 코드로 실패하면 검사 함수를 직접 부르는 스크립트가 그 예외를 그대로 받는다. 다섯 파일 MCP HTTP 인증 조회에서는 그 예외도 판정 불가로 기록되어 503 store-unavailable이 된다. 일곱째, BUSY나 읽기 실패로 판정하지 못한 저장소는 그 프로세스 동안 비가용이다. main은 잠금이 그 뒤 풀리면 가용이 될 수 있다. 롤백 저널 파일의 BUSY는 검사가 0.2초만 기다리고 main은 5초 기다린다. 로컬 저장소의 ping류(가용 여부를 보지 않고 연결을 쓰는 경로)는 잠금이 풀린 뒤에도 거부를 다시 올리나 main은 연결된다. MCP HTTP 인증 조회는 로그 이유가 store-busy에서 store-unavailable로 바뀐다. 거부된 SQL 저장소의 새 연결은 표식이 없을 때만 만들어지며, 표식이 있으면 RuntimeError, 판정 불가이면 sqlite 오류다.
+
+  main의 billing SQL 저장소는 `billing.db`가 열리면 available이 True다. 열리지 않으면 available이 False다. 이 변경은 표식 검사가 sqlite 오류나 OS 오류로 그 파일을 판정하지 못하면 False다(전수 목록이 아닌 예: 헤더나 스키마를 읽지 못하는 손상 파일, 읽기를 막는 잠금이 걸린 WAL 파일, `-wal`이나 `-shm`을 만들거나 열 수 없는 WAL 파일, 회복하지 못한 hot journal이 남은 롤백 파일). 이 차이는 거부 기록이 있으면 파일을 열지 않기 때문이며 설계가 받아들인 차이다. 데이터 디렉터리나 그 상위 디렉터리를 탐색할 수 없으면 이 변경에서는 생성자가 예외를 올린다(#700). 잠겨 있기만 한 롤백 저널 `billing.db`는 main과 이 변경 둘 다 available이 True다.
+
+  REST 인증 조회는 예외를 종류별로 분류하므로 잠금(BUSY와 LOCKED) 중에는 store-busy 503을 그대로 남기고 그 밖의 코드는 main과 같이 500이다.
+- 한 공유 객체 위에서 저장소를 동시에 만드는 일: 훅을 등록하는 생성은 factory의 레지스트리 잠금 안에서 한 번에 하나씩 일어난다(T12-N8). 작업 단위 안의 저장소 생성은 그 잠금을 잡기 전에 거부한다(T12-G8, G10). 남은 한계는 둘이다. 열린 공유 객체를 받은 뒤 소유자를 등록하기 전에 다른 스레드가 마지막 소유자를 풀면 등록이 실패한다. 쓰기 도구의 첫 호출이 `write.lock` 안에서 컨텍스트를 만드는 기존 순서 반전은 비단일 모드와 같이 남는다.
+
+### 7.4 롤백
+
+순서는 다음 넷이다. 첫째, 서비스를 멈춘다. 둘째, 8.6에서 root로 옮긴 세 항목을 전환 전 디렉터리로 되돌리고 게시 root를 보존 이름으로 옮긴다. `<root>.intent.json`과 `<root>.lifetime.lock`도 같은 접미사의 보존 이름으로 옮긴다. intent가 남으면 다음 게시가 `publication artifacts already exist`로 거부된다. 순서의 정본은 8.6의 롤백 항목이다. 셋째, `SINGLE_SQLITE_FILE`을 비운다. 8.6처럼 전환 전 디렉터리를 원래 이름으로 되돌렸으면 `LOCAL_DATA_DIR` 값은 바꾸지 않는다. 되돌리지 않았으면 `LOCAL_DATA_DIR`을 전환 전 데이터 디렉터리로 바꾼다. 넷째, 서비스를 시작한다. root를 옮기기 전에 설정만 바꾸면 안 된다. `SINGLE_SQLITE_FILE`만 비우고 `LOCAL_DATA_DIR`이 root인 채로 두면 다섯 파일 factory가 root를 거부한다(7.2의 7번). 그 거부는 root를 바꾸지 않으므로 서비스는 뜨지 않고 root에는 빈 파일이 생기지 않는다. 단일 모드에서 쓴 데이터는 이전 파일에 없다. 그러므로 이 롤백은 단일 모드에서 새로 쓰기 전까지만 데이터 손실이 없다. 설정이 비어 있는 경로는 코드를 되돌리지 않아도 이전과 같다(T-N1). authorized 상태는 되돌리는 명령이 없다. 게시 root를 되돌릴 때는 root를 보존 이름으로 옮긴다.
+
+단일 모드에서 쓴 뒤 단일 파일을 롤백 지점으로 되돌릴 때는 복원 명령을 쓴다. 롤백 지점은 `python -m opencrab.stores.backup --to <root 밖 목적지>`가 만든 세트다. 서비스와 임시 인스턴스를 멈추고 `single.db`, `billing.db`와 각 `-wal`, `-shm`의 `fuser` 출력이 0줄인 것을 확인한 뒤 다음을 실행한다.
+
+```bash
+python -m opencrab.stores.single_restore <세트 디렉터리>            # dry-run(기본): 점검과 계획만 출력하고 root를 바꾸지 않는다
+python -m opencrab.stores.single_restore <세트 디렉터리> --apply    # root의 두 파일을 세트로 되돌린다
+```
+
+- 종료 코드: 0은 전부 통과다. 1은 보존 링크를 거는 단계 앞의 거부다(설정 읽기, 사전 점검, 수명 잠금, `write.lock`, 임시 복사). root의 두 파일은 그대로다. 임시 복사가 실패한 뒤 임시 이름 정리까지 실패한 드문 경우에만 `.restore-tmp-*` 이름이 남는다(#692). 2는 root가 바뀌었을 수 있는 오류다. 교체 중 오류, 교체 뒤 점검(무결성과 행 수) 불일치, `write.lock` 구간의 예외, 교체 뒤 결속 검증 실패, 예상하지 못한 실패가 여기에 든다. 사람이 보존 이름과 임시 이름을 보고 판단한다. 3은 이전 적용이 남긴 `.restore-tmp-*`나 `.restore-saved-*` 이름을 root에서 발견한 거부이고 root는 그대로다.
+- 되돌리기 전에 옛 `single.db`, `billing.db`와 곁파일(`-wal`, `-shm`, `-journal`)을 지우지 않고 `<이름>.restore-saved-<적용 id>`로 남긴다. 임시 복사본은 `<이름>.restore-tmp-<적용 id>`다. 보존 이름이나 임시 이름이 하나라도 root에 있으면 재복원은 rc 3으로 거부한다. 그 이름을 확인해 치우거나 옮긴 뒤 다시 실행한다.
+- 교체 순서는 `single.db` 보존 링크를 가장 먼저 걸고 `single.db` rename을 가장 나중에 한다. 그 사이 중단되면 live `single.db`의 링크 수가 2라 factory 경유 열기가 `file must be regular and have one link`로 거부된다. 이 거부는 의도한 닫힌 실패다.
+- 점검(`integrity_check`와 표별 행 수)은 독점 수명 잠금 아래에서 하고 결속 검증은 잠금을 푼 뒤에 한다. 계획 문서의 `quick_check` 순서와 다르다.
+- 복원 도구는 `openclaw-conversations/automation`과 `cursor_state.json`을 건드리지 않는다. 8.6 P7의 롤백 지점 사본의 되돌림은 운영 절차가 맡는다.
+
+### 7.5 재현 명령
+
+- factory 단일 모드 시험: `python -m pytest tests/test_factory_single_file.py tests/test_factory_storage_modes.py`.
+- authorize 하위 명령 시험: `python -m pytest tests/test_authorize_single_root.py`.
+- 이 절의 문서 점검: 저장소 루트에서 `rg -nP` 패턴으로 머신 경로와 커밋 해시를 찾아 0건(종료 코드 1)임을 확인한다.
+- 8절의 문서 점검: 같은 `rg -nP` 명령을 8절 범위에도 적용해 0건(종료 코드 1)임을 확인한다.
+
+## 8. 게시 중단 복구와 전환 런북
+
+이 절은 운영자가 따르는 절차다. 7절은 코드 동작과 시험 근거를 적고 8절은 사람이 하는 일을 적는다. 모든 경로의 `<root 부모>`와 `<root 이름>`은 실제 값으로 바꿔 쓴다. 한 줄에 단순 명령 하나만 실행한다.
+
+### 8.1 산출물 이름과 잠금
+
+게시 단계에 쓰는 이름은 다음과 같다.
+
+| 이름 | 위치 | 만드는 때 | 사라지는 때 |
+|---|---|---|---|
+| `<세트 이름>.source.lifetime.lock` | 원본 세트의 상위 디렉터리 | 운영자가 게시 전에 만든다 | 운영자가 지운다 |
+| `<root>.lifetime.lock` | root의 부모 | 게시 도구가 잠글 때 만든다 | 남는다(다음 게시가 다시 잠근다). 8.6 P7 롤백에서 보존 이름으로 옮긴다 |
+| `<root>.intent.json` | root의 부모 | 게시 도구가 만든다(state는 preparing, publishing, ready 순서) | 게시 도구는 지우지 않는다. 게시가 끝나면 ready로 남고 실패하면 그때의 state로 남는다. 8.4 복구와 8.6 롤백에서 보존 이름으로 옮긴다 |
+| `<root>.intent.json.tmp` | root의 부모 | 게시 도구가 intent를 publishing이나 ready로 바꿀 때 만든다 | rename으로 사라진다. 그 사이에 게시 도구가 죽거나 쓰기가 실패하면 남는다 |
+| `<root>.staging` | root의 부모 | 게시 도구가 만든다 | 이름이 root로 바뀐다 |
+| `<root>` | root의 부모 | staging이 이름을 바꿔 생긴다 | 8.4 복구와 8.6 P7 롤백에서 보존 이름으로 옮긴다 |
+| `ledger.json.tmp` | root 안 | 게시 도구가 ledger를 ready로 바꿀 때와 `authorize`가 ledger를 authorized로 바꿀 때 만든다 | rename으로 사라진다. 그 사이에 게시 도구나 authorize가 죽거나 쓰기가 실패하면 남는다 |
+| `billing.db`, `ledger.json`, `manifest.json`, `marker.json`, `single.db`, `single.db.lifetime.lock` | root 안 | 게시 도구가 만든다(여섯 이름이 게시한 파일 전부다) | root와 함께 움직인다 |
+
+### 8.2 게시 준비
+
+1. 원본 세트를 검증한다. 이 명령은 병합 원본 세트(다섯 파일 형식)에만 쓴다. 종료 코드 0과 `OK` 줄이 나와야 한다.
+
+```bash
+python -m opencrab.stores.backup --verify <세트 디렉터리>
+```
+
+2. 원본 잠금 파일을 만든다. 파일은 비어 있는 일반 파일이고 링크 수가 1이어야 한다. 병합 도구는 이 파일을 만들지 않고 읽기 전용으로 열어 공유 잠금만 건다. 아래 명령은 파일이 이미 있으면 덮어쓰지 않고 `cannot overwrite existing file`과 rc 1로 멈춘다.
+
+```bash
+bash -c 'set -o noclobber; : > <세트 상위 디렉터리>/<세트 이름>.source.lifetime.lock'
+stat -c '%F %s %h' <세트 상위 디렉터리>/<세트 이름>.source.lifetime.lock
+```
+
+`stat` 출력은 `regular empty file 0 1`이어야 한다.
+
+3. 증거 파일을 만든다. 만드는 코드는 없으므로 운영자가 쓴다. 키는 13개다: `version`, `snapshot_id`, `source_manifest_sha256`, `preparer_id`, `frozen_from`, `frozen_until`, `writer_stopped`, `billing_same_snapshot`, `packs_observation`, `backup_at`, `packs_checked_at`, `capture_from`, `capture_until`. 값의 관계는 다음과 같다.
+   - `version`은 1이다. `preparer_id`는 비어 있지 않은 문자열이다. `snapshot_id`는 세트 `MANIFEST.json`의 `set_id`와 같다. `source_manifest_sha256`은 `MANIFEST.json` 바이트의 sha256이다.
+   - `frozen_from` <= `capture_from` <= `capture_until` <= `frozen_until`이고 `packs_checked_at`은 `frozen_from`과 `frozen_until` 사이다.
+   - `backup_at`은 `MANIFEST.json`의 `created_at`과 같고 `capture_until`은 `created_at`에 1초를 더한 시각보다 앞선다.
+   - 시각은 모두 `Z`나 `+00:00` 같은 UTC 오프셋을 명시해 쓴다. 오프셋이 없거나 UTC가 아니면 증거 검사가 거부한다. `writer_stopped`와 `billing_same_snapshot`은 true이고 `packs_observation`은 `"absent"`다.
+4. 증거 경로 규칙: authorize의 증거 인자(`--verification-pass`, `--copy-test-pass`)는 절대 경로로 쓰고 경로에 쉼표를 넣지 않는다. `authorize applied` 줄은 경로를 쉼표로 이어 찍으므로 쉼표가 있으면 실행 기록과의 대조가 갈라진다.
+5. 병합 도구를 `--apply` 없이 먼저 돌려 계획을 본다. `--apply`가 없으면 계획 모드이고 이 모드는 정상이어도 `publication mode is not ready`와 rc 2로 끝난다.
+
+### 8.3 정상 완료 상태
+
+`ledger authorized`와 `intent ready`의 조합이 정상 완료 상태다. 런타임이 root를 연 뒤에는 병합 도구의 `authorize` 재실행이 `root file set differs`로 거부되는 것이 정상이다. 열기 경로에 따라 `single.db-wal`과 `single.db-shm`이 생겨 root의 항목 집합이 달라지기 때문이다. 이 상태를 재실행으로 확인하지 않는다.
+
+factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/stores/_sqlite_base.py`, `opencrab/stores/sql_store.py`와 일부 스크립트). 이 경로는 `mode=ro`로 열어도 `-wal`과 `-shm` 곁파일을 만들 수 있다.
+
+### 8.4 게시 중단 복구
+
+정본 절차는 하나다. 남은 산출물을 보존 이름으로 옮기고 병합을 처음부터 다시 돌린다. 보존 이름은 `<이름>.aborted-<UTC 시각>`이고 한 번의 복구에서 네 이름 모두 같은 접미사를 쓴다. 접미사는 운영자가 한 번 정해 이후 명령에 그대로 적는다.
+
+1. 바깥 잠금 확인. 바깥 잠금은 게시 도구만 잡고 런타임은 잡지 않는다. 안쪽 잠금은 런타임이 공유로 쥔다. 먼저 `ls -d <root 부모>/<root 이름>.lifetime.lock`을 실행한다. 파일이 없으면 flock을 실행하지 않는다(flock이 빈 잠금 파일을 만든다). 잠금 파일이 없는데 다른 산출물이 있으면 멈추고 담당자에게 알린다. 파일이 있으면 `flock -n <root 부모>/<root 이름>.lifetime.lock true`를 실행한다. rc 0이면 게시 도구가 살아 있지 않다. rc 1이면 다른 게시 도구가 잠금을 쥔 것이므로 기다리고 아무것도 옮기지 않는다. 잠금 파일이 없고 `<root>`, `<root>.staging`, `<root>.intent.json`, `<root>.intent.json.tmp`도 모두 없으면 옮길 것이 없으므로 5단계로 간다.
+2. 읽기 전용 상태 읽기. `ls -d`로 `<root>`, `<root>.staging`, `<root>.intent.json`, `<root>.intent.json.tmp`의 존재를 적는다. root가 있으면 `ls -A <root>`로 `ledger.json.tmp`의 존재를 적는다. 존재하는 intent와 root의 `ledger.json`은 `cat`으로 읽어 state 값을 적는다. 파일을 열어 고치지 않는다.
+3. 분기. root 안에 `ledger.json.tmp`가 있고 root ledger가 ready이며 intent가 ready이면 authorize가 중간에 죽은 것이다. 이때는 4로 가지 않고 8.5를 따른다. `<root>`, `<root>.staging`, `<root>.intent.json`, `<root>.intent.json.tmp`가 모두 없으면 옮길 것이 없으므로 5단계로 간다. 그 밖에서: root ledger가 authorized이고 intent가 ready이면 8.3의 정상 상태이므로 끝낸다. root ledger가 ready이고 intent가 ready이면 게시는 끝났으므로 authorize 단계(7.2의 1번)로 간다. 그 밖(`<root>.staging`이 있음, root ledger가 staged, intent가 preparing이나 publishing, intent tmp가 있음)은 4로 간다. ledger나 intent가 읽히지 않거나 state 값이 알려진 값이 아니거나 authorized인데 intent가 ready가 아닌 경우는 멈추고 읽은 내용을 담당자에게 알린다.
+4. 보존 이름으로 옮기기. 존재하는 것만 같은 접미사로 이 순서로 옮긴다: root, staging, intent, intent tmp. 옮기기 전에 각 이름마다 두 가지를 확인한다. 하나, `stat -c %d <root 부모> <원래 이름>`이 같은 값을 두 줄로 낸다. 둘, `ls -d <보존 이름>`이 0줄이다(`mv -T`는 같은 이름의 빈 디렉터리 위로 조용히 덮어쓰므로 이 확인이 필요하다). 1단계의 `flock -n`은 확인 뒤 잠금을 곧바로 푼다. 그래서 복구하는 동안에는 병합과 authorize를 실행하지 않는다. 각 이동은 `flock -n <root 부모>/<root 이름>.lifetime.lock mv -T <원래 이름> <보존 이름>` 한 줄로 실행해 바깥 잠금을 쥔 채 옮긴다. 이 명령이 rc 1이면 다른 게시 도구가 잠금을 쥔 것이므로 멈춘다. stderr에 `mv:` 메시지가 있으면 잠금이 아니라 mv의 실패이므로 메시지를 읽고 멈춘다. rc가 0이 아니면 이유와 관계없이 멈춘다. root 안의 `ledger.json.tmp`는 root와 함께 옮겨진다. `<root>.lifetime.lock`은 옮기지 않는다. 다음 게시가 그 파일을 다시 잠근다.
+5. 원본 세트 확인. 8.2의 검증 명령을 다시 돌려 통과를 본다. 원본 세트와 증거 파일은 게시가 읽기 전용으로만 열었으므로 바뀌지 않았어야 한다.
+6. 같은 인자로 병합을 처음부터 다시 돌린다(계획 모드 확인 뒤 `--apply --verify --immutable-source`). 부분 재개는 없다.
+7. 끝난 뒤 root ledger ready와 intent ready를 확인하고 authorize 단계로 간다. 보존 이름은 자동으로 지우지 않는다. 지울 때는 원본 세트와 증거 파일이 남아 있어 다시 만들 수 있음을 확인하고 담당자의 승인을 받는다. 디스크 여유 하한에 걸려 재실행이 거부되면 보존 staging부터 승인을 받아 지운다.
+
+게시 도구의 종료 코드는 다음과 같다.
+
+- rc 0 `publication ready`: 7단계로 간다.
+- rc 1 `publication staging failed:` 또는 `publication publish failed:`: 중간 산출물이 남는다. 1단계부터 따른다.
+- rc 2: 두 갈래다. `publication preflight failed:` 앞에 `publication publish failed:` 줄이 없으면 root는 만들어지지 않았다. 그 줄이 먼저 있으면 게시 단계가 실패한 뒤 원본 파일이나 원본 잠금의 재확인 또는 정리가 실패한 것이고 root가 남았을 수 있다. 다만 intent를 쓴 뒤의 실패(여유 공간 부족, staging 생성 실패)는 `<root>.intent.json`(state preparing)과 `<root>.staging`을 남길 수 있다. 그래서 rc와 메시지에 관계없이 1단계부터 따른다. 메시지 없이 traceback으로 끝난 rc 1도 같다. 계획 모드(`--apply` 없음)는 정상이어도 `publication mode is not ready`와 rc 2로 끝난다.
+- rc 2 `publication ready; cleanup failed` 또는 `publication ready; post-ready source check failed`: root는 이미 유효하다. 재실행하지 않고 메시지의 원인만 처리한다.
+
+### 8.5 authorize 중단 복구
+
+8.2의 4번 규칙대로 증거 경로는 절대 경로이고 쉼표가 없어야 한다. `authorize`가 죽었을 때는 `ledger.json`을 읽어 아래 표로 판단한다. 요약하면 ledger가 authorized면 완료다. ready면 `ledger.json.tmp`를 지우고 다시 실행한다. `ledger.json.tmp`는 `ledger.json`이 ready임을 읽은 뒤에만 지운다.
+
+| 죽은 지점 | root ledger | `ledger.json.tmp` | 다음 실행 결과 | 조치 |
+|---|---|---|---|---|
+| 점검 중 | ready | 없음 | 정상 실행 | 없음 |
+| 임시 파일을 만든 뒤 쓰기 전 | ready | 빈 파일 | `root file set differs`로 거부 | ledger가 ready임을 확인하고 임시 파일을 지운 뒤 다시 실행 |
+| 임시 파일 fsync 뒤 rename 전 | ready | 완전한 새 본문 | `root file set differs`로 거부 | 위와 같다 |
+| rename 뒤 디렉터리 fsync 전 | authorized(페이지 캐시) | 없음 | 재부팅하지 않았으면 `ledger state differs`로 거부. 재부팅했으면 ready나 authorized 중 하나 | ledger를 읽어 확인한다. authorized면 완료. ready면 다시 실행 |
+| 디렉터리 fsync 뒤 재읽기 전 | authorized | 없음 | `ledger state differs`로 거부 | 완료로 본다. factory 열기로 확인 |
+| 쓰기 실패 rc 1 (`not performed` 또는 쓰기 실패) | ready | 남음(부분 또는 완전) | `root file set differs`로 거부 | 출력의 observed ledger state가 ready임을 확인하고 임시 파일을 지운 뒤 다시 실행 |
+| 쓰기 실패 rc 1 (`took effect`) | authorized | 없음 | `ledger state differs`로 거부 | 완료로 본다. observed ledger state가 authorized임을 확인하고 factory 열기로 확인 |
+| 디렉터리 교체 감지 rc 1 | 옮겨진 원래 디렉터리의 ledger는 authorized. 현재 이름의 디렉터리는 그대로 | 없음 | observed 값은 현재 이름의 디렉터리 기준 | 두 디렉터리를 확인하고 정본 root를 정한 뒤 다시 실행 |
+| 완료(런타임이 root를 열기 전) | authorized | 없음 | `ledger state differs`로 거부 | 없음 |
+| 완료(런타임이 root를 연 뒤) | authorized | 없음 | `root file set differs`로 거부(`single.db-wal`과 `single.db-shm`이 생겨 항목 집합이 달라진다. 런타임이 정상 종료해 곁파일이 사라지면 `ledger state differs`) | 정상 상태다. 재실행으로 확인하지 않는다 |
+
+어느 지점에서도 `ledger.json`은 옛 본문 전체이거나 새 본문 전체다. 부분 본문은 임시 파일에만 생긴다.
+
+### 8.6 옛 데이터 이동과 롤백
+
+이 소절은 서비스를 멈춘 구간에서 옛 데이터 디렉터리의 세 항목을 게시 root로 옮기고 되돌리는 절차다. 옛 데이터 디렉터리를 root 밖에서 `<이름>.pre671`이라는 이름으로 두는 것이 이 운영 절차의 약속이다. 저장소 코드는 이 이름을 쓰지 않는다. 이동 대상은 `packs/`, `openclaw-conversations/`, `datasets/` 셋이다. 삭제 저널은 옛 디렉터리에 둔다. 아래 항목에 팩 이름, 건수, 머신 경로는 적지 않는다.
+
+- P1 이동 순서. 병합 게시(ready), authorize, 항목 이동, `SINGLE_SQLITE_FILE` 설정, 읽기 검증, 롤백 지점 기록, 쓰기 개방 순이다. 롤백 지점 기록은 7.4의 롤백 지점 세트와 P7의 `openclaw-conversations/automation` 사본을 같은 시점에 만드는 일이다. 이동이 authorize 앞이면 `root file set differs`로 거부된다. 롤백 지점 기록 전에 P5의 임시 인스턴스를 멈춘다. 같은 시점에 `packs/` 파일 목록과 sha256 목록을 남긴다. 사본은 `<root 부모>` 아래 새 디렉터리에 `cp -a`로 뜨고 rc 0과 두 트리의 sha256 목록이 같음을 확인한다. 사본 경로는 롤백 지점 기록에 함께 적는다.
+- P2 같은 파일시스템 확인과 이동 방법. 이동 직전에 옛 디렉터리와 root의 장치 번호를 `stat -c %d`로 비교한다. 같으면 `mv -T`로 옮긴다. 같은 장치의 `mv`는 rename 하나이므로 원자적이다. 다르면 중단한다. 다른 장치의 `mv`는 복사 뒤 삭제로 바뀌어 원자성과 정지 시간 계산이 깨진다. 이동 대상 이름이 root에 이미 있으면 `ls -d`로 확인해 덮어쓰지 않고 중단한다. `mv -T`는 같은 이름의 빈 디렉터리 위로 조용히 덮어쓰므로 이 확인이 필요하다.
+- P3 이동 전 서비스 정지 확인. 재인입 서비스와 타이머가 inactive인지 `systemctl --user is-active`로 확인한다. 활성이면 이동하지 않는다. 한 항목씩 옮기고 항목마다 이동 뒤 목록을 기록한다.
+- P4 이동 전후 기록. 이동 전에 각 이동 항목의 파일 목록(상대 경로와 크기)과 `packs/` 파일의 sha256 목록을 남긴다. 이동 뒤 같은 명령을 root에서 돌려 두 기록이 같음을 확인한다. rename은 내용을 바꾸지 않으므로 어긋나면 다른 프로세스가 건드린 것이고 중단한다.
+- P5 읽기 검증. 루프백 임시 인스턴스에서 `content_pack_list`와 `packs list`가 이동 전 `packs/` manifest의 팩 목록을 포함하는지 본다. 기준은 SQL `packs` 행이 있고 읽기 범위 안인 manifest 팩이다. 기준 집합의 누락이 0인지를 보고 건수를 기준으로 삼지 않는다. `content_pack_list`의 query로 manifest 키워드에만 있는 단어를 검색해 그 팩이 돌아오는지도 본다.
+- P6 서비스 시작 전 디렉터리 확인. 재인입 단위의 표준 출력 경로의 부모(`root/openclaw-conversations/automation`)가 있는지 확인한다. 없으면 단위가 시작하지 못할 수 있다. 시작 명령 앞에서 늘 확인한다.
+- P7 롤백 순서. 서비스 정지 상태를 확인한다. 세 항목을 root에서 옛 디렉터리로 되돌린다(P2와 같은 확인). 디렉터리 이름을 맞바꾼다. `<root>.intent.json`과 `<root>.lifetime.lock`을 같은 접미사의 보존 이름으로 옮긴다. 모든 rename은 대상 이름이 이미 있으면 중단한다. root 잠금 파일(`<root>.lifetime.lock`)이 없으면 중단한다. 설정 출처에서 `SINGLE_SQLITE_FILE` 줄을 지우고 서비스 프로세스 환경에 그 값이 없음을 확인한다. 롤백 접미사는 `.saved-<UTC 시각>` 하나이며 root, intent, 잠금 파일 셋과 쓰기 개방 뒤에 옮기는 `openclaw-conversations/automation`에 같은 값을 쓴다. 쓰기 개방 직전에 7.4의 롤백 지점 세트를 만들 때 같은 시점에 `openclaw-conversations/automation`(`cursor_state.json`이 그 안에 있다)의 사본을 root 밖에 떠 둔다. 쓰기 개방 뒤 다섯 파일로 돌아갈 때는 위 순서에 더해 옛 디렉터리로 되돌린 `openclaw-conversations/automation`을 그 사본으로 바꾼다. 이 단계를 빼면 커서가 앞서 있어 재인입이 롤백 지점 뒤의 메시지를 건너뛴다. 쓰기 개방 뒤의 MCP 쓰기는 다섯 파일에 없으므로 사라진다. 단일 모드에 남아 롤백 지점으로 되돌릴 때는 7.4의 복원 명령을 쓰고 같은 사본을 함께 되돌린다. 사본으로 바꿀 때는 먼저 지금의 `openclaw-conversations/automation`을 같은 롤백 접미사의 보존 이름으로 옮기고 그다음 사본을 그 자리로 옮긴다. 이 두 이동도 P2와 같은 확인을 하고 대상 이름이 이미 있으면 중단한다. 다섯 파일로 돌아갈 때는 이 교체를 디렉터리 이름을 맞바꾸기 전에 한다. 사본은 root와 같은 파일시스템에 둔다. 지금의 `openclaw-conversations/automation`이 옮겨 가는 보존 이름은 root 밖 `<root 부모>/automation.saved-<UTC 시각>`이고 시각은 롤백 접미사와 같은 값이다. 항목 이동(P1의 항목 이동 단계) 전에 롤백하면 세 항목을 옛 디렉터리로 되돌리는 단계를 건너뛴다. 이동을 시작했으면 root에 있는 이동 항목만 되돌린다. root가 없거나 8.4 복구로 보존 이름으로 옮겨졌으면 root 쪽 이름 바꾸기를 건너뛰고 `.pre671` 디렉터리만 기본 경로로 옮긴다. 재실행하지 않고 다섯 파일로 돌아가기로 정하면 8.4의 1~4단계로 남은 산출물을 보존 이름으로 옮긴 뒤 이 순서를 한다. 게시를 시작하지 않아 잠금 파일이 없으면 위의 '잠금 파일이 없으면 중단'을 적용하지 않는다.
+- P8 외부 경로 확인. `grep -rn 'data/localcrab' <외부 스크립트 디렉터리>`를 다시 실행해 이동 항목 셋 밖의 기본 경로를 고정 문자열로 쓰는 외부 스크립트가 있는지 확인한다. 새로 나온 경로가 있으면 이동 대상에 넣을지 정한 뒤에 이동한다.
+- P9 경로 조건 확인. 기본 경로와 그 부모의 `realpath`가 자기 자신과 같은지, 기본 경로가 마운트 지점이 아닌지 확인한다(`findmnt -n <경로>`가 출력을 내지 않아야 한다). 마운트 지점이면 그 디렉터리를 rename할 수 없다. 사본 시험 전에 한 번, 전환 당일에 한 번 더 한다. 다르면 게시가 거부되므로 시작하지 않는다.
+- P10 `build_nemotron_personas_korea_pack.py`의 기능 제한. 이 스크립트는 단일 모드에서 쓸 수 없다. 단일 root를 가리키면 거부되고 root 밖 데이터 디렉터리로 돌리면 다섯 파일 구조의 별도 작업이라 운영 root에 반영되지 않는다. 이 스크립트가 만든 stage 산출물만 P3의 방법으로 `root/packs/`에 옮길 수 있다.
+
+기본 출력 경로가 `packs/` 아래인 오프라인 스크립트 셋(`export_pack_graph_from_neo4j.py`, `import_pack_graph_to_neo4j.py`, `build_nemotron_personas_korea_pack.py`)은 단일 root 안에서 거부가 유지된다. 이 스크립트 셋을 스위치 뒤에 다시 쓰려면 root 밖 경로로 실행하고 완성된 산출물만 옮긴다.
+
+### 8.7 설정 순서
+
+환경 설정은 root를 치운 뒤에 고친다. api와 gateway 서비스 유닛의 `EnvironmentFile` 줄을 주석 처리하고 재시작하는 롤백은 금지한다. root를 둔 채 그렇게 하면 다섯 파일 factory가 root를 거부해 서비스가 뜨지 않는다(7.2의 7번). 단일 모드에서는 사용자를 만들지 않으며 사용자와 토큰은 병합 입력에서 온다(7.3의 첫 항목).
+
+## 9. 단일 모드 벡터 질의 경로: 한 스냅숏과 ANN 캐시
+
+단일 파일 모드의 벡터 질의가 다섯 파일 모드보다 늦었다. 이 절은 원인과 수리 설계, 불변식, 시험을 적는다. 구현은 `opencrab/stores/sqlite_vec_store.py`와 `opencrab/pack/load.py`에 있다.
+
+### 9.1 문제
+
+운영 DB 사본에서 같은 질의 목록을 같은 heavy-run 틀(주소 공간 2 GiB, nice 19, ionice 3)로 옛 코드(다섯 파일, A)와 단일 모드(C)에서 재었다. 절대값은 제약 아래의 값이므로 비율로만 읽는다. C는 A보다 분명히 늦었고 공간 필터가 붙은 질의의 차이가 가장 컸다. 비율은 측정 시점과 사본마다 달라 이 문서에 적지 않는다. 같은 절차는 9.5의 1번 게이트가 정한다(A와 C를 교대로 3회 이상 재고 호출별 웜 중앙값과 벡터 다리 단독 중앙값을 비교한다).
+
+원인은 `SqliteVecStore`의 공유 모드 조건 둘이다. `git log -S'self._shared is None and pack_values' -- opencrab/stores/sqlite_vec_store.py`(조건 1)와 `git log -S'self._shared is None and self._ann' -- opencrab/stores/sqlite_vec_store.py`(조건 2)가 같은 두 커밋을 낸다. 조건이 처음 들어간 커밋과 이 변경의 커밋이다.
+
+1. `query()`의 대규모 범위 fallback이 `self._shared is None`일 때만 켜진다. 읽을 수 있는 팩이 `_PACK_KNN_MAX`(32)를 넘어도 공유 모드는 팩별 KNN을 직렬로 돈다.
+2. `_select_query_mode()`의 binary ANN 경로도 `self._shared is None`일 때만 켜진다. 운영 설정은 `VECTOR_ANN=binary`이므로 단일 모드는 ANN 캐시를 쓰지 못했다.
+
+두 조건의 목적은 한 질의가 한 스냅숏을 보게 하는 것이다. 지연 비용을 검토한 기록은 없다.
+
+### 9.2 불변식
+
+- I1. 단일 모드에서 쓰기 구간 밖의 질의는 모든 벡터 읽기를 한 읽기 스냅숏 안에서 한다. 질의 도중 다른 연결이 commit해도 그 질의가 읽는 행은 변하지 않는다. I1은 읽는 행에만 걸린다. 후보를 만드는 ANN 캐시는 질의 스냅숏과 다른 시점일 수 있고, 그 경우 후보에서 빠진 행은 결과에 나오지 않을 수 있다.
+- I2. 쓰기 구간 밖 읽기 경로는 다섯 파일 모드와 같은 검색 알고리즘(대규모 범위 fallback, binary ANN, 같은 캐시 신선도 규칙)을 쓴다.
+- I3. 이미 열린 트랜잭션 안(쓰기 구간 `unit_of_work`이나 합류 트랜잭션)의 질의는 종전과 같다. ANN 캐시를 읽지 않고 만들지 않으며 미커밋 벡터를 본다.
+- I4. 접근 제어는 최종 후필터가 정한다. 후필터는 스냅숏 안에서 읽어 온 행의 메타데이터에 적용한다. ANN 캐시는 후보를 만들 뿐 접근 판정을 하지 않는다.
+
+### 9.3 설계
+
+A. 스냅숏을 먼저 정하고 fallback을 그 결과에 묶는다. `query()`가 질의 임베딩을 계산한 뒤 대규모 범위 fallback 판정 앞에서 `snapshot_opened`를 정한다(공유 모드이고 연결이 트랜잭션 밖이면 참). 조건 `self._shared is None`을 `(self._shared is None or snapshot_opened)`로 바꾼다. 팩이 32개를 넘으면 `pack_values`를 비우고 `pack_only`를 거짓으로 두며 `pack_scope`를 세운다. 이 두 값의 결합은 기존 주석이 요구하는 그대로다.
+
+B. 쓰기 구간 밖 공유 모드 읽기를 한 스냅숏으로 감싼다. `snapshot_opened`가 참이면 `query()`가 `try` 안에서 `_open_snapshot()`(`BEGIN`)을 열고 `finally`에서 `rollback()`한다. 열기를 `try` 밖에 두면 `BEGIN` 뒤 예외가 롤백을 건너뛰어 그 스레드 연결에 트랜잭션이 남고 다음 `unit_of_work`가 거부된다. 스냅숏 안에서 캐시 신선도 판정과 빌드, 후보 후필터, 정밀 재계산이 돈다. 최종 `predicate`는 메모리에 가져온 행에 적용한다. `_open_snapshot()`은 시험이 스냅숏 없는 음성 대조를 만들 이음매이다.
+
+C. `_select_query_mode()`가 `allow_ann`을 받는다. `query()`는 `allow_ann = (self._shared is None) or snapshot_opened`로 넘긴다. 다섯 파일 모드는 그대로이다.
+
+D. ANN 캐시 신선도는 다섯 파일 모드의 규칙을 바꾸지 않는다. `_get_ann_cache`는 `_ann_cache_fresh`를 잠금 밖과 안에서 부르고, 그 시점에 캐시가 `None`이 아니면 매 호출이 연결의 `data_version`을 기록한다. 캐시가 `None`이면 잠금 밖과 안의 신선도 호출을 모두 건너뛰고 `data_version`도 기록하지 않는다. 첫 호출에서 `data_version`이 바뀌었으면 거짓이다. 둘째 호출은 `data_version`이 기록값과 같으므로 벡터 표 `_rowids`의 `max(rowid)`가 캐시의 값과 같은지만 본다. 단일 모드에서는 질의가 스냅숏 안에서 `data_version`을 읽으므로 두 호출의 값이 같다. 그래서 그래프, 문서, 레지스트리 쓰기가 `data_version`을 올려도 벡터 `max(rowid)`가 그대로면 캐시를 유지한다. 벡터 삽입은 `max(rowid)`를 올려 다음 질의가 재빌드한다.
+- 알려진 한계(기존 동작): 가장 큰 rowid가 아닌 행만 지운 삭제는 `max(rowid)`가 그대로라 캐시가 낡은 채 남을 수 있다. 낡은 id는 정밀 재계산이 건너뛰므로(I4) 영향은 재현율이다. 다섯 파일 모드에도 있으며 #706이 추적한다.
+- 재빌드는 스냅숏 안의 연결로 한다. 스냅숏 밖에서 빌드하면 읽는 사이 쓰기가 끼어 id와 벡터가 어긋날 수 있다.
+- 오래된 스냅숏 가드는 두지 않는다. 최상위 rowid를 지운 뒤 모든 질의가 정확 KNN으로 내려가는 회귀를 만든다.
+- 이 변경이 단일 모드에 ANN 캐시를 처음 연다. 콜드 첫 질의는 다섯 파일 모드와 같은 빌드 비용을 치른다.
+
+벡터 표를 바꾸는 쓰기 경로는 `grep -rnE '(DELETE FROM|INSERT INTO|INSERT OR [A-Z]+ INTO|UPDATE) *(\{[^}]*(table|collection|_table)[^}]*\}|vectors_kure)' opencrab scripts apps`로 찾았다. 삽입은 새 rowid를 만든다. 삭제는 삭제만 있는 변경이라 위 한계에 든다. 제자리 UPDATE는 메타데이터만 바꾸는 `_vec_meta_update`와 `scripts/backfill_space.py`뿐이며 반례가 아니다. 캐시가 `ids`, `bits`, `q8`, `scale`만 담고, 반환 행은 정밀 재계산이 스냅숏 안 점조회로 읽기 때문이다. 임베딩을 제자리로 바꾸는 문장이 생기면 이 가정을 다시 본다.
+
+E. 캐시 무효화를 commit 뒤로 옮긴다. 쓰기 메서드 다섯 곳이 `with self._tx()` 다음 줄에서 캐시를 비우던 자리는 단일 모드에서 commit 앞이었다. 다른 스레드가 그 사이에 재빌드하면 commit 전 스냅숏으로 캐시가 다시 서고, 삭제만 있는 commit이면 낡은 캐시가 남는다.
+- 헬퍼 `_invalidate_ann_after_write()`가 그 자리를 대신한다. 쓰기 구간 안이면 `after_commit` 콜백으로 commit 뒤에 `_drop_ann_cache()`(`_ann_cache = None`과 `_ann_epoch += 1`, `_ann_epoch_lock` 안)를 실행한다. 롤백과 commit 실패에서는 콜백이 호출되지 않아 캐시가 그대로이다. 쓰기 구간 밖이면 즉시 실행한다. 콜백이 한 번 더 돌면 `epoch`가 한 번 더 오르지만 효과(캐시 비움)는 같다. 그래서 콜백 중복 방지 플래그를 두지 않는다.
+- 빌드는 오래 걸려 commit을 가로지를 수 있다. 가로지른 빌드가 commit 전 스냅숏의 캐시를 콜백 뒤에 설치하면 낡은 캐시가 되살아난다. `_get_ann_cache`는 첫 줄에서 `epoch`를 읽는다. 스냅숏은 그 뒤 첫 DB 읽기(`_ann_cache_fresh`의 `PRAGMA data_version` 또는 `_build_ann_cache`)에서 고정된다. 설치는 `_ann_epoch_lock` 안에서 `epoch`를 비교하고 같을 때만 한다. 비교와 설치가 한 임계 구역이라 비교 직후 콜백이 끼는 틈이 없다. `query()`의 `BEGIN`과 `_get_ann_cache` 첫 줄 사이에는 DB 읽기가 없다는 것이 이 순서의 전제이다.
+- 대기 스레드는 `_ann_cache_lock`을 얻은 직후 (1) 신선한 캐시가 있으면 쓰고, (2) 없고 `epoch`가 달라졌으면 빌드하지 않고 `None`을 돌려주어 정확 KNN으로 가며, (3) 그러지 않으면 빌드한다. (2)가 없으면 대기 스레드마다 설치가 거부될 빌드를 차례로 돈다. commit 뒤 새 연결이 연결별 `data_version` 때문에 각자 재빌드하는 중복은 다섯 파일 모드에서 상속한 동작이며 #707이 추적한다.
+- 락 순서는 `_ann_cache_lock`에서 `_ann_epoch_lock`으로 한 방향이다. 콜백은 `shared.lock`을 놓은 뒤 `_ann_epoch_lock`만 잡는다. 질의 경로는 `shared.lock`을 잡지 않는다.
+- `opencrab/pack/load.py`의 직접 DELETE 두 곳이 같은 헬퍼를 부른다. 단일 파일 삭제 적용은 기존 commit 앞 무효화를 헬퍼 호출로 바꾸고, 지울 벡터가 있을 때만 부른다. sql 분기 팩 삭제는 commit 블록과 삭제 수 확인 뒤에 부른다. 헬퍼가 없는 시험 대역은 `getattr` 가드로 건너뛴다. 이 호출은 다섯 파일 모드에서도 돌아 같은 프로세스의 캐시를 비운다.
+
+F. 다섯 파일 모드는 `_select_query_mode`의 서명, 무효화 헬퍼, 설치 때의 `epoch` 비교, 팩 삭제 뒤 헬퍼 호출, 대기 규칙을 빼고 바뀌지 않는다. 대기 규칙은 `_get_ann_cache`가 두 모드에 공통이므로 다섯 파일 모드에도 걸린다. 쓰기가 곧바로 `epoch`를 올리므로 빌드 잠금을 기다리던 질의가 그 사이 쓰기를 만나면 빌드하지 않고 정확 KNN 경로로 간다. 종전 코드는 그 질의도 빌드했다. 범위 질의에서 이 경로는 전역 후보(4096)를 최종 후필터로 거르는 다섯 파일 모드의 기존 근사 경로이고, 접근 판정은 최종 후필터가 하므로 접근 결과는 같다. 다섯 파일 모드의 공간 필터가 벡터를 놓치는 문제는 #705가 맡는다.
+
+### 9.4 기대 결과와 승인된 차이
+
+- 쓰기 구간 밖 단일 모드 벡터 다리가 다섯 파일 모드와 같은 알고리즘이 된다. 사본 시험의 질의 목록에서 단일 모드와 옛 코드가 달랐던 결과가 같아져야 한다.
+- 운영 설정은 `ann=binary`이다. `ann=""`인 단일 모드는 팩 33개 이상 범위에서 팩별 정확 KNN 대신 전역 KNN(k=4096)과 후필터를 쓴다. 다섯 파일 모드와 같은 알고리즘이며 재현율이 종전과 다를 수 있다.
+- 공간 필터 질의 하나는 종전 단일 모드보다 적게 돌려준다. 원인은 `_select_query_mode`가 잔여 predicate가 있어도 `pack_scope`가 있으면 ANN을 허용하는 조건이며 다섯 파일 모드와 같다. 이 결함은 #705가 다룬다.
+- `schema_pack_list`는 이 수정과 무관하다. 코드 검사가 코드 체크아웃의 `types/<t>.yaml`을 보므로 이름공간 구성 차이이다.
+
+### 9.5 게이트
+
+구현을 막는 게이트는 다섯 개이다.
+1. 지연: 질의 목록의 중앙값과 p95와 호출별 웜 중앙값과 콜드 빌드 시간이 A의 1.2배 이하이다.
+2. 사본 시험의 질의 목록 결과가 `schema_pack_list`를 뺀 전부 같다.
+3. 전체 시험 묶음을 시험 id별로 대사한다.
+4. 스냅숏 불변식 시험과 그 음성 대조가 통과한다.
+5. 같은 프로세스의 쓰기 스레드가 있을 때 질의가 잘못된 결과를 내지 않는다.
+
+그 밖의 항목(WAL 크기, 메모리, 재빌드 횟수 상한, 변이 검증 등)은 측정할 수 있으면 기록하고 막지 않는다. 지연 측정은 같은 heavy-run 틀에서 A와 C를 교대로 3회 이상 잰다.
+
+### 9.6 시험
+
+- `tests/test_single_file_vector_ann.py`: 팩 삭제 도우미의 commit 뒤 무효화(단일 파일은 구간 안 유지와 구간 뒤 비움, 다섯 파일은 즉시), 대규모 범위 질의가 범위 밖 팩과 공간을 돌려주지 않음(ann 꺼짐과 binary, 공간 필터 있음과 없음)과 항등 후보 필터 아래에서도 같음, 트랜잭션 안 대규모 범위의 팩별 질의, 빈 표 질의와 전부 지운 뒤 질의, 스냅숏 고정과 음성 대조(`_open_snapshot`을 끈 쪽은 삭제를 본다), 예외 뒤 열린 트랜잭션 없음(스냅숏 안의 예외와 `BEGIN` 뒤 열기 실패 둘), 대규모 범위의 전역 KNN 한 번, 쓰기 구간 밖 ANN 사용과 안 불사용, 단일 모드와 다섯 파일 모드의 동등성, 낡은 후보 제거(I4), 접근 제어 predicate, 상위 rowid 삭제와 외부 삽입의 재빌드와 비벡터 commit의 비재빌드, 제자리 메타 갱신, commit 뒤 무효화와 롤백, 빌드가 commit을 가로지름, 웜 경로의 `epoch` 순서, 비교와 설치의 같은 임계 구역, 대기 스레드, `load.py` 헬퍼 가드.
+- `tests/test_single_file_store.py`: 옛 시험 둘(`..._queries_each_partition_in_one_snapshot`, `..._never_uses_ann_cache`)은 위 파일의 대체 시험으로 옮겼다. 단일 파일 삭제 적용 시험이 commit 뒤 무효화(`epoch` 상승)와 실패 때의 무변화를 단언한다. 새 시험 하나(`stores_ann` 픽스처)는 무효화 호출 뒤에 실패를 주입해 롤백 때 캐시와 `epoch`가 그대로임을 단언한다.
+- 변이 확인: 폐기용 checkout에서 변이를 하나씩 적용해 시험 묶음(위 두 파일과 `tests/test_pack_load.py`)을 돌렸다. 치환 전 문자열이 대상 파일에 정확히 한 번 나오는지 먼저 확인했다. 사망한 변이는 스냅숏 끔, `allow_ann` 항상 거짓, 트랜잭션 안 ANN 허용, commit 앞 무효화, 설치 때 `epoch` 비교 제거, `epoch` 증가 제거, `epoch`를 잠금 안에서 읽기, 대기 스레드의 `epoch` 재확인 제거, 비교와 설치 분리, `max(rowid)` 비교 제거, 단일 파일 삭제 자리의 헬퍼 호출 제거와 즉시 비움, sql 분기 팩 삭제의 헬퍼 호출 제거, 헬퍼의 즉시 비움, `pack_scope`가 있을 때 최종 후필터 건너뛰기, 트랜잭션 안의 대규모 범위 fallback, 빈 캐시 가드 제거다. 항등 `_filter_candidates_by_pack`은 생존한다. 최종 후필터가 접근을 정하므로 그 후보 필터는 접근 결함이 아니라 회수율과 속도의 장치이기 때문이다. 삽입 계열과 `reset_collection`의 무효화를 지운 변이는 `max(rowid)`가 변화를 잡아 결과가 같으므로 실행하지 않았고 시험을 더하지 않았다.
+
+### 9.7 위험과 미해결
+
+- 가장 큰 rowid가 아닌 행만 지운 삭제가 캐시를 낡게 두는 한계는 다른 프로세스의 쓰기와 오프라인 스크립트에서 남는다. 운영의 2-instance 서빙에서는 한 인스턴스의 팩 삭제가 다른 인스턴스의 캐시를 낡게 둔다. 영향은 재현율이며 다음 벡터 삽입이나 재시작이 바로잡는다. #706이 추적한다.
+- commit 뒤 대기 스레드의 재빌드 중복은 다섯 파일 모드에서 상속했다. #707이 추적한다.
+- 쓰기 간격이 빌드 시간보다 짧으면 빌드한 질의는 설치를 거부당하고, 그 사이 기다리던 질의는 빌드 없이 전역 정확 KNN 경로로 간다. 같은 부하의 A와 비교해 잰다.
+- 콜드 첫 질의, 빌드 중 읽기 스냅숏이 붙잡는 WAL, 캐시 메모리는 측정으로 확인한다. 빌드를 스냅숏 밖에서 하는 대안은 일관된 빌드를 보장하지 못해 택하지 않는다.
+- 되돌리기: 코드 변경이므로 `git revert`로 종전 동작에 돌아간다. 데이터 형식은 바꾸지 않는다.

@@ -76,13 +76,47 @@ from opencrab.pack.normalize import (
     with_chunk_space,
 )
 from opencrab.pack.write_gate import authorize, authorize_delete
-from opencrab.stores._single_file import is_single_file, unit_of_work_for
+from opencrab.stores._pg_uow import common_pg_uow
+from opencrab.stores._single_file import is_single_file
 from opencrab.stores._sql_dialect import SQLITE, SqlDialect, json_valid_expr
 from opencrab.stores._vector_base import slot_owner
 
 # 로거 이름은 `__name__` 이다. 이관 전에는 호출자 스크립트 파일명으로 고정돼 있었는데
 # 그 이름에 의존하는 곳은 정의 자신뿐이었다(전수 grep 1건).
 log = logging.getLogger(__name__)
+
+
+class ChunkTransactionUncertainError(RuntimeError):
+    """청크 트랜잭션의 실패 상태를 확인하지 못했다."""
+
+
+class _ChunkTransactionStartError(Exception):
+    def __init__(self, original):
+        self.original = original
+
+
+@contextlib.contextmanager
+def _chunk_transaction(pg_uow, shared, sql=None):
+    outcome = {}
+    entered = False
+    try:
+        if pg_uow is not None:
+            manager = pg_uow.unit_of_work(outcome=outcome)
+        elif sql is not None:
+            from opencrab.stores.sql_store import shared_write_unit
+
+            manager = shared_write_unit(sql, outcome=outcome)
+        else:
+            manager = shared.unit_of_work(outcome=outcome)
+        with manager:
+            entered = True
+            yield
+    except Exception as exc:
+        if not entered:
+            raise _ChunkTransactionStartError(exc) from exc
+        if outcome.get("state") != "rolled_back":
+            raise ChunkTransactionUncertainError("chunk transaction outcome is not confirmed") from exc
+        raise
 
 
 class NodeIncrementalResult(tuple):
@@ -551,6 +585,13 @@ def _safe_str(obj) -> str:
     return s
 
 
+def _invalidate_vec_ann(vec) -> None:
+    """벡터 저장소의 ANN 캐시를 commit 뒤에 비운다(#671). 헬퍼가 없는 시험 대역은 건너뛴다."""
+    hook = getattr(vec, "_invalidate_ann_after_write", None)
+    if callable(hook):
+        hook()
+
+
 def _confirmed_rowcount(rc) -> int | None:
     """드라이버가 **실제로 센 삭제 행 수**일 때만 그 값, 아니면 `None`(미확인).
 
@@ -745,7 +786,9 @@ def _live_vec_ids(
             vec_ids.update(got.get("ids", []))
     elif kind == "sqlalchemy":
         from sqlalchemy import text as _sa_text
-        with handle.connect() as _c:
+        pg_uow = getattr(vec, "_pg_uow", None)
+        cm = pg_uow.connection() if pg_uow is not None else handle.connect()
+        with cm as _c:
             for (node_id,) in _c.execute(
                 _sa_text(f"SELECT node_id FROM {table} WHERE pack_id = :p"), {"p": pack_name}):
                 vec_ids.add(node_id)
@@ -879,6 +922,9 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict, pack_id: str) -> bool:
     # docstring 의 fast-path pack 스코프 계약과 동일한 의무).
     updater = getattr(vec, "update_metadata", None)
     if callable(updater):
+        shared = getattr(vec, "shared_file", None)
+        if shared is not None and shared.in_unit_of_work:
+            raise RuntimeError("metadata updater cannot join a shared transaction")
         try:
             return bool(updater(chunk_id, meta))
         except Exception as exc:                              # noqa: BLE001
@@ -889,10 +935,23 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict, pack_id: str) -> bool:
     import json as _json
     try:
         if kind == "sql":
+            shared = getattr(vec, "shared_file", None)
+            if shared is not None:
+                marker = handle.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    if not shared.in_unit_of_work:
+                        raise RuntimeError("single SQLite vector write requires a guarded unit")
+                    if pack_id not in shared._uow.validated_packs or meta.get("pack_id") != pack_id:
+                        shared.mark_rollback_only()
+                        raise RuntimeError("vector owner is not validated")
             cur = handle.execute(
                 f"UPDATE {table} SET metadata = ? WHERE node_id = ? AND pack_id = ?",
                 (_json.dumps(meta, ensure_ascii=False), chunk_id, pack_id))
-            handle.commit()
+            shared = getattr(vec, "shared_file", None)
+            if shared is None or not shared.in_unit_of_work:
+                handle.commit()
             # rowcount == 0이면 UPDATE가 아무 행도 못 건드린 것이다(node_id가 벡터
             # 테이블에 없음, 또는 있어도 다른 팩 소유 — #172 재리뷰) — 그런데도
             # True를 돌려주면 호출자가 "메타를 고쳤다"고 믿고 doc 기준을 옮기고,
@@ -945,7 +1004,9 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict, pack_id: str) -> bool:
             return True
         if kind == "sqlalchemy":
             from sqlalchemy import text as _sa_text
-            with handle.begin() as _c:
+            pg_uow = getattr(vec, "_pg_uow", None)
+            cm = pg_uow.connection(write=True) if pg_uow is not None else handle.begin()
+            with cm as _c:
                 cur = _c.execute(
                     _sa_text(_sqlalchemy_meta_update_sql(table, handle.dialect.name)),
                     {"meta": _json.dumps(meta), "id": chunk_id, "pid": pack_id},
@@ -956,6 +1017,10 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict, pack_id: str) -> bool:
                 # 주석과 동일 근거).
                 return bool(cur.rowcount)
     except Exception as exc:                                  # noqa: BLE001
+        shared = getattr(vec, "shared_file", None)
+        pg_uow = getattr(vec, "_pg_uow", None)
+        if (shared is not None and shared.in_unit_of_work) or (pg_uow is not None and pg_uow.active):
+            raise
         log.warning("벡터 메타 갱신 실패(%s): %s — 재임베딩으로 우회한다", chunk_id, exc)
     return False
 
@@ -1036,7 +1101,9 @@ def pack_live_counts(pack_name: str, graph, docs, vec) -> dict[str, int | None]:
         v = len(got.get("ids", []))
     elif kind == "sqlalchemy":
         from sqlalchemy import text as _sa_text
-        with handle.connect() as _c:
+        pg_uow = getattr(vec, "_pg_uow", None)
+        cm = pg_uow.connection() if pg_uow is not None else handle.connect()
+        with cm as _c:
             v = _c.execute(
                 _sa_text(f"SELECT COUNT(*) FROM {table} WHERE pack_id = :p"), {"p": pack_name}
             ).scalar()
@@ -1207,11 +1274,25 @@ def _delete_pack_vectors(
         # `_vec_backend` 의 게이트를 통과했을 때와 결과가 같다.
         kind, handle, table = _vec_shape(vec)
         if kind == "sql":
+            shared = getattr(vec, "shared_file", None)
+            if shared is not None:
+                marker = handle.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    if not shared.in_unit_of_work:
+                        raise RuntimeError("single SQLite vector write requires a guarded unit")
+                    if pack_name not in shared._uow.validated_packs:
+                        shared.mark_rollback_only()
+                        raise RuntimeError("vector owner is not validated")
             chunk_vec_del = None                                   # R1
             cur = handle.execute(f"DELETE FROM {table} WHERE pack_id = ?", (pack_name,))
             rc = cur.rowcount                     # 담아만 둔다 — 아직 발행 안 한다
-            handle.commit()
+            shared = getattr(vec, "shared_file", None)
+            if shared is None or not shared.in_unit_of_work:
+                handle.commit()
             chunk_vec_del = _confirmed_rowcount(rc)                # R2
+            _invalidate_vec_ann(vec)
             if chunk_vec_del is None:
                 vec_confirmed = False
                 # 미확인은 **보이는** 실패여야 한다 — 요약의 "미확인"만으로는
@@ -1270,7 +1351,9 @@ def _delete_pack_vectors(
         elif kind == "sqlalchemy":
             from sqlalchemy import text as _sa_text
             chunk_vec_del = None                                   # R1
-            with handle.begin() as _c:
+            pg_uow = getattr(vec, "_pg_uow", None)
+            cm = pg_uow.connection(write=True) if pg_uow is not None else handle.begin()
+            with cm as _c:
                 rc = _c.execute(_sa_text(f"DELETE FROM {table} WHERE pack_id = :p"),
                                 {"p": pack_name}).rowcount
             chunk_vec_del = _confirmed_rowcount(rc)   # R2 — commit(컨텍스트 종료) 뒤
@@ -1290,6 +1373,12 @@ def _delete_pack_vectors(
                 "벡터 삭제 미지원 백엔드(%s) — 팩 %s 의 벡터가 남는다. "
                 "수동 정리가 필요하다", _safe_type_name(vec), pack_name)
     except Exception as e:
+        shared = getattr(vec, "shared_file", None)
+        if shared is not None and shared.in_unit_of_work:
+            shared.mark_rollback_only()
+        pg_uow = getattr(vec, "_pg_uow", None)
+        if pg_uow is not None and pg_uow.active:
+            pg_uow.mark_rollback_only()
         vec_confirmed = False   # 예외로 중단됐으니 축 완료로 볼 수 없다.
         log.warning("벡터 delete 오류(%s): %s", pack_name, _safe_str(e))
 
@@ -1327,6 +1416,475 @@ def _delete_pack_pending_message(pack_name: str, journal: dict, graph, docs, vec
         "새 콘텐츠가 추가됐을 수 있고, 재개는 그것도 함께 지운다. 검토한 뒤 완주하려면 "
         "delete_pack(..., resume=True) 로 다시 실행해라."
     )
+
+
+def _reserve_single_file_delete(shared, sql, principal, pack_name: str) -> tuple[str, str]:
+    """재인가한 팩의 삭제 예약을 독립 트랜잭션에 기록한다."""
+    import uuid
+
+    if shared.in_unit_of_work:
+        shared.mark_rollback_only()
+        raise RuntimeError("delete reservation requires a separate transaction")
+    with shared.unit_of_work() as conn:
+        authorize_delete(sql, principal, pack_name)
+        row = conn.execute(
+            "SELECT incarnation FROM packs WHERE pack_id = ?", (pack_name,)
+        ).fetchone()
+        if row is None or not row[0]:
+            raise delete_journal.DeletePackJournalConflict("pack incarnation is missing")
+        incarnation = str(row[0])
+        pending = conn.execute(
+            "SELECT 1 FROM pack_delete_operations WHERE pack_id = ? AND state = 'pending'",
+            (pack_name,),
+        ).fetchone()
+        if pending is not None:
+            raise delete_journal.DeletePackJournalPending("pack deletion is pending")
+        operation_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO pack_delete_operations "
+            "(operation_id, pack_id, incarnation, state, result_json) VALUES (?, ?, ?, 'pending', NULL)",
+            (operation_id, pack_name, incarnation),
+        )
+    return operation_id, incarnation
+
+
+def _start_single_file_delete(shared, sql, principal, pack_name: str, data_dir: str) -> dict:
+    """저널 충돌을 확인한 뒤 삭제 예약과 외부 저널을 차례로 기록한다."""
+    existing = delete_journal.load_journal(data_dir, pack_name, schema=2)
+    if existing is not None:
+        raise delete_journal.DeletePackJournalPending("pack deletion journal exists")
+    operation_id, incarnation = _reserve_single_file_delete(shared, sql, principal, pack_name)
+    journal = {
+        "schema": 2,
+        "pack_id": pack_name,
+        "operation_id": operation_id,
+        "incarnation": incarnation,
+        "state": "pending",
+        "result": None,
+    }
+    delete_journal.save_journal(data_dir, pack_name, journal)
+    return journal
+
+
+def _single_file_delete_owner(conn, raw):
+    """참조 행의 팩 태그를 엄격히 읽고 등록된 팩의 예약을 확인한다."""
+    from opencrab.stores._graph_common import decode_properties
+
+    props, corrupt = decode_properties(raw)
+    if corrupt:
+        raise RuntimeError("delete reference properties are invalid")
+    owner = props.get("pack_id")
+    if owner is None or owner == "":
+        return None
+    if not isinstance(owner, str):
+        raise RuntimeError("delete reference pack identity is invalid")
+    row = conn.execute("SELECT incarnation FROM packs WHERE pack_id=?", (owner,)).fetchone()
+    if row is None or not row[0]:
+        raise RuntimeError("delete reference pack incarnation is missing")
+    return owner, str(row[0])
+
+
+def _single_file_delete_evidence(operation_id, incarnation, result, keys):
+    """삭제 집합을 정규화하고 완료 결과와 결속한다."""
+    if not isinstance(keys, dict):
+        raise RuntimeError("delete evidence kinds are invalid")
+    kinds = ("nodes", "edges", "doc_twins", "doc_extras", "sources", "vectors")
+    if set(keys) != set(kinds):
+        raise RuntimeError("delete evidence kinds are incomplete")
+    lengths = {"nodes": 3, "edges": 3, "doc_twins": 2, "doc_extras": 2, "sources": 1, "vectors": 1}
+    if any(
+        not isinstance(keys[kind], (list, tuple))
+        or any(not isinstance(row, (list, tuple)) or len(row) != lengths[kind]
+               or any(not isinstance(value, str) or not value for value in row)
+               for row in keys[kind])
+        for kind in kinds
+    ):
+        raise RuntimeError("delete evidence keys are invalid")
+    normalized = {kind: sorted([list(key) for key in keys[kind]]) for kind in kinds}
+    if any(len(rows) != len({tuple(row) for row in rows}) for rows in normalized.values()):
+        raise RuntimeError("delete evidence contains duplicate keys")
+    expected_result = [len(normalized["nodes"]) + len(normalized["doc_extras"]),
+                       len(normalized["sources"]), len(normalized["vectors"])]
+    if result != expected_result:
+        raise RuntimeError("delete evidence result differs from keys")
+    payload = {"operation_id": operation_id, "incarnation": incarnation,
+               "result": list(result), "keys": normalized,
+               "counts": {kind: len(normalized[kind]) for kind in kinds}}
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return {**payload, "sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest()}
+
+
+def _verify_single_file_delete_evidence(raw, operation_id, incarnation, result):
+    """완료 증거의 식별, 종류, 개수와 해시를 검증한다."""
+    def unique_pairs(pairs):
+        values = {}
+        for key, value in pairs:
+            if key in values:
+                raise ValueError("duplicate evidence field")
+            values[key] = value
+        return values
+
+    try:
+        evidence = json.loads(raw, object_pairs_hook=unique_pairs)
+        if not isinstance(evidence, dict) or set(evidence) != {
+            "operation_id", "incarnation", "result", "keys", "counts", "sha256"
+        }:
+            raise ValueError("evidence fields differ")
+        expected = _single_file_delete_evidence(operation_id, incarnation, result, evidence["keys"])
+        if evidence != expected:
+            raise ValueError("evidence contents differ")
+        return evidence["keys"]
+    except (TypeError, ValueError, KeyError, RuntimeError) as exc:
+        raise delete_journal.DeletePackJournalConflict("delete evidence is invalid") from exc
+
+
+def _single_file_delete_history_references(conn, pack_name, current_scope):
+    """완료 이력의 참조가 현재 삭제 대상과 연결되는지 확인한다."""
+    rows = conn.execute(
+        "SELECT operation_id, incarnation, predecessor, result_json, evidence_json "
+        "FROM pack_delete_operations WHERE pack_id=? AND state='committed'", (pack_name,)
+    ).fetchall()
+    operations = {row[0]: row for row in rows}
+    if len(operations) != len(rows):
+        raise delete_journal.DeletePackJournalConflict("duplicate delete operation")
+    edges, twins, successors = set(), set(), set()
+    for operation_id, incarnation, predecessor, result_json, evidence_json in rows:
+        if predecessor is not None:
+            previous = operations.get(predecessor)
+            if previous is None or previous[1] != incarnation or predecessor in successors:
+                raise delete_journal.DeletePackJournalConflict("delete predecessor is invalid")
+            successors.add(predecessor)
+        try:
+            result = json.loads(result_json)
+        except (TypeError, ValueError) as exc:
+            raise delete_journal.DeletePackJournalConflict("delete result is invalid") from exc
+        if not isinstance(result, list) or len(result) != 3 or any(type(n) is not int or n < 0 for n in result):
+            raise delete_journal.DeletePackJournalConflict("delete result is invalid")
+        keys = _verify_single_file_delete_evidence(evidence_json, operation_id, incarnation, result)
+        edges.update(map(tuple, keys["edges"]))
+        twins.update(map(tuple, keys["doc_twins"]))
+    checked = set()
+    for operation_id in operations:
+        seen = set()
+        cursor = operation_id
+        while cursor is not None and cursor not in checked:
+            if cursor in seen:
+                raise delete_journal.DeletePackJournalConflict("delete predecessor cycle")
+            seen.add(cursor)
+            cursor = operations[cursor][2]
+        checked.update(seen)
+    allowed_edges = set(map(tuple, current_scope["edges"]))
+    allowed_twins = set(map(tuple, current_scope["doc_twins"]))
+    for key in edges:
+        if conn.execute("SELECT 1 FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?", key).fetchone():
+            if key not in allowed_edges:
+                raise delete_journal.DeletePackJournalConflict("historical edge lacks current authority")
+    for key in twins:
+        if conn.execute("SELECT 1 FROM doc_nodes WHERE space=? AND node_id=?", key).fetchone():
+            if key not in allowed_twins:
+                raise delete_journal.DeletePackJournalConflict("historical twin lacks current authority")
+
+
+def _single_file_delete_scope(conn, pack_name, graph, docs, vec):
+    """같은 트랜잭션에서 대상과 정확한 참조 키를 고정한다."""
+    from opencrab.stores._graph_common import decode_properties
+
+    for table, column, keys in (
+        ("graph_nodes", "properties", ("pack_id",)),
+        ("doc_nodes", "properties", ("pack_id",)),
+        ("doc_sources", "metadata", ("pack_id", "source")),
+    ):
+        placeholders = ",".join("?" for _ in keys)
+        rows = conn.execute(
+            f"SELECT {column} FROM {table} WHERE EXISTS ("
+            f"SELECT 1 FROM json_each(CASE WHEN json_valid({column}) THEN {column} ELSE '{{}}' END) "
+            f"WHERE key IN ({placeholders}) AND type='text' AND value=?)",
+            (*keys, pack_name),
+        )
+        for (raw,) in rows:
+            _, corrupt = decode_properties(raw)
+            if corrupt:
+                raise RuntimeError("delete owner properties are invalid")
+    node_pred = _json_str_eq(graph._dialect, "properties", "pack_id", "pack")
+    space_expr = graph._dialect.json_get_safe("properties", "space")
+    nodes = [tuple(row) for row in graph._fetch_all(
+        f"SELECT node_type, node_id, COALESCE({space_expr}, 'concept') "
+        f"FROM {graph._table('graph_nodes')} WHERE {node_pred}", {"pack": pack_name}
+    )]
+    edges = set()
+    twins = set()
+    references = []
+    for node_type, node_id, space in nodes:
+        node_row = conn.execute(
+            "SELECT properties FROM graph_nodes WHERE node_type=? AND node_id=?", (node_type, node_id)
+        ).fetchone()
+        identity = _single_file_delete_owner(conn, node_row[0]) if node_row is not None else None
+        if identity is None or identity[0] != pack_name:
+            raise RuntimeError("delete node owner differs")
+        edge_rows = conn.execute(
+            "SELECT from_id, relation, to_id, properties FROM graph_edges WHERE from_id=? OR to_id=?",
+            (node_id, node_id),
+        ).fetchall()
+        for row in edge_rows:
+            edges.add(tuple(row[:3]))
+            references.append(row[3])
+        doc_row = conn.execute(
+            "SELECT properties FROM doc_nodes WHERE space=? AND node_id=?", (space, node_id)
+        ).fetchone()
+        if doc_row is not None:
+            twins.add((space, node_id))
+            references.append(doc_row[0])
+    for raw in references:
+        if raw is None:
+            raise RuntimeError("delete reference properties are invalid")
+        identity = _single_file_delete_owner(conn, raw)
+        if identity is None or identity[0] == pack_name:
+            continue
+        pending = conn.execute(
+            "SELECT 1 FROM pack_delete_operations WHERE pack_id=? AND state='pending'", (identity[0],)
+        ).fetchone()
+        if pending is not None:
+            raise RuntimeError("delete reference pack is pending")
+    doc_pred = _json_str_eq(docs._dialect, "properties", "pack_id", "pack")
+    extras = {tuple(row) for row in docs._fetch_all(
+        f"SELECT space, node_id FROM {docs._table('doc_nodes')} WHERE {doc_pred}", {"pack": pack_name}
+    )} - twins
+    for space, node_id in extras:
+        row = conn.execute("SELECT properties FROM doc_nodes WHERE space=? AND node_id=?", (space, node_id)).fetchone()
+        identity = _single_file_delete_owner(conn, row[0]) if row is not None and row[0] is not None else None
+        if identity is None or identity[0] != pack_name:
+            raise RuntimeError("delete document owner differs")
+    source_pred = _doc_owner_pred(docs._dialect)
+    sources = [tuple(row) for row in docs._fetch_all(
+        f"SELECT source_id FROM {docs._table('doc_sources')} WHERE {source_pred}", {"pack": pack_name}
+    )]
+    for (source_id,) in sources:
+        row = conn.execute("SELECT metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchone()
+        props, corrupt = decode_properties(row[0]) if row is not None and row[0] is not None else ({}, True)
+        if corrupt:
+            raise RuntimeError("delete source properties are invalid")
+        tag = props.get("pack_id")
+        owner = tag or props.get("source")
+        if not isinstance(owner, str) or owner != pack_name:
+            raise RuntimeError("delete source owner differs")
+    vectors = [tuple(row) for row in conn.execute(
+        f"SELECT node_id FROM {vec._table} WHERE pack_id=?", (pack_name,)
+    ).fetchall()]
+    return {"nodes": nodes, "edges": list(edges), "doc_twins": list(twins),
+            "doc_extras": list(extras), "sources": sources, "vectors": vectors}
+
+
+def _independent_single_file_delete_keys(conn, pack_name, vec):
+    """원시 행에서 삭제 키를 별도로 산출한다."""
+    from opencrab.stores._graph_common import decode_properties
+
+    def properties(raw):
+        value, corrupt = decode_properties(raw)
+        if corrupt:
+            raise RuntimeError("delete scope properties are invalid")
+        return value
+
+    nodes = set()
+    for node_type, node_id, raw in conn.execute("SELECT node_type, node_id, properties FROM graph_nodes"):
+        try:
+            props = properties(raw)
+        except RuntimeError:
+            continue
+        if props.get("pack_id") == pack_name:
+            nodes.add((node_type, node_id, props.get("space") if props.get("space") is not None else "concept"))
+    ids = {node_id for _, node_id, _ in nodes}
+    edges = {tuple(row) for row in conn.execute("SELECT from_id, relation, to_id FROM graph_edges")
+             if row[0] in ids or row[2] in ids}
+    twins = set()
+    extras = set()
+    node_pairs = {(space, node_id) for _, node_id, space in nodes}
+    for space, node_id, raw in conn.execute("SELECT space, node_id, properties FROM doc_nodes"):
+        key = (space, node_id)
+        if key in node_pairs:
+            twins.add(key)
+            continue
+        try:
+            props = properties(raw)
+        except RuntimeError:
+            continue
+        if props.get("pack_id") == pack_name:
+            extras.add(key)
+    sources = set()
+    for source_id, raw in conn.execute("SELECT source_id, metadata FROM doc_sources"):
+        try:
+            props = properties(raw)
+        except RuntimeError:
+            continue
+        tag = props.get("pack_id")
+        if isinstance(tag, str) and tag:
+            owner = tag
+        elif tag is None or tag == "" or tag is False or tag == 0:
+            owner = props.get("source")
+        else:
+            owner = None
+        if owner == pack_name:
+            sources.add((source_id,))
+    vectors = {tuple(row) for row in conn.execute(f"SELECT node_id FROM {vec._table} WHERE pack_id=?", (pack_name,))}
+    return {"nodes": nodes, "edges": edges, "doc_twins": twins,
+            "doc_extras": extras, "sources": sources, "vectors": vectors}
+
+
+def _apply_single_file_delete(shared, sql, principal, pack_name, journal, graph, docs, vec):
+    """검증한 삭제 작업의 모든 저장소 변경과 완료 상태를 함께 커밋한다."""
+    from opencrab.stores import _node_bm25_sqlite, _source_fts_sqlite
+
+    if shared.in_unit_of_work:
+        shared.mark_rollback_only()
+        raise RuntimeError("delete apply requires a separate transaction")
+    if any(getattr(store, "shared_file", None) is not shared for store in (graph, docs, vec, sql)):
+        raise RuntimeError("delete stores do not share the same SQLite file")
+    with shared.unit_of_work() as conn:
+        authorize_delete(sql, principal, pack_name)
+        shared.validate_delete_operation(pack_name, journal["incarnation"], journal["operation_id"])
+        if not all((graph.available, docs.available, vec.available)):
+            raise RuntimeError("delete store is unavailable")
+        scope = _single_file_delete_scope(conn, pack_name, graph, docs, vec)
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_active'"
+        ).fetchone():
+            _single_file_delete_history_references(conn, pack_name, scope)
+        confirmation = _independent_single_file_delete_keys(conn, pack_name, vec)
+        if set(scope) != set(confirmation) or any(set(map(tuple, scope[kind])) != confirmation[kind] for kind in scope):
+            raise RuntimeError("delete scope changed before mutation")
+        for space, node_id in scope["doc_twins"] + scope["doc_extras"]:
+            if conn.execute("DELETE FROM doc_nodes WHERE space=? AND node_id=?", (space, node_id)).rowcount != 1:
+                raise RuntimeError("node document deletion could not be confirmed")
+            if docs._node_bm25_ok:
+                with shared.joined_tx():
+                    _node_bm25_sqlite.reindex_key(conn, docs._row_to_node, space, node_id)
+        for (node_id,) in scope["vectors"]:
+            if conn.execute(f"DELETE FROM {vec._table} WHERE node_id=? AND pack_id=?", (node_id, pack_name)).rowcount != 1:
+                raise RuntimeError("vector deletion could not be confirmed")
+        for (source_id,) in scope["sources"]:
+            if conn.execute("DELETE FROM doc_sources WHERE source_id=?", (source_id,)).rowcount != 1:
+                raise RuntimeError("source deletion could not be confirmed")
+            conn.execute("DELETE FROM doc_source_integrity WHERE source_id=?", (source_id,))
+            if docs._fts_ok:
+                conn.execute(_source_fts_sqlite.delete_sql("= :source_id"), {"source_id": source_id})
+        for from_id, relation, to_id in scope["edges"]:
+            if conn.execute(
+                "DELETE FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?",
+                (from_id, relation, to_id),
+            ).rowcount != 1:
+                raise RuntimeError("graph edge deletion could not be confirmed")
+        for node_type, node_id, _space in scope["nodes"]:
+            if conn.execute("DELETE FROM graph_nodes WHERE node_type=? AND node_id=?", (node_type, node_id)).rowcount != 1:
+                raise RuntimeError("graph node deletion could not be confirmed")
+        checks = {
+            "nodes": "SELECT 1 FROM graph_nodes WHERE node_type=? AND node_id=?",
+            "edges": "SELECT 1 FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?",
+            "doc_twins": "SELECT 1 FROM doc_nodes WHERE space=? AND node_id=?",
+            "doc_extras": "SELECT 1 FROM doc_nodes WHERE space=? AND node_id=?",
+            "sources": "SELECT 1 FROM doc_sources WHERE source_id=?",
+            "vectors": f"SELECT 1 FROM {vec._table} WHERE node_id=?",
+        }
+        for kind, query in checks.items():
+            for key in scope[kind]:
+                params = key[:2] if kind == "nodes" else key
+                if conn.execute(query, params).fetchone() is not None:
+                    raise RuntimeError("pack deletion has remaining records")
+        remaining = _single_file_delete_scope(conn, pack_name, graph, docs, vec)
+        if any(remaining[kind] for kind in ("nodes", "doc_extras", "sources", "vectors")):
+            raise RuntimeError("pack deletion left owned records")
+        result = [len(scope["doc_extras"]) + len(scope["nodes"]), len(scope["sources"]), len(scope["vectors"])]
+        evidence = _single_file_delete_evidence(journal["operation_id"], journal["incarnation"], result, scope)
+        if scope["vectors"]:
+            _invalidate_vec_ann(vec)
+        changed = conn.execute(
+            "UPDATE pack_delete_operations SET state='committed', result_json=?, evidence_json=? "
+            "WHERE operation_id=? AND pack_id=? AND incarnation=? AND state='pending'",
+            (json.dumps(result), json.dumps(evidence), journal["operation_id"], pack_name, journal["incarnation"]),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("delete operation changed during transaction")
+    return tuple(result)
+
+
+def _resume_single_file_delete(shared, sql, principal, pack_name, data_dir, journal, graph, docs, vec):
+    """삭제 작업의 DB 상태와 저널을 대조해 명시적 재개를 수행한다."""
+    with shared.unit_of_work() as conn:
+        authorize_delete(sql, principal, pack_name)
+        row = conn.execute(
+            "SELECT p.incarnation, o.incarnation, o.state, o.result_json, o.evidence_json "
+            "FROM packs p JOIN pack_delete_operations o ON o.pack_id=p.pack_id "
+            "WHERE p.pack_id=? AND o.operation_id=?",
+            (pack_name, journal["operation_id"]),
+        ).fetchone()
+        if row is None or row[0] != journal["incarnation"] or row[1] != journal["incarnation"]:
+            raise delete_journal.DeletePackJournalConflict("delete operation identity differs")
+        state, result_json, evidence_json = row[2], row[3], row[4]
+        if state == "pending":
+            if journal["state"] != "pending" or result_json is not None or evidence_json is not None:
+                raise delete_journal.DeletePackJournalConflict("pending delete states differ")
+        elif state == "committed":
+            try:
+                result = json.loads(result_json)
+            except (TypeError, ValueError) as exc:
+                raise delete_journal.DeletePackJournalConflict("delete result is invalid") from exc
+            if not isinstance(result, list) or len(result) != 3 or any(type(n) is not int or n < 0 for n in result):
+                raise delete_journal.DeletePackJournalConflict("delete result is invalid")
+            if journal["state"] == "committed" and journal["result"] != result:
+                raise delete_journal.DeletePackJournalConflict("delete results differ")
+            keys = _verify_single_file_delete_evidence(
+                evidence_json, journal["operation_id"], journal["incarnation"], result
+            )
+            checks = {
+                "nodes": "SELECT 1 FROM graph_nodes WHERE node_type=? AND node_id=?",
+                "edges": "SELECT 1 FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?",
+                "doc_twins": "SELECT 1 FROM doc_nodes WHERE space=? AND node_id=?",
+                "doc_extras": "SELECT 1 FROM doc_nodes WHERE space=? AND node_id=?",
+                "sources": "SELECT 1 FROM doc_sources WHERE source_id=?",
+                "vectors": f"SELECT 1 FROM {vec._table} WHERE node_id=?",
+            }
+            for kind, query in checks.items():
+                for key in keys[kind]:
+                    params = key[:2] if kind == "nodes" else key
+                    if conn.execute(query, params).fetchone() is not None:
+                        raise delete_journal.DeletePackJournalConflict("committed deletion has remaining records")
+            remaining = _single_file_delete_scope(conn, pack_name, graph, docs, vec)
+            if any(remaining[kind] for kind in ("nodes", "doc_extras", "sources", "vectors")):
+                raise delete_journal.DeletePackJournalConflict("committed deletion has remaining records")
+        else:
+            raise delete_journal.DeletePackJournalConflict("delete operation state is invalid")
+    if state == "pending":
+        result = list(_apply_single_file_delete(shared, sql, principal, pack_name, journal, graph, docs, vec))
+    completed = {**journal, "state": "committed", "result": result}
+    delete_journal.save_journal(data_dir, pack_name, completed)
+    return tuple(result)
+
+
+def _single_file_delete(shared, sql, principal, pack_name, graph, docs, vec, resume, lock_timeout):
+    """팩 잠금 아래 삭제 예약과 명시적 재개를 처리한다."""
+    with file_lock(delete_journal.lock_filename(pack_name), timeout=lock_timeout):
+        authorize_delete(sql, principal, pack_name)
+        data_dir = lock_data_dir()
+        journal = delete_journal.load_journal(data_dir, pack_name, schema=2)
+        if journal is None:
+            pending = shared.connection().execute(
+                "SELECT 1 FROM pack_delete_operations WHERE pack_id=? AND state='pending'", (pack_name,)
+            ).fetchone()
+            if pending is not None:
+                raise delete_journal.DeletePackJournalConflict("pending operation has no journal")
+            journal = _start_single_file_delete(shared, sql, principal, pack_name, data_dir)
+        else:
+            identity = shared.connection().execute(
+                "SELECT p.incarnation, o.incarnation, o.state FROM packs p "
+                "JOIN pack_delete_operations o ON o.pack_id=p.pack_id "
+                "WHERE p.pack_id=? AND o.operation_id=?",
+                (pack_name, journal["operation_id"]),
+            ).fetchone()
+            if identity is None or identity[0] != journal["incarnation"] or identity[1] != journal["incarnation"]:
+                raise delete_journal.DeletePackJournalConflict("delete operation identity differs")
+            if identity[2] not in ("pending", "committed") or (identity[2] == "pending" and journal["state"] != "pending"):
+                raise delete_journal.DeletePackJournalConflict("delete states differ")
+            if not resume:
+                raise delete_journal.DeletePackJournalPending("pack deletion journal exists; specify resume")
+        return _resume_single_file_delete(shared, sql, principal, pack_name, data_dir, journal, graph, docs, vec)
 
 
 def delete_pack(
@@ -1407,6 +1965,15 @@ def delete_pack(
     principal = _require_bound_principal()
     # 비소유자는 잠금 파일과 저널에 닿기 전에 여기서 거부된다.
     authorize_delete(sql, principal, pack_name)
+    pg_uow = getattr(sql, "_pg_uow", None)
+    if pg_uow is not None and pg_uow.active:
+        raise RuntimeError("delete_pack cannot run inside a PostgreSQL unit of work")
+    if is_single_file(graph, docs, vec, sql):
+        marker = sql.shared_file.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            raise RuntimeError("single SQLite deletion is not yet supported")
     _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
     _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
 
@@ -2351,6 +2918,15 @@ def load_nodes_incremental(
         raise ValueError(
             "load_nodes_incremental: sql은 필수다(팩 소유권 인가, #424)")
     authorize(sql, principal, pack_name)
+    required = [graph, docs, sql]
+    if vec is not None:
+        required.append(vec)
+    if is_single_file(*required):
+        marker = sql.shared_file.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            raise RuntimeError("single SQLite incremental node cleanup is not yet supported")
 
     # #374: same 판정이 문서 sink 자신의 값(node_type 컬럼, properties)도 보도록
     # 문서 행 지문을 한 번 읽는다. 호출자가 넘긴 `doc_node_spaces` 는 행 존재만
@@ -2963,13 +3539,21 @@ def load_chunks(
     ok = err = 0
     # #671: 벡터와 doc 저장소가 같은 SharedSqliteFile을 나눠 쓰면 한 트랜잭션으로 쓴다.
     # 아니면(기본) 아래 기존 경로가 한 줄도 달라지지 않는다.
-    atomic = is_single_file(vec, docs)
+    pg_uow = common_pg_uow(vec, docs, sql)
+    sqlite_shared = is_single_file(vec, docs, sql)
+    if pg_uow is not None and sqlite_shared:
+        raise RuntimeError("chunk stores cannot mix shared PostgreSQL and SQLite units of work")
+    atomic = pg_uow is not None or sqlite_shared
+    shared = sql.shared_file if sqlite_shared else None
+    if (pg_uow is not None and pg_uow.active) or (shared is not None and shared.in_unit_of_work):
+        raise RuntimeError("chunk loader cannot run inside a shared unit of work")
+    incarnation = shared.pack_incarnation(pack_name) if shared is not None else None
     seen_ids: set[str]  = set()   # 중복 청크 ID dedup
     b_texts: list[str]  = []
     b_ids:   list[str]  = []
     b_metas: list[dict] = []
 
-    def flush_single(sid: str, txt: str, meta: dict) -> bool:
+    def flush_single(sid: str, txt: str, meta: dict, vector: Any = None) -> bool:
         """청크 1건 upsert. 성공 시 True — **doc 쓰기까지 성공해야** True다.
 
         [Δ r11 P2, #142 재리뷰] 종전엔 `docs.upsert_source` 실패를 통째로
@@ -2982,9 +3566,17 @@ def load_chunks(
         if atomic:
             # #671: 한 건의 벡터와 doc을 한 트랜잭션에 넣는다. 실패하면 둘 다 남지 않는다.
             try:
-                with unit_of_work_for(vec, docs):
-                    vec.upsert_texts(texts=[txt], ids=[sid], metadatas=[meta])
+                if vector is None:
+                    vector = vec.prepare_upsert_vectors([txt])[0]
+                with _chunk_transaction(pg_uow, shared, sql):
+                    if incarnation is not None:
+                        shared.validate_pack_writes({pack_name: incarnation})
+                    vec.upsert_precomputed([txt], [meta], [sid], [vector])
                     docs.upsert_source(sid, txt, meta)
+            except _ChunkTransactionStartError as exc:
+                raise exc.original
+            except ChunkTransactionUncertainError:
+                raise
             except Exception as exc_unit:
                 err += 1
                 log.warning("청크 개별 오류(%s) %s: %s", pack_name, sid[:8], exc_unit)
@@ -3014,15 +3606,23 @@ def load_chunks(
             # #671: 벡터와 doc이 한 파일을 나눠 쓴다. 배치 전체를 한 트랜잭션에 넣고 예외를
             # 삼키지 않는다. 어느 한 쓰기라도 실패하면 배치 전체가 롤백된다(고아 행 없음).
             # 그다음 건별 재시도로 내려가 문제 건만 err로 센다.
+            vectors = None
             try:
-                with unit_of_work_for(vec, docs):
-                    vec.upsert_texts(texts=b_texts, ids=b_ids, metadatas=b_metas)
+                vectors = vec.prepare_upsert_vectors(b_texts)
+                with _chunk_transaction(pg_uow, shared, sql):
+                    if incarnation is not None:
+                        shared.validate_pack_writes({pack_name: incarnation})
+                    vec.upsert_precomputed(b_texts, b_metas, b_ids, vectors)
                     for sid, txt, meta in zip(b_ids, b_texts, b_metas):
                         docs.upsert_source(sid, txt, meta)
+            except _ChunkTransactionStartError as exc:
+                raise exc.original
+            except ChunkTransactionUncertainError:
+                raise
             except Exception as exc:
                 log.warning("청크 배치 롤백(%s), 건별 재시도: %s", pack_name, exc)
-                for sid, txt, meta in zip(b_ids, b_texts, b_metas):
-                    flush_single(sid, txt, meta)
+                for index, (sid, txt, meta) in enumerate(zip(b_ids, b_texts, b_metas)):
+                    flush_single(sid, txt, meta, None if vectors is None or index >= len(vectors) else vectors[index])
             else:
                 ok += len(b_texts)
         else:
@@ -3124,6 +3724,15 @@ def load_chunks_incremental(
     authorize(sql, principal, pack_name)
     c_new = c_txt = c_meta = c_same = err = 0
     vec_unrecovered = 0  # #332: 열거 불가 백엔드에서 존재를 확인 못 한 c_same 후보 수
+    pg_uow = common_pg_uow(vec, docs, sql)
+    sqlite_shared = is_single_file(vec, docs, sql)
+    if pg_uow is not None and sqlite_shared:
+        raise RuntimeError("chunk stores cannot mix shared PostgreSQL and SQLite units of work")
+    atomic = pg_uow is not None or sqlite_shared
+    shared = sql.shared_file if sqlite_shared else None
+    if (pg_uow is not None and pg_uow.active) or (shared is not None and shared.in_unit_of_work):
+        raise RuntimeError("chunk loader cannot run inside a shared unit of work")
+    incarnation = shared.pack_incarnation(pack_name) if shared is not None else None
     seen_ids: set[str]  = set()   # 중복 청크 ID dedup
     bypack_ids: set[str] = set()
     b_texts: list[str]  = []
@@ -3148,10 +3757,32 @@ def load_chunks_incremental(
         if callable(_cand):
             vec_get_by_id = _cand
 
-    def flush_single(sid: str, txt: str, meta: dict, kind: str) -> None:
+    def flush_single(sid: str, txt: str, meta: dict, kind: str, vector: Any = None) -> None:
         """청크 1건 upsert(재임베딩). doc 쓰기까지 성공해야 kind 에 따라
         c_new/c_txt 반영한다(불변식 ①, [Δ r11 P2] — 형제 `flush()` 와 동일)."""
         nonlocal c_new, c_txt, err
+        if atomic:
+            try:
+                if vector is None:
+                    vector = vec.prepare_upsert_vectors([txt])[0]
+                with _chunk_transaction(pg_uow, shared, sql):
+                    if incarnation is not None:
+                        shared.validate_pack_writes({pack_name: incarnation})
+                    vec.upsert_precomputed([txt], [meta], [sid], [vector])
+                    docs.upsert_source(sid, txt, meta)
+            except _ChunkTransactionStartError as exc:
+                raise exc.original
+            except ChunkTransactionUncertainError:
+                raise
+            except Exception as exc:
+                err += 1
+                log.warning("증분 청크 오류(%s) %s: %s", pack_name, sid[:8], exc)
+                return
+            if kind == "new":
+                c_new += 1
+            else:
+                c_txt += 1
+            return
         try:
             vec.upsert_texts(texts=[txt], ids=[sid], metadatas=[meta])
         except Exception as exc2:
@@ -3172,6 +3803,32 @@ def load_chunks_incremental(
     def flush() -> None:
         nonlocal c_new, c_txt, err
         if not b_texts:
+            return
+        if atomic:
+            vectors = None
+            try:
+                vectors = vec.prepare_upsert_vectors(b_texts)
+                with _chunk_transaction(pg_uow, shared, sql):
+                    if incarnation is not None:
+                        shared.validate_pack_writes({pack_name: incarnation})
+                    vec.upsert_precomputed(b_texts, b_metas, b_ids, vectors)
+                    for sid, txt, meta in zip(b_ids, b_texts, b_metas):
+                        docs.upsert_source(sid, txt, meta)
+            except _ChunkTransactionStartError as exc:
+                raise exc.original
+            except ChunkTransactionUncertainError:
+                raise
+            except Exception as exc:
+                log.warning("증분 청크 배치 롤백(%s), 건별 재시도: %s", pack_name, exc)
+                for index, (sid, txt, meta, kind) in enumerate(zip(b_ids, b_texts, b_metas, b_kinds)):
+                    flush_single(sid, txt, meta, kind, None if vectors is None or index >= len(vectors) else vectors[index])
+            else:
+                c_new += b_kinds.count("new")
+                c_txt += b_kinds.count("txt")
+            b_texts.clear()
+            b_ids.clear()
+            b_metas.clear()
+            b_kinds.clear()
             return
         try:
             vec.upsert_texts(texts=b_texts, ids=b_ids, metadatas=b_metas)
@@ -3227,12 +3884,17 @@ def load_chunks_incremental(
                 b_kinds.append("txt")
             elif strip_retired_keys(live[1]) != meta:
                 try:
-                    if _vec_meta_update(vec, chunk_id, meta, pack_name):
-                        state_reader = getattr(docs, "read_source_state_exact", None)
-                        metadata_rewriter = getattr(docs, "rewrite_source_metadata", None)
-                        if not (callable(state_reader) and callable(metadata_rewriter)):
-                            raise RuntimeError("doc store lacks source-state rewrite boundary")
-                        metadata_rewriter(chunk_id, meta, state_reader(chunk_id))
+                    with (_chunk_transaction(pg_uow, shared, sql) if atomic else contextlib.nullcontext()):
+                        if incarnation is not None:
+                            shared.validate_pack_writes({pack_name: incarnation})
+                        updated = _vec_meta_update(vec, chunk_id, meta, pack_name)
+                        if updated:
+                            state_reader = getattr(docs, "read_source_state_exact", None)
+                            metadata_rewriter = getattr(docs, "rewrite_source_metadata", None)
+                            if not (callable(state_reader) and callable(metadata_rewriter)):
+                                raise RuntimeError("doc store lacks source-state rewrite boundary")
+                            metadata_rewriter(chunk_id, meta, state_reader(chunk_id))
+                    if updated:
                         c_meta += 1
                     else:
                         b_ids.append(chunk_id)
@@ -3240,6 +3902,10 @@ def load_chunks_incremental(
                         b_metas.append(meta)
                         b_kinds.append("txt")
                         continue
+                except _ChunkTransactionStartError as exc:
+                    raise exc.original
+                except ChunkTransactionUncertainError:
+                    raise
                 except Exception as exc:
                     err += 1
                     log.warning("청크 메타갱신 오류(%s) %s: %s", pack_name, chunk_id[:8], exc)
@@ -3368,6 +4034,12 @@ def incremental_finalize(
     require_live_data("incremental_finalize")
     principal = _require_bound_principal()
     authorize(sql, principal, pack_name)
+    if is_single_file(graph, docs, vec, sql):
+        marker = sql.shared_file.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            raise RuntimeError("single SQLite incremental deletion is not yet supported")
     _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
     _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
     live_nodes  = live["nodes"]

@@ -31,6 +31,209 @@ PACK = "pk"
 _EMB = struct.pack("32f", *([0.1] * 32))
 
 
+@pytest.mark.parametrize("alias", ["direct", "symlink", "hardlink"])
+def test_write_open_rejects_unified_db_without_setting(tmp_path, monkeypatch, alias):
+    monkeypatch.delenv("SINGLE_SQLITE_FILE", raising=False)
+    db = tmp_path / "external.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE pack_delete_operations (id TEXT)")
+    target = db
+    if alias == "symlink":
+        target = tmp_path / "alias.db"
+        target.symlink_to(db)
+    elif alias == "hardlink":
+        target = tmp_path / "alias.db"
+        os.link(db, target)
+    with pytest.raises((RuntimeError, ValueError)):
+        bf._open(target, "rw", False)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM pack_delete_operations").fetchone()[0] == 0
+
+
+def test_write_open_holds_lifetime_lock_until_close(tmp_path):
+    from opencrab.locking import acquire_file_lock, release_file_lock
+
+    db = tmp_path / "external.db"
+    sqlite3.connect(db).close()
+    conn = bf._open(db, "rw", False)
+    try:
+        with pytest.raises(RuntimeError, match="upgrade"):
+            acquire_file_lock("external.db.lifetime.lock", str(tmp_path), timeout=0)
+    finally:
+        conn.close()
+    lock = acquire_file_lock("external.db.lifetime.lock", str(tmp_path), timeout=0)
+    release_file_lock(lock)
+
+
+def test_write_connection_close_failure_preserves_lifetime_after_stack(tmp_path, monkeypatch):
+    from contextlib import ExitStack
+
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    db = tmp_path / "external.db"
+    sqlite3.connect(db).close()
+    shared = SharedSqliteFile(str(db), checked=True)
+    stack = ExitStack()
+    stack.callback(shared.close)
+    conn = bf._open(db, "rw", False, shared=shared)
+    real_close = bf._CheckedWriteConnection.close
+    failure = True
+
+    def close(connection):
+        if failure:
+            raise OSError("close failure")
+        return real_close(connection)
+
+    monkeypatch.setattr(bf._CheckedWriteConnection, "close", close)
+    with pytest.raises(OSError, match="close failure"):
+        conn.close()
+    with pytest.raises(RuntimeError, match="close"):
+        stack.close()
+    assert shared.all_conns == [conn]
+    script = tmp_path / "exclusive.py"
+    script.write_text(
+        "import sys\nfrom opencrab.locking import acquire_file_lock\n"
+        "acquire_file_lock('external.db.lifetime.lock', sys.argv[1], timeout=0)\n"
+    )
+    result = subprocess.run([sys.executable, str(script), str(tmp_path)], capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0 and "TimeoutError" in result.stderr
+    failure = False
+    shared.close()
+    result = subprocess.run([sys.executable, str(script), str(tmp_path)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0
+
+
+def test_run_apply_close_failure_retains_owner_after_gc(world, tmp_path, monkeypatch, capsys):
+    import gc
+
+    from opencrab.stores._single_file import failed_shared_file
+
+    _failure_world(world)
+    dest = tmp_path / "bk"
+    dest.mkdir()
+    real_close = bf._CheckedWriteConnection.close
+    failures = True
+
+    def close(connection):
+        if failures:
+            raise OSError("close failure")
+        return real_close(connection)
+
+    monkeypatch.setattr(bf._CheckedWriteConnection, "close", close)
+    with pytest.raises(RuntimeError, match="close"):
+        bf.main(["--apply", "--backup-to", str(dest)])
+    capsys.readouterr()
+    gc.collect()
+    path = world.root / "doc_store.db"
+    owner = failed_shared_file(str(path))
+    assert owner is not None and owner.all_conns and owner._lifetime_lock is not None
+    with pytest.raises(RuntimeError, match="closed"):
+        owner.acquire(object(), None)
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    with pytest.raises(RuntimeError, match="requires close retry"):
+        SharedSqliteFile(str(path), checked=True)
+    script = tmp_path / "exclusive_run.py"
+    script.write_text(
+        "import sys\nfrom opencrab.locking import acquire_file_lock\n"
+        "acquire_file_lock('doc_store.db.lifetime.lock', sys.argv[1], timeout=0)\n"
+    )
+    result = subprocess.run([sys.executable, str(script), str(world.root)], capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0 and "TimeoutError" in result.stderr
+    failures = False
+    for file in (world.root / "doc_store.db", world.vpath):
+        pending = failed_shared_file(str(file))
+        if pending is not None:
+            pending.close()
+            assert failed_shared_file(str(file)) is None
+    result = subprocess.run([sys.executable, str(script), str(world.root)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0
+
+
+def test_write_connection_body_and_close_failure_keeps_context(tmp_path, monkeypatch):
+    from contextlib import ExitStack
+
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    db = tmp_path / "external.db"
+    sqlite3.connect(db).close()
+    shared = SharedSqliteFile(str(db), checked=True)
+    conn = bf._open(db, "rw", False, shared=shared)
+    real_close = bf._CheckedWriteConnection.close
+    failure = True
+
+    def close(connection):
+        if failure:
+            raise OSError("close failure")
+        return real_close(connection)
+
+    monkeypatch.setattr(bf._CheckedWriteConnection, "close", close)
+    with pytest.raises(RuntimeError, match="close") as caught:
+        with ExitStack() as stack:
+            stack.callback(shared.close)
+            raise ValueError("body failure")
+    assert isinstance(caught.value.__context__, ValueError)
+    assert shared.all_conns == [conn] and shared._lifetime_lock is not None
+    failure = False
+    shared.close()
+
+
+def test_write_open_connect_failure_releases_lifetime(tmp_path, monkeypatch):
+    from opencrab.locking import acquire_file_lock, release_file_lock
+
+    db = tmp_path / "external.db"
+    sqlite3.connect(db).close()
+    monkeypatch.setattr(bf.sqlite3, "connect", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("open failure")))
+    with pytest.raises(OSError, match="open failure"):
+        bf._open(db, "rw", False)
+    lock = acquire_file_lock("external.db.lifetime.lock", str(tmp_path), timeout=0)
+    release_file_lock(lock)
+
+
+def test_write_batches_closes_first_connection_if_second_open_fails(tmp_path, monkeypatch):
+    first = sqlite3.connect(tmp_path / "doc_store.db")
+    paths = bf.Paths(tmp_path, "missing.db", "vectors")
+    monkeypatch.setattr(bf, "_open", lambda *_args, **_kwargs: first if _args[0] == paths.doc else (_ for _ in ()).throw(OSError("second open")))
+    state = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(OSError, match="second open"):
+            bf._write_state_batches(paths, state, 1, None, False, None)
+    finally:
+        state.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        first.execute("SELECT 1")
+
+
+def test_write_open_rejects_unchecked_lifetime_owner(tmp_path):
+    from opencrab.stores._single_file import SharedSqliteFile
+
+    db = tmp_path / "external.db"
+    sqlite3.connect(db).close()
+    shared = SharedSqliteFile(str(db))
+    try:
+        with pytest.raises(ValueError, match="lifetime owner"):
+            bf._open(db, "rw", False, shared=shared)
+    finally:
+        shared.close()
+
+
+def test_write_open_detects_replacement_before_marker(tmp_path, monkeypatch):
+    db = tmp_path / "original.db"
+    replacement = tmp_path / "replacement.db"
+    sqlite3.connect(db).close()
+    with sqlite3.connect(replacement) as conn:
+        conn.execute("CREATE TABLE pack_delete_operations (id TEXT)")
+    original_connect = bf.sqlite3.connect
+
+    def replace_then_connect(*args, **kwargs):
+        os.replace(replacement, db)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(bf.sqlite3, "connect", replace_then_connect)
+    with pytest.raises(ValueError, match="identity changed|one link"):
+        bf._open(db, "rw", False)
+
+
 class World:
     """A local data directory with graph.db, doc_store.db and vectors.db."""
 
@@ -434,6 +637,14 @@ def test_apply_requires_backup(world, capsys):
     assert bf.main(["--apply"]) == 2
     assert bf.main(["--backup-to", "x"]) == 2
     capsys.readouterr()
+    assert world.dump() == before
+
+
+def test_single_sqlite_mode_is_refused_before_store_access(world, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("SINGLE_SQLITE_FILE", str(tmp_path / "single.db"))
+    before = world.dump()
+    assert bf.main(["--dry-run-scratch", str(tmp_path)]) == 2
+    assert "single SQLite mode" in capsys.readouterr().err
     assert world.dump() == before
 
 
@@ -1416,8 +1627,8 @@ def test_failure_after_commit_is_not_reported_as_rolled_back(world, tmp_path, ca
         def __getattr__(self, name):
             return getattr(self._c, name)
 
-    def opener(path, mode, vec):
-        conn = real_open(path, mode, vec)
+    def opener(path, mode, vec, **kwargs):
+        conn = real_open(path, mode, vec, **kwargs)
         return Wrapped(conn) if mode == "rw" and path.name == "doc_store.db" else conn
 
     monkeypatch.setattr(bf, "_open", opener)
@@ -1483,8 +1694,8 @@ def test_failed_rollback_does_not_hide_the_original_error(world, tmp_path, capsy
         def __getattr__(self, name):
             return getattr(self._c, name)
 
-    def opener(path, mode, vec):
-        conn = real_open(path, mode, vec)
+    def opener(path, mode, vec, **kwargs):
+        conn = real_open(path, mode, vec, **kwargs)
         return Wrapped(conn) if mode == "rw" and path.name == "doc_store.db" else conn
 
     monkeypatch.setattr(bf, "_open", opener)
@@ -1632,8 +1843,8 @@ def test_secondary_interrupts_never_hide_the_original_error(
         def __getattr__(self, name):
             return getattr(self._c, name)
 
-    def opener(path, mode, vec):
-        conn = real_open(path, mode, vec)
+    def opener(path, mode, vec, **kwargs):
+        conn = real_open(path, mode, vec, **kwargs)
         return (
             Wrapped(conn)
             if place == "rollback" and mode == "rw" and path.name == "doc_store.db"
@@ -1756,10 +1967,10 @@ def test_a_row_count_mismatch_fails_loudly_and_rolls_back(world, tmp_path, capsy
     monkeypatch.setattr(
         bf,
         "_open",
-        lambda path, mode, vec: (
-            Wrapped(real_open(path, mode, vec))
+        lambda path, mode, vec, **kwargs: (
+            Wrapped(real_open(path, mode, vec, **kwargs))
             if mode == "rw" and path.name == "doc_store.db"
-            else real_open(path, mode, vec)
+            else real_open(path, mode, vec, **kwargs)
         ),
     )
     dest = tmp_path / "bk"
@@ -1974,8 +2185,8 @@ def test_resolver_name_collision_fails_before_reconcile_and_deletes_nothing(
     monkeypatch.setattr(bf, "uuid", SimpleNamespace(uuid4=lambda: fixed))
     real_write = bf._write_state_batches
 
-    def write(paths, state, *a):
-        stats = real_write(paths, state, *a)
+    def write(paths, state, *a, **kwargs):
+        stats = real_write(paths, state, *a, **kwargs)
         set_dir = Path(state.execute("PRAGMA database_list").fetchone()[2]).parent
         (set_dir / f"{_RESOLVER}{fixed}").mkdir()
         (set_dir / f"{_RESOLVER}{fixed}" / "sentinel").write_text("keep")

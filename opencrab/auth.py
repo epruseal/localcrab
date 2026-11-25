@@ -128,6 +128,21 @@ def create_user(sql: Any, display_name: str, is_local: bool = False) -> str:
     from opencrab.pack.ownership import ensure_default_pack
 
     user_id = f"user_{uuid.uuid4().hex[:12]}"
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        marker = shared.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            from opencrab.stores.sql_store import shared_write_unit
+
+            with shared_write_unit(sql) as conn:
+                conn.execute(
+                    "INSERT INTO users (user_id, display_name, is_local) VALUES (?, ?, ?)",
+                    (user_id, display_name, is_local),
+                )
+                ensure_default_pack(sql, user_id, conn=conn)
+            return user_id
     with sql._engine.begin() as conn:
         conn.execute(
             text(
@@ -151,11 +166,13 @@ def get_local_user(sql: Any) -> Principal | None:
     """
     from sqlalchemy import text
 
-    with sql._engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT user_id, disabled FROM users WHERE is_local = :is_local"),
-            {"is_local": True},
-        ).fetchone()
+    query = "SELECT user_id, disabled FROM users WHERE is_local = :is_local"
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None and shared.in_unit_of_work:
+        row = shared.connection().execute(query, {"is_local": True}).fetchone()
+    else:
+        with sql._engine.connect() as conn:
+            row = conn.execute(text(query), {"is_local": True}).fetchone()
     if row is None:
         return None
     return Principal(user_id=row[0], is_local=True, disabled=row[1] == 1)
@@ -165,12 +182,13 @@ def list_users(sql: Any) -> list[dict[str, Any]]:
     """List all users (for ``opencrab user list``)."""
     from sqlalchemy import text
 
-    with sql._engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT user_id, display_name, is_local, disabled, created_at FROM users"
-            )
-        ).fetchall()
+    query = "SELECT user_id, display_name, is_local, disabled, created_at FROM users"
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None and shared.in_unit_of_work:
+        rows = shared.connection().execute(query).fetchall()
+    else:
+        with sql._engine.connect() as conn:
+            rows = conn.execute(text(query)).fetchall()
     return [
         {
             "user_id": r[0],
@@ -187,6 +205,12 @@ def disable_user(sql: Any, user_id: str) -> bool:
     """Set ``disabled=TRUE`` for *user_id*. Returns False if no such user."""
     from sqlalchemy import text
 
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        from opencrab.stores.sql_store import shared_write_unit
+
+        with shared_write_unit(sql) as conn:
+            return conn.execute("UPDATE users SET disabled=1 WHERE user_id=?", (user_id,)).rowcount > 0
     with sql._engine.begin() as conn:
         result = conn.execute(
             text("UPDATE users SET disabled = :disabled WHERE user_id = :user_id"),
@@ -203,6 +227,12 @@ def enable_user(sql: Any, user_id: str) -> bool:
     """
     from sqlalchemy import text
 
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        from opencrab.stores.sql_store import shared_write_unit
+
+        with shared_write_unit(sql) as conn:
+            return conn.execute("UPDATE users SET disabled=0 WHERE user_id=?", (user_id,)).rowcount > 0
     with sql._engine.begin() as conn:
         result = conn.execute(
             text("UPDATE users SET disabled = :disabled WHERE user_id = :user_id"),
@@ -227,6 +257,23 @@ def issue_token(sql: Any, user_id: str, name: str | None = None) -> tuple[str, s
     """
     from sqlalchemy import text
 
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        from opencrab.stores.sql_store import shared_write_unit
+
+        with shared_write_unit(sql) as conn:
+            row = conn.execute("SELECT disabled FROM users WHERE user_id=?", (user_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown user: {user_id}")
+            if row[0] == 1:
+                raise ValueError(f"User is disabled: {user_id}")
+            secret = _TOKEN_PREFIX + secrets.token_urlsafe(32)
+            token_id = f"tok_{uuid.uuid4().hex[:12]}"
+            conn.execute(
+                "INSERT INTO api_tokens (token_id,user_id,token_hash,name) VALUES (?,?,?,?)",
+                (token_id, user_id, hash_token(secret), name),
+            )
+        return token_id, secret
     with sql._engine.connect() as conn:
         row = conn.execute(
             text("SELECT disabled FROM users WHERE user_id = :user_id"),
@@ -291,6 +338,28 @@ def bootstrap_local_user(
 
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     secret: str | None = None
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        marker = shared.connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is not None:
+            from opencrab.stores.sql_store import shared_write_unit
+
+            with shared_write_unit(sql) as conn:
+                conn.execute(
+                    "INSERT INTO users (user_id, display_name, is_local) VALUES (?, ?, ?)",
+                    (user_id, display_name, True),
+                )
+                ensure_default_pack(sql, user_id, conn=conn)
+                if issue_token:
+                    secret = _TOKEN_PREFIX + secrets.token_urlsafe(32)
+                    token_id = f"tok_{uuid.uuid4().hex[:12]}"
+                    conn.execute(
+                        "INSERT INTO api_tokens (token_id, user_id, token_hash, name) VALUES (?, ?, ?, ?)",
+                        (token_id, user_id, hash_token(secret), token_name),
+                    )
+            return user_id, secret
     with sql._engine.begin() as conn:
         conn.execute(
             text(
@@ -342,16 +411,17 @@ def verify_token(sql: Any, presented: str) -> Principal | None:
 
     from sqlalchemy import text
 
-    with sql._engine.connect() as conn:
-        row = conn.execute(
-            text(
-                "SELECT u.user_id, u.is_local FROM api_tokens t "
-                "JOIN users u ON u.user_id = t.user_id "
-                "WHERE t.token_hash = :token_hash "
-                "AND t.revoked_at IS NULL AND u.disabled = :not_disabled"
-            ),
-            {"token_hash": hash_token(presented), "not_disabled": False},
-        ).fetchone()
+    shared = getattr(sql, "shared_file", None)
+    query = ("SELECT u.user_id, u.is_local FROM api_tokens t "
+             "JOIN users u ON u.user_id = t.user_id "
+             "WHERE t.token_hash = :token_hash "
+             "AND t.revoked_at IS NULL AND u.disabled = :not_disabled")
+    params = {"token_hash": hash_token(presented), "not_disabled": False}
+    if shared is not None and shared.in_unit_of_work:
+        row = shared.connection().execute(query, params).fetchone()
+    else:
+        with sql._engine.connect() as conn:
+            row = conn.execute(text(query), params).fetchone()
     if row is None:
         return None
     # This query's WHERE already excludes disabled owners, so the returned
@@ -386,8 +456,20 @@ def token_store_unavailable_reason(exc: BaseException) -> str | None:
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+    from opencrab.stores._single_file import SingleFileUnavailableError
+
+    if isinstance(exc, SingleFileUnavailableError):
+        # 단일 SQLite 인증 저장소를 열지 못했다(#671). make_auth_sql_store가 이유를 이미 정했다.
+        return exc.reason
     if isinstance(exc, PoolTimeoutError):
         return "store-unavailable"
+    if isinstance(exc, sqlite3.OperationalError):
+        # No caller in opencrab/ or apps/ passes a raw driver error now (#671). SQLAlchemy wraps the error that
+        # the do_connect listener raises, and the wrapped error takes the branch below. This branch stays for a
+        # raw sqlite3 error that comes from outside SQLAlchemy. Only a lock is "store-busy".
+        from opencrab.stores._single_file import sqlite_busy_or_locked
+
+        return "store-busy" if sqlite_busy_or_locked(exc) else None
     if not isinstance(exc, OperationalError):
         return None
     orig = getattr(exc, "orig", None)
@@ -409,6 +491,16 @@ def revoke_token(sql: Any, token_id: str) -> None:
 
     from opencrab.execution._sql import now_expr
 
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None:
+        from opencrab.stores.sql_store import shared_write_unit
+
+        with shared_write_unit(sql) as conn:
+            conn.execute(
+                "UPDATE api_tokens SET revoked_at=datetime('now') WHERE token_id=? AND revoked_at IS NULL",
+                (token_id,),
+            )
+        return
     with sql._engine.begin() as conn:
         conn.execute(
             text(
@@ -424,14 +516,14 @@ def list_tokens(sql: Any, user_id: str) -> list[dict[str, Any]]:
     secret (the latter was never stored)."""
     from sqlalchemy import text
 
-    with sql._engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT token_id, name, created_at, last_used_at, revoked_at "
-                "FROM api_tokens WHERE user_id = :user_id"
-            ),
-            {"user_id": user_id},
-        ).fetchall()
+    query = ("SELECT token_id, name, created_at, last_used_at, revoked_at "
+             "FROM api_tokens WHERE user_id = :user_id")
+    shared = getattr(sql, "shared_file", None)
+    if shared is not None and shared.in_unit_of_work:
+        rows = shared.connection().execute(query, {"user_id": user_id}).fetchall()
+    else:
+        with sql._engine.connect() as conn:
+            rows = conn.execute(text(query), {"user_id": user_id}).fetchall()
     return [
         {
             "token_id": r[0],
@@ -486,6 +578,12 @@ def principal_scope(principal: Principal) -> Iterator[None]:
 # calls the same two functions cli.py's `serve --transport stdio` does.
 # ---------------------------------------------------------------------------
 
+_SINGLE_NOT_BOOTSTRAPPED = (
+    "No local user exists in the single SQLite database. A single root takes its users from the "
+    "merge input. This process does not create users."
+)
+
+
 def require_local_principal() -> Principal:
     """Return the enabled local-user Principal, or raise with what to do.
 
@@ -513,65 +611,64 @@ def require_local_principal() -> Principal:
     missing file. A *connection* failure is not: swallowing it as "run init"
     would send an operator chasing the wrong problem.
     """
-    from pathlib import Path
-
     from opencrab.config import get_settings
-    from opencrab.stores.sql_store import SQLStore
+    from opencrab.stores.factory import make_auth_sql_store
 
     settings = get_settings()
-    not_bootstrapped = RuntimeError(
-        "No local user is bootstrapped. Run 'opencrab init' first -- it "
-        "creates the local user and issues its first token. (Looked for a "
-        f"local user under {settings.local_data_dir!r}. If this process is "
-        "a stdio MCP server with an explicit LOCAL_DATA_DIR, set "
-        "OPENCRAB_BOOTSTRAP_ON_EMPTY=1 to bootstrap it automatically "
-        "instead of running 'opencrab init' by hand -- see #245.)"
-    )
-
-    if settings.is_local:
-        # File first: on SQLite, *connecting* to a missing path creates it.
-        if not Path(settings.local_data_dir, "opencrab.db").is_file():
-            raise not_bootstrapped
-        url = settings.sqlite_url
+    if settings.single_sqlite_file:
+        # 단일 root의 사용자는 병합 입력에서 온다. init과 bootstrap-on-empty는 사용자를 만들지 않으므로
+        # 그 안내를 따르면 막다른 길이다(#671).
+        not_bootstrapped = RuntimeError(_SINGLE_NOT_BOOTSTRAPPED)
     else:
-        # docker and pg both mean PostgreSQL. No file to check, and
-        # `make_sql_store` is not used here because it would take SQLStore's
-        # default create_tables=True and run DDL -- this function must not.
-        url = settings.postgres_url
-
-    sql = SQLStore(url=url, create_tables=False)
-
-    if not getattr(sql, "available", False):
-        # SQLStore swallows the connect error into a log line and a False
-        # flag, so the reason is not retrievable here. What IS known: the
-        # local file existed (checked above) or this is a remote database.
-        # Either way the store failed to open, which is not the same thing as
-        # "you have not run init" -- reporting it as that would send an
-        # operator to fix the wrong problem.
-        raise RuntimeError(
-            "Could not open the SQL store. This is not a missing bootstrap -- "
-            "the database exists (or is remote) but did not connect. Check the "
-            "preceding 'SQL store unavailable' log line for the driver error, "
-            "then the file permissions or the PostgreSQL connection settings."
+        not_bootstrapped = RuntimeError(
+            "No local user is bootstrapped. Run 'opencrab init' first -- it "
+            "creates the local user and issues its first token. (Looked for a "
+            f"local user under {settings.local_data_dir!r}. If this process is "
+            "a stdio MCP server with an explicit LOCAL_DATA_DIR, set "
+            "OPENCRAB_BOOTSTRAP_ON_EMPTY=1 to bootstrap it automatically "
+            "instead of running 'opencrab init' by hand -- see #245.)"
         )
 
-    try:
-        principal = get_local_user(sql)
-    except Exception as exc:  # noqa: BLE001
-        # Distinguish "no users table yet" (not bootstrapped) from a real
-        # query/driver failure, which must surface as itself.
-        if _looks_like_missing_table(exc):
-            raise not_bootstrapped from exc
-        raise
-
-    if principal is None:
+    # make_auth_sql_store keeps the no-create rule: no DDL, and on SQLite no connect to a missing
+    # opencrab.db. None means there is demonstrably nothing to look up.
+    sql = make_auth_sql_store(settings)
+    if sql is None:
         raise not_bootstrapped
-    if principal.disabled:
-        raise RuntimeError(
-            f"The local user ({principal.user_id}) is disabled. Re-enable it "
-            f"with 'opencrab user enable {principal.user_id}'."
-        )
-    return principal
+    try:
+        if not getattr(sql, "available", False):
+            # SQLStore swallows the connect error into a log line and a False
+            # flag, so the reason is not retrievable here. What IS known: the
+            # local file existed (checked above) or this is a remote database.
+            # Either way the store failed to open, which is not the same thing as
+            # "you have not run init" -- reporting it as that would send an
+            # operator to fix the wrong problem.
+            raise RuntimeError(
+                "Could not open the SQL store. This is not a missing bootstrap -- "
+                "the database exists (or is remote) but did not connect. Check the "
+                "preceding 'SQL store unavailable' log line for the driver error, "
+                "then the file permissions or the PostgreSQL connection settings."
+            )
+
+        try:
+            principal = get_local_user(sql)
+        except Exception as exc:  # noqa: BLE001
+            # Distinguish "no users table yet" (not bootstrapped) from a real
+            # query/driver failure, which must surface as itself.
+            if _looks_like_missing_table(exc):
+                raise not_bootstrapped from exc
+            raise
+
+        if principal is None:
+            raise not_bootstrapped
+        if principal.disabled:
+            raise RuntimeError(
+                f"The local user ({principal.user_id}) is disabled. Re-enable it "
+                f"with 'opencrab user enable {principal.user_id}'."
+            )
+        return principal
+    finally:
+        # 단일 모드에서 닫지 않으면 공유 파일의 소유자가 남아 수명 잠금을 쥔 채로 둔다.
+        _close_store(sql)
 
 
 def _looks_like_missing_table(exc: Exception) -> bool:
@@ -749,9 +846,22 @@ def maybe_bootstrap_on_empty() -> Principal | None:
 
     from opencrab.config import get_settings
     from opencrab.locking import file_lock
+    from opencrab.stores._single_file import reject_single_root
+    from opencrab.stores.factory import make_auth_sql_store
     from opencrab.stores.sql_store import SQLStore
 
     settings = get_settings()
+    if settings.single_sqlite_file:
+        # 단일 모드는 읽기만 한다(#671). 단일 root의 사용자는 병합이 가져온 것이므로 만들지 않는다. 결속 검증이
+        # 잘못된 디렉터리를 이미 막으므로 아래 G2~G4와 reject_single_root는 비단일 모드만 지난다.
+        # 열기 오류는 삼키지 않고 호출자에게 올린다. None은 사용자 없음과 비활성 사용자에만 쓴다. 그때
+        # 호출자가 require_local_principal의 진단을 낸다.
+        sql = make_auth_sql_store(settings)
+        try:
+            outcome = _discover_local_user(sql)
+        finally:
+            _close_store(sql)
+        return None if outcome is _NOT_FOUND else outcome
 
     # G2: exactly "local" -- narrower than settings.is_local (also true for
     # "kuzu"), since the plugin contract pins a local sqlite store only.
@@ -788,6 +898,9 @@ def maybe_bootstrap_on_empty() -> Principal | None:
             "bootstrap never creates directories, only the database inside "
             "one that already exists."
         )
+
+    # SINGLE_SQLITE_FILE 없이 단일 root를 받았으면 bootstrap.lock을 만들기 전에 거부한다(B11).
+    reject_single_root(data_dir)
 
     db_path = Path(data_dir, "opencrab.db")
 

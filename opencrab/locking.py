@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 _process_locks: dict[str, threading.RLock] = {}
 _process_locks_guard = threading.Lock()
 _held = threading.local()
+_lifetime_handles_lock = threading.Lock()
+_lifetime_handles: dict[BinaryIO, tuple[str, int, bool]] = {}
 
 
 def lock_data_dir() -> str:
@@ -691,15 +693,17 @@ def file_lock(
             held = _held.locks = {}
         current = held.get(path)
         if current is not None:
-            held[path] = (current[0] + 1, current[1])
+            if current[2] and not shared:
+                raise RuntimeError("shared lock upgrade is not allowed")
+            held[path] = (current[0] + 1, current[1], current[2])
             try:
                 yield
             finally:
-                depth, fh = held[path]
+                depth, fh, held_shared = held[path]
                 if depth == 1:
                     del held[path]
                 else:
-                    held[path] = (depth - 1, fh)
+                    held[path] = (depth - 1, fh, held_shared)
             return
 
         # Three failure boundaries, deliberately separate: a failed open
@@ -713,7 +717,7 @@ def file_lock(
         except BaseException:
             fh.close()
             raise
-        held[path] = (1, fh)
+        held[path] = (1, fh, shared)
         try:
             yield
         finally:
@@ -724,6 +728,14 @@ def file_lock(
                 fh.close()
     finally:
         process_lock.release()
+
+
+def assert_lifetime_lock_order() -> None:
+    """쓰기 또는 삭제 잠금보다 수명 잠금을 먼저 잡도록 확인한다."""
+    for path in getattr(_held, "locks", {}):
+        name = os.path.basename(path)
+        if name == "write.lock" or (name.startswith("delete-pack-") and name.endswith(".lock")):
+            raise RuntimeError("lifetime lock order violated")
 
 
 def acquire_file_lock(
@@ -740,13 +752,31 @@ def acquire_file_lock(
     forever.
     """
     timeout = _resolve_timeout(timeout)
-    fh = _open_lock(_lock_path(filename, data_dir))
+    path = _lock_path(filename, data_dir)
+    lifetime = filename.endswith(".lifetime.lock")
+    if lifetime and not shared:
+        with _lifetime_handles_lock:
+            if any(held_path == path and thread_id == threading.get_ident()
+                   for held_path, thread_id, shared_lock in _lifetime_handles.values()
+                   if shared_lock):
+                raise RuntimeError("shared lifetime lock upgrade is not allowed")
+    fh = _open_lock(path)
     try:
         _acquire(fh, shared=shared, timeout=timeout)
+        if lifetime:
+            with _lifetime_handles_lock:
+                _lifetime_handles[fh] = (path, threading.get_ident(), shared)
     except BaseException:
         fh.close()
         raise
     return fh
+
+
+def assert_exclusive_lifetime_lock(fh: BinaryIO, path: str) -> None:
+    """현재 스레드가 요청한 독점 수명 잠금의 소유자인지 확인한다."""
+    with _lifetime_handles_lock:
+        if _lifetime_handles.get(fh) != (path, threading.get_ident(), False):
+            raise RuntimeError("exclusive lifetime lock is not held")
 
 
 def release_file_lock(fh: BinaryIO) -> None:
@@ -754,6 +784,8 @@ def release_file_lock(fh: BinaryIO) -> None:
     try:
         _release(fh)
     finally:
+        with _lifetime_handles_lock:
+            _lifetime_handles.pop(fh, None)
         fh.close()
 
 
@@ -786,6 +818,16 @@ def write_lock(
     block.
     """
     path = _lock_path("write.lock", data_dir or lock_data_dir())
+    held = getattr(_held, "locks", {})
+    if path not in held:
+        from opencrab.stores._single_file import sqlite_unit_active
+
+        if sqlite_unit_active():
+            raise RuntimeError("write lock cannot enter an active SQLite unit of work")
+        for held_path in held:
+            name = os.path.basename(held_path)
+            if name == "billing.db.lock" or (name.startswith("delete-pack-") and name.endswith(".lock")):
+                raise RuntimeError("write lock order violated")
     with ExitStack() as stack:
         _held.pending_purpose = purpose
         try:

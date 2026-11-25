@@ -562,22 +562,16 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
         ``_auth_store`` returns it unchanged, and ``_lookup`` answers 503 for it.
         """
         if not auth_sql:
-            from pathlib import Path
-
             from opencrab.config import get_settings
-            from opencrab.stores.sql_store import SQLStore
+            from opencrab.stores.factory import make_auth_sql_store
 
-            settings = get_settings()
-            if settings.is_local:
-                # Same reason as opencrab.auth.require_local_principal: on
-                # SQLite, *connecting* to a missing path creates it. An
-                # unauthenticated request must not leave a database behind.
-                if not Path(settings.local_data_dir, "opencrab.db").is_file():
-                    return None
-                url = settings.sqlite_url
-            else:
-                url = settings.postgres_url
-            store = SQLStore(url=url, create_tables=False)
+            # One rule for every auth path (opencrab.auth.require_local_principal too): no DDL, and on
+            # SQLite no connect to a missing opencrab.db, since an unauthenticated request must not leave a
+            # database behind. None means there is nothing to look up (401). A single SQLite file that
+            # cannot be opened raises SingleFileUnavailableError, which _lookup answers with 503 (#671).
+            store = make_auth_sql_store(get_settings())
+            if store is None:
+                return None
             if not getattr(store, "available", False):
                 # Do NOT cache a store that failed to connect. SQLStore
                 # swallows a connect failure into `available = False` and
@@ -603,7 +597,18 @@ def mcp_router(*, allow_query_token: bool = False) -> APIRouter:
         says nothing about the token, and a 401 would send the client into an
         OAuth flow.
         """
-        store = _auth_store()
+        try:
+            store = _auth_store()
+        except Exception as exc:  # noqa: BLE001
+            # A five-file store that the unmanaged single-file check (#671) could not judge is built unavailable
+            # (no exception here); the lookup below answers 503 for it. This clause still covers the single-mode
+            # open failure that make_auth_sql_store reports with a reason. Anything the code does not classify,
+            # such as the single-mode refusal, propagates as before. This try covers only the store lookup; the verify_token try below
+            # keeps its own answer (None, then 401) for an unclassified error.
+            reason = token_store_unavailable_reason(exc)
+            if reason is None:
+                raise
+            raise _unavailable(reason) from None
         if store is None:
             return None
         if not getattr(store, "available", False):

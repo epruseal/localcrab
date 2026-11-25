@@ -18,6 +18,7 @@ from typing import Any
 import pyarrow.parquet as pq
 
 from opencrab.config import Settings
+from opencrab.stores._single_file import reject_single_root_under
 
 REPO_ID = "nvidia/Nemotron-Personas-Korea"
 REVISION = "d0a9272116a2ebf139b964ca72b8b8f604616689"
@@ -276,6 +277,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     dataset_root = Path(args.dataset_root).expanduser().resolve()
     out_root = Path(args.output_root).expanduser().resolve()
     stage = out_root / "stage"
+    reject_single_root_under(stage)
+    reject_single_root_under(Path(args.local_data_dir) / "graph.db")
     if args.reset and stage.exists():
         shutil.rmtree(stage)
     for sub in ["graph", "evidence", "quality", "neo4j", "raw", "images"]:

@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -75,21 +76,54 @@ def journal_path(data_dir: str | os.PathLike[str], pack_name: str) -> Path:
     return Path(data_dir) / "delete-pack-journals" / f"{_slug(pack_name)}.json"
 
 
-def load_journal(data_dir: str | os.PathLike[str], pack_name: str) -> dict[str, Any] | None:
+def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate journal field")
+        result[key] = value
+    return result
+
+
+def load_journal(
+    data_dir: str | os.PathLike[str], pack_name: str, *, schema: int = JOURNAL_SCHEMA,
+) -> dict[str, Any] | None:
     """저널이 없으면 `None`, 있는데 못 읽으면 `DeletePackJournalCorrupt`."""
     path = journal_path(data_dir, pack_name)
-    if not path.exists():
-        return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_pairs)
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            raise DeletePackJournalCorrupt(f"삭제 저널 경로가 유효하지 않다({path})") from None
+        return None
     except (OSError, ValueError) as exc:
         raise DeletePackJournalCorrupt(
             f"삭제 저널을 읽을 수 없다({path}): {exc}"
         ) from exc
-    if not isinstance(payload, dict) or payload.get("schema") != JOURNAL_SCHEMA:
+    if not isinstance(payload, dict) or payload.get("schema") != schema:
         raise DeletePackJournalCorrupt(
             f"삭제 저널 스키마가 다르다({path}): {payload!r}"
         )
+    if schema == 2:
+        keys = {"schema", "pack_id", "operation_id", "incarnation", "state", "result"}
+        state = payload.get("state")
+        result = payload.get("result")
+        valid_result = (
+            result is None if state == "pending" else
+            isinstance(result, list) and len(result) == 3
+            and all(type(count) is int and count >= 0 for count in result)
+        )
+        if (
+            set(payload) != keys
+            or payload.get("pack_id") != pack_name
+            or not isinstance(payload.get("operation_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", payload["operation_id"])
+            or not isinstance(payload.get("incarnation"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", payload["incarnation"])
+            or state not in ("pending", "committed")
+            or not valid_result
+        ):
+            raise DeletePackJournalCorrupt(f"삭제 저널 내용이 유효하지 않다({path})")
     return payload
 
 

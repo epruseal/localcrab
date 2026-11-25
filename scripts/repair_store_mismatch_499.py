@@ -866,6 +866,8 @@ def _registry_delete(stores: Stores, sql: str, params: dict[str, Any]) -> None:
     # transaction, guarded by every recorded column.
     from sqlalchemy import text
 
+    if stores.sql.shared_file is not None:
+        raise RuntimeError("single SQLite registry repair requires a guarded implementation")
     with stores.sql._engine.begin() as conn:
         conn.execute(text(sql), params)
 
@@ -983,7 +985,9 @@ def apply(data_dir: Path, run_dir: Path, input_root: Path, approved: Path | None
           vector_table: str, batch: int = 500,
           scan: Callable[[Path], tuple[list[int], int]] = holders, lock_timeout: float = 10.0) -> Counter:
     from opencrab.locking import write_lock
+    from opencrab.stores._single_file import reject_single_root
 
+    reject_single_root(str(data_dir))
     with ExitStack() as stack:
         stack.enter_context(write_lock(str(data_dir), timeout=lock_timeout, purpose="repair_store_mismatch_499"))
         check_holders(data_dir, scan)
@@ -1040,7 +1044,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.check_guard:
             from opencrab.locking import write_lock
+            from opencrab.stores._single_file import reject_single_root
 
+            reject_single_root(str(data_dir))
             with write_lock(str(data_dir), timeout=10.0, purpose="repair_store_mismatch_499 check"):
                 found, foreign = holders(data_dir)
                 state = graph_schema_state_ro(data_dir)

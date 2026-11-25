@@ -264,6 +264,15 @@ def _run_migration(db: Path, *extra: str) -> subprocess.CompletedProcess:
 
 
 class TestMigrationScript:
+    def test_refuses_unmanaged_single_database(self, tmp_path):
+        db = self._make_plain_db(tmp_path)
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT PRIMARY KEY)")
+        result = _run_migration(db, "--dry-run")
+        assert result.returncode != 0
+        assert "requires shared connection" in result.stderr
+        assert "embedding_bit" not in _table_cols(str(db), "vtest")
+
     def _make_plain_db(self, tmp_path) -> Path:
         store = build_vector_store("sqlite-vec", tmp_path, dim=DIM)
         _load(store)

@@ -41,9 +41,15 @@ from opencrab.pack.write_gate import (
     resolved_endpoint_pack_conflict,
     stamp,
 )
+from opencrab.stores._pg_uow import common_pg_uow
+from opencrab.stores._single_file import (
+    PackWriteRejectedError,
+    RollbackOnlyError,
+    is_single_file,
+)
 from opencrab.stores.mongo_store import MongoStore
 from opencrab.stores.neo4j_store import Neo4jStore
-from opencrab.stores.sql_store import SQLStore
+from opencrab.stores.sql_store import SQLStore, shared_write_unit
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +167,8 @@ class OntologyBuilder:
         write_vector: bool = True,
         _allow_ready_anchor: bool = False,
         _expected_current_digest: str | None = None,
+        _atomic_inner: bool = False,
+        _precomputed_vector: Any = None,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -367,6 +375,73 @@ class OntologyBuilder:
         if reason:
             raise ValueError(identity_reject_message("node", node_id, reason))
 
+        required = [self._neo4j, self._mongo, self._sql]
+        if self._vec is not None:
+            required.append(self._vec)
+        pg_uow = common_pg_uow(*required)
+        if not _atomic_inner and (pg_uow is not None or is_single_file(*required)):
+            shared = self._sql.shared_file
+            incarnation = shared.pack_incarnation(pack_id) if shared is not None else None
+            active = pg_uow.active if pg_uow is not None else shared.in_unit_of_work
+            if active and write_vector:
+                raise RuntimeError("builder vector must be prepared before the shared unit")
+            prepared = None
+            if write_vector and self._vec is not None and self._vec.available:
+                from opencrab.ontology.bm25 import _node_text
+
+                vector_text = _node_text({"node_id": node_id, "node_type": node_type, "properties": props})
+                if vector_text.strip():
+                    try:
+                        prepared = self._vec.prepare_upsert_vectors([vector_text])
+                    except Exception as exc:
+                        logger.warning("Node embedding preparation failed: %s", exc, exc_info=True)
+                        return {
+                            "node_id": node_id, "space": space, "node_type": node_type,
+                            "properties": props, "receipt_id": f"rcpt_{uuid.uuid4().hex[:12]}",
+                            "receipt_ts": now_iso(),
+                            "stores": {"graph": "error: rolled back", "docs": "error: rolled back",
+                                       "sql": "error: rolled back", "audit": "error: rolled back",
+                                       "vector": _safe_store_status(exc)},
+                        }
+            output = None
+            try:
+                manager = pg_uow.unit_of_work() if pg_uow is not None else shared_write_unit(self._sql)
+                with manager:
+                    if incarnation is not None:
+                        shared.validate_pack_writes({pack_id: incarnation})
+                    output = self.add_node(
+                        space, node_type, node_id, properties, pack_id=pack_id, origin=origin,
+                        pack_anchor=pack_anchor, fork_copy=fork_copy, write_vector=write_vector,
+                        _allow_ready_anchor=_allow_ready_anchor,
+                        _expected_current_digest=_expected_current_digest,
+                        _atomic_inner=True, _precomputed_vector=prepared,
+                    )
+                    stores = output["stores"]
+                    mandatory = ["graph", "docs", "sql"]
+                    if self._vec is not None and write_vector:
+                        mandatory.append("vector")
+                    if any(not store_write_succeeded(stores, key) and not (
+                        key == "vector" and stores.get(key) == "skipped (no text)"
+                    ) for key in mandatory):
+                        (pg_uow if pg_uow is not None else shared).mark_rollback_only()
+                        for key, status in stores.items():
+                            if store_write_succeeded({key: status}, key):
+                                stores[key] = "error: rolled back"
+            except PackWriteRejectedError:
+                return {
+                    "node_id": node_id, "space": space, "node_type": node_type,
+                    "properties": props, "receipt_id": f"rcpt_{uuid.uuid4().hex[:12]}",
+                    "receipt_ts": now_iso(),
+                    "stores": {key: "error: rolled back" for key in ("graph", "docs", "sql", "audit", "vector")},
+                }
+            except RollbackOnlyError:
+                if output is None:
+                    raise
+                for key, status in output["stores"].items():
+                    if store_write_succeeded({key: status}, key):
+                        output["stores"][key] = "error: rolled back"
+            return output
+
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
         receipt_ts = now_iso()
 
@@ -528,7 +603,10 @@ class OntologyBuilder:
                         # 과도기 경고를 노출한다(sqlite_vec_store.py 주석 참조).
                         "space": space,
                     }
-                    self._vec.upsert_texts(texts=[text], ids=[node_id], metadatas=[meta])
+                    if _atomic_inner and _precomputed_vector is not None:
+                        self._vec.upsert_precomputed([text], [meta], [node_id], _precomputed_vector)
+                    else:
+                        self._vec.upsert_texts(texts=[text], ids=[node_id], metadatas=[meta])
                     output["stores"]["vector"] = "ok"
                 else:
                     output["stores"]["vector"] = "skipped (no text)"
@@ -588,6 +666,7 @@ class OntologyBuilder:
         origin: str = "client",
         fork_copy: bool = False,
         replace_own: bool = False,
+        _atomic_inner: bool = False,
     ) -> dict[str, Any]:
         """
         Add a directed edge between two nodes.
@@ -669,6 +748,45 @@ class OntologyBuilder:
             origin=origin,
         )
         canonicalize_pack_alias(props)          # #171 — see add_node
+        required = (self._neo4j, self._mongo, self._sql)
+        pg_uow = common_pg_uow(*required)
+        if not _atomic_inner and (pg_uow is not None or is_single_file(*required)):
+            shared = self._sql.shared_file
+            incarnation = shared.pack_incarnation(pack_id) if shared is not None else None
+            output = None
+            try:
+                manager = pg_uow.unit_of_work() if pg_uow is not None else shared_write_unit(self._sql)
+                with manager:
+                    if incarnation is not None:
+                        shared.validate_pack_writes({pack_id: incarnation})
+                    output = self.add_edge(
+                        from_space, from_id, relation, to_space, to_id, properties,
+                        pack_id=pack_id, origin=origin, fork_copy=fork_copy,
+                        replace_own=replace_own, _atomic_inner=True,
+                    )
+                    if not all(store_write_succeeded(output["stores"], key) for key in ("graph", "sql")):
+                        (pg_uow if pg_uow is not None else shared).mark_rollback_only()
+                        for key in ("graph", "sql"):
+                            if store_write_succeeded(output["stores"], key):
+                                output["stores"][key] = "error: rolled back"
+                        if output["stores"].get("docs") == "audited":
+                            output["stores"]["docs"] = "error: rolled back"
+            except PackWriteRejectedError:
+                return {
+                    "from": {"space": from_space, "id": from_id},
+                    "relation": relation, "to": {"space": to_space, "id": to_id},
+                    "receipt_id": f"rcpt_{uuid.uuid4().hex[:12]}", "receipt_ts": now_iso(),
+                    "stores": {key: "error: rolled back" for key in ("graph", "docs", "sql")},
+                }
+            except RollbackOnlyError:
+                if output is None:
+                    raise
+                for key in ("graph", "sql"):
+                    if store_write_succeeded(output["stores"], key):
+                        output["stores"][key] = "error: rolled back"
+                if output["stores"].get("docs") == "audited":
+                    output["stores"]["docs"] = "error: rolled back"
+            return output
         receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
         receipt_ts = now_iso()
 

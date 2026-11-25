@@ -276,6 +276,9 @@ def _ro(path: Path, immutable: bool) -> sqlite3.Connection:
 
 
 def _rw(path: Path) -> sqlite3.Connection:
+    from opencrab.stores._single_file import reject_unmanaged_single_file
+
+    reject_unmanaged_single_file(str(path))
     return sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True)
 
 
@@ -2267,6 +2270,9 @@ def apply(data_dir: Path, run_dir: Path, vector_table: str, approved_manifest: P
     """승인, 백업, CAS가 모두 맞을 때만 frozen 후보를 삭제한다."""
     global _SCOPE
 
+    from opencrab.stores._single_file import reject_single_root
+
+    reject_single_root(str(data_dir))
     candidates, manifest = _load_run(run_dir)
     scope = _RunScope(data_dir, vector_table, candidates, manifest)
     _SCOPE = scope
@@ -2480,7 +2486,9 @@ def prepare_rollback(data_dir: Path, run_dir: Path, backup_dir: Path) -> None:
     from repair_store_mismatch_499 import check_holders, holders
 
     from opencrab.locking import write_lock
+    from opencrab.stores._single_file import reject_single_root
 
+    reject_single_root(str(data_dir))
     candidates, manifest = _load_run(run_dir)
     receipt = _load_receipt(run_dir, backup_dir, manifest, candidates, data_dir)
     state, _, _ = marker_state(run_dir)
@@ -2500,7 +2508,9 @@ def rollback(data_dir: Path, run_dir: Path, backup_dir: Path) -> None:
     from repair_store_mismatch_499 import check_holders, holders
 
     from opencrab.locking import write_lock
+    from opencrab.stores._single_file import reject_single_root
 
+    reject_single_root(str(data_dir))
     candidates, manifest = _load_run(run_dir)
     receipt = _load_receipt(run_dir, backup_dir, manifest, candidates, data_dir)
     state, tombstone, completion = marker_state(run_dir)

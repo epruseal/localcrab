@@ -60,6 +60,7 @@ WHERE 번역 (Chroma dict → SQL, sqlite-vec과의 차이):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from collections.abc import Callable
@@ -119,6 +120,7 @@ class PgVectorStore:
         dim: int = 1024,
         collection_name: str = "opencrab_vectors_kure",
         ef_search: int = 500,
+        *, pg_uow: Any = None,
     ) -> None:
         """
         Parameters
@@ -143,6 +145,8 @@ class PgVectorStore:
             노브). 기본 500 — 179k 전량 실측에서 150은 recall 0.9370로 게이트
             미달, 500이 recall 0.9600/p95 24.6ms(ef 곡선: vector-backends.md §4.2).
         """
+        if pg_uow is not None and pg_uow.active:
+            raise RuntimeError("PG store cannot initialize inside a shared unit")
         if embedding_function is None:
             raise ValueError("PgVectorStore requires an embedding_function.")
         if not _IDENT_RE.match(collection_name):
@@ -155,12 +159,24 @@ class PgVectorStore:
         self._owns_engine = False
         self._available = False
         self._init_engine(dsn_or_engine)
+        if pg_uow is not None and pg_uow.engine is not self._engine:
+            raise ValueError("PostgreSQL unit of work uses a different engine")
+        self._pg_uow = pg_uow
         if self._available:
             self._ensure_schema()
 
     # ------------------------------------------------------------------
     # Connection / lifecycle
     # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _pg_connection(self, *, write: bool = False):
+        uow = getattr(self, "_pg_uow", None)
+        cm = uow.connection(write=write) if uow is not None else (
+            self._engine.begin() if write else self._engine.connect()
+        )
+        with cm as conn:
+            yield conn
 
     def _init_engine(self, dsn_or_engine: Any) -> None:
         try:
@@ -308,7 +324,7 @@ class PgVectorStore:
             f"INSERT INTO {self._table} (node_id, pack_id, embedding, document, metadata) "
             "VALUES (:node_id, :pack_id, (:embedding)::vector, :document, (:metadata)::jsonb)"
         )
-        with self._engine.begin() as conn:
+        with self._pg_connection(write=True) as conn:
             for _id, txt, meta, vec, meta_json in zip(
                 ids, texts, metadatas, vectors, serialized_metadata
             ):
@@ -364,8 +380,30 @@ class PgVectorStore:
         # 배치 전체를 먼저 직렬화한다(issue #82 리뷰 후속) — 그래야 이 뒤의
         # 임베딩 호출과 소유권 확인 SELECT(둘 다 되돌릴 수 없거나 비용이 드는
         # 작업)가 저장 불가능한 배치에 대해 헛수고로 실행되지 않는다.
+        [dump_props(meta) for meta in metadatas]
+        vectors = self.prepare_upsert_vectors(texts)
+        return self._upsert_vectors(texts, metadatas, ids, vectors, strict_count=False)
+
+    def prepare_upsert_vectors(self, texts: list[str]) -> list[list[float]]:
+        self._require_available()
+        return self._embed(texts)
+
+    def upsert_precomputed(
+        self, texts: list[str], metadatas: list[dict[str, Any]], ids: list[str],
+        vectors: list[list[float]],
+    ) -> list[str]:
+        return self._upsert_vectors(texts, metadatas, ids, vectors, strict_count=True)
+
+    def _upsert_vectors(
+        self, texts: list[str], metadatas: list[dict[str, Any]], ids: list[str],
+        vectors: list[list[float]], *, strict_count: bool,
+    ) -> list[str]:
+        self._require_available()
+        validate_lengths(texts, metadatas, ids)
+        if strict_count and (len(vectors) != len(texts) or any(len(vec) != self._dim for vec in vectors)):
+            raise ValueError("precomputed vectors do not match texts or dimension")
+        reject_batch_pack_conflicts(ids, metadatas)
         serialized_metadata = [dump_props(meta) for meta in metadatas]
-        vectors = self._embed(texts)
 
         from sqlalchemy import text
 
@@ -379,7 +417,7 @@ class PgVectorStore:
             f"OR {self._table}.pack_id = '' "
             f"OR {self._table}.pack_id = EXCLUDED.pack_id"
         )
-        with self._engine.begin() as conn:
+        with self._pg_connection(write=True) as conn:
             reject_foreign_slot_writes(ids, metadatas, self._slot_owners(conn, ids))
             for _id, txt, meta, vec, meta_json in zip(
                 ids, texts, metadatas, vectors, serialized_metadata
@@ -434,7 +472,7 @@ class PgVectorStore:
             pname = f"id{i}"
             params[pname] = _id
             names.append(f":{pname}")
-        with self._engine.begin() as conn:
+        with self._pg_connection(write=True) as conn:
             conn.execute(
                 text(f"DELETE FROM {self._table} WHERE node_id IN ({', '.join(names)})"),
                 params,
@@ -448,7 +486,7 @@ class PgVectorStore:
         self._require_available()
         from sqlalchemy import text
 
-        with self._engine.begin() as conn:
+        with self._pg_connection(write=True) as conn:
             conn.execute(text(f"DELETE FROM {self._table}"))
         logger.info("PgVectorStore: table '%s' reset.", self._table)
 
@@ -487,7 +525,7 @@ class PgVectorStore:
 
         from sqlalchemy import text
 
-        with self._engine.connect() as conn:
+        with self._pg_connection() as conn:
             # SET은 파라미터 바인딩을 지원하지 않는 유틸리티 커맨드라 리터럴로
             # 보간한다 — self._ef_search는 생성자에서 int() 캐스트되어 안전.
             conn.execute(text(f"SET hnsw.ef_search = {self._ef_search}"))
@@ -512,7 +550,7 @@ class PgVectorStore:
         self._require_available()
         from sqlalchemy import text
 
-        with self._engine.connect() as conn:
+        with self._pg_connection() as conn:
             row = conn.execute(
                 text(
                     f"SELECT node_id, document, metadata FROM {self._table} "
@@ -546,7 +584,7 @@ class PgVectorStore:
         self._require_available()
         from sqlalchemy import text
 
-        with self._engine.connect() as conn:
+        with self._pg_connection() as conn:
             rows = conn.execute(
                 text(
                     f"SELECT node_id, embedding::text AS embedding, document, metadata "
@@ -596,7 +634,7 @@ class PgVectorStore:
             f"INSERT INTO {self._table} (node_id, pack_id, embedding, document, metadata) "
             "VALUES (:node_id, :pack_id, (:embedding)::vector, :document, (:metadata)::jsonb)"
         )
-        with self._engine.begin() as conn:
+        with self._pg_connection(write=True) as conn:
             for record, meta_json in zip(clean, serialized_metadata):
                 meta = record["metadata"]
                 conn.execute(
@@ -616,7 +654,7 @@ class PgVectorStore:
             return 0
         from sqlalchemy import text
 
-        with self._engine.connect() as conn:
+        with self._pg_connection() as conn:
             row = conn.execute(text(f"SELECT count(*) FROM {self._table}")).fetchone()
         return int(row[0]) if row is not None else 0
 

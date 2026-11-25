@@ -101,11 +101,25 @@ def write_lock_for_store(
     directory = os.path.dirname(os.path.abspath(db_path))
     if own_file:
         from opencrab.locking import file_lock
+        from opencrab.stores._single_file import sqlite_unit_active
 
+        if sqlite_unit_active():
+            raise RuntimeError("billing lock cannot enter an active SQLite unit of work")
         return file_lock(f"{os.path.basename(db_path)}.lock", directory)
     from opencrab.locking import write_lock
 
     return write_lock(directory)
+
+
+@contextlib.contextmanager
+def shared_write_unit(sql_store: Any, *, outcome: dict | None = None):
+    """독립 쓰기는 write.lock 뒤 공유 트랜잭션을 연다."""
+    shared = sql_store.shared_file
+    lock = contextlib.nullcontext() if shared.in_unit_of_work else write_lock_for_store(sql_store)
+    with lock:
+        with shared.unit_of_work(outcome=outcome) as conn:
+            yield conn
+
 
 # ---------------------------------------------------------------------------
 # SQLAlchemy table declarations (metadata-only, not using ORM declarative)
@@ -402,11 +416,55 @@ def _decode_granted(
 class SQLStore:
     """SQLAlchemy adapter supporting PostgreSQL and SQLite."""
 
-    def __init__(self, url: str, *, create_tables: bool = True) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        create_tables: bool = True,
+        shared: Any = None,
+        engine: Any = None,
+        pg_uow: Any = None,
+        allow_single_root: bool = False,
+    ) -> None:
+        if pg_uow is not None and pg_uow.active:
+            raise RuntimeError("PG store cannot initialize inside a shared unit")
+        if engine is not None:
+            from sqlalchemy.engine import make_url
+
+            from opencrab.stores._pg_url import normalize_pg_url
+
+            if engine.url != make_url(normalize_pg_url(url)):
+                raise ValueError("SQLStore engine URL differs from store URL")
+        if pg_uow is not None and (engine is None or pg_uow.engine is not engine or shared is not None):
+            raise ValueError("PostgreSQL unit of work uses a different engine")
+        self._pg_uow = pg_uow
         self._url = url
+        self._provided_engine = engine
+        self._owns_engine = engine is None
+        self._shared = shared
+        self._shared_registered = False
         self._engine: Any = None
         self._available = False
         self._is_sqlite = url.startswith("sqlite")
+        # #671: 보호 검사가 판정하지 못한 파일의 거부 기록. 있으면 `_connect`가 파일을 열지 않고 비가용이 된다.
+        self._open_refusal: BaseException | None = None
+        self._refusal_db_path: str | None = None
+        if self._is_sqlite and shared is None:
+            from sqlalchemy.engine import make_url
+
+            from opencrab.stores._single_file import (
+                reject_unmanaged_single_file,
+                unmanaged_open_refusal,
+            )
+
+            db_path = make_url(url).database
+            if db_path:
+                if allow_single_root:
+                    # 단일 모드 billing은 엄격하게 거부한다(예외를 그대로 올린다).
+                    reject_unmanaged_single_file(db_path, allow_single_root=True)
+                else:
+                    self._open_refusal = unmanaged_open_refusal(db_path)
+                    self._refusal_db_path = db_path
         # issue #105 (verifier follow-up): billing.db is meant to hold only
         # billing_events (BillingHooks._ensure_tables() creates that table
         # itself), but SQLStore._connect() unconditionally created the full
@@ -417,11 +475,40 @@ class SQLStore:
         # tables were sitting in billing.db. make_billing_sql_store passes
         # create_tables=False; every other caller keeps the default (True).
         self._create_tables_on_connect = create_tables
-        self._connect()
+        if shared is not None:
+            if shared.in_unit_of_work:
+                raise RuntimeError("SQLStore cannot initialize inside a shared transaction")
+            from sqlalchemy.engine import make_url
+
+            db_path = make_url(url).database
+            if not self._is_sqlite or db_path is None or os.path.abspath(db_path) != shared.db_path:
+                raise ValueError("shared SQLite path does not match SQLStore URL")
+            self._shared_registered = True
+            try:
+                shared.acquire(self, self._configure_shared_connection)
+            except BaseException:
+                self._shared_registered = False
+                shared.release(self)
+                raise
+        try:
+            self._connect()
+        except BaseException as exc:
+            # 잠금 시간 초과는 _connect가 이미 닫고 올렸으므로 다시 닫지 않는다(#578).
+            from opencrab.locking import StoreBootstrapLockTimeoutError
+
+            if not isinstance(exc, StoreBootstrapLockTimeoutError):
+                self.close()
+            raise
 
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _configure_shared_connection(conn: Any) -> None:
+        conn.execute("PRAGMA foreign_keys=ON")
+        if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise RuntimeError("failed to enable SQLite foreign keys")
 
     def _connect(self) -> None:
         from opencrab.locking import StoreBootstrapLockTimeoutError, store_bootstrap_lock
@@ -452,13 +539,20 @@ class SQLStore:
                 # opencrab.stores.factory.make_billing_sql_store.
                 connect_args["timeout"] = 5.0
 
-            self._engine = create_engine(
+            self._engine = self._provided_engine if self._provided_engine is not None else create_engine(
                 normalize_pg_url(self._url), connect_args=connect_args
             )
             self._text = text
 
             if self._is_sqlite:
                 enable_sqlite_fk(self._engine)
+
+            if self._open_refusal is not None:
+                # 판정하지 못한 파일은 열지 않는다. 엔진은 남긴다(REST 인증이 `_engine`을 직접 쓴다). 이 엔진의
+                # 새 연결마다 검사를 다시 해서 `_engine`을 쓰는 모든 호출자가 표식 있는 파일을 열지 못하게 한다.
+                if self._provided_engine is None:
+                    self._register_refusal_recheck()
+                raise RuntimeError("unmanaged single-file check refused the open") from self._open_refusal
 
             with self._engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
@@ -480,6 +574,25 @@ class SQLStore:
             logger.warning("SQL store unavailable: %s", exc)
             self._available = False
 
+    def _register_refusal_recheck(self) -> None:
+        """거부를 기록한 엔진이 새 DBAPI 연결을 만들기 전에 보호 검사를 다시 부른다(#671).
+
+        표식이 있으면 RuntimeError가 나가 파일을 열지 않는다. 판정 불가이면 sqlite 오류가 나가고, 표식이 없으면
+        연결한다. 풀에 이미 있는 연결의 체크아웃에는 걸리지 않는다. 검사는 모듈 속성으로 부른다.
+        """
+        from sqlalchemy import event
+
+        # 엔진 생성 때의 절대 경로로 고정해, 뒤의 chdir이 있어도 검사 대상이 엔진이 여는 파일과 같게 한다.
+        db_path = os.path.abspath(self._refusal_db_path) if self._refusal_db_path else None
+
+        def _recheck(dialect: Any, conn_rec: Any, cargs: Any, cparams: Any) -> None:
+            from opencrab.stores import _single_file
+
+            _single_file.reject_unmanaged_single_file(db_path)
+            return None
+
+        event.listen(self._engine, "do_connect", _recheck)
+
     def close(self) -> None:
         """Dispose the underlying SQLAlchemy engine's connection pool.
 
@@ -491,9 +604,14 @@ class SQLStore:
         빠진 반쪽이다. SQLite 로컬 파일이면 커넥션 풀이 열어 둔 파일
         핸들을 반환하고, PostgreSQL 이면 풀의 소켓 연결을 반환한다.
         """
-        if self._engine is not None:
-            self._engine.dispose()
-        self._available = False
+        try:
+            if self._engine is not None and self._owns_engine:
+                self._engine.dispose()
+        finally:
+            if self._shared_registered:
+                self._shared.release(self)
+                self._shared_registered = False
+            self._available = False
 
     def _create_tables(self) -> None:
         """Create all tables if they do not exist."""
@@ -749,6 +867,19 @@ class SQLStore:
 
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_packs_status ON packs (status)"))
 
+    @contextlib.contextmanager
+    def _pg_connection(self, *, write: bool = False):
+        uow = getattr(self, "_pg_uow", None)
+        cm = uow.connection(write=write) if uow is not None else (
+            self._engine.begin() if write else self._engine.connect()
+        )
+        with cm as conn:
+            yield conn
+
+    @property
+    def shared_file(self) -> Any:
+        return self._shared
+
     @property
     def available(self) -> bool:
         return self._available
@@ -771,6 +902,21 @@ class SQLStore:
     # ------------------------------------------------------------------
     # Node registry
     # ------------------------------------------------------------------
+
+    def _require_guarded_registry_write(self) -> None:
+        if self._shared is None:
+            return
+        conn = self._shared.connection()
+        marker = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone()
+        if marker is None:
+            return
+        if not self._shared.in_unit_of_work:
+            raise RuntimeError("single SQLite registry write requires a guarded unit")
+        if not getattr(self._shared._uow, "validated_packs", {}):
+            self._shared.mark_rollback_only()
+            raise RuntimeError("single SQLite registry write requires a validated pack")
 
     def register_node(self, space: str, node_type: str, node_id: str) -> None:
         """Insert or update a node registry entry.
@@ -827,8 +973,28 @@ class SQLStore:
             f"node_type = EXCLUDED.node_type, updated_at = {now}"
         )
 
-        with self._engine.begin() as conn:
-            conn.execute(sql, {"space": space, "node_type": node_type, "node_id": node_id})
+        params = {"space": space, "node_type": node_type, "node_id": node_id}
+        self._require_guarded_registry_write()
+        if self._shared is not None and self._shared.in_unit_of_work:
+            with self._shared.joined_tx() as conn:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    import json
+
+                    row = conn.execute("SELECT properties FROM graph_nodes WHERE node_id=?", (node_id,)).fetchone()
+                    try:
+                        owner = json.loads(row[0]).get("pack_id") if row else None
+                    except (TypeError, ValueError, AttributeError):
+                        owner = None
+                    if not isinstance(owner, str) or owner not in self._shared._uow.validated_packs:
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("registry node owner is not validated")
+                conn.execute(str(sql), params)
+        else:
+            with self._pg_connection(write=True) as conn:
+                conn.execute(sql, params)
 
     def register_edge(
         self, from_space: str, from_id: str, relation: str, to_space: str, to_id: str
@@ -851,11 +1017,31 @@ class SQLStore:
                 "ON CONFLICT DO NOTHING"
             )
 
-        with self._engine.begin() as conn:
-            conn.execute(
-                sql,
-                {"fs": from_space, "fi": from_id, "rel": relation, "ts": to_space, "ti": to_id},
-            )
+        params = {"fs": from_space, "fi": from_id, "rel": relation, "ts": to_space, "ti": to_id}
+        self._require_guarded_registry_write()
+        if self._shared is not None and self._shared.in_unit_of_work:
+            with self._shared.joined_tx() as conn:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    import json
+
+                    row = conn.execute(
+                        "SELECT properties FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?",
+                        (from_id, relation, to_id),
+                    ).fetchone()
+                    try:
+                        owner = json.loads(row[0]).get("pack_id") if row else None
+                    except (TypeError, ValueError, AttributeError):
+                        owner = None
+                    if not isinstance(owner, str) or owner not in self._shared._uow.validated_packs:
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("registry edge owner is not validated")
+                conn.execute(str(sql), params)
+        else:
+            with self._pg_connection(write=True) as conn:
+                conn.execute(sql, params)
 
     # ------------------------------------------------------------------
     # Impact records
@@ -876,6 +1062,14 @@ class SQLStore:
             "VALUES (:node_id, :change_type, :json) "
             "RETURNING id"
         )
+        if self._shared is not None:
+            with shared_write_unit(self) as conn:
+                cursor = conn.execute(
+                    "INSERT INTO impact_records (node_id, change_type, impact_json) "
+                    "VALUES (:node_id, :change_type, :json)",
+                    {"node_id": node_id, "change_type": change_type, "json": json.dumps(impact)},
+                )
+                return int(cursor.lastrowid)
         if self._is_sqlite:
             with self._engine.begin() as conn:
                 conn.execute(
@@ -947,6 +1141,15 @@ class SQLStore:
 
         from sqlalchemy import text
 
+        if self._shared is not None:
+            with shared_write_unit(self) as conn:
+                cursor = conn.execute(
+                    "INSERT INTO lever_simulations (lever_id, direction, magnitude, results) "
+                    "VALUES (:lever_id, :direction, :magnitude, :results)",
+                    {"lever_id": lever_id, "direction": direction, "magnitude": magnitude,
+                     "results": json.dumps(results)},
+                )
+                return int(cursor.lastrowid)
         if self._is_sqlite:
             with self._engine.begin() as conn:
                 conn.execute(
@@ -1018,16 +1221,18 @@ class SQLStore:
             "ON CONFLICT (subject_id, permission, resource_id) DO UPDATE SET "
             "granted = EXCLUDED.granted"
         )
-        with self._engine.begin() as conn:
-            conn.execute(
-                sql,
-                {
-                    "sid": subject_id,
-                    "perm": permission,
-                    "rid": resource_id,
-                    "granted": granted_value,
-                },
-            )
+        params = {
+            "sid": subject_id,
+            "perm": permission,
+            "rid": resource_id,
+            "granted": granted_value,
+        }
+        if self._shared is not None:
+            with shared_write_unit(self) as conn:
+                conn.execute(str(sql), params)
+        else:
+            with self._engine.begin() as conn:
+                conn.execute(sql, params)
 
     def check_policy(
         self, subject_id: str, permission: str, resource_id: str

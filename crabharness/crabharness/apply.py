@@ -76,7 +76,9 @@ def apply_promotion_package(
         from opencrab.ontology.builder import OntologyBuilder, graph_write_failed
         from opencrab.pack.ownership import resolve_write_pack
         from opencrab.pack.write_gate import reject_boundary_identity
+        from opencrab.stores._single_file import reject_single_root
         from opencrab.stores.factory import (
+            hold_single_file,
             make_billing_sql_store,
             make_doc_store,
             make_graph_store,
@@ -125,7 +127,13 @@ def apply_promotion_package(
     # 않아 harness_promotion_apply(MCP 트윈, 같은 잠금을 쥔다)와 동시에
     # 돌면 그래프/문서/SQL 스토어에 레이스가 났다. billing 이벤트 기록은
     # 별도 파일(billing.db)이라 락 바깥에 그대로 둔다.
-    with write_lock(settings.local_data_dir):
+    #
+    # B11: SINGLE_SQLITE_FILE 없이 단일 root를 받으면 잠금 파일이 생기기 전에 거부한다.
+    # 단일 모드에서는 root의 write.lock이 정상 구성원이므로 건너뛴다. 대신 hold_single_file이
+    # write.lock 앞에서 결속을 판정하고, 첫 factory 호출이 열린 공유 객체를 재사용하게 한다(#671).
+    if not settings.single_sqlite_file:
+        reject_single_root(settings.local_data_dir)
+    with hold_single_file(settings), write_lock(settings.local_data_dir):
         graph = make_graph_store(settings)
         docs = make_doc_store(settings)
         sql = make_sql_store(settings)

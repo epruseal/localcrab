@@ -88,6 +88,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import sqlite3
 import struct
 import threading
@@ -113,6 +114,49 @@ from opencrab.stores._vector_base import (
 from opencrab.stores.chroma_store import _sanitize_metadata
 
 logger = logging.getLogger(__name__)
+
+
+class VectorTableMismatchError(RuntimeError):
+    """설정의 컬렉션 이름이나 차원이 게시 DB의 vec0 표와 다르다(#671 B7).
+
+    ``guard_existing_table=True``인 생성(단일 모드)에서만 난다. 표를 새로 만들지 않고 거부한다.
+    ``reason``은 ``name``(같은 이름이 없고 다른 vec0 표만 있음), ``kind``(같은 이름이 vec0 표가 아님),
+    ``unreadable``(같은 이름의 vec0 표에서 차원을 읽지 못함), ``dim``(차원이 다름) 중 하나다.
+    ``found``는 DB의 vec0 표 이름과 차원(읽지 못하면 ``None``) 쌍의 목록이다.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        table: str,
+        expected_dim: int,
+        found: list[tuple[str, int | None]],
+    ) -> None:
+        self.reason = reason
+        self.table = table
+        self.expected_dim = expected_dim
+        self.found = list(found)
+        listing = ", ".join(f"{name}(차원 {dim})" for name, dim in self.found) or "없음"
+        super().__init__(
+            f"벡터 표가 설정과 다르다(사유 {reason}): 설정 VECTOR_COLLECTION={table!r}, "
+            f"EMBED_DIM={expected_dim}, DB의 vec0 표 {listing}. 표를 새로 만들지 않았다. "
+            "설정을 DB에 맞추거나 DB를 설정에 맞게 다시 게시한다."
+        )
+
+
+def _is_vec0(sql: str | None) -> bool:
+    """sqlite_master의 sql 문장이 vec0 가상 표 정의인지 판정한다. sql이 없는 행(자동 인덱스 등)은 아니다."""
+    if not sql:
+        return False
+    pattern = r"^\s*CREATE\s+VIRTUAL\s+TABLE\b.*?\bUSING\s+vec0\s*\("
+    return re.match(pattern, sql, re.IGNORECASE | re.DOTALL) is not None
+
+
+def _declared_dim(sql: str | None) -> int | None:
+    """vec0 표 정의에서 ``embedding float[N]``의 N을 읽는다. 읽지 못하면 None이다."""
+    match = re.search(r"\bembedding\s+float\s*\[\s*(\d+)\s*\]", sql or "", re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
 
 # vec0 hard-caps the KNN `k` parameter at 4096 (0.1.9). Any query MUST clamp
 # fetch_k to this or it raises OperationalError. Pack constraints are pushed
@@ -203,6 +247,7 @@ class SqliteVecStore(_SqliteConnMixin):
         ann_coarse_k: int = 512,
         *,
         shared: Any = None,
+        guard_existing_table: bool = False,
     ) -> None:
         """
         Parameters
@@ -230,6 +275,10 @@ class SqliteVecStore(_SqliteConnMixin):
         ann_coarse_k:
             Coarse candidate count C for the binary 2-stage path (recall knob;
             higher = closer to exact, slower). Clamped to vec0's k cap (4096).
+        guard_existing_table:
+            #671 B7: True이면 표를 만들기 전에 게시 DB의 vec0 표와 이름 및 차원을 대조하고, 다르면
+            ``VectorTableMismatchError``로 거부한다(빈 표를 조용히 만들지 않는다). 기본 False는 종전 동작이다.
+            factory의 단일 모드만 True를 넘긴다.
         """
         if embedding_function is None:
             raise ValueError("SqliteVecStore requires an embedding_function.")
@@ -242,6 +291,7 @@ class SqliteVecStore(_SqliteConnMixin):
         self._table = collection_name
         self._ann = ann
         self._ann_coarse_k = int(ann_coarse_k)
+        self._guard_existing_table = bool(guard_existing_table)
         # Whether the ACTUAL table schema has the embedding_bit column — set in
         # _init_db from PRAGMA table_info. Drives the write path independently
         # of `ann` (vec0 requires a value for every vector column on INSERT).
@@ -250,10 +300,23 @@ class SqliteVecStore(_SqliteConnMixin):
         # query; invalidated by this store's writes and by freshness checks.
         self._ann_cache: _AnnCache | None = None
         self._ann_cache_lock = threading.Lock()
+        # Invalidation generation (issue #671). Bumped under `_ann_epoch_lock` by every
+        # post-commit invalidation; a build installs its cache only if the generation it
+        # read before its snapshot is unchanged. Leaf lock: no other lock is taken inside.
+        self._ann_epoch = 0
+        self._ann_epoch_lock = threading.Lock()
         self._conn_dv: dict[int, int] = {}
         self._available = False
         self._init_conn_state(db_path, shared)
-        self._init_db()
+        try:
+            self._init_db()
+        except BaseException as exc:
+            # 일반 예외는 _init_db가 삼킨다. 중단(KeyboardInterrupt 등)이 생성자 밖으로 나가면
+            # 등록한 공유 소유자를 풀지 않아 수명 잠금이 남는다(#671). 잠금 시간 초과는
+            # _init_db가 이미 닫고 올렸으므로 다시 닫지 않는다(#578).
+            if not isinstance(exc, StoreBootstrapLockTimeoutError):
+                self.close()
+            raise
 
     # ------------------------------------------------------------------
     # Connection / lifecycle
@@ -292,6 +355,36 @@ class SqliteVecStore(_SqliteConnMixin):
             ")"
         )
 
+    def _check_existing_table(self, conn: Any) -> None:
+        """게시 DB의 vec0 표와 설정(이름, 차원)을 대조해 다르면 표를 만들기 전에 거부한다(#671 B7).
+
+        읽기만 한다. 판정 순서는 R1(name), R3(kind), R4(unreadable), R2(dim)이다. 같은 이름의 객체도
+        vec0 표도 없는 새 DB는 통과시켜 종전처럼 첫 생성을 한다. 이름은 SQLite 식별자 규칙대로 ASCII 대소문자를
+        구분하지 않고 비교한다.
+        """
+        named = conn.execute(
+            "SELECT name, type, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'view', 'index') AND lower(name) = lower(?)",
+            (self._table,),
+        ).fetchall()
+        found = [
+            (name, _declared_dim(sql))
+            for name, sql in conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'")
+            if _is_vec0(sql)
+        ]
+        if not named:
+            if found:
+                raise VectorTableMismatchError("name", self._table, self._dim, found)
+            return
+        _, kind, sql = named[0]
+        if kind != "table" or not _is_vec0(sql):
+            raise VectorTableMismatchError("kind", self._table, self._dim, found)
+        declared = _declared_dim(sql)
+        if declared is None:
+            raise VectorTableMismatchError("unreadable", self._table, self._dim, found)
+        if declared != self._dim:
+            raise VectorTableMismatchError("dim", self._table, self._dim, found)
+
     def _detect_bit_column(self, conn: Any) -> bool:
         cols = [r[1] for r in conn.execute(f"PRAGMA table_info({self._table})")]
         return "embedding_bit" in cols
@@ -307,6 +400,8 @@ class SqliteVecStore(_SqliteConnMixin):
                 os.makedirs(parent, exist_ok=True)
             with self._bootstrap_lock():
                 conn = self._conn
+                if self._guard_existing_table:
+                    self._check_existing_table(conn)
                 # New/empty DBs get the bit column at CREATE when ann=binary; an
                 # EXISTING float-only table is left untouched (IF NOT EXISTS) — vec0
                 # cannot ALTER TABLE ADD COLUMN, so pre-existing DBs are upgraded by
@@ -334,6 +429,11 @@ class SqliteVecStore(_SqliteConnMixin):
                 self._ann or "off",
                 self._has_bit_column,
             )
+        except VectorTableMismatchError:
+            # #671 B7: 설정과 게시 DB의 표가 다르면 일반 초기화 실패처럼 삼키지 않고 올린다.
+            # 생성자의 바깥 except가 저장소를 닫아 공유 소유자를 푼다.
+            self._available = False
+            raise
         except StoreBootstrapLockTimeoutError:
             # #578: propagate a busy write.lock instead of degrading (see
             # LocalGraphStore._init_db).
@@ -360,7 +460,10 @@ class SqliteVecStore(_SqliteConnMixin):
     # ------------------------------------------------------------------
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
-        return embed_and_validate(self._ef, self._dim, texts)
+        vectors = embed_and_validate(self._ef, self._dim, texts)
+        if len(vectors) != len(texts):
+            raise RuntimeError("embedding count does not match text count")
+        return vectors
 
     def _serialize(self, vec: list[float]) -> Any:
         import sqlite_vec
@@ -427,9 +530,18 @@ class SqliteVecStore(_SqliteConnMixin):
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
         with self._tx() as conn:
+            if self._shared is not None and self._shared.in_unit_of_work:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    validated = self._shared._uow.validated_packs
+                    if any(not slot_owner(meta) or slot_owner(meta) not in validated for meta in clean_meta):
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("vector owner is not validated")
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
                 conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
-        self._ann_cache = None  # in-process write → invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write: invalidate ANN cache
         return ids
 
     def upsert_texts(
@@ -467,10 +579,37 @@ class SqliteVecStore(_SqliteConnMixin):
         validate_lengths(texts, metadatas, ids)
         reject_batch_pack_conflicts(ids, metadatas)
         clean_meta = [_sanitize_metadata(m) for m in metadatas]
-        vectors = self._embed(texts)
+        vectors = self.prepare_upsert_vectors(texts)
+        return self.upsert_precomputed(texts, clean_meta, ids, vectors)
+
+    def prepare_upsert_vectors(self, texts: list[str]) -> list[list[float]]:
+        self._require_available()
+        return self._embed(texts)
+
+    def upsert_precomputed(
+        self, texts: list[str], metadatas: list[dict[str, Any]], ids: list[str],
+        vectors: list[list[float]],
+    ) -> list[str]:
+        self._require_available()
+        validate_lengths(texts, metadatas, ids)
+        if len(vectors) != len(texts) or any(len(vec) != self._dim for vec in vectors):
+            raise ValueError("precomputed vectors do not match texts or dimension")
+        reject_batch_pack_conflicts(ids, metadatas)
+        clean_meta = [_sanitize_metadata(m) for m in metadatas]
         insert_sql = self._insert_sql()
         with self._tx() as conn:
-            reject_foreign_slot_writes(ids, clean_meta, self._slot_owners(conn, ids))
+            owners = self._slot_owners(conn, ids)
+            if self._shared is not None and self._shared.in_unit_of_work:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    validated = self._shared._uow.validated_packs
+                    incoming = [slot_owner(meta) for meta in clean_meta]
+                    if any(not owner or owner not in validated for owner in incoming + list(owners.values())):
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("vector owner is not validated")
+            reject_foreign_slot_writes(ids, clean_meta, owners)
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
                 incoming = slot_owner(meta)
                 conn.execute(
@@ -523,7 +662,7 @@ class SqliteVecStore(_SqliteConnMixin):
                             "this write"
                         ) from exc
                     raise
-        self._ann_cache = None  # in-process write → invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write: invalidate ANN cache
         return ids
 
     def _slot_owners(self, conn, ids: list[str]) -> dict[str, str]:
@@ -555,9 +694,19 @@ class SqliteVecStore(_SqliteConnMixin):
         if not ids:
             return
         with self._tx() as conn:
+            if self._shared is not None and self._shared.in_unit_of_work:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None:
+                    owners = self._slot_owners(conn, ids)
+                    validated = self._shared._uow.validated_packs
+                    if any(not owner or owner not in validated for owner in owners.values()):
+                        self._shared.mark_rollback_only()
+                        raise RuntimeError("vector owner is not validated")
             for _id in ids:
                 conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
-        self._ann_cache = None  # in-process write → invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write: invalidate ANN cache
 
     def reset_collection(self) -> None:
         """Empty the collection (destructive). Uses DELETE (not DROP+CREATE) so
@@ -565,12 +714,20 @@ class SqliteVecStore(_SqliteConnMixin):
         table" gap, and the write lock serialises concurrent resets. Same
         dim/schema is retained (dim is fixed at construction)."""
         self._require_available()
+        if self._shared is not None:
+            marker = self._shared.connection().execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            ).fetchone()
+            if marker is not None:
+                if self._shared.in_unit_of_work:
+                    self._shared.mark_rollback_only()
+                raise RuntimeError("single SQLite vector reset is not supported")
         with self._tx() as conn:
             # ensure the table exists (idempotent, schema-preserving) then
             # clear all rows atomically
             conn.execute(self._create_table_sql(with_bit=self._has_bit_column))
             conn.execute(f"DELETE FROM {self._table}")
-        self._ann_cache = None  # in-process write → invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write: invalidate ANN cache
         logger.info("SqliteVecStore: table '%s' reset.", self._table)
 
     # ------------------------------------------------------------------
@@ -622,8 +779,17 @@ class SqliteVecStore(_SqliteConnMixin):
         # makes the `if predicate is None or pack_only:` check below take
         # the ELSE branch, which sets `fetch_k = _VEC0_K_MAX` (4096) — a
         # bounded, approximate, but non-empty candidate pool.
+        # Single-file mode (#671): outside a unit of work every vector read of this query runs
+        # in one read snapshot (BEGIN ... rollback below). Decide this first, because the
+        # large-scope fallback and the ANN use depend on it. Inside an open transaction the
+        # query behaves as before: per-pack exact KNN, no ANN cache (I3).
+        snapshot_opened = self._shared is not None and not self._conn.in_transaction
         pack_scope: frozenset[str] | None = None
-        if pack_values is not None and len(pack_values) > _PACK_KNN_MAX:
+        if (
+            (self._shared is None or snapshot_opened)
+            and pack_values is not None
+            and len(pack_values) > _PACK_KNN_MAX
+        ):
             pack_scope = frozenset(pack_values)
             pack_values = None
             pack_only = False
@@ -649,9 +815,23 @@ class SqliteVecStore(_SqliteConnMixin):
         else:
             fetch_k = _VEC0_K_MAX
 
-        rows = self._select_query_mode(
-            qvec, pack_values, predicate, fetch_k, n_results, pack_scope=pack_scope
-        )
+        if snapshot_opened:
+            conn = self._conn
+            try:
+                # Inside the try so that an exception after BEGIN still reaches the rollback below.
+                self._open_snapshot()
+                rows = self._select_query_mode(
+                    qvec, pack_values, predicate, fetch_k, n_results,
+                    pack_scope=pack_scope, allow_ann=True,
+                )
+            finally:
+                conn.rollback()
+        else:
+            # This is five-file mode, or single-file mode inside an open transaction (no ANN there).
+            rows = self._select_query_mode(
+                qvec, pack_values, predicate, fetch_k, n_results,
+                pack_scope=pack_scope, allow_ann=self._shared is None,
+            )
 
         hits: list[dict[str, Any]] = []
         for row in rows:
@@ -661,6 +841,12 @@ class SqliteVecStore(_SqliteConnMixin):
             if len(hits) >= n_results:
                 break
         return hits
+
+    def _open_snapshot(self) -> None:
+        """Open the read snapshot of one query (deferred BEGIN: the first read pins it).
+
+        A seam so tests can build a no-snapshot negative control."""
+        self._conn.execute("BEGIN")
 
     def _knn(
         self, qvec: list[float], k: int, pack: str | None
@@ -697,6 +883,7 @@ class SqliteVecStore(_SqliteConnMixin):
         n_results: int,
         *,
         pack_scope: frozenset[str] | None = None,
+        allow_ann: bool,
     ) -> list[dict[str, Any]]:
         """Pick which KNN strategy serves this query, and run it.
 
@@ -730,7 +917,10 @@ class SqliteVecStore(_SqliteConnMixin):
                 rows.extend(self._knn(qvec, fetch_k, pack=pk))
             rows.sort(key=lambda r: r["distance"])
             return rows
-        if self._ann == "binary" and self._has_bit_column and (
+        # `allow_ann` (#671) is true in five-file mode, or in single-file mode inside the query's
+        # own read snapshot. `_get_ann_cache` reads the invalidation epoch first. No database
+        # read may come between the BEGIN of that snapshot and the epoch read.
+        if allow_ann and self._ann == "binary" and self._has_bit_column and (
             predicate is None or pack_scope is not None
         ):
             rows_ann = self._knn_bit_rerank(
@@ -754,7 +944,7 @@ class SqliteVecStore(_SqliteConnMixin):
           appends/upserts even on a connection that has no recorded
           data_version yet (every insert gets a fresh monotonic rowid; upsert
           is delete+insert). In-process writes through this store invalidate
-          explicitly (``self._ann_cache = None``), so the only theoretical
+          explicitly after commit (``_invalidate_ann_after_write``), so the only theoretical
           miss is an external delete-only change observed by a brand-new
           connection — stale candidates until the next detected change.
         """
@@ -848,7 +1038,28 @@ class SqliteVecStore(_SqliteConnMixin):
         return _AnnCache(ids=ids, bits=bits, q8=q8, scale=scale,
                          max_rowid=max_rowid)
 
+    def _invalidate_ann_after_write(self) -> None:
+        """Drop the ANN cache after a vector write, once the write is committed.
+
+        In a single-file unit of work the commit happens later, so the drop runs as a
+        post-commit callback (not called on rollback). Dropping before the commit would let a
+        concurrent query rebuild the cache from the pre-commit snapshot and keep it.
+        """
+        shared = self._shared
+        if shared is not None and shared.in_unit_of_work:
+            shared.after_commit(self._drop_ann_cache)
+        else:
+            self._drop_ann_cache()
+
+    def _drop_ann_cache(self) -> None:
+        with self._ann_epoch_lock:
+            self._ann_cache = None
+            self._ann_epoch += 1
+
     def _get_ann_cache(self) -> _AnnCache | None:
+        # The epoch must be read before any database read of this query's snapshot:
+        # `_ann_cache_fresh` (cache present) or `_build_ann_cache` (cache absent) pins it.
+        epoch = self._ann_epoch
         cache = self._ann_cache
         if cache is not None and self._ann_cache_fresh(cache):
             return cache
@@ -856,9 +1067,17 @@ class SqliteVecStore(_SqliteConnMixin):
             cache = self._ann_cache
             if cache is not None and self._ann_cache_fresh(cache):
                 return cache
+            if self._ann_epoch != epoch:
+                # The epoch changed after this query read it, so the install check would refuse
+                # any cache that this query builds now. If a cache was present, the freshness
+                # check above has also pinned a stale snapshot. Take the exact path, so that
+                # each waiting query does not repeat a refused build.
+                return None
             t0 = time.perf_counter()
             cache = self._build_ann_cache()
-            self._ann_cache = cache
+            with self._ann_epoch_lock:
+                if self._ann_epoch == epoch:
+                    self._ann_cache = cache
             if cache is not None:
                 logger.info(
                     "SqliteVecStore: ANN cache built — %d vectors in %.1fs",
@@ -1091,6 +1310,13 @@ class SqliteVecStore(_SqliteConnMixin):
             return []
         insert_sql = self._insert_sql()
         with self._tx() as conn:
+            if self._shared is not None and self._shared.in_unit_of_work:
+                marker = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                ).fetchone()
+                if marker is not None and pack_id not in self._shared._uow.validated_packs:
+                    self._shared.mark_rollback_only()
+                    raise RuntimeError("vector owner is not validated")
             for record in clean:
                 meta = _sanitize_metadata(record["metadata"])
                 conn.execute(
@@ -1099,7 +1325,7 @@ class SqliteVecStore(_SqliteConnMixin):
                         record["id"], record["document"], meta, record["embedding"]
                     ),
                 )
-        self._ann_cache = None  # in-process write -> invalidate ANN cache
+        self._invalidate_ann_after_write()  # in-process write -> invalidate ANN cache
         return [record["id"] for record in clean]
 
     def verify_recovery_row(self, node_id: str) -> bool:

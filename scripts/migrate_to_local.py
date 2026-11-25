@@ -852,6 +852,9 @@ def migrate_sql(
     from sqlalchemy import create_engine, inspect, text  # type: ignore[import]
 
     from opencrab.stores._pg_url import normalize_pg_url
+    from opencrab.stores._single_file import reject_unmanaged_single_file
+
+    reject_unmanaged_single_file(sqlite_path)
 
     # SQLite 스키마 초기화 (SQLStore 생성자가 처리). 이 store 는 스키마 생성용으로만
     # 쓰고, 쓰기는 아래 별도 engine 으로 한다.
@@ -1167,6 +1170,10 @@ def _run(args: argparse.Namespace) -> int:
         or "./opencrab_data"
     )
     local_data_dir = os.path.abspath(local_data_dir)
+    # 단일 SQLite root는 preflight와 백업과 makedirs 앞에서 거부한다(B11).
+    from opencrab.stores._single_file import reject_single_root
+
+    reject_single_root(local_data_dir)
     if not args.dry_run:
         os.makedirs(local_data_dir, exist_ok=True)
 

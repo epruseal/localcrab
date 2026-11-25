@@ -21,6 +21,7 @@ from opencrab.pack.neo4j_export import (
     _sha_id,
     _stable_json,
 )
+from opencrab.stores._single_file import reject_single_root_under
 
 PACK_ID = "nvidia-nemotron-personas-korea"
 LABELS = ["Document", "Evidence", "Persona"]
@@ -124,6 +125,7 @@ def main() -> int:
     args = parser.parse_args()
 
     output = Path(args.output).expanduser().resolve()
+    reject_single_root_under(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         output.unlink()

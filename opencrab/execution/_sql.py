@@ -18,7 +18,8 @@ the ensure-tables loop", and "what's the now() fragment" by hand.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from opencrab.stores._sql_dialect import POSTGRES, SQLITE, SqlDialect
@@ -38,6 +39,28 @@ def now_expr(sql_store: Any) -> str:
     """SQL "current time" fragment for *sql_store*'s dialect: ``datetime('now')``
     for SQLite, ``NOW()`` for PostgreSQL."""
     return dialect_for(sql_store).now_expr()
+
+
+@contextmanager
+def write_connection(sql_store: Any) -> Iterator[Any]:
+    """공유 SQLite 쓰기는 공통 잠금과 연결에 참가한다."""
+    shared = getattr(sql_store, "shared_file", None)
+    if shared is None:
+        with sql_store._engine.begin() as conn:
+            yield conn
+        return
+
+    from opencrab.stores.sql_store import shared_write_unit
+
+    class SQLiteConnection:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def execute(self, statement, params=None):
+            return self.conn.execute(str(statement), params or {})
+
+    with shared_write_unit(sql_store) as conn:
+        yield SQLiteConnection(conn)
 
 
 def ensure_tables(
@@ -73,6 +96,11 @@ def ensure_tables(
     from opencrab.stores.sql_store import write_lock_for_store
 
     ddl = ddl_sqlite if sql_store._is_sqlite else ddl_pg
+    if getattr(sql_store, "shared_file", None) is not None and not own_file_lock:
+        with write_connection(sql_store) as conn:
+            for stmt in ddl:
+                conn.execute(text(stmt))
+        return
     lock_ctx = write_lock_for_store(sql_store, own_file=own_file_lock)
     with lock_ctx, sql_store._engine.begin() as conn:
         for stmt in ddl:
