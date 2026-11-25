@@ -571,6 +571,8 @@ opencrab/
 apps/             REST 앱(`apps/api`)과 웹(`apps/web`)
 scripts/          운영·이관·진단 스크립트(마이그레이션 도구 포함)
 packaging/        Agent Plugin 패키징
+requirements/     선택 기능 의존성(`localcrab-media.txt`, `localcrab-pack-build.txt`)
+server/           배포 진입점 어댑터(`server.api:app`이 `apps.api.main`의 `app`을 노출)
 tests/            시험
 crabharness/
   crabharness/    미션 플래너, 런타임, 검증, 프로모션 패키지 빌더
