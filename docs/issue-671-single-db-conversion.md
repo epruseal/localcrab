@@ -249,7 +249,7 @@ stat -c '%F %s %h' <세트 상위 디렉터리>/<세트 이름>.source.lifetime.
 
 `stat` 출력은 `regular empty file 0 1`이어야 한다.
 
-3. 증거 파일을 만든다. 만드는 코드는 없으므로 운영자가 쓴다. 키는 13개다: `version`, `snapshot_id`, `source_manifest_sha256`, `preparer_id`, `frozen_from`, `frozen_until`, `writer_stopped`, `billing_same_snapshot`, `packs_observation`, `backup_at`, `packs_checked_at`, `capture_from`, `capture_until`. 값의 관계는 다음과 같다.
+3. 증거 파일을 만든다. `scripts/make_publication_evidence.py <세트 디렉터리> --out <증거 파일> --preparer-id <PREPARER> --frozen-from <UTC 시각> --packs-checked-at <UTC 시각> --frozen-until <UTC 시각>`이 세트의 `MANIFEST.json`에서 만들고 병합 도구의 규칙 함수로 검사한다. 규칙을 어기면 파일을 만들지 않고 rc 2로 끝난다. 증거 파일은 세트 디렉터리 밖에 둔다. 손으로 쓸 때의 키는 13개다: `version`, `snapshot_id`, `source_manifest_sha256`, `preparer_id`, `frozen_from`, `frozen_until`, `writer_stopped`, `billing_same_snapshot`, `packs_observation`, `backup_at`, `packs_checked_at`, `capture_from`, `capture_until`. 값의 관계는 다음과 같다.
    - `version`은 1이다. `preparer_id`는 비어 있지 않은 문자열이다. `snapshot_id`는 세트 `MANIFEST.json`의 `set_id`와 같다. `source_manifest_sha256`은 `MANIFEST.json` 바이트의 sha256이다.
    - `frozen_from` <= `capture_from` <= `capture_until` <= `frozen_until`이고 `packs_checked_at`은 `frozen_from`과 `frozen_until` 사이다.
    - `backup_at`은 `MANIFEST.json`의 `created_at`과 같고 `capture_until`은 `created_at`에 1초를 더한 시각보다 앞선다.
@@ -321,6 +321,433 @@ factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/sto
 ### 8.7 설정 순서
 
 환경 설정은 root를 치운 뒤에 고친다. api와 gateway 서비스 유닛의 `EnvironmentFile` 줄을 주석 처리하고 재시작하는 롤백은 금지한다. root를 둔 채 그렇게 하면 다섯 파일 factory가 root를 거부해 서비스가 뜨지 않는다(7.2의 7번). 단일 모드에서는 사용자를 만들지 않으며 사용자와 토큰은 병합 입력에서 온다(7.3의 첫 항목).
+
+### 8.8 PASS 파일 두 개 마련
+
+`authorize --run-kind production`은 PASS 파일 두 개를 받는다(7.2의 1번). 도구는 두 파일의 존재와 형태만 본다. 내용은 해석하지 않는다. 그래서 파일이 무엇을 증명하는지는 마련하는 사람이 정한다. 아래는 이 저장소가 쓰는 마련 방법이다.
+
+| 파일 | 담는 내용 | 마련 시점 |
+|---|---|---|
+| 독립 검증 PASS(`--verification-pass`) | 변경 대상 커밋을 새 컨텍스트에서 독립 검증한 판정 원문 | 병합 대상 커밋이 정해진 뒤, 사본 시험 전 |
+| 사본 시험 PASS(`--copy-test-pass`) | 운영 데이터의 일관된 사본으로 8.9절 전체를 돌린 결과에 대한 독립 검증 판정 원문 | 사본 시험을 끝낸 뒤, 운영 전환 전 |
+
+마련 규칙은 다음과 같다.
+
+1. 판정 원문을 한 글자도 고치지 않고 일반 파일 하나에 저장한다. 심볼릭 링크와 빈 파일은 거부된다.
+2. 두 파일은 서로 다른 파일이어야 한다. 같은 파일을 두 인자에 넣으면 거부된다.
+3. 파일은 게시 root 밖에 둔다. root 안에 있으면 거부된다.
+4. 절대 경로를 쓰고 경로에 쉼표를 넣지 않는다(8.2의 4번).
+5. 저장한 뒤 `sha256sum`으로 각 파일의 해시를 읽어 실행 기록에 적는다. 판정이 가리키는 대상 커밋도 함께 적는다.
+6. `authorize --apply`가 stderr의 `authorize applied` 줄에 찍은 해시 둘이 기록과 같은지 대조한다. 다르면 전이를 무효로 보고 롤백 경로로 간다. 이 대조는 도구가 하지 않는다.
+7. 판정 대상 커밋이 운영에 배포할 커밋과 같은지 배포 전에 확인한다. 어긋나면 판정을 새로 받는다.
+
+사본 시험 PASS를 받으려면 사본 시험 자체를 8.9절대로 끝까지 돌려야 한다. 사본 시험은 `--run-kind copy-test --verification-pass <PASS1> --copy-test-run-id <COPY_RUN_ID>`로 authorize한다. 운영 데이터를 읽는 구간은 읽기 전용으로 하고 사본만 쓴다.
+
+### 8.9 일반화 실행표
+
+이 표는 한 운영 환경에서 다섯 파일 데이터 디렉터리를 단일 root로 바꾸는 순서를 변수로 적는다. 8.1~8.7이 동작과 복구의 정본이고 이 표는 그 순서를 한 줄에 단순 명령 하나로 이어 붙인다. 표의 명령은 합성 데이터 디렉터리 하나로 끝까지 돌려 확인했다. 확인 방법은 이 절 끝에 있다. 한 줄에 단순 명령 하나만 실행하고, 반복문, 파이프, `&&`는 쓰지 않는다. 합격 기준을 어기면 같은 단계에서 멈추고 아래 갈래를 따른다.
+
+#### 변수
+
+| 변수 | 뜻 |
+|---|---|
+| `<DATA_PARENT>` | 데이터 디렉터리의 부모. root와 같은 파일시스템이어야 한다 |
+| `<ROOT>` | 게시 root. 전환 전 데이터 디렉터리와 같은 경로다(`<DATA_PARENT>/<ROOT 이름>`) |
+| `<OLD>` | 전환 전 데이터 디렉터리의 보존 이름(`<ROOT>.pre671`). 저장소 코드는 이 이름을 쓰지 않는다 |
+| `<REPO>` | localcrab 체크아웃 경로 |
+| `<PY>` | 운영 가상환경의 python |
+| `<ENVFILE>` | 서비스 단위가 읽는 환경 파일. 값은 열지 않고 키 이름만 읽는다 |
+| `<UNIT_FRONT>`, `<UNIT_PROXY>`, `<UNIT_GW>`, `<UNIT_API>` | 외부 노출, 인증 프록시, MCP 게이트웨이, REST 앱 단위. 이름에 `.service`를 붙인다(차단 디렉터리 `<RT>/<단위>.d`의 이름이 된다) |
+| `<UNIT_REINGEST>`, `<TIMER_REINGEST>` | 대화 재인입 서비스와 타이머(없으면 이 줄을 건너뛴다) |
+| `<SETA>`, `<SETC>` | 2단계의 첫 백업 세트와 병합 원본 세트 디렉터리 이름 |
+| `<T0>`, `<T1>`, `<T2>` | 증거 파일의 `frozen_from`, `packs_checked_at`, `frozen_until`(UTC 오프셋 명시) |
+| `<PASS1>`, `<PASS2>` | 독립 검증 PASS와 사본 시험 PASS의 절대 경로(8.8) |
+| `<TMP>` | 병합이 임시 파일을 쓸 디렉터리(`<DATA_PARENT>/sqlite-tmp`). root와 같은 파일시스템이고 tmpfs가 아니다 |
+| `<RT>` | systemd 사용자 런타임 단위 디렉터리(`$XDG_RUNTIME_DIR/systemd/user`). 1단계의 시작 차단 파일을 둔다 |
+| `<TMP_GW>`, `<TMP_PROXY>`, `<TMP_API>` | 6단계 임시 단위 이름. 운영 단위와 다른 이름이다 |
+| `<GW_PORT>`, `<PROXY_PORT>`, `<API_PORT>`, `<GW_PORT_운영>` | 임시 게이트웨이, 임시 프록시, 임시 REST 앱의 루프백 포트와 운영 게이트웨이 포트. 임시 포트는 운영이 쓰지 않는 값이다 |
+| `<토큰 변수>` | 읽기 검증 도구에 넘길 토큰이 든 환경변수 이름. 값은 명령줄에 쓰지 않는다 |
+| `<기준 팩 목록 파일>` | 0단계에서 서비스가 도는 동안 `--save-expected`로 만든 팩 id 목록 파일. 저장소에 올리지 않는다 |
+| `<홈 디렉터리>`, `<운영 단위와 같은 PATH>` | 임시 게이트웨이의 `WorkingDirectory`와 `PATH`. 운영 단위의 값을 `systemctl --user show`로 읽어 쓴다 |
+| `<ROOT 이름>` | `<ROOT>`의 마지막 경로 이름(intent 파일은 `<DATA_PARENT>/<ROOT 이름>.intent.json`) |
+| `<PREPARER>` | 증거 파일을 만든 사람이나 절차의 이름(`--preparer-id` 값) |
+| `<COPY_RUN_ID>` | 사본 시험 authorize의 실행 식별자(8.8) |
+| `<서버 이름>`, `<클라이언트 설정 파일>` | `--client-config` 파일의 `mcpServers` 키와 그 파일 경로 |
+| `<UTC 시각>` | 롤백 접미사 `.saved-<UTC 시각>`의 값. 롤백 한 번에 하나를 정해 root, intent, 잠금 파일, `automation`에 같은 값을 쓴다(8.6 P7) |
+| `<대상 커밋>`, `<롤백 세트 이름>` | 1b에서 배포할 커밋, 7단계 백업이 낸 세트 디렉터리 이름 |
+| `<게이트웨이 MainPID>` | 8단계에서 `show -p MainPID --value`로 읽은 값. 프록시와 REST 앱은 각 단위의 값이다 |
+| `<DATA 경로 문자열>`, `<외부 스크립트 디렉터리>` | 5단계에서 외부 스크립트가 기본 경로를 고정 문자열로 쓰는지 찾을 때의 경로 문자열과 스크립트 디렉터리 |
+| `<단위>` | 갈래 A에서 차단 파일을 지울 단위나 0단계에서 환경을 읽을 단위(`<UNIT_FRONT>`, `<UNIT_PROXY>`, `<UNIT_GW>`, `<UNIT_API>` 중 하나) |
+| `<RUN>` | 실행 기록 디렉터리. 데이터 디렉터리 밖에 둔다 |
+| `<HEAVY>` | 무거운 실행을 한 번에 하나씩 돌리는 래퍼(없으면 빈 값). 운영 장치의 메모리 상한을 지킨다 |
+
+서비스 매니저가 systemd 사용자 유닛이 아니면 `systemctl --user` 줄을 그 매니저의 같은 뜻의 명령으로 바꾼다. 매니저가 관리하는 프로세스는 `kill`로 죽이지 않는다.
+
+#### 0단계 사전 조건과 기록 (정지 전)
+
+서비스가 아직 도는 동안 기준 팩 목록 파일을 만든다. 이 도구의 `ontology_query`는 billing 행을 더한다. 정지 전에 한 번만 돌린다.
+
+이 시점의 `<REPO>`는 되돌림 지점 커밋이어서 `scripts/check_read_endpoints.py`가 없을 수 있다(1b가 배포한다). 도구는 표준 라이브러리만 쓰므로 대상 커밋에서 파일 하나만 꺼내 `<RUN>`에서 돌린다. `<REPO>`의 작업 트리와 HEAD는 바꾸지 않는다.
+
+```bash
+mkdir -p <RUN>
+git -C <REPO> fetch origin
+git -C <REPO> show <대상 커밋>:scripts/check_read_endpoints.py > <RUN>/check_read_endpoints.py
+<PY> <RUN>/check_read_endpoints.py <GW_PORT_운영> mcp --token-env <토큰 변수> --save-expected <기준 팩 목록 파일>
+grep -c . <기준 팩 목록 파일>
+```
+
+- 합격: `RESULT: PASS`와 rc 0이다. 저장된 파일이 비어 있지 않다(`grep -c .`가 1 이상. 빈 목록은 줄바꿈 한 줄로 저장되므로 `wc -l`은 쓰지 않는다). 파일이 이미 있으면 도구가 거부한다. 이 파일은 팩 id 목록이므로 저장소에 올리지 않는다.
+
+```bash
+mkdir -p <RUN>
+date -Is
+sha256sum <PASS1>
+sha256sum <PASS2>
+git -C <REPO> rev-parse HEAD
+git -C <REPO> status --porcelain
+```
+
+- 합격: 점검 시각이 백업과 정기 작업(백업 서비스, 재인입 타이머)의 시각과 겹치지 않는다. 두 PASS 해시와 판정 대상 커밋을 `<RUN>`에 적었다(사본 시험은 아래 "사본 시험으로 돌릴 때의 차이"를 따른다). 현재 HEAD(되돌림 지점)를 적었다. `status --porcelain`이 0줄이다.
+- 실패: 정지하지 않는다. 시각을 다시 정한다.
+
+```bash
+stat -c '%F %h %n' <ROOT>/opencrab.db <ROOT>/graph.db <ROOT>/doc_store.db <ROOT>/vectors.db <ROOT>/billing.db
+stat -c '%d %n' <ROOT> <DATA_PARENT>
+realpath <ROOT>
+realpath <DATA_PARENT>
+findmnt -n <ROOT>
+findmnt -n <DATA_PARENT>
+findmnt -n -o FSTYPE -T <DATA_PARENT>
+ls -d <ROOT>/ledger.json <ROOT>/single.db <OLD>
+ls -A <ROOT>
+df -B1 --output=avail <DATA_PARENT>
+```
+
+- 합격: 다섯 파일이 일반 파일이고 링크 수가 1이다. 장치 번호가 같다. `realpath`가 자기 자신이다. `findmnt`가 `<ROOT>`와 `<DATA_PARENT>`에 출력을 내지 않는다(마운트 지점이면 rename이 안 된다. 8.6 P9). `<DATA_PARENT>`의 파일시스템 종류가 tmpfs가 아니다(`<TMP>`는 3단계에서 `<DATA_PARENT>` 아래에 만든다). `ledger.json`, `single.db`, `<OLD>`가 없다. `ls -A <ROOT>`의 최상위 이름이 8.6의 이동 대상 세 항목과 다섯 DB, 곁파일, 잠금과 삭제 저널, 백업 세트 같은 알려진 이름뿐이다. 모르는 이름이 있으면 처리 방법을 정한 뒤 시작한다. 디스크 여유가 `5.3 * S + 30 GiB` 이상이다(`S`는 다섯 DB 주파일 크기의 합이다).
+- 실패: 정지하지 않는다.
+
+각 서비스 단위가 읽는 환경도 확인한다. `show -p Environment` 출력에는 값이 들어 있다. 키 이름만 읽고 값은 `<RUN>`이나 보고에 옮기지 않는다.
+
+```bash
+systemctl --user show -p EnvironmentFiles -p Environment -p WorkingDirectory <UNIT_FRONT> <UNIT_PROXY> <UNIT_GW> <UNIT_API> <UNIT_REINGEST>
+grep -c '^LOCAL_DATA_DIR=' <ENVFILE>
+grep -c '^SINGLE_SQLITE_FILE=' <ENVFILE>
+```
+
+- 합격: `LOCAL_DATA_DIR` 키가 있는 환경 파일이 한 곳이다(그 키 출현이 1이다). `SINGLE_SQLITE_FILE` 키 출현이 0이다. 모든 단위에서 `LOCAL_DATA_DIR`의 출처가 같은 파일 하나다.
+- 이유: 설정은 `LOCALCRAB_ENV_FILE`이 가리키는 파일(기본 `~/.openclaw/localcrab-kure.env`)을 읽고 현재 디렉터리의 `.env`가 그 위를 덮는다. 실제 환경변수가 둘 다 이긴다. 단위가 쓰는 파일과 `WorkingDirectory`의 `.env`가 다르면 5단계 설정이 일부 단위에만 적용된다.
+
+#### 1단계 정지
+
+```bash
+systemctl --user stop <TIMER_REINGEST>
+systemctl --user disable <TIMER_REINGEST>
+systemctl --user is-active <UNIT_REINGEST>
+```
+
+- 합격: `<UNIT_REINGEST>`가 inactive나 failed다. activating이나 active이면 끝날 때까지 같은 명령을 반복한다. 대기 상한은 최근 실행에서 읽은 시작부터 완료까지 최대 시간의 두 배다. 상한을 넘으면 서비스를 stop하지 않고 타이머를 `enable --now`로 되살리고 다시 정한다. 재인입이 끝난 뒤 미완 표식(전체 재적재 대기)이 없는지 로그를 읽는다. 표식이 있으면 스위치하지 않는다.
+
+```bash
+systemctl --user stop <UNIT_FRONT>
+systemctl --user stop <UNIT_PROXY>
+systemctl --user stop <UNIT_GW>
+systemctl --user stop <UNIT_API>
+systemctl --user stop <UNIT_REINGEST>
+mkdir -p <RT>/<UNIT_FRONT>.d <RT>/<UNIT_PROXY>.d <RT>/<UNIT_GW>.d <RT>/<UNIT_API>.d
+printf '[Service]\nExecStartPre=/bin/false\n' > <RT>/<UNIT_FRONT>.d/block.conf
+printf '[Service]\nExecStartPre=/bin/false\n' > <RT>/<UNIT_PROXY>.d/block.conf
+printf '[Service]\nExecStartPre=/bin/false\n' > <RT>/<UNIT_GW>.d/block.conf
+printf '[Service]\nExecStartPre=/bin/false\n' > <RT>/<UNIT_API>.d/block.conf
+systemctl --user daemon-reload
+systemctl --user show -p DropInPaths <UNIT_FRONT> <UNIT_PROXY> <UNIT_GW> <UNIT_API>
+systemctl --user show -p ActiveState -p MainPID <UNIT_FRONT> <UNIT_PROXY> <UNIT_GW> <UNIT_API> <UNIT_REINGEST>
+fuser -v <ROOT>/opencrab.db <ROOT>/graph.db <ROOT>/doc_store.db <ROOT>/vectors.db <ROOT>/billing.db
+date -u +%Y-%m-%dT%H:%M:%S+00:00
+```
+
+- 합격: 넷 모두 `DropInPaths`에 `block.conf`가 보인다(시작 차단). 단위 파일이 `~/.config/systemd/user`에 있으면 `mask --runtime`은 효과가 없다. 그 디렉터리가 런타임 디렉터리보다 우선해 `LoadState`가 `loaded`로 남고, `mask`는 `already exists`로 거부된다. 그래서 런타임 drop-in으로 `start`를 실패시킨다. 이 차단 파일은 런타임 디렉터리에 있어 재부팅하면 사라진다. 모든 단위가 inactive이고 `MainPID`가 0이다. `fuser` 표준 출력에 PID가 없다(`-wal`과 `-shm`이 있으면 같은 방식으로 본다). 마지막 줄의 값이 `<T0>`이다.
+- 실패: 1b로 가지 않는다. 남은 단위와 점유 프로세스를 처리하고 이 단계를 다시 한다. 코드나 데이터를 바꾸기 전이므로 서비스를 다시 켜고 끝낼 수 있다.
+
+#### 1b 코드 배포 (정지 뒤)
+
+```bash
+git -C <REPO> fetch origin
+git -C <REPO> merge --ff-only <대상 커밋>
+git -C <REPO> rev-parse HEAD
+<PY> -c "from opencrab.config import Settings; print('single_sqlite_file' in Settings.model_fields)"
+<PY> -m pip install -e <REPO> --no-deps
+<PY> -m pip show opencrab
+```
+
+- 합격: `HEAD`가 대상 커밋이다. 마지막 `python -c` 출력이 `True`다. `pip show`의 `Version`이 `pyproject.toml`의 버전과 같다(editable 설치는 재설치 전까지 설치 메타데이터의 버전이 옛 값으로 남는다. `opencrab --version`과 `pip show`는 그 메타데이터를 읽고 `opencrab.__version__`은 소스를 읽는다. `docs/migrations.md` 10절의 확인 명령 참고).
+- 실패: 갈래 A.
+
+저장소 밖에서 이 저장소를 부르는 운영 스크립트(예: 재인입 스크립트)가 있으면 이 시점에 같은 방식으로 배포하고 대상 커밋의 해시로 대조한다. 실패하면 갈래 A.
+
+#### 2단계 정지 상태 증거 백업
+
+병합 원본 세트는 DB 다섯만 든 디렉터리를 다시 백업해 만든다. 첫 백업은 정지한 운영 디렉터리를, 둘째 백업은 푼 사본을 대상으로 한다. 두 백업 모두 `SINGLE_SQLITE_FILE`이 설정되지 않은 환경에서 돌린다. 설정이 있으면 단일 root용 백업이 선택된다. 백업 도구를 `write.lock`을 쥔 채 호출하지 않는다.
+
+```bash
+fuser -v <ROOT>/opencrab.db <ROOT>/graph.db <ROOT>/doc_store.db <ROOT>/vectors.db <ROOT>/billing.db
+mkdir <DATA_PARENT>/stage-a
+<HEAVY> <PY> -m opencrab.stores.backup --data-dir <ROOT> --to <DATA_PARENT>/stage-a --exclude chroma --exclude docs --exclude graph.kuzu
+<PY> -m opencrab.stores.backup --verify <DATA_PARENT>/stage-a/<SETA>
+```
+
+- 합격: 점유 프로세스 0. `--verify`가 rc 0이다. `--exclude` 대상 중 없는 항목은 세트가 `skipped`로 기록한다.
+- 실패: 갈래 E(백업은 데이터를 바꾸지 않는다).
+
+```bash
+<HEAVY> <PY> <REPO>/scripts/unpack_backup_set.py <DATA_PARENT>/stage-a/<SETA> <DATA_PARENT>/stage-unpack
+<HEAVY> <PY> -m opencrab.stores.backup --data-dir <DATA_PARENT>/stage-unpack --to <DATA_PARENT>
+<PY> -m opencrab.stores.backup --verify <DATA_PARENT>/<SETC>
+ls <DATA_PARENT>/<SETC>
+```
+
+- 합격: 푸는 도구의 마지막 줄이 `ALL OK`이고 rc 0이다. 푸는 도구는 이름이 정해진 DB 다섯만 복사하고 삭제 저널 같은 하위 경로 항목과 심볼릭 링크 항목은 건너뛰어 이름을 출력한다. 대상 디렉터리가 이미 있으면 거부한다. 둘째 백업의 `--verify`가 rc 0이다. `<SETC>` 안에 `MANIFEST.json`과 DB 다섯만 있고 `<SETC>`는 `<DATA_PARENT>`의 직접 자식이다.
+- 한계: 푸는 도구는 벡터 DB 파일 이름이 기본 `vectors.db`인 세트만 받는다. 다른 이름을 쓰는 세트는 rc 2로 끝난다.
+
+```bash
+bash -c 'set -o noclobber; : > <DATA_PARENT>/<SETC>.source.lifetime.lock'
+stat -c '%F %s %h' <DATA_PARENT>/<SETC>.source.lifetime.lock
+date -u +%Y-%m-%dT%H:%M:%S+00:00
+<PY> <REPO>/scripts/make_publication_evidence.py <DATA_PARENT>/<SETC> --out <DATA_PARENT>/evidence.json --preparer-id <PREPARER> --frozen-from <T0> --packs-checked-at <T1> --frozen-until <T2>
+stat -c '%d %n' <DATA_PARENT> <DATA_PARENT>/<SETC> <DATA_PARENT>/evidence.json
+```
+
+- 합격: `stat` 출력이 `regular empty file 0 1`이다. `date -u` 출력이 `<T1>`이다. `<T2>`는 3단계 `mv` 직전으로 예상하는 UTC 시각을 몇 분 뒤로 잡는다. 증거 도구가 `evidence written`을 출력한다. 장치 번호가 셋 같다. 증거 파일은 root, `<OLD>`, `<SETC>` 안에 있지 않다.
+- 증거 도구는 병합 도구의 규칙 함수로 만든 증거를 검사한다. 규칙을 어기면 파일을 만들지 않고 rc 2로 끝난다. `--out`이 세트 디렉터리 안이면 거부한다. 이 도구는 `writer_stopped`, `billing_same_snapshot`을 참으로, `packs_observation`을 `absent`로 고정한다. 1단계에서 정지를 실제로 확인한 사람이 하는 선언이다.
+
+#### 3단계 경로 전환과 병합 게시
+
+```bash
+fuser -v <ROOT>/opencrab.db <ROOT>/graph.db <ROOT>/doc_store.db <ROOT>/vectors.db <ROOT>/billing.db
+stat -c %d <ROOT> <DATA_PARENT>
+ls -d <OLD>
+mv -T <ROOT> <OLD>
+ls -d <ROOT> <OLD>
+mkdir <TMP>
+```
+
+- 합격: 점유 0. 장치 번호가 같다. `ls -d <OLD>`가 `No such file`이다. `mv` 뒤 `<ROOT>`는 없고 `<OLD>`가 있다. 하나라도 어긋나면 `mv`하지 않는다(갈래 E).
+
+```bash
+<HEAVY> <PY> <REPO>/scripts/merge_sqlite_stores.py --source-dir <DATA_PARENT>/<SETC> --publication-root <ROOT> --evidence-file <DATA_PARENT>/evidence.json
+```
+
+- 합격: `publication mode is not ready`와 rc 2다. 계획 모드의 정상 출력이다. 원본 세트 경로와 게시 root가 위 값과 같은지 읽는다.
+
+```bash
+env SQLITE_TMPDIR=<TMP> <HEAVY> <PY> <REPO>/scripts/merge_sqlite_stores.py --source-dir <DATA_PARENT>/<SETC> --publication-root <ROOT> --evidence-file <DATA_PARENT>/evidence.json --apply --verify --immutable-source > <RUN>/3-merge.out 2>&1
+cat <RUN>/3-merge.out
+ls -A <ROOT>
+```
+
+- 합격: rc 0이고 마지막 줄이 `publication ready`다. `--verify` 출력에 `{"verify": "counts", "mismatch": 0}` 줄과 `"vec_mismatch": 0`을 담은 `{"verify": "fts_vec", ...}` 줄이 모두 있다. `<ROOT>` 안 이름이 정확히 `billing.db`, `ledger.json`, `manifest.json`, `marker.json`, `single.db`, `single.db.lifetime.lock`이다. 경과 시간을 기록한다.
+- 실패: rc가 0이 아니면 먼저 경과 시간, `MemoryError`, rc 128 초과(신호)를 보고 상한 종료인지 가른다. 메모리 부족 거부(`<HEAVY>` 래퍼가 내는 rc 75. 래퍼가 없으면 이 경우는 없다)는 병합을 시작하지 않은 것이므로 갈래 E다. 그 밖의 실패는 갈래 C.
+
+#### 4단계 authorize
+
+```bash
+<HEAVY> <PY> <REPO>/scripts/merge_sqlite_stores.py authorize --root <ROOT> --run-kind production --verification-pass <PASS1> --copy-test-pass <PASS2>
+<HEAVY> <PY> <REPO>/scripts/merge_sqlite_stores.py authorize --root <ROOT> --run-kind production --verification-pass <PASS1> --copy-test-pass <PASS2> --apply > <RUN>/4-authorize.out 2>&1
+cat <RUN>/4-authorize.out
+cat <ROOT>/ledger.json
+cat <DATA_PARENT>/<ROOT 이름>.intent.json
+```
+
+- 합격: 첫 명령이 `authorize dry-run ok`를 출력한다. 둘째 명령의 `authorize applied` 줄에 찍힌 증거 해시 둘이 0단계에 적은 두 PASS 해시와 같다. ledger state가 `authorized`이고 intent state가 `ready`다(8.3).
+- 실패: 갈래 C(8.5의 표).
+
+#### 5단계 항목 이동과 설정
+
+```bash
+systemctl --user is-active <UNIT_REINGEST>
+systemctl --user is-active <TIMER_REINGEST>
+find <OLD>/packs -printf '%P %s\n' > <RUN>/5-before-packs.txt
+find <OLD>/openclaw-conversations -printf '%P %s\n' > <RUN>/5-before-conversations.txt
+find <OLD>/datasets -printf '%P %s\n' > <RUN>/5-before-datasets.txt
+env -C <OLD>/packs find . -type f -exec sha256sum {} + > <RUN>/5-packs-sha-before.txt
+stat -c %d <OLD> <ROOT>
+ls -d <ROOT>/packs
+mv -T <OLD>/packs <ROOT>/packs
+find <ROOT>/packs -printf '%P %s\n' > <RUN>/5-after-packs.txt
+diff <RUN>/5-before-packs.txt <RUN>/5-after-packs.txt
+ls -d <ROOT>/openclaw-conversations
+mv -T <OLD>/openclaw-conversations <ROOT>/openclaw-conversations
+find <ROOT>/openclaw-conversations -printf '%P %s\n' > <RUN>/5-after-conversations.txt
+diff <RUN>/5-before-conversations.txt <RUN>/5-after-conversations.txt
+ls -d <ROOT>/datasets
+mv -T <OLD>/datasets <ROOT>/datasets
+find <ROOT>/datasets -printf '%P %s\n' > <RUN>/5-after-datasets.txt
+diff <RUN>/5-before-datasets.txt <RUN>/5-after-datasets.txt
+env -C <ROOT>/packs find . -type f -exec sha256sum {} + > <RUN>/5-packs-sha-after.txt
+diff <RUN>/5-packs-sha-before.txt <RUN>/5-packs-sha-after.txt
+```
+
+- 합격: 서비스와 타이머가 inactive다. 장치 번호가 같고 세 `ls -d`가 `No such file`이다. 항목마다 이동 직후의 `diff`가 0줄이다(8.6 P3, P4). 마지막 sha `diff`도 0줄이다(`env -C`로 상대 경로 목록을 만들어 접두어가 같다. 줄 순서만 달라 `diff`가 나오면 두 파일을 `sort -o`(같은 파일을 입력과 출력으로)로 각각 정렬해 다시 비교한다). 없는 항목은 건너뛴다(그 항목은 이 운영 환경에 없다). 어느 `diff`든 어긋나면 다음 항목을 옮기지 않고 갈래 E다.
+- 외부 스크립트가 기본 데이터 경로를 고정 문자열로 쓰는지 `grep -rn '<DATA 경로 문자열>' <외부 스크립트 디렉터리>`로 확인한다(8.6 P8).
+
+```bash
+tail -c 1 <ENVFILE>
+printf 'SINGLE_SQLITE_FILE=<ROOT>/single.db\n' >> <ENVFILE>
+grep -c '^SINGLE_SQLITE_FILE=' <ENVFILE>
+ls -ld <ROOT>/openclaw-conversations/automation
+```
+
+- 합격: 첫 명령이 줄바꿈을 낸다(아니면 다음 줄 앞에 줄바꿈을 먼저 넣는다). 둘째 `grep`이 1이다. 재인입 단위의 로그 경로 부모가 있다(8.6 P6).
+- `LOCAL_DATA_DIR`은 그대로 `<ROOT>`다. 설정 순서는 8.7을 따른다.
+
+#### 6단계 읽기 검증 (단위는 멈춘 채, 임시 인스턴스만)
+
+임시 인스턴스는 운영 단위와 같은 환경으로 띄운다. 운영 단위의 `Environment`와 `WorkingDirectory`를 `systemctl --user show -p Environment -p WorkingDirectory <단위>`로 읽는다. 출력에 값이 들어 있으므로 키 이름만 확인하고 값은 기록하지 않는다. 아래 세 항목이 어긋나면 임시 인스턴스가 운영 단위와 다르게 동작한다.
+
+- `STORAGE_MODE=local`이 빠지면 임시 인스턴스가 다른 모드로 뜬다.
+- `PATH`가 다르면 GGUF 폴백 같은 선택 기능이 다르게 동작한다.
+- 게이트웨이 형태의 임시 인스턴스는 `WorkingDirectory`를 홈 디렉터리로 두어 운영 단위와 같게 맞춘다. 저장소 디렉터리에서 띄우면 그 `.env`가 설정을 덮는다.
+
+격리 시험(합성 데이터)에서는 `HOME`과 `LOCALCRAB_ENV_FILE`도 덮어써 운영 환경 파일을 읽지 않게 한다(0단계의 설정 규칙). 포트는 운영이 쓰지 않는 값을 쓴다.
+
+```bash
+systemd-run --user --unit=<TMP_GW> --collect -p EnvironmentFile=<ENVFILE> -p Environment=STORAGE_MODE=local -p Environment=PATH=<운영 단위와 같은 PATH> -p WorkingDirectory=<홈 디렉터리> <PY> -m opencrab.cli serve --transport http --host 127.0.0.1 --port <GW_PORT> --allow-query-token
+<PY> <REPO>/scripts/check_read_endpoints.py <GW_PORT> mcp --token-env <토큰 변수> --expected <기준 팩 목록 파일>
+systemctl --user stop <TMP_GW>
+```
+
+REST 앱 형태는 같은 환경으로 아래처럼 띄운다. `python -m apps.api.main`은 모든 인터페이스(0.0.0.0)에 바인드하므로 쓰지 않는다. `WorkingDirectory`는 운영 REST 단위의 값(저장소 디렉터리)과 같게 둔다.
+
+```bash
+systemd-run --user --unit=<TMP_API> --collect -p EnvironmentFile=<ENVFILE> -p Environment=STORAGE_MODE=local -p Environment=PATH=<운영 단위와 같은 PATH> -p WorkingDirectory=<REPO> <PY> -m uvicorn apps.api.main:app --host 127.0.0.1 --port <API_PORT>
+<PY> <REPO>/scripts/check_read_endpoints.py <API_PORT> api --token-env <토큰 변수> --expected <기준 팩 목록 파일>
+systemctl --user stop <TMP_API>
+```
+
+인증 프록시 형태는 운영 프록시 단위의 시작 명령을 `systemctl --user show -p ExecStart <UNIT_PROXY>`로 읽고(값에 비밀이 있으면 옮기지 않는다), 같은 명령을 `--host 127.0.0.1 --port <PROXY_PORT>`와 `<TMP_PROXY>` 이름으로 띄운다. 검사는 게이트웨이와 같은 `mcp` 형태로 `<PROXY_PORT>`에 돌린다.
+
+- 합격: `RESULT: PASS`와 rc 0이다. `ontology_query`의 토큰 요청이 200이고 `isError`가 거짓이며 본문에 `error` 키가 없고 `results` 목록이 있다. 무토큰 요청이 401이다. `content_pack_list`가 200이고 `expected_minus_got`가 `[]`이다. `got_minus_expected`는 읽고 기록한다. 출력에 토큰이나 헤더 값이 없다.
+- `systemd-run` 직후에는 서버가 포트를 열 때까지 몇 초 걸린다. 검사가 연결 거부로 끝나면 `ss -ltn`으로 포트가 열렸는지 보고 같은 검사를 다시 돌린다.
+- 기준 팩 목록 파일은 전환 전 운영 인스턴스에 같은 도구를 `--save-expected <기준 팩 목록 파일>`로 돌려 만든다(0단계에서 서비스가 도는 동안 한 읽기 질의). 이 파일은 팩 id 목록이므로 저장소에 올리지 않는다.
+- 토큰은 환경변수로 넘기고 명령줄에 쓰지 않는다(`--client-config <클라이언트 설정 파일> --server <서버 이름>`도 쓸 수 있다).
+- P5가 요구하는 나머지 두 검사는 사람이 한다. `opencrab packs list`(환경은 같은 `<ENVFILE>`)가 `<ROOT>/packs/`의 manifest 팩을 모두 보이는지 보고, `content_pack_list`의 query로 manifest 키워드에만 있는 단어를 검색해 그 팩이 돌아오는지 본다. 운영에 manifest 팩이 있을 때만 해당한다.
+- 도구가 보내는 질의에 `ontology_query`와 `POST /api/query`가 있다. 이 둘은 팩 데이터를 바꾸지 않지만 billing 행과 질의 이벤트를 쓴다. 7단계의 롤백 지점 백업이 그 행을 포함하도록 6단계 임시 인스턴스를 먼저 멈춘다.
+
+```bash
+systemctl --user is-active <TMP_GW> <TMP_PROXY> <TMP_API>
+```
+
+- 합격: 임시 단위가 모두 inactive이거나 not found다.
+- 실패: 쓰기 개방 전 갈래 B.
+
+#### 7단계 롤백 지점 기록 (쓰기 개방 직전)
+
+```bash
+fuser -v <ROOT>/single.db <ROOT>/billing.db
+mkdir -p <DATA_PARENT>/backups/rollback-point
+stat -c %d <ROOT> <DATA_PARENT>/backups
+<HEAVY> env SINGLE_SQLITE_FILE=<ROOT>/single.db LOCAL_DATA_DIR=<ROOT> <PY> -m opencrab.stores.backup --to <DATA_PARENT>/backups/rollback-point
+env SINGLE_SQLITE_FILE=<ROOT>/single.db LOCAL_DATA_DIR=<ROOT> <PY> -m opencrab.stores.backup --verify <DATA_PARENT>/backups/rollback-point/<롤백 세트 이름>
+cp -a <ROOT>/openclaw-conversations/automation <DATA_PARENT>/automation.rollback-copy
+env -C <ROOT>/openclaw-conversations/automation find . -type f -exec sha256sum {} +
+env -C <DATA_PARENT>/automation.rollback-copy find . -type f -exec sha256sum {} +
+env -C <ROOT>/packs find . -type f -exec sha256sum {} + > <RUN>/7-packs-sha.txt
+```
+
+- 합격: 점유 0. 장치 번호가 같다. 백업과 `--verify`가 rc 0이고 세트가 `<ROOT>` 밖에 있으며 `single.db`, `billing.db`, `MANIFEST.json`만 든다. 두 sha256 목록(상대 경로 기준)이 경로와 해시 모두 같다. 롤백 세트 경로와 사본 경로를 `<RUN>`에 적는다. 롤백은 `packs`를 복원하지 않는다.
+- 실패: 쓰기를 열지 않는다. 갈래 B.
+
+#### 8단계 쓰기 개방
+
+```bash
+systemctl --user is-active <TMP_GW> <TMP_PROXY> <TMP_API>
+fuser -v <ROOT>/single.db <ROOT>/billing.db
+rm <RT>/<UNIT_FRONT>.d/block.conf
+rm <RT>/<UNIT_PROXY>.d/block.conf
+rm <RT>/<UNIT_GW>.d/block.conf
+rm <RT>/<UNIT_API>.d/block.conf
+rmdir <RT>/<UNIT_FRONT>.d <RT>/<UNIT_PROXY>.d <RT>/<UNIT_GW>.d <RT>/<UNIT_API>.d
+systemctl --user daemon-reload
+systemctl --user start <UNIT_GW>
+systemctl --user start <UNIT_PROXY>
+systemctl --user start <UNIT_API>
+systemctl --user start <UNIT_FRONT>
+systemctl --user show -p ActiveState -p MainPID -p NRestarts <UNIT_GW> <UNIT_PROXY> <UNIT_API> <UNIT_FRONT>
+systemctl --user show -p MainPID --value <UNIT_GW>
+grep -z -c '^SINGLE_SQLITE_FILE=' /proc/<게이트웨이 MainPID>/environ
+```
+
+- 합격: 임시 단위 inactive, 점유 0. 네 단위가 active이고 `MainPID`가 0이 아니며 `NRestarts`가 0이다. 단위마다 `grep -z -c`가 1이다(프록시와 REST 앱도 같은 명령을 각 `MainPID`로 돌린다. `-z`는 각 `MainPID`의 `/proc` environ 파일의 NUL 구분 항목을 한 줄씩 읽는다). 재인입 타이머는 아직 `enable`하지 않는다.
+- 실패: 재인입 타이머가 disable 상태인지 확인하고 갈래 D를 시작할지 정한다.
+
+#### 9단계 개방 직후 확인
+
+```bash
+ls -ld <ROOT>/openclaw-conversations/automation
+<PY> <REPO>/scripts/check_read_endpoints.py <GW_PORT_운영> mcp --token-env <토큰 변수> --expected <기준 팩 목록 파일>
+systemctl --user start <UNIT_REINGEST>
+systemctl --user is-active <UNIT_REINGEST>
+journalctl --user -u <UNIT_REINGEST> -n 80 --no-pager
+```
+
+- 합격: 읽기 검증이 `RESULT: PASS`다. 이 단계는 쓰기 도구를 호출하지 않는다(쓰기 경로는 사본 시험이 이미 확인했다). 재인입 단위는 운영 환경 고유이므로 아래 판정은 그 단위의 로그를 읽어 한다. 재인입이 끝나고 최종 상태가 성공이거나 새 메시지 없음이다. 이벤트 `graph_import_delta`와 `doc_nodes_sync`가 ok다.
+- 실패: 거부 원인은 stderr의 JSON으로 가른다. 커서나 `packs` 위치 거부는 5단계 이동 누락(8.6 P1, P6)이고, 단일 root인데 설정값이 비었다는 거부는 0단계의 환경 파일 확인으로 돌아간다. 고치지 못하면 타이머를 enable하지 않고 갈래 D를 정한다.
+
+```bash
+systemctl --user enable --now <TIMER_REINGEST>
+systemctl --user is-enabled <TIMER_REINGEST>
+```
+
+- 합격: `enabled`. 밀린 실행이 한 번 일어날 수 있다.
+- 스위치 뒤 정리: `stage-a`, `stage-unpack`, `<SETC>`와 source lock, `evidence.json`, `<TMP>`, `automation.rollback-copy`, `<OLD>`는 보존 기간이 끝나기 전에 지우지 않는다. 지우기 전에 인용 검색과 재현 가능성을 확인하고 확인을 받는다.
+
+#### 사본 시험으로 돌릴 때의 차이
+
+8.8의 사본 시험은 운영 데이터의 일관된 사본을 별도 `<DATA_PARENT>` 아래 `<ROOT>`로 두고 이 표를 같은 순서로 돌린다. 운영 데이터는 사본을 만들 때만 읽는다. 운영 단위와 운영 환경 파일은 쓰지 않는다. 다른 점은 다음과 같다.
+
+- 단위와 환경: 1단계와 8단계의 단위(`<UNIT_FRONT>`, `<UNIT_PROXY>`, `<UNIT_GW>`, `<UNIT_API>`, `<UNIT_REINGEST>`)와 `<TIMER_REINGEST>`는 사본용 임시 이름의 단위로 바꿔 쓰고 `<ENVFILE>`도 사본용 파일을 쓴다. 운영 단위는 멈추지 않고 시작 차단 파일도 두지 않는다. `<T0>`는 사본에 쓰는 주체가 없음을 확인한 시각이다.
+- 코드와 가상환경: 사본 시험은 운영 체크아웃과 운영 가상환경을 건드리지 않는다. `<REPO>`와 `<PY>`를 사본용 별도 체크아웃과 별도 가상환경의 값으로 바꿔 쓰고, 1b는 그 체크아웃과 가상환경에만 한다. 운영 `<REPO>`의 `git merge`와 운영 가상환경의 `pip install`은 돌리지 않는다.
+- 기준 팩 목록: 0단계의 `--save-expected`를 운영 게이트웨이에 돌리지 않는다. 그 질의는 운영 `billing.db`에 행을 쓰고, 사본과 다른 시각의 팩 집합을 기준으로 삼는다. 전환 전 다섯 파일 상태의 사본 `<ROOT>` 위에 6단계 방식으로 임시 게이트웨이를 띄우고 그 포트를 `<GW_PORT_운영>` 자리에 넣어 한 번 돌린 뒤 그 게이트웨이를 멈춘다. 질의가 쓴 billing 행은 사본에만 남는다.
+- 0단계: `<PASS2>`는 사본 시험이 끝난 뒤에야 생긴다. `sha256sum <PASS2>` 줄을 빼고 `<PASS1>` 해시 하나만 적는다. 해시 둘 기준은 운영 실행에만 건다.
+- 4단계: 아래 두 명령으로 authorize한다. `--copy-test-pass`는 copy-test에서 거부된다. 합격은 첫 명령의 `authorize dry-run ok`, 둘째 명령의 `authorize applied` 줄에 찍힌 `run_id=<COPY_RUN_ID>`와 증거 해시 하나(0단계의 `<PASS1>` 해시), ledger state `authorized`, intent state `ready`다.
+
+```bash
+<HEAVY> <PY> <REPO>/scripts/merge_sqlite_stores.py authorize --root <ROOT> --run-kind copy-test --verification-pass <PASS1> --copy-test-run-id <COPY_RUN_ID>
+<HEAVY> <PY> <REPO>/scripts/merge_sqlite_stores.py authorize --root <ROOT> --run-kind copy-test --verification-pass <PASS1> --copy-test-run-id <COPY_RUN_ID> --apply > <RUN>/4-authorize.out 2>&1
+```
+
+- 9단계: 사본 단위로 읽기 검증만 하고 재인입 타이머는 켜지 않는다. 읽기 검증 명령의 `<GW_PORT_운영>` 자리에는 사본 게이트웨이 단위의 포트를 넣는다.
+- 끝낸 뒤: 단계별 출력 기록을 독립 검증에 넘겨 받은 판정 원문이 `<PASS2>`다(8.8). 그 뒤 운영 전환은 이 표를 운영 값으로 처음부터 돈다.
+
+#### 롤백 갈래
+
+- 갈래 A, 정지 뒤 1b 실패: 데이터를 건드리지 않았다. 체크아웃을 0단계에 적은 커밋으로 `git reset --keep`하고 `rev-parse HEAD`로 확인한다. 이어서 `<PY> -m pip install -e <REPO> --no-deps`를 다시 돌리고 `pip show opencrab`의 `Version`이 되돌린 체크아웃의 `pyproject.toml` 버전과 같은지 확인한다(설치 메타데이터가 1b의 새 버전으로 남지 않게 한다). 저장소 밖 스크립트를 되돌린다. 1단계의 시작 차단 파일을 지우고(`rm <RT>/<단위>.d/block.conf`, `rmdir`, `daemon-reload`) 단위와 재인입 타이머를 켠다. `systemctl --user enable --now <TIMER_REINGEST>`.
+- 갈래 B, 쓰기 개방 전 롤백: 임시 단위가 inactive인지 확인하고 1단계의 정지 확인을 다시 한다. 8.6 P7의 순서(이동 항목 되돌리기, 이름 맞바꾸기, intent와 잠금 파일 보존, 설정 줄 지우기)를 따른다. 설정 줄은 `sed -i '/^SINGLE_SQLITE_FILE=/d' <ENVFILE>`로 지우고 `grep -c`가 0인지 확인한다. 모든 `mv -T` 앞에서 장치 번호가 같고 대상 이름이 없음을 확인한다. 마지막에 시작 차단 파일 제거(`rm <RT>/<단위>.d/block.conf`, `rmdir`, `daemon-reload`. 갈래 A와 같다), 단위 시작, 타이머 enable, 환경의 `SINGLE_SQLITE_FILE` 출현 0을 확인한다.
+- 갈래 C, 병합이나 authorize의 비정상 종료: 8.4(게시)와 8.5(authorize)를 따른다. 다시 돌릴지 다섯 파일로 돌아갈지는 사람이 정해 기록한다.
+- 갈래 D, 쓰기 개방 뒤 롤백: 1단계의 정지를 그대로 한다(타이머 stop과 disable, 단위 stop, 시작 차단 파일). 합격 기준도 그대로 확인하되 `fuser` 대상은 `<ROOT>/single.db`, `<ROOT>/billing.db`와 각 `-wal`, `-shm`이다. 정지를 확인한 뒤 둘 중 하나로 간다. 개방 뒤의 MCP 쓰기는 두 경우 모두 롤백 지점 뒤 것이 사라진다. 대화 메시지는 커서를 되돌렸으므로 델타 적재가 다시 처리한다.
+  - D1 단일 파일로 되돌린다: 7단계와 같은 설정을 주입해 두 번 돌린다. 먼저 dry-run으로 계획을 읽는다. 그다음 `--apply`를 붙인다. 주입 없이 돌리면 셸의 설정 출처에 `SINGLE_SQLITE_FILE`이 없을 때 거부된다. 앞에 `<HEAVY>`가 필요하면 7단계의 백업 명령처럼 붙인다.
+
+    ```bash
+    env SINGLE_SQLITE_FILE=<ROOT>/single.db LOCAL_DATA_DIR=<ROOT> <PY> -m opencrab.stores.single_restore <DATA_PARENT>/backups/rollback-point/<롤백 세트 이름>
+    env SINGLE_SQLITE_FILE=<ROOT>/single.db LOCAL_DATA_DIR=<ROOT> <PY> -m opencrab.stores.single_restore <DATA_PARENT>/backups/rollback-point/<롤백 세트 이름> --apply
+    ```
+
+    그다음 `automation` 사본을 교체한다. 교체는 이동 두 번이다. 각 이동 앞에서 두 경로의 장치 번호가 같고 대상 이름이 없음을 확인한다(8.6 P2). 먼저 `<ROOT>/openclaw-conversations/automation`을 `<DATA_PARENT>/automation.saved-<UTC 시각>`으로 `mv -T`하고, 이어서 `<DATA_PARENT>/automation.rollback-copy`를 원래 자리로 `mv -T`한다(8.6 P7의 "사본을 그 자리로 옮긴다"). 사본은 이 이동으로 소비되며, 7단계의 sha256 대조가 사본이 롤백 지점 때의 `automation`과 같음을 이미 확인했다. 마지막으로 시작 차단 파일 제거와 `daemon-reload`, 8단계 순서의 단위 시작, 9단계의 읽기 검증, 타이머 enable을 한다. 합격: `--apply`가 rc 0과 `결속 검증을 통과했다`를 내고, 복원한 `automation`의 `cursor_state.json`이 사본과 같으며, 읽기 검증이 `RESULT: PASS`이고, 각 `MainPID`의 환경에 `SINGLE_SQLITE_FILE`이 1건 있다.
+  - D2 다섯 파일로 돌아간다: 갈래 B의 순서(이동 항목을 `<OLD>`로 되돌리기, 이름 맞바꾸기, intent와 잠금 파일 보존, 설정 줄 지우기)를 따르되 `automation` 교체를 이름 맞바꾸기 앞에 한다(8.6 P7). 항목을 `<OLD>`로 되돌린 직후 `<OLD>/openclaw-conversations/automation`을 D1과 같은 이동 두 번으로 사본으로 바꾼다. 갈래 B가 끝나는 단위 시작과 타이머 enable은 이 교체 뒤에 한다. 합격: 읽기 검증이 `RESULT: PASS`이고 각 `MainPID`의 환경에 `SINGLE_SQLITE_FILE`이 없다.
+- 갈래 E, 단계 중단 공통: 다음 단계로 가지 않는다. 원인을 고쳐 그 단계를 다시 할지 갈래 A나 B로 갈지 정해 결정과 다시 판정할 시각을 기록한다.
+
+#### 합성 데이터 전 과정 확인
+
+이 표는 합성 다섯 파일 데이터 디렉터리 하나로 0단계부터 9단계까지 단계마다 실행해 확인했다. 확인한 점은 다음과 같다.
+
+- 합성 데이터는 `opencrab init`과 임시 인스턴스의 `pack_create` 호출로 만들었다. 임베딩 서버는 결정적 벡터를 돌려주는 시험용 대역이다.
+- 서비스는 임시 이름의 사용자 유닛과 운영이 쓰지 않는 루프백 포트로 띄웠다. 운영 데이터와 운영 단위는 읽지도 쓰지도 않았다.
+- 모든 명령은 격리한 `HOME`, `LOCALCRAB_ENV_FILE`, `LOCAL_DATA_DIR` 아래에서 돌렸다. 병합과 백업은 무거운 실행 래퍼로 하나씩 돌렸다.
+- 갈래 D1은 쓰기 개방 뒤 쓰기를 만든 상태에서 한 번 돌려 합격 기준을 확인했다. D2는 개방 뒤 상태에서 갈래 B의 순서와 `automation` 교체를 함께 돌려 확인했다. 개방 전만의 갈래 B와 갈래 A는 따로 돌리지 않았다.
+- 시작 차단 파일은 합성 확인에서 `<UNIT_FRONT>`, `<UNIT_PROXY>`, `<UNIT_GW>` 셋으로 확인했다. `<UNIT_API>` 추가는 같은 명령의 반복이다.
+- REST 임시 인스턴스는 `uvicorn ... --host 127.0.0.1` 형태로 읽기 검증 `RESULT: PASS`를 확인했다. 인증 프록시 형태와 6단계의 `packs list`, manifest 키워드 검색은 합성 환경에 대응물이 없어 돌리지 못했다(프록시는 단위 대역이고 합성 팩에 manifest가 없다).
+- 재인입 서비스는 성공 메시지만 내는 대역으로 확인했다. 9단계의 재인입 이벤트(`graph_import_delta`, `doc_nodes_sync`) 판정은 이 확인으로 검증하지 못했다.
+- 단계별 확인 결과의 요약은 PR 본문에 있다.
 
 ## 9. 단일 모드 벡터 질의 경로: 한 스냅숏과 ANN 캐시
 
