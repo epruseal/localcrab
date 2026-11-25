@@ -41,7 +41,7 @@
 grep -rnI --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=tests -e '"version"' -e '^version' -e '__version__' -e 'version=' -e 'mcp_server_version' pyproject.toml opencrab/__init__.py opencrab/config.py apps/api/main.py packaging/agent-plugin/src/plugin.json
 ```
 
-위 다섯 파일의 값이 모두 같아야 한다. `uv.lock`의 `opencrab` 항목, `.env.example`과 `opencrab/cli.py`의 `MCP_SERVER_VERSION` 예시도 같은 값으로 맞춘다. 별도 패키지(`crabharness/pyproject.toml`, `crabharness/package.json`, `crabharness/worker_runtime/package.json`, `apps/web/package.json`)는 자기 버전을 따로 갖는다. 태그는 `v<버전>` 형식이고 머지 커밋에 붙인다(`docs/agent-plugin-release-policy.md`의 수동 릴리스 절차).
+위 다섯 파일의 값이 모두 같아야 한다. `scripts/localcrab`과 `scripts/localcrab-harness`의 `MCP_SERVER_VERSION` 기본값(`<버전>-localcrab`)도 같은 버전으로 맞춘다. `uv.lock`의 `opencrab` 항목, `.env.example`과 `opencrab/cli.py`의 `MCP_SERVER_VERSION` 예시도 같은 값으로 맞춘다. 별도 패키지(`crabharness/pyproject.toml`, `crabharness/package.json`, `crabharness/worker_runtime/package.json`, `apps/web/package.json`)는 자기 버전을 따로 갖는다. 태그는 `v<버전>` 형식(예: `v1.0.0`)으로 릴리스할 커밋에 붙인다(`docs/agent-plugin-release-policy.md`의 수동 릴리스 절차가 태그를 릴리스할 커밋에 붙이라고 정한다).
 
 ## 2. 버전과 저장소 배치
 
@@ -154,7 +154,7 @@ python scripts/migrate_sqlite_to_pg.py --only doc,sql,vector --verify
 ```
 
 - 옵션: `--data-dir`와 `--graph-db`, `--doc-db`, `--sql-db`, `--vector-db`는 원본 경로를 바꾼다. `--pg-schema`는 그래프와 문서 대상 스키마다. 접속 문자열은 `POSTGRES_URL` 설정(환경변수나 환경 파일)에서 읽는다. `--pg-url`로 명령줄에 쓰면 프로세스 목록에 노출되므로 쓰지 않는다. `--vector-src-table`과 `--vector-dst-table`은 벡터 표 이름이다. `--batch`와 `--limit`은 복사 단위와 시험용 상한이다.
-- 검증: `--verify`가 표마다 `source`와 `pg` 건수와 `missing_keys`를 비교하고 `RESULT: PASS`를 낸다. 다시 돌리는 동작은 표마다 다르다(스크립트 docstring의 IDEMPOTENCY 절이 정본이다). 자연 키가 있는 SQL 표는 건수가 같아도 건너뛰지 않고 매번 모든 행을 upsert한다. 그래서 서비스가 PostgreSQL에 쓴 뒤에 다시 돌리면 대상 행이 원본 값으로 덮인다. 서비스가 PostgreSQL을 쓰기 시작한 뒤에는 이 스크립트를 다시 돌리지 않는다. `doc_nodes`, `audit_log`, 벡터는 건수가 같고 0보다 크면 건너뛰고, `doc_sources`는 건너뛰지 않는다. 서비스를 `STORAGE_MODE=pg POSTGRES_URL=<접속 문자열>`로 시작하고 읽기 검증 도구가 `RESULT: PASS`를 낸다.
+- 검증: `--verify`가 표마다 `source`와 `pg` 건수를 비교하고(자연 키가 있는 SQL 표는 `missing_keys`도 낸다) `RESULT: PASS`를 낸다. 다시 돌리는 동작은 표마다 다르다(스크립트 docstring의 IDEMPOTENCY 절이 정본이다). 자연 키가 있는 SQL 표는 건수가 같아도 건너뛰지 않고 매번 모든 행을 upsert한다. 그래서 서비스가 PostgreSQL에 쓴 뒤에 다시 돌리면 대상 행이 원본 값으로 덮인다. 서비스가 PostgreSQL을 쓰기 시작한 뒤에는 이 스크립트를 다시 돌리지 않는다. `doc_nodes`, `audit_log`, 벡터는 건수가 같고 0보다 크면 건너뛰고, `doc_sources`는 건너뛰지 않는다. 서비스를 `STORAGE_MODE=pg POSTGRES_URL=<접속 문자열>`로 시작하고 읽기 검증 도구가 `RESULT: PASS`를 낸다.
 - 롤백: `STORAGE_MODE=local`로 되돌리고 서비스를 다시 시작한다. 원본 SQLite 파일은 바뀌지 않았다. PostgreSQL에만 쓴 데이터는 SQLite에 없다. 대상 데이터베이스는 필요하면 통째로 지운다.
 
 ## 8. docker 모드에서 local 모드로

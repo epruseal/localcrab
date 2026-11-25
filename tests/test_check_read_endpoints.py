@@ -39,6 +39,10 @@ class Fake:
         self.query_code = 200  # POST /api/query
         self.query_body = {"results": [1, 2]}
         self.mcp_query_inner = {"results": [1]}
+        self.mcp_packs_extra = {}  # content_pack_list 본문에 더 얹을 키
+        self.api_packs_extra = {}  # GET /api/packs 본문에 더 얹을 키
+        self.api_status_extra = {}
+        self.mcp_result_override = None  # result 값을 통째로 바꾼다.
         self.legacy_error_tool = None  # 이 도구는 200과 {"error": ...} 본문을 돌려준다(isError 키 없음).
         self.rpc_error = False
         self.sse = False
@@ -89,7 +93,7 @@ def _handler(fake: Fake):
             if not self._auth():
                 return
             if self.path == "/api/packs":
-                self._send(200, {"packs": [{"pack_id": p} for p in fake.packs]})
+                self._send(200, {"packs": [{"pack_id": p} for p in fake.packs], **fake.api_packs_extra})
             elif self.path == "/api/status":
                 self._send(fake.status_code, {"ok": True})
             else:
@@ -113,9 +117,11 @@ def _handler(fake: Fake):
                                  "result": {"content": [{"type": "text", "text": text}]}})
                 return
             inner = (fake.mcp_query_inner if name == "ontology_query"
-                     else {"packs": [{"pack_id": p} for p in fake.packs]})
+                     else {"packs": [{"pack_id": p} for p in fake.packs], **fake.mcp_packs_extra})
             result = {"content": [{"type": "text", "text": json.dumps(inner)}],
                       "isError": fake.tool_is_error or name == fake.is_error_tool}
+            if fake.mcp_result_override is not None:
+                result = fake.mcp_result_override
             message = {"jsonrpc": "2.0", "id": body["id"], "result": result}
             if fake.error_beside_result:
                 message["error"] = {"code": -32000, "message": "x"}
@@ -270,7 +276,9 @@ def test_save_expected_writes_list_and_refuses_overwrite(server, tmp_path):
     saved = tmp_path / "saved.txt"
     assert _run(server, "api", "--save-expected", str(saved)) == 0
     assert saved.read_text() == "pack-a\npack-b\n"
+    server.requests.clear()
     assert _run(server, "api", "--save-expected", str(saved)) == 2
+    assert server.requests == []
     assert saved.read_text() == "pack-a\npack-b\n"
 
 
@@ -379,7 +387,7 @@ def test_exception_text_with_the_token_never_reaches_output(server, monkeypatch,
     monkeypatch.setattr(tool, "_OPENER", Leaky())
     assert _run(server, "api") == 1
     out = _assert_no_leak(capsys)
-    assert "ERR:RuntimeError" not in out or TOKEN not in out
+    assert "ERR:RuntimeError" in out
 
 
 @pytest.mark.parametrize("bad", ["abc\r\nX-Injected: 1", "abc\ndef", "tok\x01en", "t\u00f6ken"])
@@ -426,3 +434,55 @@ def test_json_rpc_error_beside_a_valid_result_is_a_failure(server, capsys):
     server.error_beside_result = True
     assert _run(server, "mcp") == 1
     _assert_no_leak(capsys)
+
+
+def test_error_key_beside_a_result_list_is_a_failure_for_query(server, capsys):
+    server.mcp_query_inner = {"results": [1], "error": "backfill in progress"}
+    assert _run(server, "mcp") == 1
+    _assert_no_leak(capsys)
+
+
+def test_error_key_beside_a_pack_list_is_a_failure_for_mcp_packs(server, capsys):
+    server.mcp_packs_extra = {"error": "backfill in progress"}
+    assert _run(server, "mcp") == 1
+    _assert_no_leak(capsys)
+
+
+def test_error_key_beside_a_pack_list_is_a_failure_for_api_packs(server, capsys):
+    server.api_packs_extra = {"error": "backfill in progress"}
+    assert _run(server, "api") == 1
+    _assert_no_leak(capsys)
+
+
+@pytest.mark.parametrize("override", [{"content": None}, {"content": [{"type": "text", "text": 5}]}, {"content": "x"}, "text"])
+def test_malformed_mcp_result_is_a_failure_not_a_crash(server, capsys, override):
+    server.mcp_result_override = override
+    assert _run(server, "mcp") == 1
+    _assert_no_leak(capsys)
+
+
+def test_save_expected_write_failure_leaves_no_file(server, tmp_path, monkeypatch):
+    real_open = open
+
+    class Failing:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._handle.close()
+
+        def write(self, _data):
+            raise OSError(28, "No space left on device")
+
+    def wrapped(path, mode="r", *args, **kwargs):
+        handle = real_open(path, mode, *args, **kwargs)
+        return Failing(handle) if "x" in mode else handle
+
+    saved = tmp_path / "saved.txt"
+    monkeypatch.setattr("builtins.open", wrapped)
+    assert _run(server, "api", "--save-expected", str(saved)) == 2
+    monkeypatch.undo()
+    assert not saved.exists()

@@ -113,7 +113,8 @@ def test_missing_manifest_entry_stops_before_creating_destination(fake_set, tmp_
     assert not dest.exists()
 
 
-@pytest.mark.parametrize("mode", ["missing", "bad-json", "no-files", "symlink-entry", "bad-hash"])
+@pytest.mark.parametrize("mode", ["missing", "bad-json", "no-files", "symlink-entry", "bad-hash",
+                                  "no-size", "string-size", "bool-size"])
 def test_unusable_manifest_is_rejected(fake_set, tmp_path, mode):
     if mode == "missing":
         (fake_set / "MANIFEST.json").unlink()
@@ -125,6 +126,12 @@ def test_unusable_manifest_is_rejected(fake_set, tmp_path, mode):
             del manifest["files"]
         elif mode == "symlink-entry":
             manifest["files"]["graph.db"] = {"symlink": True}
+        elif mode == "no-size":
+            del manifest["files"]["graph.db"]["size"]
+        elif mode == "string-size":
+            manifest["files"]["graph.db"]["size"] = "12"
+        elif mode == "bool-size":
+            manifest["files"]["graph.db"]["size"] = True
         else:
             manifest["files"]["graph.db"]["sha256"] = "zz"
         _write_manifest(fake_set, manifest)

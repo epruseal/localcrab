@@ -199,3 +199,13 @@ def test_foreign_partial_file_is_left_alone(backup_set, tmp_path):
     foreign.write_text("someone else")
     assert tool.main(_args(backup_set, out)) == 2
     assert foreign.read_text() == "someone else"
+
+
+def test_out_symlink_file_in_set_pointing_outside_is_rejected(backup_set, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (backup_set / "evidence.json").symlink_to(outside / "evidence.json")
+    before = sorted(p.name for p in backup_set.rglob("*"))
+    assert tool.main(_args(backup_set, backup_set / "evidence.json")) == 2
+    assert sorted(p.name for p in backup_set.rglob("*")) == before
+    assert list(outside.iterdir()) == []

@@ -119,9 +119,12 @@ def _mcp_tool(base: str, name: str, arguments: dict, request_id: int, auth: str 
     out = {"http": code, "isError": None, "inner": None}
     payload = _parse(raw) if code == 200 else None
     if isinstance(payload, dict):
-        result = payload.get("result") or {}
+        result = payload.get("result")
+        result = result if isinstance(result, dict) else {}
         out["isError"] = result.get("isError")
-        text = "".join(c.get("text", "") for c in result.get("content", []) if isinstance(c, dict))
+        content = result.get("content")
+        content = content if isinstance(content, list) else []
+        text = "".join(c["text"] for c in content if isinstance(c, dict) and isinstance(c.get("text"), str))
         try:
             out["inner"] = json.loads(text) if text else None
         except ValueError:
@@ -193,10 +196,17 @@ def run(base: str, shape: str, auth: str, *, expected: Path | None, save_expecte
         return 1
     print(f"pack_ids ({len(ids)}):", " ".join(ids))
     if save_expected is not None and ok:
+        created = False
         try:
             with open(save_expected, "x", encoding="utf-8") as handle:
+                created = True  # 이 실행이 만든 파일만 지운다.
                 handle.write("\n".join(ids) + "\n")
         except OSError as exc:
+            if created:
+                try:
+                    os.unlink(save_expected)  # 빈 기대 파일이 남으면 이후 누락 검사가 의미 없이 통과한다.
+                except OSError:
+                    pass
             print(f"ERROR: 기대 목록을 쓰지 못했다: {type(exc).__name__}", file=sys.stderr)
             return 2
         print("expected saved:", save_expected)

@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--frozen-until", required=True, help="쓰기 정지 끝(UTC)")
     args = parser.parse_args(argv)
     try:
-        if _is_inside(args.out, args.set_dir):
+        if _is_inside(args.out, args.set_dir) or _is_inside(args.out.parent, args.set_dir):
             raise ValueError("--out은 백업 세트 디렉터리 안에 둘 수 없다(병합 도구가 목록 밖 파일을 거부한다)")
         manifest_raw = (args.set_dir / "MANIFEST.json").read_bytes()
         evidence = build_evidence(manifest_raw, args)
