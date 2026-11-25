@@ -387,12 +387,17 @@ factory를 거치지 않고 `single.db`를 여는 경로가 있다(`opencrab/sto
 
 서비스가 아직 도는 동안 기준 팩 목록 파일을 만든다. 이 도구의 `ontology_query`는 billing 행을 더한다. 정지 전에 한 번만 돌린다.
 
+이 시점의 `<REPO>`는 되돌림 지점 커밋이어서 `scripts/check_read_endpoints.py`가 없을 수 있다(1b가 배포한다). 도구는 표준 라이브러리만 쓰므로 대상 커밋에서 파일 하나만 꺼내 `<RUN>`에서 돌린다. `<REPO>`의 작업 트리와 HEAD는 바꾸지 않는다.
+
 ```bash
-<PY> <REPO>/scripts/check_read_endpoints.py <GW_PORT_운영> mcp --token-env <토큰 변수> --save-expected <기준 팩 목록 파일>
-wc -l <기준 팩 목록 파일>
+mkdir -p <RUN>
+git -C <REPO> fetch origin
+git -C <REPO> show <대상 커밋>:scripts/check_read_endpoints.py > <RUN>/check_read_endpoints.py
+<PY> <RUN>/check_read_endpoints.py <GW_PORT_운영> mcp --token-env <토큰 변수> --save-expected <기준 팩 목록 파일>
+grep -c . <기준 팩 목록 파일>
 ```
 
-- 합격: `RESULT: PASS`와 rc 0이다. 저장된 파일이 비어 있지 않다(`wc -l <기준 팩 목록 파일>`이 1 이상). 파일이 이미 있으면 도구가 거부한다. 이 파일은 팩 id 목록이므로 저장소에 올리지 않는다.
+- 합격: `RESULT: PASS`와 rc 0이다. 저장된 파일이 비어 있지 않다(`grep -c .`가 1 이상. 빈 목록은 줄바꿈 한 줄로 저장되므로 `wc -l`은 쓰지 않는다). 파일이 이미 있으면 도구가 거부한다. 이 파일은 팩 id 목록이므로 저장소에 올리지 않는다.
 
 ```bash
 mkdir -p <RUN>
@@ -711,7 +716,7 @@ systemctl --user is-enabled <TIMER_REINGEST>
 <HEAVY> <PY> <REPO>/scripts/merge_sqlite_stores.py authorize --root <ROOT> --run-kind copy-test --verification-pass <PASS1> --copy-test-run-id <COPY_RUN_ID> --apply > <RUN>/4-authorize.out 2>&1
 ```
 
-- 9단계: 사본 단위로 읽기 검증만 하고 재인입 타이머는 켜지 않는다.
+- 9단계: 사본 단위로 읽기 검증만 하고 재인입 타이머는 켜지 않는다. 읽기 검증 명령의 `<GW_PORT_운영>` 자리에는 사본 게이트웨이 단위의 포트를 넣는다.
 - 끝낸 뒤: 단계별 출력 기록을 독립 검증에 넘겨 받은 판정 원문이 `<PASS2>`다(8.8). 그 뒤 운영 전환은 이 표를 운영 값으로 처음부터 돈다.
 
 #### 롤백 갈래
@@ -720,7 +725,7 @@ systemctl --user is-enabled <TIMER_REINGEST>
 - 갈래 B, 쓰기 개방 전 롤백: 임시 단위가 inactive인지 확인하고 1단계의 정지 확인을 다시 한다. 8.6 P7의 순서(이동 항목 되돌리기, 이름 맞바꾸기, intent와 잠금 파일 보존, 설정 줄 지우기)를 따른다. 설정 줄은 `sed -i '/^SINGLE_SQLITE_FILE=/d' <ENVFILE>`로 지우고 `grep -c`가 0인지 확인한다. 모든 `mv -T` 앞에서 장치 번호가 같고 대상 이름이 없음을 확인한다. 마지막에 시작 차단 파일 제거(`rm <RT>/<단위>.d/block.conf`, `rmdir`, `daemon-reload`. 갈래 A와 같다), 단위 시작, 타이머 enable, 환경의 `SINGLE_SQLITE_FILE` 출현 0을 확인한다.
 - 갈래 C, 병합이나 authorize의 비정상 종료: 8.4(게시)와 8.5(authorize)를 따른다. 다시 돌릴지 다섯 파일로 돌아갈지는 사람이 정해 기록한다.
 - 갈래 D, 쓰기 개방 뒤 롤백: 1단계의 정지를 그대로 한다(타이머 stop과 disable, 단위 stop, 시작 차단 파일). 합격 기준도 그대로 확인하되 `fuser` 대상은 `<ROOT>/single.db`, `<ROOT>/billing.db`와 각 `-wal`, `-shm`이다. 정지를 확인한 뒤 둘 중 하나로 간다. 개방 뒤의 MCP 쓰기는 두 경우 모두 롤백 지점 뒤 것이 사라진다. 대화 메시지는 커서를 되돌렸으므로 델타 적재가 다시 처리한다.
-  - D1 단일 파일로 되돌린다: 7단계와 같은 설정을 주입해 두 번 돌린다. 먼저 dry-run으로 계획을 읽는다. 그다음 `--apply`를 붙인다. 두 명령 모두 셸의 설정 출처에 `SINGLE_SQLITE_FILE`이 없으면 거부된다. 앞에 `<HEAVY>`가 필요하면 7단계의 백업 명령처럼 붙인다.
+  - D1 단일 파일로 되돌린다: 7단계와 같은 설정을 주입해 두 번 돌린다. 먼저 dry-run으로 계획을 읽는다. 그다음 `--apply`를 붙인다. 주입 없이 돌리면 셸의 설정 출처에 `SINGLE_SQLITE_FILE`이 없을 때 거부된다. 앞에 `<HEAVY>`가 필요하면 7단계의 백업 명령처럼 붙인다.
 
     ```bash
     env SINGLE_SQLITE_FILE=<ROOT>/single.db LOCAL_DATA_DIR=<ROOT> <PY> -m opencrab.stores.single_restore <DATA_PARENT>/backups/rollback-point/<롤백 세트 이름>

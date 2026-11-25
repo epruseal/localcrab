@@ -128,7 +128,7 @@ claude mcp add localcrab -- opencrab serve
 
 **프로토콜은 dual-era 다(#136).** 2026-07-28 modern 계약(요청별 `_meta`, `server/discover`, 표준 헤더 검증, Origin guard)과 legacy initialize handshake 를 같은 엔드포인트에서 함께 서빙한다. era 판정 규칙·클라이언트 호환성 매트릭스·`MCP_PROTOCOL_VERSIONS`/`MCP_ALLOWED_ORIGINS` 설정은 [docs/mcp-protocol-compat.md](docs/mcp-protocol-compat.md) 를 본다.
 
-**인증은 사용자별 토큰뿐이다(#145).** 무인증 모드와 공유 비밀(`--auth-token-file`, `LOCALCRAB_MCP_TOKEN`, `OPENCRAB_API_KEY`)은 삭제됐다 — 그 환경변수가 남아 있으면 **기동을 거부**한다(효력 없는 변수를 보고 보호받는다고 믿는 상태가 가장 위험하다).
+**인증은 사용자별 토큰뿐이다(#145).** 무인증 모드와 공유 비밀(`--auth-token-file`, `LOCALCRAB_MCP_TOKEN`, `LOCALCRAB_MCP_TOKEN_FILE`, `OPENCRAB_API_KEY`)은 삭제됐다. 그 환경변수가 남아 있으면 **기동을 거부**한다(효력 없는 변수를 보고 보호받는다고 믿는 상태가 가장 위험하다).
 
 ```bash
 # 1) 로컬 사용자 + 첫 토큰 생성 (1회)
@@ -425,7 +425,7 @@ opencrab serve
 | `NEO4J_DATABASE` | _(비어 있음 = 서버 기본 데이터베이스)_ | docker 모드 Neo4j 데이터베이스 이름 |
 | `MONGODB_URI` | `mongodb://root:opencrab@localhost:27017` | docker 모드 MongoDB 접속 문자열 |
 | `CHROMA_HOST`, `CHROMA_PORT` | `localhost`, `8000` | docker 모드 Chroma HTTP 서버 |
-| `MCP_PROTOCOL_VERSIONS` | _(비어 있음 = 내장 버전 전부)_ | `/mcp`가 받을 프로토콜 버전을 내장 집합의 부분집합으로 제한한다(쉼표 구분). 모르는 버전은 기동을 거부한다. [docs/mcp-protocol-compat.md](docs/mcp-protocol-compat.md) |
+| `MCP_PROTOCOL_VERSIONS` | _(비어 있음 = 내장 버전 전부)_ | `/mcp`(stdio 서버도 같다)가 받을 프로토콜 버전을 내장 집합의 부분집합으로 제한한다(쉼표 구분). 모르는 버전은 기동을 거부한다. [docs/mcp-protocol-compat.md](docs/mcp-protocol-compat.md) |
 | `MCP_ALLOWED_ORIGINS` | _(비어 있음 = loopback 출처만)_ | `/mcp` Origin 검사의 허용 목록(`http(s)://host[:port]`, 쉼표 구분). 형식이 틀리면 기동을 거부한다 |
 | `OPENCRAB_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | REST 앱(`apps/api`)의 CORS 허용 출처(쉼표 구분). 빈 값으로 두면 교차 출처 접근을 모두 막는다(wildcard로 열리지 않는다) |
 | `OPENCRAB_BOOTSTRAP_ON_EMPTY` | _(꺼짐)_ | `1`이면 stdio MCP 서버가 로컬 사용자가 없을 때 시작하면서 자동으로 만든다. `STORAGE_MODE=local`과 명시한 `LOCAL_DATA_DIR`가 필요하다. 비어 있거나 `0`은 꺼짐이고 그 밖의 값은 기동을 거부한다. 단일 파일 배치에서는 사용자를 만들지 않는다 |
@@ -434,9 +434,11 @@ opencrab serve
 | `JSONL_SHARD_LIMIT` | `41943040` (40 MiB) | Pack JSONL 샤드 하나의 바이트 상한 |
 | `EMBED_WINDOW_CHARS` | `9000` | 임베딩 입력이 이 글자 수를 넘으면 윈도우로 나눠 임베딩한 뒤 평균 풀링한다 |
 | `OPENCRAB_BM25_DB_INDEX` | `1` | `0`이면 영속 노드 BM25 색인을 쓰지 않는다([issue-541](./docs/issue-541-db-bm25.md)) |
+| `OPENCRAB_BM25_CACHE` | `1` | `0`이면 BM25 게시 목록 캐시를 만들지 않는다. 스토어를 만들 때 한 번 읽는다([issue-667](./docs/issue-667-bm25-posting-cache.md)) |
+| `OPENCRAB_BACKUP_LOCK_TIMEOUT` | `60` | 백업이 `write.lock`을 기다리는 상한(초). `--lock-timeout`이 우선한다. 유한한 0 이상의 숫자가 아니면 거부한다 |
 | `OPENCRAB_BM25_PRUNE` | `1` | `0`이면 BM25 상위 k 가지치기를 끈다 |
-| `PACK_OUT_ROOT` | _(없음)_ | 팩 빌드 라이브러리(`opencrab.pack.build.Pack`)의 출력 루트. `out_root` 인자가 우선하고, 둘 다 없으면 `ValueError`로 거부한다 |
-| `PACK_LIB_STRICT` | _(꺼짐)_ | `1`이면 팩 빌드 검증(`Pack.validate`)이 grammar 위반과 끊어진 참조에서 예외를 낸다. 꺼져 있으면 경고와 요약만 출력한다 |
+| `PACK_OUT_ROOT` | _(없음)_ | 팩 빌드 라이브러리(`opencrab.pack.build.Pack`)의 출력 루트. `out_root` 인자가 우선하고, 둘 다 없으면 호스트가 `DEFAULT_OUT_ROOT`를 주입하지 않은 한 `ValueError`로 거부한다 |
+| `PACK_LIB_STRICT` | _(꺼짐)_ | `1`이면 팩 빌드 검증(`Pack.validate`)이 grammar 위반과 끊어진 참조에서 예외를 낸다. 꺼져 있으면 grammar 위반과 끊어진 참조는 경고와 요약만 출력한다. 노드 최상위의 비구조 키는 이 값과 상관없이 `ValueError`로 거부한다 |
 | `ANTHROPIC_API_KEY` | _(없음)_ | `opencrab extract`의 `--api-key` 미지정 시 폴백(Claude 모델 호출용) |
 | `OPENCRAB_BM25_NODE_LIMIT` | `50000` | BM25 인덱스가 doc 스토어에서 로드하는 노드 상한(인덱스 빌드 시간·메모리 제한). 상세: [ARCHITECTURE.md §6](./docs/ARCHITECTURE.md) |
 | `OPENCRAB_BM25_DEBOUNCE` | `1.5` | BM25 백그라운드 재빌드 디바운스(초) — 연속 ingest를 1회 재빌드로 합침. 상세: [ARCHITECTURE.md](./docs/ARCHITECTURE.md) |
