@@ -169,7 +169,7 @@ python scripts/migrate_to_local.py --dry-run
 python scripts/migrate_to_local.py
 ```
 
-- 옵션: `--skip-graph`, `--skip-docs`, `--skip-vectors`, `--skip-sql`은 해당 저장소를 건너뛴다. `--batch-size`, `--local-data-dir`, 접속 인자(`--neo4j-uri`, `--neo4j-user`, `--neo4j-pass`, `--mongo-uri`, `--mongo-db`, `--chroma-host`, `--chroma-port`, `--chroma-collection`, `--pg-url`)가 있다. `--allow-target-only-auth`와 `--allow-unmigrated`는 7절과 같은 뜻이다.
+- 옵션: `--skip-graph`, `--skip-docs`, `--skip-vectors`, `--skip-sql`은 해당 저장소를 건너뛴다. `--batch-size`, `--local-data-dir`, 접속 인자(`--neo4j-uri`, `--neo4j-user`, `--neo4j-pass`, `--mongo-uri`, `--mongo-db`, `--chroma-host`, `--chroma-port`, `--chroma-collection`, `--pg-url`)가 있다. `--allow-target-only-auth`와 `--allow-unmigrated`는 7절과 같은 뜻이다. 이 도구는 접속 정보를 설정에서 읽는 대체값이 없어 `--neo4j-pass`와 `--pg-url`을 명령줄에 쓰게 된다. 그 값은 실행하는 동안 프로세스 목록에 보이므로 다른 사용자가 없는 장치에서만 돌린다.
 - 검증: `--dry-run`이 각 저장소 건수를 출력한다. 이관 뒤 읽기 검증 도구가 `RESULT: PASS`를 낸다.
 - 롤백: 원본 서비스의 데이터는 바뀌지 않는다. 기존 로컬 DB 파일은 이관 전에 백업 세트로 복사된다. `STORAGE_MODE=docker`로 되돌린다.
 

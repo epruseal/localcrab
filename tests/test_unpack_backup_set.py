@@ -210,3 +210,11 @@ def test_copy_that_differs_on_reread_is_removed_and_exits_1(fake_set, tmp_path, 
     dest = tmp_path / "out"
     assert tool.main([str(fake_set), str(dest)]) == 1
     assert not dest.exists()
+
+
+def test_dest_in_set_when_set_is_given_through_alias(fake_set, tmp_path):
+    alias = tmp_path / "set-alias"
+    alias.symlink_to(fake_set, target_is_directory=True)
+    before = sorted(str(p.relative_to(fake_set)) for p in fake_set.rglob("*"))
+    assert tool.main([str(alias), str(fake_set / "out")]) == 2
+    assert sorted(str(p.relative_to(fake_set)) for p in fake_set.rglob("*")) == before

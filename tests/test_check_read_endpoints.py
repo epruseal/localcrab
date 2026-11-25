@@ -390,7 +390,7 @@ def test_exception_text_with_the_token_never_reaches_output(server, monkeypatch,
     assert "ERR:RuntimeError" in out
 
 
-@pytest.mark.parametrize("bad", ["abc\r\nX-Injected: 1", "abc\ndef", "tok\x01en", "t\u00f6ken"])
+@pytest.mark.parametrize("bad", ["abc\r\nX-Injected: 1", "abc\ndef", "tok\x01en", "tok\x7fen", "t\u00f6ken"])
 def test_token_with_control_or_non_ascii_chars_is_a_usage_error(server, monkeypatch, capsys, bad):
     monkeypatch.setenv("TEST_READ_TOKEN", bad)
     assert _run(server, "api") == 2

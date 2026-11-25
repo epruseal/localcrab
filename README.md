@@ -56,7 +56,7 @@ opencrab serve
 | 벡터 | `SqliteVecStore` (기본) / `ChromaStore` (옵션) | `vectors.db` / `chroma/` |
 | SQL | SQLStore (SQLite) | `opencrab.db` |
 
-**단일 파일 배치(선택, 기본 꺼짐):** `SINGLE_SQLITE_FILE`에 root 안 `single.db`의 절대 경로를 주면 graph, doc, vector, sql 저장소가 한 SQLite 파일을 나눠 쓴다. root에는 `single.db`, `billing.db`, `ledger.json`, `manifest.json`, `marker.json`이 있고 `STORAGE_MODE=local`, sqlite-vec 벡터 백엔드, `LOCAL_DATA_DIR`=root가 전제다. 다섯 파일 디렉터리를 root로 바꾸는 절차와 도구는 [마이그레이션](#마이그레이션)을 본다. 설계와 지원하지 않는 기능은 [docs/issue-671-single-db-conversion.md](./docs/issue-671-single-db-conversion.md)에 있다.
+**단일 파일 배치(선택, 기본 꺼짐):** `SINGLE_SQLITE_FILE`에 root 안 `single.db`의 절대 경로를 주면 graph, doc, vector, sql 저장소가 한 SQLite 파일을 나눠 쓴다. root에는 `single.db`, `billing.db`, `ledger.json`, `manifest.json`, `marker.json`, `single.db.lifetime.lock`이 있고 `STORAGE_MODE=local`, sqlite-vec 벡터 백엔드, `LOCAL_DATA_DIR`=root가 전제다. 다섯 파일 디렉터리를 root로 바꾸는 절차와 도구는 [마이그레이션](#마이그레이션)을 본다. 설계와 지원하지 않는 기능은 [docs/issue-671-single-db-conversion.md](./docs/issue-671-single-db-conversion.md)에 있다.
 
 > 벡터 백엔드 기본값은 조건부입니다(`EMBEDDING_BACKEND`·`STORAGE_MODE`에 따라 결정). 상세: [벡터 스토어 백엔드 섹션](#벡터-스토어-백엔드-vector_backend), [벡터 백엔드 매트릭스](./docs/vector-backends.md).
 
@@ -89,12 +89,12 @@ Ladybug의 원자적 transaction/CAS 능력을 검증하기 전까지 optional �
 
 ```bash
 # 파일 인제스트 (벡터 + 문서 스토어)
-opencrab ingest ./docs --recursive --extension .md,.txt,.pdf
+opencrab ingest ./docs --recursive --extension .md,.txt   # 파일을 UTF-8 텍스트로 읽는다. PDF 같은 이진 형식은 지원하지 않는다
 
 # 하이브리드 검색
 opencrab query "시스템 성능 지표 및 오류율"
 
-# 현재 적재된 그래프 상태 확인
+# 모든 스토어 연결 상태 확인
 opencrab status
 
 # MetaOntology 전체 문법 출력
@@ -179,8 +179,8 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab user add\|list\|disable\|enable` | 사용자 관리 (`add --local`은 stdio/CLI 로컬 주체로 묶음) |
 | `opencrab token issue\|list\|revoke` | 사용자별 토큰 관리 (`issue --name`으로 라벨, 평문은 발급 시 1회만 출력) |
 | `opencrab status` | 모든 스토어 연결 상태 확인 |
-| `opencrab ingest <path>` | 파일을 벡터·문서 스토어에 인제스트 (`--recursive`, `--extension`(기본 `.txt,.md,.py`), `--pack-id`). 파일 1건 이상 실패 시 종료 코드 3 |
-| `opencrab extract <path>` | LLM으로 노드·엣지 추출 후 그래프에 적재 (`--recursive`, `--extension`(기본 `.md,.txt,.py`), `--model`, `--dry-run`, `--api-key`, `--pack-id`). 파일 1건 이상 실패 시 종료 코드 3 |
+| `opencrab ingest <path>` | 파일을 벡터와 문서 스토어에 인제스트 (`--recursive`, `--extension`(기본 `.txt,.md,.py`), `--pack-id`). 파일 1건 이상 실패 시 종료 코드 3 |
+| `opencrab extract <path>` | LLM으로 노드와 엣지를 추출해 그래프에 적재 (`--recursive`, `--extension`(기본 `.md,.txt,.py`), `--model`, `--dry-run`, `--api-key`, `--pack-id`). 파일 1건 이상 실패 시 종료 코드 3 |
 | `opencrab query "<질문>"` | 하이브리드 검색 (`--spaces`, `--limit`, `--offset`, `--pack-id`, `--auto-pack`, `--show-pack`/`--hide-pack`, `--include-unpackaged`(무시됨, #147), `--json-output`, `--json-envelope`) |
 | `opencrab manifest` | MetaOntology 전체 문법 출력 (`--json-output`) |
 | `opencrab ocr <path>` | 이미지/문서 OCR (easyocr/tesseract/metadata 백엔드, `--backend`, `--lang`, `-o/--output`)[^media] |
@@ -189,7 +189,7 @@ opencrab serve --transport http --host 127.0.0.1 --port <port> --allow-query-tok
 | `opencrab assemble-pack-v1 <dir>` | 스테이징 디렉토리에서 Pack v1 ZIP 조립 (`--output`과 `--pack-id` 필수, `--title`) |
 | `opencrab packs list` | `<LOCAL_DATA_DIR>/packs/` 아래에서 찾은 팩 목록 |
 | `opencrab packs show <pack_id>` | 팩 매니페스트 상세 |
-| `opencrab packs backfill-pack-id` | 노드·엣지에 `pack_id` 역보충 (기본 dry-run, `--apply`로 적용, `--assume-pack-id`) |
+| `opencrab packs backfill-pack-id` | 노드와 엣지에 `pack_id` 역보충 (기본 dry-run, `--apply`로 적용, `--assume-pack-id`) |
 | `opencrab packs reindex-bm25` | BM25 캐시 강제 재구성 |
 | `opencrab packs bm25-index status\|backfill\|verify\|drop` | 영속 노드 BM25 색인 관리([issue-541](./docs/issue-541-db-bm25.md)) |
 | `opencrab packs source-fts-orphans` | `doc_sources` 행이 없는 소스 FTS 행을 보고하고 `--apply`로 지움([issue-642](./docs/issue-642-source-fts-lookup.md)) |
@@ -243,7 +243,7 @@ python -m opencrab.stores.backup --verify <백업경로>/backup.<세트 식별�
 | **하니스** | `harness_promotion_apply` | CrabHarness PromotionPackage 적용 (`dry_run` 지원) |
 | **디스커버리** | `tool_search` | 도구 카탈로그 부분 문자열 검색 — catalog fingerprint 포함, 실행 권한은 부여하지 않음 (#135) |
 
-> ReBAC/identity/promotion_promote/billing_get_usage 등 MCP 툴은 실사용 이력이 없어 죽은 코드로 삭제됐습니다(git history에 보존, 필요 시 복원). `opencrab/mcp/tools.py`는 더 이상 존재하지 않으며, 핸들러는 `opencrab/mcp/tools/`(graph.py/query.py/pack.py/schema.py/harness.py) 아래로 물리 분할됐습니다. 참고로 과금 자체(`opencrab.billing.hooks.BillingHooks`, `billing_events` 테이블)는 별개로 계속 살아 있고 `ontology_add_node`/`ontology_add_edge`/`pack_create`/`pack_ingest`/`harness_promotion_apply`에서 배선되어 있습니다 — 삭제된 것은 `billing_get_usage` 같은 조회용 MCP 툴 노출뿐입니다.
+> ReBAC/identity/promotion_promote/billing_get_usage 등 MCP 툴은 실사용 이력이 없어 죽은 코드로 삭제됐습니다(git history에 보존, 필요 시 복원). `opencrab/mcp/tools.py`는 더 이상 존재하지 않으며, 핸들러는 `opencrab/mcp/tools/`(graph.py/query.py/pack.py/schema.py/harness.py/catalog.py) 아래로 물리 분할됐습니다. 참고로 과금 자체(`opencrab.billing.hooks.BillingHooks`, `billing_events` 테이블)는 별개로 계속 살아 있고 `ontology_add_node`/`ontology_add_edge`/`pack_create`/`pack_ingest`/`harness_promotion_apply`에서 배선되어 있습니다 — 삭제된 것은 `billing_get_usage` 같은 조회용 MCP 툴 노출뿐입니다.
 
 > **사용자별 노출 (#150).** 위 표는 로컬 principal(stdio/CLI) 기준입니다. 원격(토큰 인증) principal은 `schema_pack_install` / `schema_pack_uninstall` / `harness_promotion_apply`(관리 등급, 호스트 파일시스템 또는 팩 경계 밖 쓰기) 3개가 `tools/list`에서 빠지고 `tools/call`로 직접 호출해도 거부됩니다. 등급은 `users.role` 컬럼이 아니라 `Principal.is_local`에서 유도합니다 — 로컬 사용자는 어차피 그 파일들을 직접 편집할 수 있는 주체라 나눌 실익이 있는 경계가 로컬 대 원격이기 때문입니다. 원격 관리자가 둘 이상 필요해지면 그때 역할 컬럼을 도입합니다. 자세한 내용은 `opencrab/mcp/tools/_registry.py`의 `AccessTier`/`allowed_access_tiers`를 참고하세요.
 
@@ -398,7 +398,7 @@ opencrab serve
 | `scripts/merge_sqlite_stores.py` | 다섯 파일을 단일 root로 병합해 게시하고(`--publication-root`), `authorize` 하위 명령으로 쓰기 개방을 승인한다 |
 | `scripts/unpack_backup_set.py` | 백업 세트에서 DB 다섯만 sha256 대조해 새 디렉터리로 푼다 |
 | `scripts/make_publication_evidence.py` | 병합 원본 세트의 게시 증거 파일을 만든다 |
-| `scripts/check_read_endpoints.py` | 이관 뒤 MCP 또는 REST 인스턴스에 읽기 질의만 보내 팩 목록을 기대 집합과 대조한다 |
+| `scripts/check_read_endpoints.py` | 이관 뒤 MCP 또는 REST 인스턴스에 읽기 질의를 보내 팩 목록을 기대 집합과 대조한다(팩 데이터는 바꾸지 않고 `ontology_query`와 `POST /api/query`는 billing 행과 질의 이벤트를 쓴다) |
 
 ---
 
@@ -411,6 +411,16 @@ opencrab serve
 | `STORAGE_MODE` | `local` | `local` \| `kuzu` \| `docker` \| `pg` |
 | `POSTGRES_URL` | `postgresql://opencrab:opencrab@localhost:5432/opencrab` | PostgreSQL 접속 문자열(`STORAGE_MODE=pg`, `docker`) |
 | `LOCALCRAB_ENV_FILE` | `~/.openclaw/localcrab-kure.env` | 표준 환경 파일 경로. 현재 디렉터리 `.env`가 이 파일을 덮는다 |
+| `WRITE_LOCK_TIMEOUT` | `120.0` | 이름 있는 파일 잠금(`write.lock` 포함)을 얻으려고 기다리는 상한(초). 호출자가 대기 시간을 정하지 않을 때의 기본값이다 |
+| `CHROMA_LOCK_TIMEOUT` | `30.0` | 로컬 Chroma 클라이언트를 여는 `chroma.lock` 공유 잠금의 대기 상한(초). 넘으면 거부한다 |
+| `LOG_LEVEL` | `INFO` | `opencrab serve --transport http`의 로그 수준 |
+| `MCP_HTTP_HOST` | `127.0.0.1` | `serve --transport http`의 기본 바인드 주소(`--host`가 덮는다) |
+| `MCP_HTTP_PORT` | `8765` | `serve --transport http`의 기본 포트(`--port`가 덮는다) |
+| `MCP_SERVER_NAME` | `opencrab` | MCP `serverInfo`에 보이는 서버 이름 |
+| `MCP_SERVER_VERSION` | `1.0.0` | MCP `serverInfo`에 보이는 서버 버전 |
+| `NEO4J_USER`, `NEO4J_PASSWORD` | `neo4j`, `opencrab` | docker 모드 Neo4j 계정 |
+| `MONGODB_DB` | `opencrab` | docker 모드 MongoDB 데이터베이스 이름 |
+| `CHROMA_COLLECTION` | `opencrab_vectors` | `EMBEDDING_BACKEND=local`일 때 쓰는 Chroma 컬렉션 이름 |
 | `ANTHROPIC_API_KEY` | _(없음)_ | `opencrab extract`의 `--api-key` 미지정 시 폴백(Claude 모델 호출용) |
 | `OPENCRAB_BM25_NODE_LIMIT` | `50000` | BM25 인덱스가 doc 스토어에서 로드하는 노드 상한(인덱스 빌드 시간·메모리 제한). 상세: [ARCHITECTURE.md §6](./docs/ARCHITECTURE.md) |
 | `OPENCRAB_BM25_DEBOUNCE` | `1.5` | BM25 백그라운드 재빌드 디바운스(초) — 연속 ingest를 1회 재빌드로 합침. 상세: [ARCHITECTURE.md](./docs/ARCHITECTURE.md) |
@@ -505,7 +515,7 @@ community_reports.json
 
 포맷 상세: [OpenCrab Pack v1 ZIP 형식](./docs/opencrab-pack-v1.md)
 
-`opencrab/pack/`(팩 빌드·검증·적재·내보내기 공용 라이브러리) 모듈 지도와 설계 원칙은 [팩 계약 계층](./docs/pack-contract-layer.md) 참고.
+`opencrab/pack/`(팩 빌드, 검증, 적재, 내보내기 공용 라이브러리) 모듈 지도와 설계 원칙은 [팩 계약 계층](./docs/pack-contract-layer.md) 참고.
 
 ### CrabHarness
 
@@ -560,16 +570,16 @@ opencrab/
   schemas/        YAML 타입 스키마, 스키마 팩, 액션 스키마
   ontology/       빌더, 쿼리, identity, 정규화, 승인, ReBAC
   execution/      워크플로·승인 런타임
-  stores/         Local(SQLite)·Kuzu capability-negative facade·PG(pgvector)·docker(Neo4j/Mongo/Chroma) 스토어 + 임베딩 EF, 백업·복원
+  stores/         Local(SQLite), Kuzu capability-negative facade, PG(pgvector), docker(Neo4j/Mongo/Chroma) 스토어 + 임베딩 EF, 백업과 복원
   mcp/            MCP 서버 및 툴 레지스트리
-  pack/           팩 빌드·검증·적재·내보내기 공용 라이브러리
+  pack/           팩 빌드, 검증, 적재, 내보내기 공용 라이브러리
   billing/        과금 훅과 billing_events
   common/         공용 헬퍼(그래프 식별 등)
   media/          OCR, 이미지 컨텍스트
   observability/  검색 추적
   services/       팩 선택, 결과 크기 상한, 정규 id
 apps/             REST 앱(`apps/api`)과 웹(`apps/web`)
-scripts/          운영·이관·진단 스크립트(마이그레이션 도구 포함)
+scripts/          운영, 이관, 진단 스크립트(마이그레이션 도구 포함)
 packaging/        Agent Plugin 패키징
 requirements/     선택 기능 의존성(`localcrab-media.txt`, `localcrab-pack-build.txt`)
 server/           배포 진입점 어댑터(`server.api:app`이 `apps.api.main`의 `app`을 노출)

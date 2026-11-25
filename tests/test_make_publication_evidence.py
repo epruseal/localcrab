@@ -209,3 +209,41 @@ def test_out_symlink_file_in_set_pointing_outside_is_rejected(backup_set, tmp_pa
     assert tool.main(_args(backup_set, backup_set / "evidence.json")) == 2
     assert sorted(p.name for p in backup_set.rglob("*")) == before
     assert list(outside.iterdir()) == []
+
+
+def test_frozen_from_inside_lock_interval_is_rejected(backup_set, tmp_path):
+    lock = json.loads((backup_set / "MANIFEST.json").read_text())["lock"]
+    start, end = _stamp(lock["acquired_at"]), _stamp(lock["released_at"])
+    assert end > start
+    inside = (start + (end - start) / 2).isoformat()
+    out = tmp_path / "evidence.json"
+    assert tool.main(_args(backup_set, out, frozen_from=inside, packs_checked_at=inside)) == 2
+    assert not out.exists()
+
+
+def test_lock_without_released_at_is_rejected(backup_set, tmp_path):
+    out = tmp_path / "evidence.json"
+    args = _args(backup_set, out)
+    manifest = json.loads((backup_set / "MANIFEST.json").read_text())
+    del manifest["lock"]["released_at"]
+    (backup_set / "MANIFEST.json").write_text(json.dumps(manifest))
+    assert tool.main(args) == 2
+    assert not out.exists()
+
+
+def test_out_through_alias_of_set_is_rejected(backup_set, tmp_path):
+    alias = tmp_path / "set-alias"
+    alias.symlink_to(backup_set, target_is_directory=True)
+    before = sorted(p.name for p in backup_set.iterdir())
+    assert tool.main(_args(backup_set, alias / "evidence.json")) == 2
+    assert sorted(p.name for p in backup_set.iterdir()) == before
+
+
+def test_out_in_set_when_set_is_given_through_alias(backup_set, tmp_path):
+    alias = tmp_path / "set-alias"
+    alias.symlink_to(backup_set, target_is_directory=True)
+    before = sorted(p.name for p in backup_set.iterdir())
+    args = _args(backup_set, backup_set / "evidence.json")
+    args[0] = str(alias)
+    assert tool.main(args) == 2
+    assert sorted(p.name for p in backup_set.iterdir()) == before

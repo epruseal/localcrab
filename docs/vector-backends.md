@@ -214,9 +214,10 @@ opencrab serve
   (sqlite-vec의 "LIMIT 이후 Python 후처리 필터" 같은 2단계가 구조적으로 없다).
 - **설치**: `pip install ".[pg]"`(pgvector 파이썬 패키지 — Postgres 확장 자체는
   `CREATE EXTENSION vector`를 스토어 ensure-schema가 최초 사용 시 idempotent하게 실행).
-- **이관**: 기존 SQLite(graph.db/doc_store.db/opencrab.db/vectors.db) → PG는
-  `scripts/migrate_sqlite_to_pg.py`로 1:1 복사(재임베딩 불필요 — sqlite-vec 표준이
-  이미 KURE 1024d이므로 벡터는 raw float 그대로 옮긴다).
+- **이관**: 기존 SQLite(doc_store.db/opencrab.db/vectors.db) → PG는
+  `scripts/migrate_sqlite_to_pg.py --only doc,sql,vector`로 1:1 복사한다(재임베딩 불필요. sqlite-vec 표준이
+  이미 KURE 1024d이므로 벡터는 raw float 그대로 옮긴다). graph.db는 이 스크립트로 옮기지 못한다
+  ([마이그레이션 7절](./migrations.md#7-sqlite에서-postgresql로)).
 - 인프라 제약(`/dev/shm`, cgroup 메모리): 아래 §4.3.
 
 #### 4.2 Phase 2 통합 벤치: sqlite-vec(A) vs pgvector(B) 벤치마크 성공 기준 실측
@@ -435,7 +436,7 @@ opencrab serve
   않으므로 WAL 모드 파일에는 곁파일이 생길 수 있다. 이 스크립트에는 `--backup-to`
   옵션이 없다. 이관 전 백업은 `python -m opencrab.stores.backup --to <경로>`로 한다.
   `--verify`로 이관 후 행수 대조.
-- 재실행 — 표마다 다르다. 자연 키가 있는 SQL 표는 행수가 같아도 매번 upsert하고, 벡터, `doc_nodes`, `audit_log`는 행수가 같고 0보다 크면 건너뛰며 `doc_sources`는 건너뛰지 않는다. 상세는 [마이그레이션 7절](./migrations.md#7-sqlite에서-postgresql로).
+- 재실행: 표마다 다르다. 자연 키가 있는 SQL 표는 행수가 같아도 매번 upsert하고, 벡터, `doc_nodes`, `audit_log`는 행수가 같고 0보다 크면 건너뛰며 `doc_sources`는 건너뛰지 않는다. 상세는 [마이그레이션 7절](./migrations.md#7-sqlite에서-postgresql로).
 
 ### sqlite-vec → Chroma 롤백
 
