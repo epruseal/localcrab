@@ -268,6 +268,7 @@ def write_source(
     source_copy_state: SourceCopyState | None = None,
     _atomic_inner: bool = False,
     _precomputed_vectors: Any = None,
+    _expected_pack_incarnation: str | None = None,
 ) -> dict[str, Any]:
     """Write one source's graph node, doc row and vector under one ownership stamp.
 
@@ -379,7 +380,9 @@ def write_source(
     pg_uow = common_pg_uow(*required)
     if not _atomic_inner and (pg_uow is not None or is_single_file(*required)):
         shared = sql.shared_file
-        incarnation = shared.pack_incarnation(pack_id) if shared is not None else None
+        incarnation = _expected_pack_incarnation
+        if incarnation is None and shared is not None:
+            incarnation = shared.pack_incarnation(pack_id)
         if write_vector and getattr(hybrid, "_chroma", None) is not vector:
             raise RuntimeError("hybrid vector differs from shared vector store")
         if write_vector and getattr(hybrid, "_doc_store", None) is not docs:
@@ -404,12 +407,13 @@ def write_source(
             with manager:
                 if incarnation is not None:
                     shared.validate_pack_writes({pack_id: incarnation})
+                    shared._uow.requested_pack = pack_id
                 output = write_source(
                     sql, hybrid, docs, vector, graph=graph, text=text, source_id=source_id,
                     metadata=metadata, pack_id=pack_id, origin=origin, fork_copy=fork_copy,
                     write_vector=write_vector, write_graph=write_graph,
                     source_copy_state=source_copy_state, _atomic_inner=True,
-                    _precomputed_vectors=prepared,
+                    _precomputed_vectors=prepared, _expected_pack_incarnation=incarnation,
                 )
                 statuses = output["stores"]
                 from opencrab.ontology.builder import store_write_succeeded
@@ -454,6 +458,7 @@ def write_source(
         receipt, graph, docs, sql, vector,
         text=text, source_id=source_id, meta=meta, pack_id=pack_id,
         origin=origin, fork_copy=fork_copy, write_graph=write_graph,
+        expected_pack_incarnation=_expected_pack_incarnation,
     ):
         receipt["stores"]["documents"] = _SKIPPED_GRAPH_FAILED
         receipt["stores"]["chromadb"] = _SKIPPED_GRAPH_FAILED
@@ -641,6 +646,7 @@ def _graph_leg(
     origin: str,
     fork_copy: bool,
     write_graph: bool,
+    expected_pack_incarnation: str | None = None,
 ) -> bool:
     """Materialise the source as an ``evidence/TextUnit`` node.
 
@@ -711,6 +717,7 @@ def _graph_leg(
             write_vector=False,
             # The CAS token of an existing row of this type (see `_node_digest`).
             _expected_current_digest=_node_digest(graph, source_id, rows),
+            _expected_pack_incarnation=expected_pack_incarnation,
         )
     except (GraphSchemaMigrationRequired, GraphWriteUnavailable) as exc:
         # Operational failure of the system of record -- reported, not raised,

@@ -16,9 +16,15 @@ See docs/issue-642-source-fts-lookup.md for the decisions and the tests.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
+
+
+class DerivedRowProtectionError(RuntimeError):
+    """단일 모드의 파생 행 보호를 통과하지 못했다."""
+
 
 FTS = "doc_sources_fts"
 CONTENT = "doc_sources_fts_content"
@@ -56,6 +62,107 @@ def delete_sql(source_id_condition: str) -> str:
     return (
         f"DELETE FROM {FTS} WHERE rowid IN "
         f"(SELECT id FROM {CONTENT} WHERE c0 {source_id_condition})"
+    )
+
+
+_PROTECTED_VOCAB = "source_fts_protection_vinst"
+_VOCAB_ATOM = r'''(?:[A-Za-z_][A-Za-z_0-9]*|"(?:[^"]|"")*"|'(?:[^']|'')*'|`(?:[^`]|``)*`|\[[^\]]*\])'''
+_VOCAB_DECLARATION = re.compile(
+    rf"CREATE\s+VIRTUAL\s+TABLE\s+({_VOCAB_ATOM})\s+"
+    rf"USING\s+({_VOCAB_ATOM})\s*\(\s*({_VOCAB_ATOM})\s*,\s*"
+    rf"({_VOCAB_ATOM})\s*,\s*({_VOCAB_ATOM})\s*\)\s*;?\s*",
+    re.IGNORECASE | re.ASCII,
+)
+
+
+def _vocab_atom(token: str) -> str:
+    if token[0] == "[":
+        return token[1:-1]
+    if token[0] in "\"'`":
+        quote = token[0]
+        return token[1:-1].replace(quote * 2, quote)
+    return token
+
+
+def require_protection_vocab(conn: sqlite3.Connection, *, create: bool = False) -> str:
+    """main 이름 충돌을 피하고 고정 TEMP vocab 선언을 검사한다."""
+    from opencrab.stores._single_file import ascii_identifier
+
+    main_names = {ascii_identifier(row[0]) for row in conn.execute(
+        "SELECT name FROM main.sqlite_master"
+    )}
+    name = _PROTECTED_VOCAB
+    suffix = 0
+    while ascii_identifier(name) in main_names:
+        suffix += 1
+        name = f"{_PROTECTED_VOCAB}_{suffix}"
+    rows = conn.execute("SELECT name, type, sql FROM temp.sqlite_master").fetchall()
+    row = next((row for row in rows if ascii_identifier(row[0]) == ascii_identifier(name)), None)
+    if row is None and create:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE temp.{name} USING fts5vocab(main, '{FTS}', 'instance')"
+        )
+        rows = conn.execute("SELECT name, type, sql FROM temp.sqlite_master").fetchall()
+        row = next((row for row in rows if ascii_identifier(row[0]) == ascii_identifier(name)), None)
+        if row is None:
+            raise DerivedRowProtectionError("source FTS TEMP vocabulary definition missing")
+    if row is None:
+        return f"temp.{name}"
+    actual_name, kind, declaration = row
+    match = _VOCAB_DECLARATION.fullmatch(declaration or "")
+    expected = (name, "fts5vocab", "main", FTS, "instance")
+    if kind != "table" or match is None or tuple(
+        ascii_identifier(_vocab_atom(token)) for token in match.groups()
+    ) != tuple(ascii_identifier(token) for token in expected):
+        raise DerivedRowProtectionError("source FTS TEMP vocabulary definition differs")
+    quoted_name = '"' + actual_name.replace('"', '""') + '"'
+    columns = [entry[1] for entry in conn.execute(f"PRAGMA temp.table_info({quoted_name})")]
+    if columns != ["term", "doc", "col", "offset"]:
+        raise DerivedRowProtectionError("source FTS TEMP vocabulary layout differs")
+    return f"temp.{actual_name}"
+
+
+def _protected_vocab(conn: sqlite3.Connection) -> str:
+    """파생 쓰기에 필요한 vocab만 생성하고 기존 선언을 다시 검사한다."""
+    return require_protection_vocab(conn, create=True)
+
+
+def _rowid_occupied(conn: sqlite3.Connection, vocab: str, rowid: int) -> bool:
+    return any(conn.execute(sql, (rowid,)).fetchone() is not None for sql in (
+        f"SELECT 1 FROM main.{CONTENT} WHERE id=?",
+        f"SELECT 1 FROM main.{FTS}_docsize WHERE id=?",
+        f"SELECT 1 FROM {vocab} WHERE doc=? LIMIT 1",
+    ))
+
+
+def delete_protected(conn: sqlite3.Connection, source_id: str) -> None:
+    """대상의 모든 FTS 행을 지운 뒤 대상 rowid의 잔여를 거부한다."""
+    vocab = _protected_vocab(conn)
+    rowids = [row[0] for row in conn.execute(
+        f"SELECT id FROM main.{CONTENT} WHERE c0=?", (source_id,)
+    )]
+    for rowid in rowids:
+        conn.execute(f"DELETE FROM main.{FTS} WHERE rowid=?", (rowid,))
+        if _rowid_occupied(conn, vocab, rowid):
+            raise DerivedRowProtectionError(f"source FTS residue after delete: {source_id!r}")
+
+
+def insert_protected(conn: sqlite3.Connection, source_id: str, text: str) -> None:
+    """실제 세 FTS 저장 영역에서 비어 있는 양의 rowid만 쓴다."""
+    vocab = _protected_vocab(conn)
+    highest = max(0, *(conn.execute(sql).fetchone()[0] or 0 for sql in (
+        f"SELECT max(id) FROM main.{CONTENT}",
+        f"SELECT max(id) FROM main.{FTS}_docsize",
+    )))
+    rowid = highest + 1 if highest < 9223372036854775807 else 1
+    # vocab만 남은 구간은 순서대로 검사한다. 큰 손상 구간은 별도 정비가 필요하다.
+    while _rowid_occupied(conn, vocab, rowid):
+        rowid = rowid + 1 if rowid < 9223372036854775807 else 1
+        if rowid == (highest + 1 if highest < 9223372036854775807 else 1):
+            raise DerivedRowProtectionError(f"source FTS rowid exhausted: {source_id!r}")
+    conn.execute(
+        f"INSERT INTO main.{FTS}(rowid, source_id, text) VALUES (?, ?, ?)",
+        (rowid, source_id, text),
     )
 
 

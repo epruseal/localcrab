@@ -24,6 +24,7 @@ from typing import Any
 
 from opencrab.stores import _node_bm25_cache as _cache
 from opencrab.stores import _node_bm25_prune as _prune
+from opencrab.stores._source_fts_sqlite import DerivedRowProtectionError
 
 logger = logging.getLogger(__name__)
 
@@ -238,18 +239,53 @@ def _require_format(meta: dict[str, str | None]) -> None:
 _NODE_COLUMNS = "space, node_id, node_type, properties, updated_at"
 
 
+def require_mapping_owner(conn, space: str, node_id: str, requested_pack: str) -> None:
+    """대기 키 대신 기존 매핑의 소유를 요청 팩과 직접 비교한다."""
+    try:
+        row = conn.execute(
+            f"SELECT pack_id FROM main.{DOCS} WHERE space=? AND node_id=?", (space, node_id)
+        ).fetchone()
+    except Exception as exc:
+        raise DerivedRowProtectionError("BM25 mapping owner read failed") from exc
+    if row is not None and (not requested_pack or row[0] != requested_pack):
+        raise DerivedRowProtectionError(f"BM25 mapping owner differs: ({space!r}, {node_id!r})")
+
+
+def _require_empty_rowid(conn, rowid: int) -> None:
+    try:
+        occupied = (
+            conn.execute(f"SELECT 1 FROM main.{FTS}_docsize WHERE id=?", (rowid,)).fetchone()
+            or conn.execute(f"SELECT 1 FROM main.{VINST} WHERE doc=? LIMIT 1", (rowid,)).fetchone()
+        )
+    except Exception as exc:
+        raise DerivedRowProtectionError(f"BM25 FTS rowid check failed: {rowid}") from exc
+    if occupied:
+        raise DerivedRowProtectionError(f"BM25 FTS residue at rowid {rowid}")
+
+
 def reindex_key(
     conn: sqlite3.Connection,
     row_to_node: RowToNode,
     space: str,
     node_id: str,
     meta: dict[str, str | None] | None = None,
+    *,
+    requested_pack: str | None = None,
 ) -> None:
-    """Make the index entry of one key match its current row (design 4.2)."""
+    """현재 문서를 재색인한다. 요청 팩이 있으면 파생 행도 보호한다."""
     if meta is None:
         meta = _meta(conn)
     _require_format(meta)
     max_text_chars = _decode_chars(meta.get("max_text_chars"))
+    protected = requested_pack is not None
+    if protected:
+        try:
+            require_mapping_owner(conn, space, node_id, requested_pack)
+        except Exception as exc:
+            logger.warning("BM25 protection rejected key (%r, %r): mapping_owner_rejected", space, node_id)
+            if isinstance(exc, DerivedRowProtectionError):
+                raise
+            raise DerivedRowProtectionError("BM25 mapping owner read failed") from exc
     row = conn.execute(
         f"SELECT {_NODE_COLUMNS} FROM doc_nodes WHERE space=? AND node_id=?",
         (space, node_id),
@@ -258,7 +294,16 @@ def reindex_key(
         f"SELECT doc_key, dl FROM {DOCS} WHERE space=? AND node_id=?", (space, node_id)
     ).fetchone()
     if old is not None:
-        conn.execute(f"DELETE FROM {FTS} WHERE rowid=?", (old[0],))
+        try:
+            conn.execute(f"DELETE FROM {FTS} WHERE rowid=?", (old[0],))
+            if protected:
+                _require_empty_rowid(conn, old[0])
+        except Exception as exc:
+            if protected:
+                raise DerivedRowProtectionError(
+                    f"BM25 FTS deletion rejected: ({space!r}, {node_id!r})"
+                ) from exc
+            raise
         conn.execute(f"DELETE FROM {DOCS} WHERE doc_key=?", (old[0],))
         conn.execute(
             f"UPDATE {STATS} SET doc_count=doc_count-1, total_len=total_len-? WHERE id=1",
@@ -268,6 +313,8 @@ def reindex_key(
         from opencrab.ontology.pack_provenance import scope_pack_id
 
         node = row_to_node(row)
+        if protected and (node.get("property_decode_error") or scope_pack_id(node) != requested_pack):
+            raise DerivedRowProtectionError(f"BM25 document owner differs: ({space!r}, {node_id!r})")
         terms = node_terms(node, max_text_chars)
         updated = row["updated_at"]
         cur = conn.execute(
@@ -275,8 +322,11 @@ def reindex_key(
             (space, node_id, scope_pack_id(node) or "", len(terms),
              "" if updated is None else str(updated)),
         )
+        new_rowid = cur.lastrowid
+        if protected:
+            _require_empty_rowid(conn, new_rowid)
         conn.execute(f"INSERT INTO {FTS}(rowid, tokens) VALUES (?, ?)",
-                     (cur.lastrowid, " ".join(terms)))
+                     (new_rowid, " ".join(terms)))
         conn.execute(
             f"UPDATE {STATS} SET doc_count=doc_count+1, total_len=total_len+? WHERE id=1",
             (len(terms),),

@@ -63,6 +63,10 @@ BOUNDARY_REJECTED = (
 _PAYLOAD_KEYS = ("properties", "metadata")
 
 
+class IdentityWriteRejectedError(ValueError):
+    """기존 저장소의 신원을 확인하지 못했거나 소유자가 다르다."""
+
+
 class ClientIdentityFieldError(ValueError):
     """A request carried server-owned identity, or contradicted it."""
 

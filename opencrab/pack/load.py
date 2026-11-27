@@ -53,6 +53,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable
 from decimal import Decimal
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +76,7 @@ from opencrab.pack.normalize import (
     transform_node,
     with_chunk_space,
 )
-from opencrab.pack.write_gate import authorize, authorize_delete
+from opencrab.pack.write_gate import IdentityWriteRejectedError, authorize, authorize_delete
 from opencrab.stores._pg_uow import common_pg_uow
 from opencrab.stores._single_file import is_single_file
 from opencrab.stores._sql_dialect import SQLITE, SqlDialect, json_valid_expr
@@ -90,32 +91,142 @@ class ChunkTransactionUncertainError(RuntimeError):
     """청크 트랜잭션의 실패 상태를 확인하지 못했다."""
 
 
+class LoaderWriteCleanupError(RuntimeError):
+    """DB 결과를 확인했지만 쓰기 잠금 정리에 실패했다."""
+
+
+class LoaderRollbackOnlyError(RuntimeError):
+    """정상 본문 뒤 쓰기 단위가 rollback_only로 종료됐다."""
+
+
 class _ChunkTransactionStartError(Exception):
     def __init__(self, original):
         self.original = original
+
+
+class _LoaderWriteAbort(BaseException):
+    """발생 경계의 중단을 행별 Exception 처리와 구분한다."""
+
+    def __init__(self, original):
+        self.original = original
+
+
+def _loader_write_boundary(function):
+    @wraps(function)
+    def call(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except _LoaderWriteAbort as abort:
+            raise abort.original
+    return call
 
 
 @contextlib.contextmanager
 def _chunk_transaction(pg_uow, shared, sql=None):
     outcome = {}
     entered = False
+    body_error = None
     try:
         if pg_uow is not None:
             manager = pg_uow.unit_of_work(outcome=outcome)
         elif sql is not None:
             from opencrab.stores.sql_store import shared_write_unit
 
-            manager = shared_write_unit(sql, outcome=outcome)
+            manager = shared_write_unit(sql, outcome=outcome, safe_log=True)
         else:
-            manager = shared.unit_of_work(outcome=outcome)
+            manager = shared.unit_of_work(outcome=outcome, safe_log=True)
         with manager:
             entered = True
-            yield
-    except Exception as exc:
+            try:
+                yield outcome
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except BaseException as exc:
+        if pg_uow is not None:
+            if not isinstance(exc, Exception):
+                raise
+            if not entered:
+                raise _ChunkTransactionStartError(exc) from exc
+            if outcome.get("state") != "rolled_back":
+                raise ChunkTransactionUncertainError("chunk transaction outcome is not confirmed") from exc
+            raise
+        state = outcome.get("state")
+        cleanup = outcome.get("cleanup_error")
+        unit_error = outcome.get("unit_error")
+        if state == "committed" and unit_error is not None and not isinstance(unit_error, Exception):
+            if cleanup is not None:
+                log.error("쓰기 취소 뒤 잠금 정리 실패: state=%s", state)
+            raise _LoaderWriteAbort(unit_error) from exc
         if not entered:
-            raise _ChunkTransactionStartError(exc) from exc
-        if outcome.get("state") != "rolled_back":
-            raise ChunkTransactionUncertainError("chunk transaction outcome is not confirmed") from exc
+            if cleanup is not None:
+                log.error("쓰기 시작 실패 뒤 잠금 정리 실패")
+            raise _LoaderWriteAbort(outcome.get("unit_error", exc)) from exc
+        if state not in {"committed", "rolled_back"}:
+            error = ChunkTransactionUncertainError("chunk transaction outcome is not confirmed")
+        elif outcome.get("rollback_only") and body_error is None:
+            error = LoaderRollbackOnlyError("loader write unit is rollback-only")
+        elif cleanup is not None:
+            error = LoaderWriteCleanupError(f"loader write cleanup failed; state={state}")
+        else:
+            raise
+        error.outcome = outcome.copy()
+        error.body_error = outcome.get("body_error", body_error)
+        error.rollback_error = outcome.get("rollback_error")
+        error.cleanup_error = cleanup
+        raise _LoaderWriteAbort(error) from exc
+
+
+def _loader_shared_entry(sql, principal, pack_name, *, docs, graph=None, vec=None,
+                         node_indexes=False, incremental=False):
+    stores = [docs, sql]
+    if graph is not None:
+        stores.append(graph)
+    if vec is not None:
+        stores.append(vec)
+    if not is_single_file(*stores):
+        return None, None
+    shared = sql.shared_file
+    if shared.in_unit_of_work or shared.connection().in_transaction:
+        raise RuntimeError("chunk loader cannot run inside a shared unit of work or raw transaction")
+    if vec is None or not vec.available:
+        raise RuntimeError("single SQLite loader requires an available vector store")
+    if incremental:
+        if any(not callable(getattr(docs, name, None)) for name in
+               ("read_source_state_exact", "rewrite_source_metadata")):
+            raise RuntimeError("doc store lacks source-state rewrite boundary")
+    if (node_indexes or incremental) and callable(getattr(vec, "update_metadata", None)):
+        raise RuntimeError("metadata updater cannot join a shared transaction")
+    incarnation = shared.pack_incarnation(pack_name)
+    if incarnation is None:
+        raise RuntimeError("single SQLite loader requires the supported deletion journal schema")
+    with _loader_write_unit(shared, sql, principal, pack_name, incarnation,
+                            docs=docs, graph=graph, vec=vec, node_indexes=node_indexes):
+        shared.connection().execute("UPDATE main.packs SET incarnation=incarnation WHERE 0")
+    return shared, incarnation
+
+
+@contextlib.contextmanager
+def _loader_write_unit(shared, sql, principal, pack_name, incarnation, *,
+                       docs, graph=None, vec=None, node_indexes=False, pg_uow=None):
+    if shared is None and pg_uow is None:
+        yield
+        return
+    try:
+        with _chunk_transaction(pg_uow, shared, sql):
+            if shared is not None:
+                shared.require_write_layout(node_indexes=node_indexes, docs=docs, graph=graph, vec=vec)
+                shared.validate_pack_writes({pack_name: incarnation})
+                shared._uow.requested_pack = pack_name
+                authorize(sql, principal, pack_name)
+            yield
+    except _ChunkTransactionStartError as exc:
+        if pg_uow is not None:
+            raise _LoaderWriteAbort(exc.original) from exc
+        raise
+    except ChunkTransactionUncertainError as exc:
+        if pg_uow is not None:
+            raise _LoaderWriteAbort(exc) from exc
         raise
 
 
@@ -837,12 +948,15 @@ def _live_vec_ids_or_unconfirmed(
             PermissionError, LookupError):
         raise
     except Exception as exc:
-        log.warning(
-            "벡터 ID 열거 실패(%s): 벡터 상태 미확인으로 처리해 "
-            "단건 조회로도 확인하지 못한 행의 벡터 유실 회수를 보류하고 그래프와 "
-            "문서 동기화는 계속한다. 다음 적재가 열거에 성공하면 유실 슬롯을 "
-            "회수한다. 원인 %s: %s",
-            pack_name, type(exc).__name__, exc)
+        if getattr(vec, "shared_file", None) is not None:
+            log.warning("벡터 ID 열거 실패(%s) reason=vector_enumeration_failed", pack_name)
+        else:
+            log.warning(
+                "벡터 ID 열거 실패(%s): 벡터 상태 미확인으로 처리해 "
+                "단건 조회로도 확인하지 못한 행의 벡터 유실 회수를 보류하고 그래프와 "
+                "문서 동기화는 계속한다. 다음 적재가 열거에 성공하면 유실 슬롯을 "
+                "회수한다. 원인 %s: %s",
+                pack_name, type(exc).__name__, exc)
         return None, True
 
 
@@ -938,12 +1052,17 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict, pack_id: str) -> bool:
             shared = getattr(vec, "shared_file", None)
             if shared is not None:
                 marker = handle.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                    "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='pack_delete_operations'"
                 ).fetchone()
                 if marker is not None:
                     if not shared.in_unit_of_work:
                         raise RuntimeError("single SQLite vector write requires a guarded unit")
-                    if pack_id not in shared._uow.validated_packs or meta.get("pack_id") != pack_id:
+                    if shared._uow.delete_operation is None:
+                        requested = shared.require_requested_pack()
+                        owner_valid = pack_id == requested and meta.get("pack_id") == requested
+                    else:
+                        owner_valid = pack_id in shared._uow.validated_packs and meta.get("pack_id") == pack_id
+                    if not owner_valid:
                         shared.mark_rollback_only()
                         raise RuntimeError("vector owner is not validated")
             cur = handle.execute(
@@ -1019,7 +1138,7 @@ def _vec_meta_update(vec, chunk_id: str, meta: dict, pack_id: str) -> bool:
     except Exception as exc:                                  # noqa: BLE001
         shared = getattr(vec, "shared_file", None)
         pg_uow = getattr(vec, "_pg_uow", None)
-        if (shared is not None and shared.in_unit_of_work) or (pg_uow is not None and pg_uow.active):
+        if (shared is not None and (shared.in_unit_of_work or shared.connection().in_transaction)) or (pg_uow is not None and pg_uow.active):
             raise
         log.warning("벡터 메타 갱신 실패(%s): %s — 재임베딩으로 우회한다", chunk_id, exc)
     return False
@@ -2725,8 +2844,11 @@ def _doc_node_fingerprints(
                 "last_node_id": last_node_id, "batch": _DOC_FP_BATCH,
             })
         except Exception as exc:
-            log.warning("%s doc 행 지문 조회 실패, 이번 런은 문서 값을 비교하지 않는다(#374): %s",
-                        pack_name, exc)
+            if getattr(docs, "shared_file", None) is not None:
+                log.warning("doc 지문 조회 실패(%s) reason=doc_fingerprint_unavailable", pack_name)
+            else:
+                log.warning("%s doc 행 지문 조회 실패, 이번 런은 문서 값을 비교하지 않는다(#374): %s",
+                            pack_name, exc)
             return None
         for row in rows:
             space = docs._row_get(row, "space")
@@ -2742,6 +2864,7 @@ def _doc_node_fingerprints(
             return out
 
 
+@_loader_write_boundary
 def load_nodes_incremental(
     pack_name: str,
     nodes_file: Path,
@@ -2782,10 +2905,12 @@ def load_nodes_incremental(
     동일한 등록부 `SQLStore` 인스턴스를 넘겨야 한다(청크 축의 `sql` 계약과
     같은 레지스트리 동일성 요구).
 
-    이 `authorize()`도 호출당 1회이고 대상은 `pack_name`이다. 행마다
-    인가하는 `builder.add_node()`와 달리, 이 적재가 도는 동안 소유권이 바뀌는
-    창이 남는다. 청크 축 `load_chunks_incremental`과 같은 의도한 모서리다
-    (그쪽 독스트링의 같은 설명 참고).
+    단일 SQLite 모드는 진입에서 지원 스키마, 그래프, BM25, 원본 FTS와 벡터를 확인한다.
+    활성 공유 단위나 원시 트랜잭션에서의 최외곽 호출은 거부한다. 직접 삭제 단위마다
+    시작 세대와 요청 팩을 검증하고 재인가한다. 빌더는 로더 내부 표식을 받아 임베딩 뒤
+    실제 단위에서 구성을 재검사하고 시작 세대 및 요청 팩을 검증한다. 재귀 인가도 유지한다.
+    공유 신원 충돌은 skip으로 세고 전체 요청 키와 고정 사유 코드로 경고한다.
+    비공유 모드는 기존 호출당 인가를 유지한다. 호출 사이 전체 적재 원자성은 보장하지 않는다.
 
     `doc_node_spaces`는 F4-b `live_pack_state` 의 반환이다 — **필수 인자**다.
     노드가 이번 적재에서 space X 로 확인됐는데 doc_nodes 에 다른 space Y 의 행이
@@ -2891,10 +3016,14 @@ def load_nodes_incremental(
         stale = doc_node_spaces.get(node_id, set()) - {space} - already_deleted_spaces
         for other_space in stale:
             try:
-                ok_del = docs.delete_node_doc(other_space, node_id)
+                with write_unit():
+                    ok_del = docs.delete_node_doc(other_space, node_id)
             except Exception as exc:
                 cleanup_err += 1
-                log.warning("doc 이종 space 정리 오류 %s space=%s: %s", node_id, other_space, exc)
+                if shared is not None:
+                    log.warning("노드 정리 %s/%s reason=stale_doc_delete_failed", other_space, node_id)
+                else:
+                    log.warning("doc 이종 space 정리 오류 %s space=%s: %s", node_id, other_space, exc)
                 continue
             if not ok_del:
                 log.warning("doc 이종 space 정리 실패(반환 False) %s space=%s", node_id, other_space)
@@ -2921,12 +3050,12 @@ def load_nodes_incremental(
     required = [graph, docs, sql]
     if vec is not None:
         required.append(vec)
-    if is_single_file(*required):
-        marker = sql.shared_file.connection().execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-        ).fetchone()
-        if marker is not None:
-            raise RuntimeError("single SQLite incremental node cleanup is not yet supported")
+    shared, incarnation = _loader_shared_entry(
+        sql, principal, pack_name, docs=docs, graph=graph, vec=vec, node_indexes=True)
+
+    def write_unit():
+        return _loader_write_unit(shared, sql, principal, pack_name, incarnation,
+                                  docs=docs, graph=graph, vec=vec, node_indexes=True)
 
     # #374: same 판정이 문서 sink 자신의 값(node_type 컬럼, properties)도 보도록
     # 문서 행 지문을 한 번 읽는다. 호출자가 넘긴 `doc_node_spaces` 는 행 존재만
@@ -3117,9 +3246,13 @@ def load_nodes_incremental(
                         hit = vec_get_by_id(node_id)
                     except Exception as exc:
                         vec_unrecovered += 1
-                        log.warning(
-                            "노드 단건 벡터 조회 오류(%s) %s: %s — 미확인으로 남긴다",
-                            pack_name, node_id, exc)
+                        if shared is not None:
+                            log.warning("노드 벡터 조회 오류(%s) %s/%s/%s reason=vector_read_failed",
+                                        pack_name, space, node_type, node_id)
+                        else:
+                            log.warning(
+                                "노드 단건 벡터 조회 오류(%s) %s: %s — 미확인으로 남긴다",
+                                pack_name, node_id, exc)
                     else:
                         owner = slot_owner(hit.get("metadata") if hit else None)
                         if hit is None or owner != pack_name:
@@ -3173,7 +3306,18 @@ def load_nodes_incremental(
         # source error, or malformed result must stop before this node can
         # overwrite a same-id chunk vector. Earlier rows keep the loader's
         # existing row-at-a-time commits.
-        shared_source = _same_pack_source(docs, node_id, pack_name)
+        try:
+            shared_source = _same_pack_source(docs, node_id, pack_name)
+        except Exception as exc:
+            if shared is not None:
+                from opencrab.common.graph_identity import PropertyDecodeDepthError
+
+                log.warning("노드 원본 판독 오류(%s) %s/%s/%s reason=source_read_failed",
+                            pack_name, space, node_type, node_id)
+                if isinstance(exc, PropertyDecodeDepthError):
+                    ingest_err += 1
+                    continue
+            raise
 
         try:
             # Qualified graph identity makes ``upsert_node`` a
@@ -3197,21 +3341,30 @@ def load_nodes_incremental(
             res = builder.add_node(space, node_type, node_id, properties=props,
                                      pack_id=pack_name, origin="server",
                                      write_vector=not shared_source,
-                                     _expected_current_digest=expected_current_digest)
+                                     _expected_current_digest=expected_current_digest,
+                                     **({"_expected_pack_incarnation": incarnation, "_loader_write": True} if shared is not None else {}))
             # **영수증을 본다.** `add_node` 는 스토어 실패를 예외로 올리지 않고 반환
             # dict 에 적는다 — `builder.store_write_failures()` 의 docstring 이
             # "호출자가 이것을 불러야 실제 성공 여부를 안다"고 명시한다.
             fails = store_write_failures(res.get("stores", {}) if isinstance(res, dict) else {})
             if fails:
                 ingest_err += 1
-                log.warning("노드 저장 실패 %s (%s/%s): %s",
-                            node_id, space, node_type, "; ".join(fails))
+                if shared is not None:
+                    stores = res.get("stores", {}) if isinstance(res, dict) else {}
+                    for store in ("graph", "docs", "sql", "audit", "vector"):
+                        if store_write_failures({store: stores.get(store)}):
+                            log.warning("노드 저장 실패 %s/%s/%s store=%s reason=store_write_failed",
+                                        space, node_type, node_id, store)
+                else:
+                    log.warning("노드 저장 실패 %s (%s/%s): %s",
+                                node_id, space, node_type, "; ".join(fails))
             else:
                 already_deleted_spaces: frozenset[str] = frozenset()
                 if stale_typed is not None:
                     # 새 행이 저장된 뒤에만 구 타입 행을 지운다.
                     try:
-                        graph.delete_node(stale_typed[0], node_id)
+                        with write_unit():
+                            graph.delete_node(stale_typed[0], node_id)
                     except Exception as exc:
                         # R3(#142 재리뷰): 즉시 신호 — 이 실패는 warning 만 남기고
                         # err 미계수였다. live_pack_state 는 node_id 로 collapse
@@ -3219,8 +3372,11 @@ def load_nodes_incremental(
                         # 보고 재시도하지 않아 구 행 + cascade 엣지가 영구 잔존했다
                         # — err+1 은 즉시 신호, 루프 말미 스윕(아래)이 구조적 회수다.
                         cleanup_err += 1
-                        log.warning("구 타입 노드 삭제 실패 %s(%s): %s",
-                                    node_id, stale_typed[0], exc)
+                        if shared is not None:
+                            log.warning("노드 정리 %s/%s reason=stale_node_delete_failed", stale_typed[0], node_id)
+                        else:
+                            log.warning("구 타입 노드 삭제 실패 %s(%s): %s",
+                                        node_id, stale_typed[0], exc)
                     # space 동일성 가드(2026-08-12, 이관 회귀 수정): `doc_nodes`
                     # PK 는 `(space, node_id)` 로 타입을 안 담는다. space 가 같으면
                     # 위 `add_node` 의 `upsert_node_doc` 이 **같은 행을 이미 신 값으로
@@ -3232,12 +3388,16 @@ def load_nodes_incremental(
                     # 필요하게 만들었다.
                     if stale_typed[1] != space:
                         try:
-                            if docs.delete_node_doc(stale_typed[1], node_id):
-                                already_deleted_spaces = frozenset({stale_typed[1]})
+                            with write_unit():
+                                if docs.delete_node_doc(stale_typed[1], node_id):
+                                    already_deleted_spaces = frozenset({stale_typed[1]})
                         except Exception as exc:
                             cleanup_err += 1
-                            log.warning("구 타입 노드 doc 삭제 실패 %s(%s): %s",
-                                        node_id, stale_typed[1], exc)
+                            if shared is not None:
+                                log.warning("노드 정리 %s/%s reason=stale_doc_delete_failed", stale_typed[1], node_id)
+                            else:
+                                log.warning("구 타입 노드 doc 삭제 실패 %s(%s): %s",
+                                            node_id, stale_typed[1], exc)
                 # F4-c: 저장이 확인된 뒤 doc_node_spaces 기준으로 다른 space 의
                 # doc 행을 정리한다. stale_typed 삭제와는 별개다 — 저건 "타입이
                 # 바뀐 구 행"이고 이건 "같은 노드가 다른 space 로도 찍혀 있던 것"이다.
@@ -3249,13 +3409,28 @@ def load_nodes_incremental(
         except GrammarValidationError as exc:
             skip += 1
             grammar_reasons[exc.reason] += 1
-            log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, exc)
+            if shared is not None:
+                log.debug("노드 검증 %s/%s/%s reason=grammar_rejected", space, node_type, node_id)
+            else:
+                log.debug("노드 문법위반 skip %s (%s/%s): %s", node_id, space, node_type, exc)
+        except IdentityWriteRejectedError as ve:
+            skip += 1
+            if shared is not None:
+                log.warning("노드 신원 충돌 %s/%s/%s reason=node_identity_conflict", space, node_type, node_id)
+            else:
+                log.debug("노드 검증 skip %s (%s/%s): %s", node_id, space, node_type, ve)
         except ValueError as ve:
             skip += 1
-            log.debug("노드 검증 skip %s (%s/%s): %s", node_id, space, node_type, ve)
+            if shared is not None:
+                log.debug("노드 검증 %s/%s/%s reason=validation_rejected", space, node_type, node_id)
+            else:
+                log.debug("노드 검증 skip %s (%s/%s): %s", node_id, space, node_type, ve)
         except Exception as exc:
             ingest_err += 1
-            log.warning("노드 오류 %s: %s", node_id, exc)
+            if shared is not None:
+                log.warning("노드 오류 %s/%s/%s reason=node_write_failed", space, node_type, node_id)
+            else:
+                log.warning("노드 오류 %s: %s", node_id, exc)
 
         err = ingest_err + cleanup_err
         done = n_new + n_chg + n_same + skip + ingest_err
@@ -3335,10 +3510,14 @@ def load_nodes_incremental(
             continue                        # 실데이터 도달 불가지만 다른 삭제 지점과 일관
         for stale_type in types - {file_type}:
             try:
-                graph.delete_node(stale_type, node_id)
+                with write_unit():
+                    graph.delete_node(stale_type, node_id)
             except Exception as exc:
                 cleanup_err += 1
-                log.warning("구 타입 행 스윕 삭제 실패 %s(%s): %s", node_id, stale_type, exc)
+                if shared is not None:
+                    log.warning("노드 정리 %s/%s reason=stale_type_delete_failed", stale_type, node_id)
+                else:
+                    log.warning("구 타입 행 스윕 삭제 실패 %s(%s): %s", node_id, stale_type, exc)
             else:
                 log.warning("구 타입 행 스윕 삭제(%s) %s(%s)", pack_name, node_id, stale_type)
 
@@ -3393,6 +3572,7 @@ def load_edges(
         reasons = Counter()
     handled_keys: set[tuple[str, str, str]] = set()
 
+    shared_edges = getattr(builder._neo4j, "shared_file", None) is not None
     _require_bound_principal()
     for row in iter_jsonl(edges_file):  # shard-aware 논리 스트림
         raw_label = row.get("label") or row.get("relation") or ""
@@ -3407,7 +3587,7 @@ def load_edges(
             miss = 'src' if src_info is None else ''
             miss += ('+' if miss and tgt_info is None else '') + ('tgt' if tgt_info is None else '')
             reasons[('endpoint 미존재', raw_label, miss, '')] += 1
-            log.debug("엣지 endpoint 미존재 skip: %s->%s (%s)", src_id[:8], tgt_id[:8], raw_label)
+            log.debug("엣지 endpoint 미존재 skip: %s->%s (%s)", (src_id if shared_edges else src_id[:8]), (tgt_id if shared_edges else tgt_id[:8]), raw_label)
             continue
 
         from_space = src_info[0]
@@ -3451,7 +3631,8 @@ def load_edges(
         try:
             res = builder.add_edge(from_space, src_id, relation, to_space, tgt_id,
                                      properties=props, pack_id=pack_name, origin="server",
-                                     replace_own=replace_own)
+                                     replace_own=replace_own,
+                                     **({"_loader_write": True} if shared_edges else {}))
             # **영수증을 본다.** `add_edge`도 `add_node`와 같은 계약이다 — 스토어
             # 실패를 예외로 올리지 않고 반환 dict에 적으므로, 호출자가 이것을 불러야
             # 실제 성공 여부를 안다(`builder.store_write_failures()` docstring).
@@ -3459,21 +3640,40 @@ def load_edges(
             if fails:
                 err += 1
                 reasons[('저장 실패', f'{raw_label}→{relation}', from_space, to_space)] += 1
-                log.warning("엣지 저장 실패 %s->%s [%s→%s]: %s",
-                            src_id[:8], tgt_id[:8], raw_label, relation, "; ".join(fails))
+                if shared_edges:
+                    stores = res.get("stores", {}) if isinstance(res, dict) else {}
+                    for store in ("graph", "docs", "sql"):
+                        if store_write_failures({store: stores.get(store)}):
+                            log.warning("엣지 저장 실패 %s/%s-%s->%s/%s store=%s reason=store_write_failed",
+                                        from_space, src_id, relation, to_space, tgt_id, store)
+                else:
+                    log.warning("엣지 저장 실패 %s->%s [%s→%s]: %s",
+                                src_id[:8], tgt_id[:8], raw_label, relation, "; ".join(fails))
             else:
                 ok += 1
                 if isinstance(res, dict) and res.get("replaced"):
                     n_replaced += 1
         except ValueError as ve:
             skip += 1
-            reasons[('grammar 위반', f'{raw_label}→{relation}', from_space, to_space)] += 1
-            log.debug("엣지 문법위반 skip %s->%s [%s→%s]: %s", src_id[:8], tgt_id[:8], raw_label, relation, ve)
+            identity = shared_edges and isinstance(ve, IdentityWriteRejectedError)
+            reasons[("신원 충돌" if identity else "grammar 위반",
+                     f'{raw_label}→{relation}', from_space, to_space)] += 1
+            if identity:
+                log.warning("엣지 신원 충돌 %s/%s-%s->%s/%s reason=edge_identity_conflict", from_space, src_id, relation, to_space, tgt_id)
+            else:
+                if shared_edges:
+                    log.debug("엣지 검증 %s/%s-%s->%s/%s reason=validation_rejected",
+                              from_space, src_id, relation, to_space, tgt_id)
+                else:
+                    log.debug("엣지 문법위반 skip %s->%s [%s→%s]: %s", src_id[:8], tgt_id[:8], raw_label, relation, ve)
         except Exception as exc:
             err += 1
             # err도 사유를 남긴다 — skip만 집계하면 예외 경로가 감시 밖에 남는다
             reasons[('예외', f'{raw_label}: {type(exc).__name__}', from_space, to_space)] += 1
-            log.warning("엣지 오류 %s->%s: %s", src_id[:8], tgt_id[:8], exc)
+            if shared_edges:
+                log.warning("엣지 오류 %s/%s-%s->%s/%s reason=edge_write_failed", from_space, src_id, relation, to_space, tgt_id)
+            else:
+                log.warning("엣지 오류 %s->%s: %s", src_id[:8], tgt_id[:8], exc)
 
     if n_replaced:
         if counters is not None:
@@ -3501,6 +3701,7 @@ def load_edges(
 
 
 
+@_loader_write_boundary
 def load_chunks(
     pack_name: str,
     chunks_file: Path,
@@ -3517,10 +3718,17 @@ def load_chunks(
     같은 형태다. 빠뜨린 호출은 본문에 들어오지도 못하고 `TypeError` 로 죽는다 —
     아무것도 쓰기 전에.
 
-    인가는 호출당 1회이고 대상은 `pack_name` 이다. 행마다 인가하는
-    `OntologyBuilder` 와 달리 **긴 배치가 도는 동안 소유권이 바뀌는 창**이 남는다.
-    의도한 모서리다: 대량 적재에서 행당 등록부 조회는 비용 축이 다르고, 이 경로의
-    입력은 이미 한 팩으로 고정돼 있다.
+    단일 SQLite 모드는 vec, docs, sql의 공유 구성, 원본 FTS와 벡터 가용성을 검사한다.
+    지원 삭제 저널이 없거나 활성 작업 단위 또는 원시 트랜잭션이 있으면 쓰기 전에 거부한다.
+    각 단위는 호출 시작 세대와 요청 팩을 검증하고 실제 연결에서 재인가한다.
+    배치 준비의 일반 Exception은 각 id를 err로 세고 배치를 한 번 비운다.
+    시작 실패는 원 예외로 중단한다. 결과 미확인은 `ChunkTransactionUncertainError`,
+    정상 본문 뒤 rollback_only는 `LoaderRollbackOnlyError`, 정리 실패는
+    `LoaderWriteCleanupError`로 중단한다. 확인된 본문 rollback과 정상 정리만 재시도한다.
+    결과 미확인은 본문과 정리 오류보다 우선한다. 정상 본문 뒤 rollback_only는 정리 오류보다 우선한다.
+    정리에서만 발생한 취소는 LoaderWriteCleanupError이며 원 cleanup 객체를 보존한다.
+    공유 경고는 전체 요청 키와 고정 사유 코드만 기록한다. 취소는 재시도하지 않는다.
+    비공유 및 PostgreSQL의 기존 준비 재시도는 유지한다.
 
     예외: 미바인딩 principal 은 `RuntimeError`, 남의 팩(비공개)은
     `PackNotFoundError`, 남의 공개 팩은 `PackForbiddenError`, 등록부 미가용은
@@ -3532,22 +3740,26 @@ def load_chunks(
     # 배포에서 비소유자 호출이 거부 대신 "0건 성공" 으로 보인다 — 거부 여부가
     # 배포 형태에 좌우돼선 안 된다.
     authorize(sql, principal, pack_name)
-    if not vec.available:
-        print(f"  [{pack_name}] Chroma 미가용 → 청크 skip", flush=True)
-        return 0, 0
-
     ok = err = 0
     # #671: 벡터와 doc 저장소가 같은 SharedSqliteFile을 나눠 쓰면 한 트랜잭션으로 쓴다.
     # 아니면(기본) 아래 기존 경로가 한 줄도 달라지지 않는다.
-    pg_uow = common_pg_uow(vec, docs, sql)
     sqlite_shared = is_single_file(vec, docs, sql)
+    if not sqlite_shared and not vec.available:
+        print(f"  [{pack_name}] Chroma 미가용 -> 청크 skip", flush=True)
+        return 0, 0
+    pg_uow = common_pg_uow(vec, docs, sql)
     if pg_uow is not None and sqlite_shared:
         raise RuntimeError("chunk stores cannot mix shared PostgreSQL and SQLite units of work")
     atomic = pg_uow is not None or sqlite_shared
     shared = sql.shared_file if sqlite_shared else None
-    if (pg_uow is not None and pg_uow.active) or (shared is not None and shared.in_unit_of_work):
+    if (pg_uow is not None and pg_uow.active) or (shared is not None and (shared.in_unit_of_work or shared.connection().in_transaction)):
         raise RuntimeError("chunk loader cannot run inside a shared unit of work")
-    incarnation = shared.pack_incarnation(pack_name) if shared is not None else None
+    shared, incarnation = _loader_shared_entry(
+        sql, principal, pack_name, docs=docs, vec=vec, incremental=False)
+
+    def write_unit():
+        return _loader_write_unit(shared, sql, principal, pack_name, incarnation,
+                                  docs=docs, vec=vec, pg_uow=pg_uow)
     seen_ids: set[str]  = set()   # 중복 청크 ID dedup
     b_texts: list[str]  = []
     b_ids:   list[str]  = []
@@ -3568,18 +3780,15 @@ def load_chunks(
             try:
                 if vector is None:
                     vector = vec.prepare_upsert_vectors([txt])[0]
-                with _chunk_transaction(pg_uow, shared, sql):
-                    if incarnation is not None:
-                        shared.validate_pack_writes({pack_name: incarnation})
+                with write_unit():
                     vec.upsert_precomputed([txt], [meta], [sid], [vector])
                     docs.upsert_source(sid, txt, meta)
-            except _ChunkTransactionStartError as exc:
-                raise exc.original
-            except ChunkTransactionUncertainError:
-                raise
             except Exception as exc_unit:
                 err += 1
-                log.warning("청크 개별 오류(%s) %s: %s", pack_name, sid[:8], exc_unit)
+                if shared is not None:
+                    log.warning("청크 개별 오류(%s) %s reason=chunk_write_failed", pack_name, sid)
+                else:
+                    log.warning("청크 개별 오류(%s) %s: %s", pack_name, (sid if shared is not None else sid[:8]), exc_unit)
                 return False
             ok += 1
             return True
@@ -3587,13 +3796,13 @@ def load_chunks(
             vec.upsert_texts(texts=[txt], ids=[sid], metadatas=[meta])
         except Exception as exc2:
             err += 1
-            log.warning("청크 개별 오류(%s) %s: %s", pack_name, sid[:8], exc2)
+            log.warning("청크 개별 오류(%s) %s: %s", pack_name, (sid if shared is not None else sid[:8]), exc2)
             return False
         try:
             docs.upsert_source(sid, txt, meta)
         except Exception as exc3:
             err += 1
-            log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
+            log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, (sid if shared is not None else sid[:8]), exc3)
             return False
         ok += 1
         return True
@@ -3609,18 +3818,30 @@ def load_chunks(
             vectors = None
             try:
                 vectors = vec.prepare_upsert_vectors(b_texts)
-                with _chunk_transaction(pg_uow, shared, sql):
-                    if incarnation is not None:
-                        shared.validate_pack_writes({pack_name: incarnation})
+                if shared is not None and len(vectors) != len(b_texts):
+                    raise ValueError("embedding result count differs from chunk count")
+            except Exception:
+                if shared is not None:
+                    for sid in b_ids:
+                        log.warning("청크 준비 오류(%s) %s reason=embedding_preparation_failed", pack_name, sid)
+                    err += len(b_ids)
+                    b_texts.clear()
+                    b_ids.clear()
+                    b_metas.clear()
+                    return
+                vectors = None
+            try:
+                if vectors is None:
+                    raise RuntimeError("chunk batch preparation failed")
+                with write_unit():
                     vec.upsert_precomputed(b_texts, b_metas, b_ids, vectors)
                     for sid, txt, meta in zip(b_ids, b_texts, b_metas):
                         docs.upsert_source(sid, txt, meta)
-            except _ChunkTransactionStartError as exc:
-                raise exc.original
-            except ChunkTransactionUncertainError:
-                raise
             except Exception as exc:
-                log.warning("청크 배치 롤백(%s), 건별 재시도: %s", pack_name, exc)
+                if shared is not None:
+                    log.warning("청크 배치 롤백(%s) reason=batch_write_failed", pack_name)
+                else:
+                    log.warning("청크 배치 롤백(%s), 건별 재시도: %s", pack_name, exc)
                 for index, (sid, txt, meta) in enumerate(zip(b_ids, b_texts, b_metas)):
                     flush_single(sid, txt, meta, None if vectors is None or index >= len(vectors) else vectors[index])
             else:
@@ -3643,7 +3864,7 @@ def load_chunks(
                     except Exception as exc3:
                         doc_failed += 1
                         err += 1
-                        log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
+                        log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, (sid if shared is not None else sid[:8]), exc3)
                 ok += len(b_texts) - doc_failed
         b_texts.clear()
         b_ids.clear()
@@ -3671,6 +3892,7 @@ def load_chunks(
     return ok, err
 
 
+@_loader_write_boundary
 def load_chunks_incremental(
     pack_name: str,
     chunks_file: Path,
@@ -3695,8 +3917,11 @@ def load_chunks_incremental(
     세지 않는다. 보류한 행은 `vec_unrecovered` 에 세어지고 경고가 남는다.
     반환 형태는 그대로다.
 
-    `sql` 과 인가 계약은 `load_chunks` 와 같다(#205) — 키워드 전용 필수 인자,
-    호출당 1회 소유자 검사, 첫 쓰기 이전 거부. 그쪽 docstring 이 정본이다.
+    `sql`과 단위별 재인가, 시작 세대, 준비 실패 집계 및 공개 중단 예외는
+    `load_chunks`의 계약을 따른다. 단일 SQLite 모드는 공유 구성, 원본 FTS와 벡터를 확인한다.
+    `read_source_state_exact`와 `rewrite_source_metadata`도 첫 쓰기 전에 요구한다.
+    callable `vec.update_metadata`는 공유 단위에 합류하지 못하므로 진입에서 거부한다.
+    메타데이터 대조와 벡터 및 원본 변경은 같은 단위에서 실행한다.
 
     `recover_vectors`(#332, 기본 `False`): R1(아래)의 존재 확인은 `_live_vec_ids`
     가 이 팩의 벡터 ID를 **열거**할 수 있는 백엔드에서만 동작한다. 열거를
@@ -3730,9 +3955,14 @@ def load_chunks_incremental(
         raise RuntimeError("chunk stores cannot mix shared PostgreSQL and SQLite units of work")
     atomic = pg_uow is not None or sqlite_shared
     shared = sql.shared_file if sqlite_shared else None
-    if (pg_uow is not None and pg_uow.active) or (shared is not None and shared.in_unit_of_work):
+    if (pg_uow is not None and pg_uow.active) or (shared is not None and (shared.in_unit_of_work or shared.connection().in_transaction)):
         raise RuntimeError("chunk loader cannot run inside a shared unit of work")
-    incarnation = shared.pack_incarnation(pack_name) if shared is not None else None
+    shared, incarnation = _loader_shared_entry(
+        sql, principal, pack_name, docs=docs, vec=vec, incremental=True)
+
+    def write_unit():
+        return _loader_write_unit(shared, sql, principal, pack_name, incarnation,
+                                  docs=docs, vec=vec, pg_uow=pg_uow)
     seen_ids: set[str]  = set()   # 중복 청크 ID dedup
     bypack_ids: set[str] = set()
     b_texts: list[str]  = []
@@ -3765,18 +3995,15 @@ def load_chunks_incremental(
             try:
                 if vector is None:
                     vector = vec.prepare_upsert_vectors([txt])[0]
-                with _chunk_transaction(pg_uow, shared, sql):
-                    if incarnation is not None:
-                        shared.validate_pack_writes({pack_name: incarnation})
+                with write_unit():
                     vec.upsert_precomputed([txt], [meta], [sid], [vector])
                     docs.upsert_source(sid, txt, meta)
-            except _ChunkTransactionStartError as exc:
-                raise exc.original
-            except ChunkTransactionUncertainError:
-                raise
             except Exception as exc:
                 err += 1
-                log.warning("증분 청크 오류(%s) %s: %s", pack_name, sid[:8], exc)
+                if shared is not None:
+                    log.warning("증분 청크 오류(%s) %s reason=chunk_write_failed", pack_name, sid)
+                else:
+                    log.warning("증분 청크 오류(%s) %s: %s", pack_name, (sid if shared is not None else sid[:8]), exc)
                 return
             if kind == "new":
                 c_new += 1
@@ -3787,13 +4014,13 @@ def load_chunks_incremental(
             vec.upsert_texts(texts=[txt], ids=[sid], metadatas=[meta])
         except Exception as exc2:
             err += 1
-            log.warning("청크 개별 오류(%s) %s: %s", pack_name, sid[:8], exc2)
+            log.warning("청크 개별 오류(%s) %s: %s", pack_name, (sid if shared is not None else sid[:8]), exc2)
             return
         try:
             docs.upsert_source(sid, txt, meta)
         except Exception as exc3:
             err += 1
-            log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
+            log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, (sid if shared is not None else sid[:8]), exc3)
             return
         if kind == "new":
             c_new += 1
@@ -3808,18 +4035,31 @@ def load_chunks_incremental(
             vectors = None
             try:
                 vectors = vec.prepare_upsert_vectors(b_texts)
-                with _chunk_transaction(pg_uow, shared, sql):
-                    if incarnation is not None:
-                        shared.validate_pack_writes({pack_name: incarnation})
+                if shared is not None and len(vectors) != len(b_texts):
+                    raise ValueError("embedding result count differs from chunk count")
+            except Exception:
+                if shared is not None:
+                    for sid in b_ids:
+                        log.warning("청크 준비 오류(%s) %s reason=embedding_preparation_failed", pack_name, sid)
+                    err += len(b_ids)
+                    b_texts.clear()
+                    b_ids.clear()
+                    b_metas.clear()
+                    b_kinds.clear()
+                    return
+                vectors = None
+            try:
+                if vectors is None:
+                    raise RuntimeError("chunk batch preparation failed")
+                with write_unit():
                     vec.upsert_precomputed(b_texts, b_metas, b_ids, vectors)
                     for sid, txt, meta in zip(b_ids, b_texts, b_metas):
                         docs.upsert_source(sid, txt, meta)
-            except _ChunkTransactionStartError as exc:
-                raise exc.original
-            except ChunkTransactionUncertainError:
-                raise
             except Exception as exc:
-                log.warning("증분 청크 배치 롤백(%s), 건별 재시도: %s", pack_name, exc)
+                if shared is not None:
+                    log.warning("증분 청크 배치 롤백(%s) reason=batch_write_failed", pack_name)
+                else:
+                    log.warning("증분 청크 배치 롤백(%s), 건별 재시도: %s", pack_name, exc)
                 for index, (sid, txt, meta, kind) in enumerate(zip(b_ids, b_texts, b_metas, b_kinds)):
                     flush_single(sid, txt, meta, kind, None if vectors is None or index >= len(vectors) else vectors[index])
             else:
@@ -3844,7 +4084,7 @@ def load_chunks_incremental(
                     docs.upsert_source(sid, txt, meta)
                 except Exception as exc3:
                     err += 1
-                    log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, sid[:8], exc3)
+                    log.warning("청크 doc 쓰기 오류(%s) %s: %s", pack_name, (sid if shared is not None else sid[:8]), exc3)
                     continue
                 if kind == "new":
                     c_new += 1
@@ -3884,9 +4124,7 @@ def load_chunks_incremental(
                 b_kinds.append("txt")
             elif strip_retired_keys(live[1]) != meta:
                 try:
-                    with (_chunk_transaction(pg_uow, shared, sql) if atomic else contextlib.nullcontext()):
-                        if incarnation is not None:
-                            shared.validate_pack_writes({pack_name: incarnation})
+                    with (write_unit() if atomic else contextlib.nullcontext()):
                         updated = _vec_meta_update(vec, chunk_id, meta, pack_name)
                         if updated:
                             state_reader = getattr(docs, "read_source_state_exact", None)
@@ -3902,13 +4140,12 @@ def load_chunks_incremental(
                         b_metas.append(meta)
                         b_kinds.append("txt")
                         continue
-                except _ChunkTransactionStartError as exc:
-                    raise exc.original
-                except ChunkTransactionUncertainError:
-                    raise
                 except Exception as exc:
                     err += 1
-                    log.warning("청크 메타갱신 오류(%s) %s: %s", pack_name, chunk_id[:8], exc)
+                    if shared is not None:
+                        log.warning("청크 메타갱신 오류(%s) %s reason=metadata_write_failed", pack_name, chunk_id)
+                    else:
+                        log.warning("청크 메타갱신 오류(%s) %s: %s", pack_name, (chunk_id if shared is not None else chunk_id[:8]), exc)
             elif vec_set is not None and chunk_id not in vec_set:
                 # R1: 텍스트·메타 모두 라이브와 동일하지만 벡터가 없다(부분 복원·
                 # 백엔드 삭제로 유실). same 으로 넘기면 다음 증분도 텍스트·메타가
@@ -3918,7 +4155,7 @@ def load_chunks_incremental(
                 b_texts.append(row["text"])
                 b_metas.append(meta)
                 b_kinds.append("txt")
-                log.warning("벡터 유실 회수(%s) %s", pack_name, chunk_id[:8])
+                log.warning("벡터 유실 회수(%s) %s", pack_name, (chunk_id if shared is not None else chunk_id[:8]))
             elif vec_set is None and vec_get_by_id is not None:
                 # #332: 열거 불가 백엔드지만 단건 조회는 지원하고
                 # recover_vectors=True 다 — chunk_id 하나로 존재를 확인한다.
@@ -3927,9 +4164,12 @@ def load_chunks_incremental(
                 except Exception as exc:
                     vec_unrecovered += 1
                     c_same += 1
-                    log.warning(
-                        "청크 단건 벡터 조회 오류(%s) %s: %s — 미확인으로 남긴다",
-                        pack_name, chunk_id[:8], exc)
+                    if shared is not None:
+                        log.warning("청크 벡터 조회 오류(%s) %s reason=vector_read_failed", pack_name, chunk_id)
+                    else:
+                        log.warning(
+                            "청크 단건 벡터 조회 오류(%s) %s: %s — 미확인으로 남긴다",
+                            pack_name, chunk_id[:8], exc)
                 else:
                     # get_by_id 는 pack_id 로 좁히지 않는다(3 백엔드 공통, node_id
                     # 단일 키 조회) — 슬롯을 다른 팩이 차지했으면 "존재"로 오판해
@@ -3947,7 +4187,7 @@ def load_chunks_incremental(
                         b_metas.append(meta)
                         b_kinds.append("txt")
                         log.warning(
-                            "벡터 유실 회수(단건조회, %s) %s", pack_name, chunk_id[:8])
+                            "벡터 유실 회수(단건조회, %s) %s", pack_name, (chunk_id if shared is not None else chunk_id[:8]))
                     else:
                         c_same += 1
             elif vec_set is None:
@@ -3987,6 +4227,7 @@ def load_chunks_incremental(
     return c_new, c_txt, c_meta, c_same, err, bypack_ids, vec_unrecovered
 
 
+@_loader_write_boundary
 def incremental_finalize(
     pack_name: str,
     graph,
@@ -4012,8 +4253,12 @@ def incremental_finalize(
     `authorize(sql, principal, pack_name)` 순으로 건 뒤에야 어떤 스토어에든 닿는다.
     바인딩됐어도 이 팩의 소유자가 아니면(또는 팩이 ready 가 아니면)
     `PackNotFoundError`/`PackForbiddenError` 로 아무것도 지우지 않고 끝난다. 청크 축
-    `load_chunks_incremental` 과 같은 호출당 1회 검사이며 같은 의도한 모서리(적재 도중
-    소유권 변경)를 갖는다. 호출자는 증분 적재에 넘긴 것과 같은 등록부 `SQLStore` 를 넘긴다.
+    비공유 모드는 호출당 1회 검사한다. 단일 SQLite 모드는 지원 삭제 저널, 그래프,
+    BM25, 원본 FTS와 벡터를 진입에서 확인한다. 활성 UOW와 원시 트랜잭션은 거부한다.
+    직접 삭제 단위마다 시작 세대와 요청 팩을 검증하고 재인가한다. 확인된 rollback 뒤
+    벡터와 원본 배치만 건별로 복구한다. 시작, 미확인 결과, rollback_only와 정리 오류는
+    실행 전체를 중단한다. 이미 커밋된 단위는 유지한다. 호출 사이 원자성은 보장하지 않는다.
+    호출자는 증분 적재에 넘긴 것과 같은 등록부 `SQLStore`를 넘긴다.
 
     삭제 순서(#636): 후보 노드의 doc 행을 먼저 지우고, 그 뒤 그래프 노드를 지운다. 한
     노드의 doc 행을 지우다 예외가 나면 그 노드는 이번 실행에서 그래프에 남기고 건수를 경고로
@@ -4034,12 +4279,13 @@ def incremental_finalize(
     require_live_data("incremental_finalize")
     principal = _require_bound_principal()
     authorize(sql, principal, pack_name)
-    if is_single_file(graph, docs, vec, sql):
-        marker = sql.shared_file.connection().execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-        ).fetchone()
-        if marker is not None:
-            raise RuntimeError("single SQLite incremental deletion is not yet supported")
+    shared, incarnation = _loader_shared_entry(
+        sql, principal, pack_name, docs=docs, graph=graph, vec=vec, node_indexes=True)
+
+    def write_unit():
+        return _loader_write_unit(shared, sql, principal, pack_name, incarnation,
+                                  docs=docs, graph=graph, vec=vec, node_indexes=True)
+
     _require_sql_hooks(graph, _GRAPH_SQL_HOOKS, "graph 스토어")
     _require_sql_hooks(docs, _DOC_SQL_HOOKS, "doc 스토어")
     live_nodes  = live["nodes"]
@@ -4122,10 +4368,14 @@ def incremental_finalize(
     for node_id in doc_del_candidates:
         for space in doc_node_spaces[node_id]:
             try:
-                ok_del = docs.delete_node_doc(space, node_id)
+                with write_unit():
+                    ok_del = docs.delete_node_doc(space, node_id)
             except Exception as exc:
                 doc_failed.add(node_id)
-                log.warning("doc 고아 삭제 오류(%s) %s space=%s: %s", pack_name, node_id, space, exc)
+                if shared is not None:
+                    log.warning("doc 고아 삭제 오류(%s) %s/%s reason=doc_delete_failed", pack_name, space, node_id)
+                else:
+                    log.warning("doc 고아 삭제 오류(%s) %s space=%s: %s", pack_name, node_id, space, exc)
                 continue
             if ok_del:
                 doc_orphan_del += 1
@@ -4153,35 +4403,56 @@ def incremental_finalize(
         vec_orphans = [
             i for i in live_vecids - (bypack_node_ids | bypack_chunk_ids) if not _is_anchor(i)
         ]
-        for batch in _batched(vec_orphans):
-            try:
-                # vec.delete는 요청 개수만 안다(실제 삭제 건수를 돌려주지 않는다) —
-                # 아래 카운트는 "요청 수"이지 확인된 삭제 수가 아니다.
-                # **이 자리는 #161(적재 완료 판정 계약)이 소유한다.** `delete_pack` 의 같은
-                # 결함은 #165 에서 재조회 확인으로 닫혔지만, 여기(와 아래 청크 벡터 삭제)는
-                # 원장과 처분 계약과 함께 바뀌어야 해서 그대로 남겨 뒀다. 고칠 때는 #165 가
-                # 세운 어휘를 쓴다: 확인된 수만 숫자로 내고 미확인은 `None`.
-                vec.delete(batch)
-                vec_orphan_del += len(batch)
-            except Exception as exc:
-                vec_failed.update(batch)
-                log.warning("벡터 고아 삭제 오류(%s): %s", pack_name, exc)
-        # 청크 벡터: evidence 노드 id == 청크 id 공유 팩에서 청크만 사라지고 노드가 남는
-        # id의 벡터는 보존한다(노드 벡터 겸용, 오삭제 방지, 2026-07-22). 한 번에 부른다.
-        # 이 호출이 실패하면 이번 실행의 청크 원본 삭제를 그 대상 전부에 대해 미룬다.
+        def delete_vectors(ids, *, orphan):
+            nonlocal vec_orphan_del
+            for batch in _batched(ids):
+                try:
+                    with write_unit():
+                        vec.delete(batch)
+                except Exception as exc:
+                    if shared is None:
+                        vec_failed.update(batch)
+                        log.warning("벡터 삭제 오류(%s): %s", pack_name, exc)
+                        continue
+                    for sid in batch:
+                        try:
+                            with write_unit():
+                                vec.delete([sid])
+                        except Exception:
+                            vec_failed.add(sid)
+                            log.warning("벡터 삭제 오류(%s) %s reason=vector_delete_failed", pack_name, sid)
+                        else:
+                            if orphan:
+                                vec_orphan_del += 1
+                else:
+                    if orphan:
+                        vec_orphan_del += len(batch)
+
         vec_del_ids = [i for i in chunk_del_candidates if i not in bypack_node_ids]
-        try:
-            if vec_del_ids:
-                vec.delete(vec_del_ids)
-        except Exception as exc:
-            vec_failed.update(vec_del_ids)
-            log.warning("청크 벡터 삭제 오류(%s): %s", pack_name, exc)
+        if shared is not None:
+            delete_vectors(vec_orphans, orphan=True)
+            delete_vectors(vec_del_ids, orphan=False)
+        else:
+            for batch in _batched(vec_orphans):
+                try:
+                    vec.delete(batch)
+                    vec_orphan_del += len(batch)
+                except Exception as exc:
+                    vec_failed.update(batch)
+                    log.warning("벡터 고아 삭제 오류(%s): %s", pack_name, exc)
+            try:
+                if vec_del_ids:
+                    vec.delete(vec_del_ids)
+            except Exception as exc:
+                vec_failed.update(vec_del_ids)
+                log.warning("청크 벡터 삭제 오류(%s): %s", pack_name, exc)
     # vec_mode == "absent": 벡터 저장소가 없다. 지울 벡터가 없으므로 부르지 않는다.
 
     # ── 노드 삭제: doc 행과 벡터를 다 지운 노드만 ───────────────────────────
     # doc 삭제는 여기서 하지 않는다. 위 doc 축 정리(doc_del_candidates)가 이 node_id 의
     # 모든 space 를 한 번에 지운다. 예전엔 여기서 live_nodes 의 space_id 하나만 지워서
     # 다른 space 의 행을 놓쳤다(F4-d, 2026-08-11 설계 지적).
+    cascaded_edges = set()
     node_deferred = node_vec_deferred = 0
     for node_id in node_del_candidates:
         if node_id in doc_failed:
@@ -4192,9 +4463,20 @@ def incremental_finalize(
             continue
         node_type, _space_id, _props = live_nodes[node_id]
         try:
-            deleted = graph.delete_node(node_type, node_id)
+            with write_unit():
+                incident = set()
+                if shared is not None:
+                    incident = {tuple(row) for row in shared.connection().execute(
+                        "SELECT from_id, relation, to_id FROM main.graph_edges WHERE from_id=? OR to_id=?",
+                        (node_id, node_id))}
+                deleted = graph.delete_node(node_type, node_id)
+            if deleted and shared is not None:
+                cascaded_edges.update(incident)
         except Exception as exc:
-            log.warning("노드 삭제 오류(%s) %s type=%s: %s", pack_name, node_id, node_type, exc)
+            if shared is not None:
+                log.warning("노드 삭제 오류(%s) %s/%s reason=node_delete_failed", pack_name, node_type, node_id)
+            else:
+                log.warning("노드 삭제 오류(%s) %s type=%s: %s", pack_name, node_id, node_type, exc)
             continue
         if deleted:
             node_del += 1
@@ -4214,9 +4496,20 @@ def incremental_finalize(
             delete_sources = getattr(docs, "delete_sources_with_state", None)
             if not callable(delete_sources):
                 raise RuntimeError("doc store lacks source-state delete boundary")
-            chunk_del += delete_sources(batch)
+            with write_unit():
+                deleted_sources = delete_sources(batch)
+            chunk_del += deleted_sources
         except Exception as exc:
-            log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
+            if shared is None:
+                log.warning("청크 삭제 오류(%s): %s", pack_name, exc)
+                continue
+            for sid in batch:
+                try:
+                    with write_unit():
+                        deleted_sources = delete_sources([sid])
+                    chunk_del += deleted_sources
+                except Exception:
+                    log.warning("청크 삭제 오류(%s) %s reason=source_delete_failed", pack_name, sid)
     if node_vec_deferred or chunk_vec_deferred:
         log.warning(
             "벡터 삭제 미확인 보류(%s): 그래프 노드 %d건, 청크 원본 %d건. 벡터를 먼저 "
@@ -4242,9 +4535,21 @@ def incremental_finalize(
         try:
             # Ownership-scoped public mutation.  It also handles a cascade
             # that already removed the row without double-counting it.
-            edge_del += int(graph.delete_edge(f_id, r, t_id, owner_pack_id=pack_name))
+            with write_unit():
+                deleted_edge = graph.delete_edge(f_id, r, t_id, owner_pack_id=pack_name)
+                if shared is not None and not deleted_edge:
+                    absent = shared.connection().execute(
+                        "SELECT 1 FROM main.graph_edges WHERE from_id=? AND relation=? AND to_id=?",
+                        (f_id, r, t_id)).fetchone() is None
+                    cascade = absent and (f_id, r, t_id) in cascaded_edges
+                    log.warning("엣지 삭제 반환 False(%s) %s-%s->%s reason=%s", pack_name,
+                                f_id, r, t_id, "confirmed_node_cascade" if cascade else "missing_or_owner_conflict")
+            edge_del += int(deleted_edge)
         except Exception as exc:
-            log.warning("엣지 삭제 오류(%s) %s-%s->%s: %s", pack_name, f_id[:8], r, t_id[:8], exc)
+            if shared is not None:
+                log.warning("엣지 삭제 오류(%s) %s-%s->%s reason=edge_delete_failed", pack_name, f_id, r, t_id)
+            else:
+                log.warning("엣지 삭제 오류(%s) %s-%s->%s: %s", pack_name, f_id[:8], r, t_id[:8], exc)
 
     # ── 3원 대사 출력 (assert 아님 — 숫자 보고) ────────────────────────────
     counts = pack_live_counts(pack_name, graph, docs, vec)

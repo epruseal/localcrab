@@ -56,7 +56,7 @@ opencrab serve
 | 벡터 | `SqliteVecStore` (기본) / `ChromaStore` (옵션) | `vectors.db` / `chroma/` |
 | SQL | SQLStore (SQLite) | `opencrab.db` |
 
-**단일 파일 배치(선택, 기본 꺼짐):** `SINGLE_SQLITE_FILE`에 root 안 `single.db`의 절대 경로를 주면 graph, doc, vector, sql 저장소가 한 SQLite 파일을 나눠 쓴다. root에는 `single.db`, `billing.db`, `ledger.json`, `manifest.json`, `marker.json`, `single.db.lifetime.lock`이 있고 `STORAGE_MODE=local`, sqlite-vec 벡터 백엔드, `LOCAL_DATA_DIR`=root가 전제다. 다섯 파일 디렉터리를 root로 바꾸는 절차와 도구는 [마이그레이션](#마이그레이션)을 본다. 설계와 지원하지 않는 기능은 [docs/issue-671-single-db-conversion.md](./docs/issue-671-single-db-conversion.md)에 있다.
+**단일 파일 배치(선택, 기본 꺼짐):** `SINGLE_SQLITE_FILE`에 root 안 `single.db`의 절대 경로를 주면 graph, doc, vector, sql 저장소가 한 SQLite 파일을 나눠 쓴다. root에는 `single.db`, `billing.db`, `ledger.json`, `manifest.json`, `marker.json`, `single.db.lifetime.lock`이 있고 `STORAGE_MODE=local`, sqlite-vec 벡터 백엔드, `LOCAL_DATA_DIR`=root가 전제다. 다섯 파일 디렉터리를 root로 바꾸는 절차와 도구는 [마이그레이션](#마이그레이션)을 본다. 지원 스키마의 단일 모드는 팩 증분 노드, 청크와 마감 삭제를 처리한다. 로더는 진입과 실제 쓰기 단위에서 필요한 구성을 확인한다. 노드 빌더는 임베딩 뒤 실제 단위에서 구성과 시작 세대 및 요청 팩을 재검증하고 재인가한다. 직접 청크는 미사용 노드 등록부와 BM25를 요구하지 않는다. 행별 소유 충돌은 해당 행을 보존하고 전체 요청 키와 고정 사유 코드로 경고한다. 설계와 지원하지 않는 기능은 [docs/issue-671-single-db-conversion.md](./docs/issue-671-single-db-conversion.md)에 있다.
 
 > 벡터 백엔드 기본값은 조건부입니다(`EMBEDDING_BACKEND`·`STORAGE_MODE`에 따라 결정). 상세: [벡터 스토어 백엔드 섹션](#벡터-스토어-백엔드-vector_backend), [벡터 백엔드 매트릭스](./docs/vector-backends.md).
 

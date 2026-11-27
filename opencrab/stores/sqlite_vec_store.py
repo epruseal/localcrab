@@ -362,11 +362,11 @@ class SqliteVecStore(_SqliteConnMixin):
         vec0 표도 없는 새 DB는 통과시켜 종전처럼 첫 생성을 한다. 이름은 SQLite 식별자 규칙대로 ASCII 대소문자를
         구분하지 않고 비교한다.
         """
-        named = conn.execute(
-            "SELECT name, type, sql FROM sqlite_master "
-            "WHERE type IN ('table', 'view', 'index') AND lower(name) = lower(?)",
-            (self._table,),
-        ).fetchall()
+        from opencrab.stores._single_file import ascii_identifier
+
+        named = [row for row in conn.execute(
+            "SELECT name, type, sql FROM main.sqlite_master WHERE type IN ('table', 'view', 'index')"
+        ) if ascii_identifier(row[0]) == ascii_identifier(self._table)]
         found = [
             (name, _declared_dim(sql))
             for name, sql in conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'")
@@ -507,6 +507,23 @@ class SqliteVecStore(_SqliteConnMixin):
             json.dumps(meta),
         )
 
+    def _require_pack_owners(self, owners) -> None:
+        shared = self._shared
+        if shared is None or not shared.in_unit_of_work:
+            return
+        if shared.connection().execute(
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+        ).fetchone() is None:
+            return
+        if shared._uow.delete_operation is None:
+            requested = shared.require_requested_pack()
+            valid = all(owner == requested for owner in owners)
+        else:
+            valid = all(owner and owner in shared._uow.validated_packs for owner in owners)
+        if not valid:
+            shared.mark_rollback_only()
+            raise RuntimeError("vector owner is not validated")
+
     def add_texts(
         self,
         texts: list[str],
@@ -530,15 +547,7 @@ class SqliteVecStore(_SqliteConnMixin):
         vectors = self._embed(texts)
         insert_sql = self._insert_sql()
         with self._tx() as conn:
-            if self._shared is not None and self._shared.in_unit_of_work:
-                marker = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-                ).fetchone()
-                if marker is not None:
-                    validated = self._shared._uow.validated_packs
-                    if any(not slot_owner(meta) or slot_owner(meta) not in validated for meta in clean_meta):
-                        self._shared.mark_rollback_only()
-                        raise RuntimeError("vector owner is not validated")
+            self._require_pack_owners([slot_owner(meta) for meta in clean_meta])
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
                 conn.execute(insert_sql, self._insert_params(_id, text, meta, vec))
         self._invalidate_ann_after_write()  # in-process write: invalidate ANN cache
@@ -599,16 +608,7 @@ class SqliteVecStore(_SqliteConnMixin):
         insert_sql = self._insert_sql()
         with self._tx() as conn:
             owners = self._slot_owners(conn, ids)
-            if self._shared is not None and self._shared.in_unit_of_work:
-                marker = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-                ).fetchone()
-                if marker is not None:
-                    validated = self._shared._uow.validated_packs
-                    incoming = [slot_owner(meta) for meta in clean_meta]
-                    if any(not owner or owner not in validated for owner in incoming + list(owners.values())):
-                        self._shared.mark_rollback_only()
-                        raise RuntimeError("vector owner is not validated")
+            self._require_pack_owners([slot_owner(meta) for meta in clean_meta] + list(owners.values()))
             reject_foreign_slot_writes(ids, clean_meta, owners)
             for _id, text, meta, vec in zip(ids, texts, clean_meta, vectors):
                 incoming = slot_owner(meta)
@@ -644,10 +644,13 @@ class SqliteVecStore(_SqliteConnMixin):
                     try:
                         owner = self._slot_owners(conn, [_id]).get(_id) or ""
                     except Exception:  # noqa: BLE001 -- 위 주석의 이유로 전 범위
-                        logger.warning(
-                            "SqliteVecStore: 소유자 재조회 실패(%s) — 최초 예외를 그대로 "
-                            "올린다", _id, exc_info=True,
-                        )
+                        if self._shared is not None and self._shared.safe_log_active:
+                            logger.warning("vector owner recheck failed: id=%s code=owner_recheck_failed", _id)
+                        else:
+                            logger.warning(
+                                "SqliteVecStore: 소유자 재조회 실패(%s): 최초 예외를 그대로 "
+                                "올린다", _id, exc_info=True,
+                            )
                         raise exc from None
                     if owner and owner != incoming:
                         # 남의 팩 id 를 메시지에 담지 않는다. 이 텍스트는 쓰기
@@ -695,15 +698,7 @@ class SqliteVecStore(_SqliteConnMixin):
             return
         with self._tx() as conn:
             if self._shared is not None and self._shared.in_unit_of_work:
-                marker = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-                ).fetchone()
-                if marker is not None:
-                    owners = self._slot_owners(conn, ids)
-                    validated = self._shared._uow.validated_packs
-                    if any(not owner or owner not in validated for owner in owners.values()):
-                        self._shared.mark_rollback_only()
-                        raise RuntimeError("vector owner is not validated")
+                self._require_pack_owners(list(self._slot_owners(conn, ids).values()))
             for _id in ids:
                 conn.execute(f"DELETE FROM {self._table} WHERE node_id = ?", (_id,))
         self._invalidate_ann_after_write()  # in-process write: invalidate ANN cache
@@ -716,7 +711,7 @@ class SqliteVecStore(_SqliteConnMixin):
         self._require_available()
         if self._shared is not None:
             marker = self._shared.connection().execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='pack_delete_operations'"
             ).fetchone()
             if marker is not None:
                 if self._shared.in_unit_of_work:
@@ -1310,13 +1305,7 @@ class SqliteVecStore(_SqliteConnMixin):
             return []
         insert_sql = self._insert_sql()
         with self._tx() as conn:
-            if self._shared is not None and self._shared.in_unit_of_work:
-                marker = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-                ).fetchone()
-                if marker is not None and pack_id not in self._shared._uow.validated_packs:
-                    self._shared.mark_rollback_only()
-                    raise RuntimeError("vector owner is not validated")
+            self._require_pack_owners([pack_id])
             for record in clean:
                 meta = _sanitize_metadata(record["metadata"])
                 conn.execute(

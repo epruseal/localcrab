@@ -112,13 +112,27 @@ def write_lock_for_store(
 
 
 @contextlib.contextmanager
-def shared_write_unit(sql_store: Any, *, outcome: dict | None = None):
+def shared_write_unit(sql_store: Any, *, outcome: dict | None = None, safe_log: bool = False):
     """독립 쓰기는 write.lock 뒤 공유 트랜잭션을 연다."""
     shared = sql_store.shared_file
     lock = contextlib.nullcontext() if shared.in_unit_of_work else write_lock_for_store(sql_store)
-    with lock:
-        with shared.unit_of_work(outcome=outcome) as conn:
-            yield conn
+    entered_lock = False
+    unit_error = None
+    try:
+        with lock:
+            entered_lock = True
+            try:
+                with shared.unit_of_work(outcome=outcome, safe_log=safe_log) as conn:
+                    yield conn
+            except BaseException as exc:
+                unit_error = exc
+                if outcome is not None:
+                    outcome["unit_error"] = exc
+                raise
+    except BaseException as exc:
+        if outcome is not None and entered_lock and exc is not unit_error:
+            outcome["cleanup_error"] = exc
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -908,7 +922,7 @@ class SQLStore:
             return
         conn = self._shared.connection()
         marker = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='pack_delete_operations'"
         ).fetchone()
         if marker is None:
             return
@@ -978,17 +992,18 @@ class SQLStore:
         if self._shared is not None and self._shared.in_unit_of_work:
             with self._shared.joined_tx() as conn:
                 marker = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                    "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='pack_delete_operations'"
                 ).fetchone()
                 if marker is not None:
-                    import json
+                    from opencrab.common.graph_identity import parse_properties_object
 
-                    row = conn.execute("SELECT properties FROM graph_nodes WHERE node_id=?", (node_id,)).fetchone()
+                    requested = (self._shared.require_requested_pack() if self._shared._uow.delete_operation is None else None)
+                    row = conn.execute("SELECT properties FROM main.graph_nodes WHERE node_id=?", (node_id,)).fetchone()
                     try:
-                        owner = json.loads(row[0]).get("pack_id") if row else None
-                    except (TypeError, ValueError, AttributeError):
+                        owner = parse_properties_object(row[0]).get("pack_id") if row else None
+                    except (ValueError, RecursionError):
                         owner = None
-                    if not isinstance(owner, str) or owner not in self._shared._uow.validated_packs:
+                    if not isinstance(owner, str) or (owner != requested if requested is not None else owner not in self._shared._uow.validated_packs):
                         self._shared.mark_rollback_only()
                         raise RuntimeError("registry node owner is not validated")
                 conn.execute(str(sql), params)
@@ -1022,20 +1037,21 @@ class SQLStore:
         if self._shared is not None and self._shared.in_unit_of_work:
             with self._shared.joined_tx() as conn:
                 marker = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+                    "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='pack_delete_operations'"
                 ).fetchone()
                 if marker is not None:
-                    import json
+                    from opencrab.common.graph_identity import parse_properties_object
 
+                    requested = (self._shared.require_requested_pack() if self._shared._uow.delete_operation is None else None)
                     row = conn.execute(
-                        "SELECT properties FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?",
+                        "SELECT properties FROM main.graph_edges WHERE from_id=? AND relation=? AND to_id=?",
                         (from_id, relation, to_id),
                     ).fetchone()
                     try:
-                        owner = json.loads(row[0]).get("pack_id") if row else None
-                    except (TypeError, ValueError, AttributeError):
+                        owner = parse_properties_object(row[0]).get("pack_id") if row else None
+                    except (ValueError, RecursionError):
                         owner = None
-                    if not isinstance(owner, str) or owner not in self._shared._uow.validated_packs:
+                    if not isinstance(owner, str) or (owner != requested if requested is not None else owner not in self._shared._uow.validated_packs):
                         self._shared.mark_rollback_only()
                         raise RuntimeError("registry edge owner is not validated")
                 conn.execute(str(sql), params)
