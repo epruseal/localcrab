@@ -18,7 +18,7 @@ LocalCrab은 **로컬에서 실행하는 온톨로지 지식 서비스**입니�
 - **팩 내보내기** (선택): 구축한 그래프를 OpenCrab Pack v1 ZIP으로 내보내기 가능.
 - **단일 파일 배치** (선택, 기본 꺼짐): 다섯 SQLite 파일을 root 디렉터리 하나의 `single.db`로 합쳐 운영한다(`SINGLE_SQLITE_FILE`). 전환 절차는 [마이그레이션](#마이그레이션)에 있다.
 
-버전 1.0.0. 버전 규칙은 [Semantic Versioning 2.0.0](https://semver.org/)이고, 공개 API 범위와 버전별 저장소 배치는 [docs/migrations.md](./docs/migrations.md)에 있다.
+버전 1.1.0. 버전 규칙은 [Semantic Versioning 2.0.0](https://semver.org/)이고, 공개 API 범위와 버전별 저장소 배치는 [docs/migrations.md](./docs/migrations.md)에 있다.
 
 ---
 
@@ -417,7 +417,7 @@ opencrab serve
 | `MCP_HTTP_HOST` | `127.0.0.1` | `serve --transport http`의 기본 바인드 주소(`--host`가 덮는다) |
 | `MCP_HTTP_PORT` | `8765` | `serve --transport http`의 기본 포트(`--port`가 덮는다) |
 | `MCP_SERVER_NAME` | `opencrab` | MCP `serverInfo`에 보이는 서버 이름 |
-| `MCP_SERVER_VERSION` | `1.0.0` | MCP `serverInfo`에 보이는 서버 버전 |
+| `MCP_SERVER_VERSION` | `1.1.0` | MCP `serverInfo`에 보이는 서버 버전 |
 | `NEO4J_USER`, `NEO4J_PASSWORD` | `neo4j`, `opencrab` | docker 모드 Neo4j 계정 |
 | `MONGODB_DB` | `opencrab` | docker 모드 MongoDB 데이터베이스 이름 |
 | `CHROMA_COLLECTION` | `opencrab_vectors` | `EMBEDDING_BACKEND=local`일 때 쓰는 Chroma 컬렉션 이름 |
@@ -463,6 +463,10 @@ opencrab serve
 | `outcome` | 결과 — KPI·리스크·임팩트·측정 가능한 결과 |
 | `lever` | 레버 — outcome·concept에 영향을 주는 조정 가능한 제어값 |
 | `policy` | 정책 — 접근·민감도·승인·거버넌스 규칙 |
+
+규칙과 제어값은 `claim`에서 `lever`로 가는 `parameterized_by`, `policy`에서 `lever`로 가는 `constrains`로 연결합니다. `parameterized_by`는 규칙이 Lever의 값을 판정이나 행동에 쓴다는 뜻입니다. `constrains`는 정책이 Lever의 허용 범위를 정한다는 뜻입니다. `evidence`에서 `policy`로 가는 `contradicts`는 정책을 반박하는 근거를 연결합니다.
+
+팩 적재는 `lever`에서 `outcome`으로 가는 `stabilizes`와 `policy`에서 `lever`로 가는 `constrains`를 같은 관계로 보존합니다. 다른 공간쌍의 기존 정규화는 유지합니다. 기존 적재 데이터는 자동으로 바뀌지 않습니다.
 
 ### 문법 확장
 

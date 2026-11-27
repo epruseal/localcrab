@@ -265,6 +265,7 @@ class TestValidateReBACPermission:
 class TestDescribeGrammar:
     def test_describe_grammar_has_all_keys(self):
         grammar = describe_grammar()
+        assert grammar["version"] == "1.1.0"
         assert "spaces" in grammar
         assert "meta_edges" in grammar
         assert "impact_categories" in grammar

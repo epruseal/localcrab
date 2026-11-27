@@ -12,7 +12,7 @@ from typing import Any
 # Grammar versioning
 # ---------------------------------------------------------------------------
 
-GRAMMAR_VERSION = "1.0.0"
+GRAMMAR_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Spaces
@@ -87,6 +87,24 @@ META_EDGES: list[dict[str, Any]] = [
         "to_space": "claim",
         "relations": ["supports", "contradicts", "timestamps"],
         "description": "Evidence grounds or challenges claims.",
+    },
+    {
+        "from_space": "claim",
+        "to_space": "lever",
+        "relations": ["parameterized_by"],
+        "description": "주장은 Lever의 값을 판정이나 행동에 쓴다.",
+    },
+    {
+        "from_space": "policy",
+        "to_space": "lever",
+        "relations": ["constrains"],
+        "description": "정책은 Lever의 허용 범위를 정한다.",
+    },
+    {
+        "from_space": "evidence",
+        "to_space": "policy",
+        "relations": ["contradicts"],
+        "description": "증거는 정책을 반박한다.",
     },
     {
         "from_space": "concept",

@@ -58,7 +58,7 @@ Required fields:
   "pack_id": "example_pack",
   "title": "Example Ontology Pack",
   "version": "1.0.0",
-  "grammar_version": "1.0.0",
+  "grammar_version": "1.1.0",
   "created_at": "2026-05-17T00:00:00Z",
   "created_by": "LocalCrab",
   "license": {

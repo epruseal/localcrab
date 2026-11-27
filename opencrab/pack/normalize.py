@@ -114,6 +114,8 @@ REVERSE_RELATIONS: frozenset[str] = frozenset({
 # (label, src_space, tgt_space) → (relation, reverse)
 # REL_MAP이 공간쌍을 구분 못 하는 경우 명시 매핑. 3-tuple로 정확히 분기.
 LABEL_SPACE_OVERRIDE: Mapping[tuple[str, str, str], tuple[str, bool]] = MappingProxyType({
+    ("STABILIZES", "lever", "outcome"): ("stabilizes", False),
+    ("CONSTRAINS", "policy", "lever"): ("constrains", False),
     # ── SUPPORTS ─────────────────────────────────────────────────────────────
     ("SUPPORTS", "claim",     "evidence"): ("supports",      True),   # 반전 → evidence→claim:supports
     ("SUPPORTS", "claim",     "outcome"):  ("supports",      False),  # claim→outcome:supports (krds 18건)
