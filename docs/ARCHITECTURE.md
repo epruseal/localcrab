@@ -563,10 +563,13 @@ python -m opencrab.stores.backup --verify /backup/path/backup.<세트 식별자>
 단일 SQLite 모드(`SINGLE_SQLITE_FILE`, #671)에서는 같은 CLI가 `backup_single_root`로
 `single.db`와 `billing.db`만 담은 세트를 만들고, 복원은
 `python -m opencrab.stores.single_restore`(기본 dry-run)가 한다. 위 목록과 `backup_data_dir`의
-단일 모드 거부는 그대로다.
+단일 모드 거부는 그대로다. 단일 모드 백업은 `write.lock`에 이어 `billing.db.lock`을 쥔 채 두 파일을
+포착하므로 서비스가 도는 중에 만든 세트가 같은 커밋 시점의 상태를 담는다(#718, 범위와 한계는
+[docs/live-backup.md](./live-backup.md)의 단일 SQLite 모드 절).
 
-`--data-dir`를 생략하면 설정의 `LOCAL_DATA_DIR`을 쓴다. `--to`를 생략하면
-데이터 디렉토리 자신을 백업 목적지로 삼는다. 백업 결과는 원본 파일명을
+`--data-dir`를 생략하면 설정의 `LOCAL_DATA_DIR`을 쓴다. 다섯 파일 모드에서 `--to`를 생략하면
+데이터 디렉터리 자신을 백업 목적지로 삼는다. 단일 모드 백업 생성에는 root 밖의 목적지를 `--to`로 지정해야 한다.
+백업 결과는 원본 파일명을
 그대로 담은 하나의 세트 디렉터리(`backup.{timestamp}.{hex}/`, 예:
 `backup.20260902_101500.a1b2c3/graph.db`)로 발행된다. 발행은 단일 원자적
 rename으로 끝나므로 세트는 완전히 있거나 아예 없는 두 상태만 가능하다.
@@ -576,10 +579,11 @@ WAL 모드 파일은 `write.lock`을 쥔 채 읽기 트랜잭션으로 고정하
 잠금 블록이 끝난 뒤 그 고정된 연결에서 복사한다. WAL이 아닌 파일과 디렉터리 대상은
 잠금 안에서 복사한다. 인벤토리의 SQLite 대상 복사본은 다시 열어
 `PRAGMA integrity_check`를 통과해야 성공으로 보고되고, 세트에는 크기와 sha256과 이 도구의 잠금 블록 길이를
-적은 `MANIFEST.json`이 들어간다. 이 보장은 **파일 하나 단위의 트랜잭션
+적은 `MANIFEST.json`이 들어간다. 다섯 파일 모드의 이 보장은 **파일 하나 단위의 트랜잭션
 일관성**이며 여러 파일이 같은 시점을 함께 가리킨다는 뜻은 아니다. 고정
 구간의 `write.lock`이 그 어긋남의 폭을 줄여 주지만 이 락을 지키는 writer에
-한해서다. `billing.db`는 issue #105에 따라 애초에 이 락 밖에서 쓰인다.
+한해서다. 다섯 파일 모드에서 `billing.db`의 질의 이벤트는 issue #105에 따라 이 락 밖에서
+커밋할 수 있다. 단일 모드는 백업이 `billing.db.lock`도 쥐므로 다르다.
 락 소유권 맵에도 issue #141이 지적한 구멍이 남아 있다.
 
 배타 획득 직후에는 `write.lock` 파일 자체에 진단용 보유자 레코드
