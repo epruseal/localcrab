@@ -2597,15 +2597,15 @@ def _same_pack_source(docs, source_id: str, pack_name: str) -> bool:
     """
     getter = getattr(docs, "get_source", None)
     if not callable(getter):
-        raise RuntimeError(f"doc store cannot read source {source_id} for vector collision protection")
+        raise RuntimeError("doc store cannot read a source for vector collision protection")
     record = getter(source_id)
     if record is None:
         return False
     if not isinstance(record, dict) or record.get("property_decode_error"):
-        raise RuntimeError(f"doc source {source_id} is malformed for vector collision protection")
+        raise RuntimeError("doc source is malformed for vector collision protection")
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
-        raise RuntimeError(f"doc source metadata {source_id} is malformed for vector collision protection")
+        raise RuntimeError("doc source metadata is malformed for vector collision protection")
     pack_id = metadata.get("pack_id")
     if isinstance(pack_id, str):
         if pack_id:
