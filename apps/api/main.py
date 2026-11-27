@@ -459,7 +459,7 @@ async def lifespan(app: FastAPI) -> Any:
 
 app = FastAPI(
     title="OpenCrab SaaS API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 

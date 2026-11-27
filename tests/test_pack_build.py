@@ -247,7 +247,7 @@ class TestEdgeUsesLoaderMappingBeforeFix:
         ("resource", "evidence", "CITES", "derived_from", False),
         ("resource", "evidence", "SUPPORTS", "derived_from", False),
         ("concept", "concept", "DEPENDS_ON", "related_to", False),
-        ("lever", "outcome", "STABILIZES", "optimizes", False),
+        ("lever", "outcome", "STABILIZES", "stabilizes", False),
         ("policy", "evidence", "SUPPORTS", "cites", False),
     ]
 

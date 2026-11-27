@@ -337,7 +337,7 @@ class Settings(BaseSettings):
     # MCP server
     # ------------------------------------------------------------------
     mcp_server_name: str = Field(default="opencrab", alias="MCP_SERVER_NAME")
-    mcp_server_version: str = Field(default="1.0.0", alias="MCP_SERVER_VERSION")
+    mcp_server_version: str = Field(default="1.1.0", alias="MCP_SERVER_VERSION")
     # HTTP transport (opencrab serve --transport http). Bind host defaults to
     # loopback; expose on a trusted network (e.g. Tailscale) via --host 0.0.0.0.
     # #145: auth is per-user bearer tokens (opencrab.auth.verify_token against
