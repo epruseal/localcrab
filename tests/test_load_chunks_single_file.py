@@ -1418,7 +1418,7 @@ def test_checkpoint_internal_logs_follow_safe_selection(tmp_path, monkeypatch, c
         else:
             assert env.run() == (N, 0)
         caplog.clear()
-        with caplog.at_level(logging.DEBUG, logger="opencrab.stores._sqlite_base"):
+        with caplog.at_level(logging.DEBUG):
             if mode == "loader":
                 assert env.run() == (N, 0)
             else:
@@ -1486,9 +1486,12 @@ def test_checkpoint_restore_cancel_preserves_committed_rows_and_original(tmp_pat
         monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
         monkeypatch.setattr(store, "_exec", execute)
         with pytest.raises(KeyboardInterrupt) as caught, shared_write_unit(env.sql, safe_log=True):
-            shared.connection().execute("SELECT 1")
+            shared.connection().execute("CREATE TABLE checkpoint_cancel_commit (value TEXT)")
+            shared.connection().execute("INSERT INTO checkpoint_cancel_commit VALUES ('committed-before-cancel')")
         assert caught.value is cancel
         assert trace == [(True, False)]
+        with sqlite3.connect(env.doc_path) as reader:
+            assert reader.execute("SELECT value FROM checkpoint_cancel_commit").fetchall() == [("committed-before-cancel",)]
         assert shared.local.conn is None
         assert old not in shared.all_conns
         assert shared.connection().execute("PRAGMA busy_timeout").fetchone()[0] == timeout
