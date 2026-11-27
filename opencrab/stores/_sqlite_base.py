@@ -267,7 +267,8 @@ class _SqliteConnMixin:
             # 보이게 해서는 안 된다(받아들임 기준 4) — 조용히 반환한다.
             logger.debug(
                 "%s._checkpoint_if_wal_large: WAL size probe failed, skipping: %s",
-                type(self).__name__, exc,
+                type(self).__name__,
+                "wal_size_probe_failed" if self._shared is not None and self._shared.safe_log_active else exc,
             )
             return
         if wal_size < self._WAL_CHECKPOINT_THRESHOLD_BYTES:
@@ -281,7 +282,8 @@ class _SqliteConnMixin:
         except Exception as exc:
             logger.debug(
                 "%s._checkpoint_if_wal_large: busy_timeout probe failed, skipping: %s",
-                type(self).__name__, exc,
+                type(self).__name__,
+                "busy_timeout_probe_failed" if self._shared is not None and self._shared.safe_log_active else exc,
             )
             return
 
@@ -299,7 +301,8 @@ class _SqliteConnMixin:
             # 실행 실패도 커밋의 성공 여부에 영향을 주지 않는다.
             logger.debug(
                 "%s._checkpoint_if_wal_large: checkpoint execution failed: %s",
-                type(self).__name__, exc,
+                type(self).__name__,
+                "checkpoint_execution_failed" if self._shared is not None and self._shared.safe_log_active else exc,
             )
         finally:
             self._restore_busy_timeout(conn, old_timeout)
@@ -325,7 +328,8 @@ class _SqliteConnMixin:
             if isinstance(exc, Exception):
                 logger.warning(
                     "%s._restore_busy_timeout: restore failed, discarded connection: %s",
-                    type(self).__name__, exc,
+                    type(self).__name__,
+                    "busy_timeout_restore_failed" if self._shared is not None and self._shared.safe_log_active else exc,
                 )
                 return
             raise
@@ -343,7 +347,10 @@ class _SqliteConnMixin:
         try:
             conn.close()
         except Exception as exc:
-            logger.debug("%s._discard_conn: close error: %s", type(self).__name__, exc)
+            logger.debug(
+                "%s._discard_conn: close error: %s", type(self).__name__,
+                "connection_close_failed" if self._shared is not None and self._shared.safe_log_active else exc,
+            )
         if getattr(self._local, "conn", None) is conn:
             self._local.conn = None
         with self._conns_lock:

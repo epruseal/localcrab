@@ -1340,6 +1340,164 @@ def test_independent_builder_generation_does_not_enable_loader_layout(tmp_path, 
         env.close()
 
 
+@pytest.mark.parametrize("mode", ["loader", "independent", "five"])
+@pytest.mark.parametrize("boundary", ["wal_size", "timeout_read", "timeout_set", "checkpoint", "restore", "close"])
+def test_checkpoint_internal_logs_follow_safe_selection(tmp_path, monkeypatch, caplog, mode, boundary):
+    import logging
+    import os
+
+    from opencrab.stores.sql_store import shared_write_unit
+
+    closing = []
+    class Connection(sqlite3.Connection):
+        def close(self):
+            super().close()
+            if self in closing:
+                closing.remove(self)
+                raise RuntimeError("private-checkpoint-close-sentinel")
+
+    connect = sqlite3.connect
+    def factory(*args, **kwargs):
+        kwargs["factory"] = Connection
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", factory)
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    env = _Env("five" if mode == "five" else "single", tmp_path)
+    shared = env.sql.shared_file
+    store = shared._checkpointer if shared is not None else env.docs
+    old = store._conn
+    timeout = old.execute("PRAGMA busy_timeout").fetchone()[0]
+    original_exec = store._exec
+    original_size = os.path.getsize
+    original_discard = store._discard_conn
+    prepare = env.vec.prepare_upsert_vectors
+    error = RuntimeError("private-checkpoint-error-sentinel")
+    trace = []
+    discarded = []
+
+    def discard(conn):
+        assert conn is old
+        original_discard(conn)
+        assert store._local.conn is None
+        assert conn not in store._all_conns
+        discarded.append(conn)
+
+    def execute(conn, sql):
+        match = {"timeout_read": "PRAGMA busy_timeout", "timeout_set": "PRAGMA busy_timeout=0",
+                 "checkpoint": "PRAGMA wal_checkpoint(TRUNCATE)",
+                 "restore": f"PRAGMA busy_timeout={timeout}", "close": f"PRAGMA busy_timeout={timeout}"}
+        if not trace and sql == match.get(boundary):
+            trace.append((shared.safe_log_active if shared is not None else False, conn.in_transaction))
+            raise error
+        return original_exec(conn, sql)
+
+    def size(path):
+        if not trace and str(path) == str(store._db_path) + "-wal":
+            trace.append((shared.safe_log_active if shared is not None else False, old.in_transaction))
+            raise error
+        return original_size(path)
+
+    def arm():
+        store._WAL_CHECKPOINT_THRESHOLD_BYTES = 1
+        monkeypatch.setattr(store, "_exec", execute)
+        monkeypatch.setattr(store, "_discard_conn", discard)
+        if boundary == "wal_size":
+            monkeypatch.setattr(os.path, "getsize", size)
+        if boundary == "close":
+            closing.append(old)
+
+    def embedding(texts):
+        result = prepare(texts)
+        arm()
+        return result
+
+    try:
+        if mode == "loader":
+            monkeypatch.setattr(env.vec, "prepare_upsert_vectors", embedding)
+        else:
+            assert env.run() == (N, 0)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="opencrab.stores._sqlite_base"):
+            if mode == "loader":
+                assert env.run() == (N, 0)
+            else:
+                arm()
+                manager = shared_write_unit(env.sql) if shared is not None else store._tx()
+                with manager as conn:
+                    conn.execute("SELECT 1")
+        assert trace == [(mode == "loader", False)]
+        reasons = {"wal_size": "wal_size_probe_failed", "timeout_read": "busy_timeout_probe_failed",
+                   "timeout_set": "busy_timeout_probe_failed", "checkpoint": "checkpoint_execution_failed",
+                   "restore": "busy_timeout_restore_failed", "close": "busy_timeout_restore_failed"}
+        raw = {"wal_size": "WAL size probe failed", "timeout_read": "busy_timeout probe failed",
+               "timeout_set": "busy_timeout probe failed", "checkpoint": "checkpoint execution failed",
+               "restore": "restore failed, discarded connection", "close": "restore failed, discarded connection"}
+        records = [record for record in caplog.records if record.name == "opencrab.stores._sqlite_base"]
+        expected = [(reasons[boundary], raw[boundary], logging.WARNING if boundary in {"restore", "close"} else logging.DEBUG)]
+        if boundary == "close":
+            expected.append(("connection_close_failed", "close error", logging.DEBUG))
+        for code, original_message, level in expected:
+            marker = code if mode == "loader" else original_message
+            matches = [record for record in records if marker in record.getMessage()]
+            assert len(matches) == 1
+            assert matches[0].levelno == level
+            assert type(store).__name__ in matches[0].getMessage()
+            assert not matches[0].exc_info
+        if mode == "loader":
+            assert str(error) not in caplog.text
+            assert "private-checkpoint-close-sentinel" not in caplog.text
+        else:
+            assert str(error) in caplog.text
+            if boundary == "close":
+                assert "private-checkpoint-close-sentinel" in caplog.text
+        if mode == "loader":
+            assert shared.safe_log_active is False
+        if boundary in {"restore", "close"}:
+            assert discarded == [old]
+            assert store._conn is not old
+            assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == timeout
+        assert env.ids() == ({f"c{i}" for i in range(N)}, {f"c{i}" for i in range(N)})
+    finally:
+        closing.clear()
+        monkeypatch.setattr(store, "_exec", original_exec)
+        env.close()
+
+
+def test_checkpoint_restore_cancel_preserves_committed_rows_and_original(tmp_path, monkeypatch):
+    from opencrab.stores.sql_store import shared_write_unit
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    env = _Env("single", tmp_path)
+    shared = env.sql.shared_file
+    store = shared._checkpointer
+    old = shared.connection()
+    timeout = old.execute("PRAGMA busy_timeout").fetchone()[0]
+    original = store._exec
+    cancel = KeyboardInterrupt("private-checkpoint-cancel-sentinel")
+    trace = []
+    def execute(conn, sql):
+        if sql == f"PRAGMA busy_timeout={timeout}":
+            trace.append((shared.safe_log_active, conn.in_transaction))
+            raise cancel
+        return original(conn, sql)
+    try:
+        assert env.run() == (N, 0)
+        monkeypatch.setattr(store, "_WAL_CHECKPOINT_THRESHOLD_BYTES", 1)
+        monkeypatch.setattr(store, "_exec", execute)
+        with pytest.raises(KeyboardInterrupt) as caught, shared_write_unit(env.sql, safe_log=True):
+            shared.connection().execute("SELECT 1")
+        assert caught.value is cancel
+        assert trace == [(True, False)]
+        assert shared.local.conn is None
+        assert old not in shared.all_conns
+        assert shared.connection().execute("PRAGMA busy_timeout").fetchone()[0] == timeout
+        assert env.ids() == ({f"c{i}" for i in range(N)}, {f"c{i}" for i in range(N)})
+    finally:
+        monkeypatch.setattr(store, "_exec", original)
+        env.close()
+
+
 @pytest.mark.parametrize("entry", ["nodes", "finalize", "chunks", "incremental_chunks"])
 @pytest.mark.parametrize("defect", ["idx_packs_incarnation", "idx_pack_delete_pending",
                                     "idx_pack_delete_successor", "temp_vocab"])
