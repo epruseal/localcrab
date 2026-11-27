@@ -1,8 +1,7 @@
 """단일 SQLite 모드의 팩 증분 적재 (#719).
 
-단일 파일 저장소(`pack_delete_operations` 표가 있는 게시 DB)에서 `load_nodes_incremental`,
-`load_edges`, `load_chunks_incremental`, `incremental_finalize`가 끝까지 실행된다. 결과는 같은 입력의
-다섯 파일 모드 결과와 같다. 합성 데이터만 쓴다.
+지원 스키마의 합성 파일 DB에서 노드, 엣지, 청크와 마감을 실행한다.
+같은 입력의 다섯 파일 모드와 반환값 및 논리 행을 대조한다.
 """
 
 from __future__ import annotations
