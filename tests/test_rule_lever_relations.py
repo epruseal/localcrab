@@ -39,6 +39,17 @@ def test_rule_relation_uses_canonical_grammar(source, target, relation, uppercas
     assert not fits(label, target, source)
 
 
+@pytest.mark.parametrize("source,target,relation", [
+    ("policy", "lever", "parameterized_by"),
+    ("claim", "lever", "constrains"),
+    ("evidence", "concept", "contradicts"),
+    ("claim", "outcome", "stabilizes"),
+])
+def test_rule_relation_rejects_other_space_pairs(source, target, relation):
+    assert relation not in ALLOWED[(source, target)]
+    assert not fits(relation, source, target)
+
+
 @pytest.mark.parametrize("source,target,relation", RELATIONS)
 def test_pack_builder_preserves_rule_relation(tmp_path, source, target, relation):
     pack = Pack("synthetic", "합성 관계 시험", out_root=str(tmp_path))
@@ -129,6 +140,7 @@ def test_rule_anchor_query_expands_exactly_one_hop(stored_rules, anchor, expecte
     try:
         result = query.query("synthetic", pack_ids=["synthetic"], graph_depth=1,
                              limit=10, use_bm25=False, use_fts=False, use_rerank=False)
+        assert anchor in {r.node_id for r in result}
         neighbors = {r.node_id: r for r in result if r.source == "graph"}
         assert set(neighbors) == set(expected)
         assert "outcome" not in neighbors
