@@ -241,9 +241,12 @@ _NODE_COLUMNS = "space, node_id, node_type, properties, updated_at"
 
 def require_mapping_owner(conn, space: str, node_id: str, requested_pack: str) -> None:
     """대기 키 대신 기존 매핑의 소유를 요청 팩과 직접 비교한다."""
-    row = conn.execute(
-        f"SELECT pack_id FROM main.{DOCS} WHERE space=? AND node_id=?", (space, node_id)
-    ).fetchone()
+    try:
+        row = conn.execute(
+            f"SELECT pack_id FROM main.{DOCS} WHERE space=? AND node_id=?", (space, node_id)
+        ).fetchone()
+    except Exception as exc:
+        raise DerivedRowProtectionError("BM25 mapping owner read failed") from exc
     if row is not None and (not requested_pack or row[0] != requested_pack):
         raise DerivedRowProtectionError(f"BM25 mapping owner differs: ({space!r}, {node_id!r})")
 
@@ -279,8 +282,10 @@ def reindex_key(
         try:
             require_mapping_owner(conn, space, node_id, requested_pack)
         except Exception as exc:
-            logger.warning("BM25 protection rejected key (%r, %r): %s", space, node_id, exc)
-            raise
+            logger.warning("BM25 protection rejected key (%r, %r): mapping_owner_rejected", space, node_id)
+            if isinstance(exc, DerivedRowProtectionError):
+                raise
+            raise DerivedRowProtectionError("BM25 mapping owner read failed") from exc
     row = conn.execute(
         f"SELECT {_NODE_COLUMNS} FROM doc_nodes WHERE space=? AND node_id=?",
         (space, node_id),

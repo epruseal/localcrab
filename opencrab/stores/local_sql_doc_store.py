@@ -238,7 +238,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='pack_delete_operations'"
         ).fetchone() is not None
 
-    def _read_only_fts_ok(self, conn: Any) -> bool:
+    def _read_only_fts_ok(self, conn: Any, *, safe_log: bool = False) -> bool:
         """쓰기 없이 doc FTS 객체 존재와 배치를 확인한다(#671). 색인 생성과 백필은 하지 않는다."""
         try:
             present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
@@ -247,10 +247,13 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                 return False
             return True
         except Exception as exc:  # noqa: BLE001 -- graceful off, same as the write path
-            logger.warning("FTS5 keyword index unavailable (read-only check): %s", exc)
+            if safe_log:
+                logger.warning("FTS5 keyword index unavailable (read-only check): capability_probe_failed")
+            else:
+                logger.warning("FTS5 keyword index unavailable (read-only check): %s", exc)
             return False
 
-    def _read_only_node_bm25_ok(self, conn: Any) -> bool:
+    def _read_only_node_bm25_ok(self, conn: Any, *, safe_log: bool = False) -> bool:
         """쓰기 없이 node BM25 객체 존재, 형식, ready 정합을 확인한다(#671).
 
         쓰기 모드의 ``ensure_schema``는 형식이나 정합이 어긋나면 색인을 비우고 backfill로
@@ -283,7 +286,10 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                         return False
             return True
         except Exception as exc:  # noqa: BLE001 -- graceful off, same as the write path
-            logger.warning("node BM25 index unavailable (read-only check): %s", exc)
+            if safe_log:
+                logger.warning("node BM25 index unavailable (read-only check): capability_probe_failed")
+            else:
+                logger.warning("node BM25 index unavailable (read-only check): %s", exc)
             return False
 
     # ------------------------------------------------------------------
@@ -408,7 +414,10 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
                     self._reject_derived((space, node_id), exc)
                 except Exception as exc:  # noqa: BLE001 -- 일반 색인 실패는 문서를 보존한다.
                     conn.execute("ROLLBACK TO SAVEPOINT node_bm25")
-                    logger.warning("node BM25 index sync failed for one key: %s", exc)
+                    if self._shared is not None and self._shared.safe_log_active:
+                        logger.warning("node BM25 index sync failed for key (%r, %r): bm25_sync_failed", space, node_id)
+                    else:
+                        logger.warning("node BM25 index sync failed for one key: %s", exc)
                 conn.execute("RELEASE SAVEPOINT node_bm25")
             return rowcount
 
@@ -564,20 +573,19 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         return event_id
 
     def _reject_derived(self, identity: Any, reason: Exception) -> None:
-        logger.warning("single SQLite derived protection rejected %r: %s", identity, reason)
+        logger.warning("single SQLite derived protection rejected %r: derived_protection_rejected", identity)
         self._shared.mark_rollback_only()
-        raise _sfts.DerivedRowProtectionError(f"{identity!r}: {reason}") from reason
+        raise _sfts.DerivedRowProtectionError(f"{identity!r}: derived_protection_rejected") from reason
 
     def _requested_pack(self, identity: Any) -> str | None:
         if self._shared is None or not self._shared.in_unit_of_work or not self._shared_guarded():
             return None
-        validated = self._shared._uow.validated_packs
-        requested = getattr(self._shared._uow, "requested_pack", None)
-        if requested is None and len(validated) == 1:
-            requested = next(iter(validated))
-        if not isinstance(requested, str) or not requested or requested not in validated:
-            self._reject_derived(identity, RuntimeError("request pack is not validated"))
-        return requested
+        if self._shared._uow.delete_operation is not None:
+            return None
+        try:
+            return self._shared.require_requested_pack()
+        except Exception as exc:
+            self._reject_derived(identity, exc)
 
     def _require_owner(self, raw: Any, requested: str, identity: Any, *, source: bool = False) -> None:
         try:
@@ -611,7 +619,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             reason = RuntimeError("source base row is absent; derived rows remain")
             if writing:
                 self._reject_derived(source_id, reason)
-            logger.warning("single SQLite source %r preserved: %s", source_id, reason)
+            logger.warning("single SQLite source %r preserved: source_derived_rows_preserved", source_id)
         return False
 
     def _write_source_state(
@@ -685,20 +693,26 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         )
         if row is None:
             return None
+        corrupted = False
         try:
-            metadata = parse_properties_object(self._row_get(row, "metadata"))
+            metadata = parse_properties_object(
+                self._row_get(row, "metadata"), _classify_decode_depth=True
+            )
         except PropertyDecodeDepthError:
             raise
         except GraphPropertyValidationError:
-            return self._row_to_source(row)
+            metadata, corrupted = {}, True
         from opencrab.stores._sql_doc_base import _ts_str
 
-        return {
+        entry = {
             "source_id": self._row_get(row, "source_id"),
             "text": self._row_get(row, "text"),
             "metadata": metadata,
             "ingested_at": _ts_str(self._row_get(row, "ingested_at")),
         }
+        if corrupted:
+            entry["property_decode_error"] = True
+        return entry
 
     def rewrite_source_metadata(self, source_id, metadata, source_state):
         if not self._shared_guarded():

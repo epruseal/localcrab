@@ -6,8 +6,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import sqlite3
+import struct
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -69,7 +73,7 @@ class _Env:
         for pack in (PACK, OTHER):
             create_pack(self.sql, self.user_id, pack)
         self.builder = OntologyBuilder(self.graph, self.docs, self.sql, vec=self.vec)
-        self.paths = {"graph": graph_path, "doc": doc_path, "vec": vec_path}
+        self.paths = {"graph": graph_path, "doc": doc_path, "vec": vec_path, "registry": sql_path}
         if self.shared is not None:
             from opencrab.stores.sql_store import shared_write_unit
 
@@ -79,13 +83,20 @@ class _Env:
                 self._seed_other_pack()
         else:
             self._seed_other_pack()
+        _other_rows(self)
 
     def _seed_other_pack(self) -> None:
         """두 번째 팩의 행은 첫 팩의 증분 적재가 바꾸지 못한다."""
-        self.graph.upsert_node("Document", "o1", {"pack_id": OTHER, "name": "other"}, "resource")
-        self.docs.upsert_node_doc("resource", "Document", "o1", {"pack_id": OTHER, "name": "other"})
+        for node_id in ("o1", "o2"):
+            props = {"pack_id": OTHER, "owner_id": self.user_id, "name": node_id}
+            self.graph.upsert_node("Document", node_id, props, "resource")
+            self.docs.upsert_node_doc("resource", "Document", node_id, props)
+            self.sql.register_node("resource", "Document", node_id)
+        self.graph.upsert_edge("Document", "o1", "cites", "Document", "o2", {"pack_id": OTHER})
+        self.sql.register_edge("resource", "o1", "cites", "resource", "o2")
         self.docs.upsert_source("oc1", "other chunk", {"pack_id": OTHER})
         self.vec.upsert_texts(["other chunk"], [{"pack_id": OTHER}], ["oc1"])
+        assert self.graph.get_edge("Document", "o1", "cites", "Document", "o2") is not None
 
     def close(self) -> None:
         for store in (self.vec, self.docs, self.graph, self.sql):
@@ -101,7 +112,9 @@ class _Env:
         nf = _write_jsonl(work / "nodes.jsonl", nodes)
         ef = _write_jsonl(work / "edges.jsonl", edges)
         cf = _write_jsonl(work / "chunks.jsonl", chunks)
-        with principal_scope(self.principal):
+        audit_before = _audit_rows(self)
+        other_before = _other_rows(self)
+        with _round_logs() as records, principal_scope(self.principal):
             state = pack_load.live_pack_state(PACK, self.graph, self.docs, self.vec)
             id_map: dict = {}
             n_res = pack_load.load_nodes_incremental(
@@ -123,57 +136,188 @@ class _Env:
             target_type = id_map[row["target_id"]][1]
             assert self.graph.get_edge(source_type, row["source_id"], "cites",
                                        target_type, row["target_id"]) is not None
+        assert (n_res[3], n_res[4], n_res[6], n_res.ingest_err, n_res.cleanup_err) == (0, 0, 0, 0, 0)
+        assert (c_res[4], c_res[6]) == (0, 0)
+        assert set(n_res[5]) == {row["id"] for row in nodes}
+        assert set(c_res[5]) == {row["id"] for row in chunks}
+        _assert_round_logs(self, records)
+        assert _other_rows(self) == other_before
+        assert set(audit_before).issubset(set(_audit_rows(self)))
+        if n_res[0] + n_res[1] + e_res[0]:
+            assert len(_audit_rows(self)) > len(audit_before)
         return {"node_errors": (n_res.ingest_err, n_res.cleanup_err),
-                "nodes": tuple(n_res[:5]) + (n_res[6],), "edges": tuple(e_res),
-                "chunks": tuple(c_res[:5]) + (c_res[6],), "finalize": fin}
+                "nodes": _result(n_res), "edges": tuple(e_res),
+                "chunks": _result(c_res), "finalize": fin}
 
     def snapshot(self) -> dict:
-        """저장소 상태의 비교용 사본. 시각과 행 번호는 뺀다."""
-        out: dict = {}
-        conns = {}
-        for key, path in self.paths.items():
-            conns[str(path)] = sqlite3.connect(str(path))
-        for conn in conns.values():
-            conn.enable_load_extension(True)
-            sqlite_vec.load(conn)
-        try:
-            gconn = conns[str(self.paths["graph"])]
-            dconn = conns[str(self.paths["doc"])]
-            vconn = conns[str(self.paths["vec"])]
-            out["graph_nodes"] = sorted(
-                (r[0], r[1], _props(r[2])) for r in gconn.execute(
-                    "SELECT node_id, node_type, properties FROM graph_nodes"))
-            out["graph_edges"] = sorted(
-                (r[0], r[1], r[2], _props(r[3])) for r in gconn.execute(
-                    "SELECT from_id, relation, to_id, properties FROM graph_edges"))
-            out["doc_nodes"] = sorted(
-                (r[0], r[1], r[2], _props(r[3])) for r in dconn.execute(
-                    "SELECT space, node_type, node_id, properties FROM doc_nodes"))
-            out["doc_sources"] = sorted(
-                (r[0], r[1], _props(r[2])) for r in dconn.execute(
-                    "SELECT source_id, text, metadata FROM doc_sources"))
-            from sqlalchemy import text
-
-            with self.sql._engine.connect() as registry:
-                out["registry_nodes"] = sorted(tuple(row) for row in registry.execute(
-                    text("SELECT space, node_type, node_id FROM ontology_nodes")))
-            out["vectors"] = sorted(
-                (r[0], _props(r[1]), r[2], bytes(r[3])) for r in vconn.execute(
-                    "SELECT node_id, metadata, document, embedding FROM vectors_kure"))
-        finally:
-            for conn in conns.values():
-                conn.close()
+        """전 열을 비교한다. 생성 시각과 검증한 물리 키만 정규화한다."""
+        out = {}
+        for role, tables in (
+            ("graph", ("graph_nodes", "graph_edges")),
+            ("doc", ("doc_nodes", "doc_sources", "doc_source_integrity")),
+            ("registry", ("ontology_nodes", "ontology_edges")),
+            ("vec", ("vectors_kure",)),
+        ):
+            with _connection(self.paths[role]) as conn:
+                for table in tables:
+                    rows = _rows(conn, table)
+                    if role == "registry":
+                        ids = [row["id"] for row in rows]
+                        assert all(isinstance(value, int) and value > 0 for value in ids)
+                        assert len(ids) == len(set(ids))
+                    out[table] = _canonical_rows(rows, omit={"id"} if role == "registry" else set())
+                if role == "doc":
+                    out.update(_derived_rows(conn))
         return out
 
 
-_VOLATILE = {"created_at", "updated_at", "ingested_at", "last_seen", "timestamp", "_ts", "owner_id"}
+_VOLATILE = {"created_at", "updated_at", "ingested_at", "last_seen", "timestamp", "_ts"}
+_JSON_COLUMNS = {"properties", "metadata", "source_integrity"}
 
 
-def _props(raw) -> str:
+@contextlib.contextmanager
+def _connection(path):
+    conn = sqlite3.connect(path)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _rows(conn, table):
+    cursor = conn.execute(f'SELECT * FROM "{table}"')
+    columns = [column[0] for column in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor]
+
+
+def _canonical_rows(rows, *, omit=frozenset(), times=True):
+    return sorted((tuple((key, _props(value) if key in _JSON_COLUMNS and times else value)
+                         for key, value in row.items()
+                         if key not in omit and not (times and key in _VOLATILE))
+                   for row in rows), key=repr)
+
+
+def _result(value):
+    if isinstance(value, dict):
+        return {key: _result(item) if isinstance(item, (tuple, set, dict)) else item
+                for key, item in value.items()}
+    if isinstance(value, set):
+        return tuple(sorted(value))
+    return tuple(_result(item) if isinstance(item, (tuple, set, dict)) else item for item in value)
+
+
+@contextlib.contextmanager
+def _round_logs():
+    records = []
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+    handler = Capture(logging.WARNING)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        yield records
+    finally:
+        root.removeHandler(handler)
+
+
+def _assert_round_logs(env, records):
+    for record in records:
+        if not record.name.startswith("opencrab."):
+            continue
+        message = record.getMessage()
+        if "reason=confirmed_node_cascade" in message:
+            assert env.shared is not None
+            assert record.args[-1] == "confirmed_node_cascade"
+            _, source, relation, target, _ = record.args
+            with _connection(env.paths["graph"]) as conn:
+                assert conn.execute("SELECT 1 FROM graph_edges WHERE from_id=? AND relation=? AND to_id=?",
+                                    (source, relation, target)).fetchone() is None
+                assert conn.execute("SELECT count(*) FROM graph_nodes WHERE node_id IN (?,?)",
+                                    (source, target)).fetchone()[0] < 2
+            continue
+        # 이 경고는 실패가 아니라 실제 문서 복구를 알린다.
+        if message.startswith(("doc 행 유실 회수(", "doc 행 값 어긋남 회수(")):
+            _, node_id, space = record.args
+            assert env.docs.get_node_doc(space, node_id)
+            continue
+        pytest.fail(f"정상 회차에서 예상하지 않은 경고: {message}")
+
+
+def _derived_rows(conn, *, raw=False, other=False):
+    from opencrab.stores import _node_bm25_sqlite as bm25
+
+    result = {}
+    mappings = _rows(conn, bm25.DOCS)
+    keys = {row["doc_key"]: (row["space"], row["node_id"]) for row in mappings}
+    assert len(keys) == len(mappings)
+    source_content = _rows(conn, "doc_sources_fts_content")
+    sources = {row["id"]: row["c0"] for row in source_content}
+    assert len(sources) == len(source_content)
+    assert len(set(sources.values())) == len(sources)
+    base_sources = {row["source_id"]: row["text"] for row in _rows(conn, "doc_sources")}
+    assert {row["c0"]: row["c1"] for row in source_content} == base_sources
+    conn.execute("CREATE VIRTUAL TABLE temp.comparison_source_vinst "
+                 "USING fts5vocab(main, doc_sources_fts, instance)")
+    for table, physical, links in (
+        (bm25.FTS, "rowid", keys), (bm25.FTS + "_docsize", "id", keys),
+        (bm25.VINST, "doc", keys), ("doc_sources_fts", "rowid", sources),
+        ("doc_sources_fts_content", "id", sources),
+        ("doc_sources_fts_docsize", "id", sources), ("comparison_source_vinst", "doc", sources),
+    ):
+        if physical == "rowid":
+            cursor = conn.execute(f'SELECT rowid, * FROM "{table}"')
+            rows = [dict(zip([item[0] for item in cursor.description], row)) for row in cursor]
+        else:
+            rows = _rows(conn, table)
+        assert all(row[physical] in links for row in rows), (table, rows, links)
+        if physical != "doc":
+            assert {row[physical] for row in rows} == set(links), table
+        if other:
+            rows = [row for row in rows if links[row[physical]] in {("resource", "o1"),
+                                                                   ("resource", "o2"), "oc1"}]
+        if not raw:
+            rows = [dict(row, **{physical: links[row[physical]]}) for row in rows]
+        result[table] = _canonical_rows(rows, times=not raw)
+    if other:
+        mappings = [row for row in mappings if row["pack_id"] == OTHER]
+    if not raw:
+        mappings = [dict(row, doc_key=keys[row["doc_key"]]) for row in mappings]
+    result[bm25.DOCS] = _canonical_rows(mappings, times=not raw)
+    pending = _rows(conn, bm25.PENDING)
+    if other:
+        pending = [row for row in pending if row["node_id"] in {"o1", "o2"}]
+    result[bm25.PENDING] = _canonical_rows(pending, times=not raw)
+    if not other:
+        for table in (bm25.STATS, bm25.META, bm25.VROW):
+            result[table] = _canonical_rows(_rows(conn, table), times=not raw)
+        meta = dict(conn.execute(f"SELECT key,value FROM {bm25.META}"))
+        max_chars = int(meta["max_text_chars"] or 0) or None
+        documents = _rows(conn, "doc_nodes")
+        expected = {}
+        for row in documents:
+            node = dict(row, properties=json.loads(row["properties"]))
+            expected[(row["space"], row["node_id"])] = bm25.node_terms(node, max_chars)
+        assert set(expected) == set(keys.values())
+        assert conn.execute(f"SELECT doc_count,total_len FROM {bm25.STATS} WHERE id=1").fetchone() == (
+            len(documents), sum(len(terms) for terms in expected.values()))
+        for row in _rows(conn, bm25.DOCS):
+            assert row["dl"] == len(expected[keys[row["doc_key"]]])
+        postings = [(keys[doc], term, column, offset) for term, doc, column, offset in
+                    conn.execute(f"SELECT * FROM {bm25.VINST}")]
+        assert Counter(postings) == Counter((key, term, "tokens", offset)
+                                           for key, terms in expected.items()
+                                           for offset, term in enumerate(terms))
+    return result
+
+
+def _props(raw):
     try:
         value = json.loads(raw)
     except (TypeError, ValueError):
-        return str(raw)
+        return raw
     if isinstance(value, dict):
         value = {k: v for k, v in value.items() if k not in _VOLATILE}
     return json.dumps(value, sort_keys=True, ensure_ascii=False)
@@ -198,7 +342,7 @@ def _chunk(i, text=None):
     return {"id": f"c{i}", "document_id": "n1", "text": text or f"본문 {i}"}
 
 
-# 한 회차의 입력 묶음이다. 첫 회는 빈 저장소에 넣고, 둘째 회는 변경과 삭제를 모두 담는다.
+# 요청 팩은 첫 회 입력 전에 비어 있다. 다른 팩의 seed는 먼저 존재한다.
 _FIRST = (
     [_node(f"n{i}") for i in range(1, 9)],
     [_edge("e1", "n1", "n2"), _edge("e2", "n2", "n3"), _edge("e3", "n4", "n5")],
@@ -240,8 +384,7 @@ def test_single_incremental_matches_five_file(tmp_path, monkeypatch):
             assert single_res == five_res
             for step, (a, b) in enumerate(zip(five_snap, single_snap)):
                 assert a == b, f"step {step}: 저장소 상태가 다섯 파일 모드와 다르다"
-            other_rows = [r for r in single_snap[-1]["graph_nodes"] if r[0] == "o1"]
-            assert other_rows, "다른 팩의 행이 남아 있어야 한다"
+            assert _other_rows(single)["graph_nodes"], "다른 팩의 행이 남아 있어야 한다"
         finally:
             single.close()
     finally:
@@ -260,28 +403,33 @@ def _seed_write(env, operation):
 
 
 def _other_rows(env):
-    from sqlalchemy import text
-
     result = {}
-    with env.sql._engine.connect() as registry:
-        result["registry"] = [tuple(row) for row in registry.execute(
-            text("SELECT * FROM ontology_nodes WHERE node_id='o1'"))]
     for role, tables in (("graph", ("graph_nodes", "graph_edges")),
                          ("doc", ("doc_nodes", "doc_sources", "doc_source_integrity")),
+                         ("registry", ("ontology_nodes", "ontology_edges")),
                          ("vec", ("vectors_kure",))):
-        with sqlite3.connect(env.paths[role]) as conn:
-            conn.enable_load_extension(True)
-            sqlite_vec.load(conn)
+        with _connection(env.paths[role]) as conn:
             for table in tables:
-                rows = conn.execute(f'SELECT * FROM "{table}"').fetchall()
-                result[table] = sorted(tuple(row) for row in rows
-                                       if any(value in {"o1", "oc1"} for value in row if isinstance(value, str)))
+                rows = [row for row in _rows(conn, table)
+                        if any(value in {"o1", "o2", "oc1"}
+                               for value in row.values() if isinstance(value, str))]
+                assert rows, f"다른 팩 seed가 없다: {table}"
+                for row in rows:
+                    for column in ("properties", "metadata"):
+                        if column in row:
+                            assert json.loads(row[column])["pack_id"] == OTHER
+                result[table] = _canonical_rows(rows, times=False)
+            if role == "doc":
+                result.update(_derived_rows(conn, raw=True, other=True))
+    assert len(result["graph_nodes"]) == len(result["ontology_nodes"]) == 2
+    assert len(result["graph_edges"]) == len(result["ontology_edges"]) == 1
+    assert len(result["doc_nodes_bm25_docs"]) == 2
+    assert result["doc_sources_fts_content"]
+    assert result["comparison_source_vinst"]
     return result
 
 
 def test_shared_id_orphans_anchor_and_final_same_rounds_match(tmp_path, monkeypatch):
-    import struct
-
     outcomes = []
     for layout in ("five", "single"):
         env = _Env(layout, tmp_path / layout, monkeypatch)
@@ -291,14 +439,38 @@ def test_shared_id_orphans_anchor_and_final_same_rounds_match(tmp_path, monkeypa
             before_other = _other_rows(env)
             rounds = []
             calls = []
+            round_calls = []
+            round_states = []
             def embedding(texts):
                 calls.append(tuple(texts))
                 return _embed(texts)
             env.vec._ef = embedding
             for index, inputs in enumerate((_FIRST, _SECOND, _SECOND, _SECOND)):
+                calls.clear()
                 nodes, edges, chunks = inputs
                 chunks = [*chunks, {"id": "n1", "document_id": "n1", "text": "shared authoritative text"}]
                 rounds.append(env.run(nodes, edges, chunks, env.d / f"run{index}"))
+                round_calls.append(tuple(calls))
+                round_states.append(env.snapshot())
+                flattened = [text for batch in calls for text in batch]
+                assert flattened.count("shared authoritative text") == (1 if index == 0 else 0)
+                from opencrab.ontology.bm25 import _node_text
+
+                embedded_nodes = nodes if index == 0 else [row for row in nodes if row["id"] in {"n2", "n9"}] if index == 1 else []
+                embedded_chunks = chunks if index == 0 else [row for row in chunks if row["id"] == "c1"] if index == 1 else []
+                expected_texts = [_node_text(env.docs.get_node_doc(row["space"], row["id"]))
+                                  for row in embedded_nodes] + [row["text"] for row in embedded_chunks]
+                assert Counter(flattened) == Counter(expected_texts)
+                with _connection(env.paths["vec"]) as conn:
+                    row = conn.execute("SELECT * FROM vectors_kure WHERE node_id='n1'")
+                    stored = dict(zip([column[0] for column in row.description], row.fetchone()))
+                assert stored["document"] == "shared authoritative text"
+                assert stored["pack_id"] == PACK
+                expected_metadata = {"pack_id": PACK, "source": PACK, "document_id": "n1", "space": "evidence"}
+                assert json.loads(stored["metadata"]) == expected_metadata
+                assert env.docs.get_source("n1")["metadata"] == expected_metadata
+                assert struct.unpack("4f", stored["embedding"]) == pytest.approx(
+                    _embed(["shared authoritative text"])[0])
                 assert _other_rows(env) == before_other
                 assert env.graph.get_node("Document", "anchor") is not None
                 shared = env.vec.get_by_id("n1")
@@ -318,12 +490,7 @@ def test_shared_id_orphans_anchor_and_final_same_rounds_match(tmp_path, monkeypa
             assert rounds[-1]["nodes"][2] == len(_SECOND[0])
             assert rounds[-1]["node_errors"] == (0, 0)
             assert rounds[-1]["chunks"][3] == len(_SECOND[2]) + 1
-            with sqlite3.connect(env.paths["vec"]) as conn:
-                conn.enable_load_extension(True)
-                sqlite_vec.load(conn)
-                vector = conn.execute("SELECT embedding FROM vectors_kure WHERE node_id='n1'").fetchone()[0]
-                assert struct.unpack("4f", vector) == pytest.approx(_embed(["shared authoritative text"])[0])
-            outcomes.append((rounds, env.snapshot(), calls))
+            outcomes.append((rounds, round_states, round_calls))
         finally:
             env.close()
     assert outcomes[0] == outcomes[1]
@@ -444,7 +611,39 @@ _DELETE_SITES = {
 }
 
 
+def _patch_write_unit(patches, manager):
+    from opencrab.ontology import builder
+    from opencrab.stores import sql_store
+
+    patches.setattr(sql_store, "shared_write_unit", manager)
+    patches.setattr(builder, "shared_write_unit", manager)
+
+
+def _observe_authorization(env, patches, unit):
+    from opencrab.pack import ownership
+
+    original = ownership.assert_writable
+    authorized = []
+    def observe(sql, principal, pack_id, **kwargs):
+        assert sql is env.sql
+        result = original(sql, principal, pack_id, **kwargs)
+        active = env.shared is not None and env.shared.in_unit_of_work
+        authorized.append((unit[0], principal, pack_id, active,
+                           env.shared.connection().in_transaction if active else False))
+        return result
+    patches.setattr(ownership, "assert_writable", observe)
+    return authorized
+
+
+def _assert_authorized(env, authorized, unit):
+    assert env.shared.in_unit_of_work
+    assert env.shared._uow.validated_packs == {PACK: env.shared.pack_incarnation(PACK)}
+    assert env.shared._uow.requested_pack == PACK
+    assert (unit[0], env.principal, PACK, True, True) in authorized
+
+
 def _observe_deletes(env, patches, trace, unit):
+    authorized = _observe_authorization(env, patches, unit)
     for store_name, method in set(_DELETE_SITES.values()):
         store = getattr(env, store_name)
         original = getattr(store, method)
@@ -452,9 +651,7 @@ def _observe_deletes(env, patches, trace, unit):
             identity = (_store, _method, repr(args), repr(sorted(kwargs.items())))
             trace.append((unit[0], identity))
             if env.shared is not None:
-                assert env.shared.in_unit_of_work
-                assert env.shared._uow.validated_packs == {PACK: env.shared.pack_incarnation(PACK)}
-                assert env.shared._uow.requested_pack == PACK
+                _assert_authorized(env, authorized, unit)
             return _original(*args, **kwargs)
         patches.setattr(store, method, observe)
 
@@ -471,8 +668,6 @@ def _deletion_setup(env, monkeypatch, site):
     env.run(*_FIRST, env.d / "initial")
     if site == "node_space":
         _seed_write(env, lambda: env.docs.upsert_node_doc("concept", "Document", "n1", {"pack_id": PACK}))
-    if site == "node_sweep":
-        monkeypatch.setattr(pack_load, "_dup_type_node_rows", lambda *_: {"n1": {"Document", "Concept"}})
     with principal_scope(env.principal):
         state = pack_load.live_pack_state(PACK, env.graph, env.docs, env.vec)
     if site.startswith("node_"):
@@ -480,8 +675,13 @@ def _deletion_setup(env, monkeypatch, site):
             "node_type", "node_old_doc"} else [_node("n1")]
         path = _write_jsonl(env.d / "nodes.jsonl", rows)
         def run():
-            return pack_load.load_nodes_incremental(PACK, path, env.builder, {}, state["nodes"],
-                env.graph, env.docs, state["doc_node_spaces"], vec=env.vec, sql=env.sql)
+            current = pack_load.live_pack_state(PACK, env.graph, env.docs, env.vec)
+            with monkeypatch.context() as scoped:
+                if site == "node_sweep":
+                    scoped.setattr(pack_load, "_dup_type_node_rows",
+                                   lambda *_: {"n1": {"Document", "Concept"}})
+                return pack_load.load_nodes_incremental(PACK, path, env.builder, {}, current["nodes"],
+                    env.graph, env.docs, current["doc_node_spaces"], vec=env.vec, sql=env.sql)
         return run
     node_ids = set(state["nodes"]) - {"n3"}
     chunk_ids = set(state["chunks"]) - {"c3"}
@@ -504,14 +704,14 @@ def test_each_public_delete_has_independent_authorized_outcome(tmp_path, monkeyp
     trace = []
     unit = [0]
     @contextlib.contextmanager
-    def counted(sql, *, outcome=None):
+    def counted(sql, *, outcome=None, **kwargs):
         unit[0] += 1
-        with original(sql, outcome=outcome) as conn:
+        with original(sql, outcome=outcome, **kwargs) as conn:
             yield conn
     try:
         run = _deletion_setup(control, monkeypatch, site)
         with monkeypatch.context() as spy:
-            spy.setattr(sql_store, "shared_write_unit", counted)
+            _patch_write_unit(spy, counted)
             _observe_deletes(control, spy, trace, unit)
             with principal_scope(control.principal):
                 run()
@@ -527,7 +727,7 @@ def test_each_public_delete_has_independent_authorized_outcome(tmp_path, monkeyp
         other_before = _other_rows(env)
         targeted = []
         @contextlib.contextmanager
-        def injected(sql, *, outcome=None):
+        def injected(sql, *, outcome=None, **kwargs):
             unit[0] += 1
             selected = unit[0] == target_unit
             if selected:
@@ -536,7 +736,7 @@ def test_each_public_delete_has_independent_authorized_outcome(tmp_path, monkeyp
                 if phase == "start":
                     raise failure
             try:
-                with original(sql, outcome=outcome) as conn:
+                with original(sql, outcome=outcome, **kwargs) as conn:
                     yield conn
                     if selected:
                         assert observed[-1] == (target_unit, target_identity)
@@ -547,7 +747,7 @@ def test_each_public_delete_has_independent_authorized_outcome(tmp_path, monkeyp
                     outcome["cleanup_error"] = failure
                     raise failure
         with monkeypatch.context() as spy:
-            spy.setattr(sql_store, "shared_write_unit", injected)
+            _patch_write_unit(spy, injected)
             _observe_deletes(env, spy, observed, unit)
             with principal_scope(env.principal):
                 if phase == "rollback":
@@ -582,6 +782,9 @@ def test_delete_prefix_interrupt_matches_modes_and_reexecution_recovers(tmp_path
 
     prefix_states = []
     final_states = []
+    prefixes = []
+    rerun_results = []
+    final_results = []
     for layout in ("five", "single"):
         env = _Env(layout, tmp_path / layout, monkeypatch)
         try:
@@ -591,9 +794,9 @@ def test_delete_prefix_interrupt_matches_modes_and_reexecution_recovers(tmp_path
             unit = [0]
             original = sql_store.shared_write_unit
             @contextlib.contextmanager
-            def counted(sql, *, outcome=None):
+            def counted(sql, *, outcome=None, **kwargs):
                 unit[0] += 1
-                with original(sql, outcome=outcome) as conn:
+                with original(sql, outcome=outcome, **kwargs) as conn:
                     yield conn
             before = env.snapshot()
             # The dry control uses the same initial state on a separate environment.
@@ -601,7 +804,7 @@ def test_delete_prefix_interrupt_matches_modes_and_reexecution_recovers(tmp_path
             try:
                 control_run = _deletion_setup(control, monkeypatch, site)
                 with monkeypatch.context() as spy:
-                    spy.setattr(sql_store, "shared_write_unit", counted)
+                    _patch_write_unit(spy, counted)
                     _observe_deletes(control, spy, trace, unit)
                     with principal_scope(control.principal):
                         control_run()
@@ -613,8 +816,11 @@ def test_delete_prefix_interrupt_matches_modes_and_reexecution_recovers(tmp_path
             unit[0] = 0
             fired = []
             store_name, method = _DELETE_SITES[site]
-            public = getattr(getattr(env, store_name), method)
+            public = None
             method_calls = 0
+            completed = []
+            observed = []
+            interruption = KeyboardInterrupt("prefix interruption")
             target_index = sum(identity[:2] == (store_name, method) for _, identity in trace[:trace.index((target_unit, target_identity))])
             def interrupted(*args, **kwargs):
                 nonlocal method_calls
@@ -624,21 +830,47 @@ def test_delete_prefix_interrupt_matches_modes_and_reexecution_recovers(tmp_path
                 if selected and not fired:
                     assert identity == target_identity
                     fired.append(True)
-                    raise KeyboardInterrupt("prefix interruption")
+                    raise interruption
                 return public(*args, **kwargs)
             with monkeypatch.context() as spy:
+                _patch_write_unit(spy, counted)
+                _observe_deletes(env, spy, observed, unit)
+                for observed_store, observed_method in set(_DELETE_SITES.values()):
+                    store = getattr(env, observed_store)
+                    original_public = getattr(store, observed_method)
+                    def committed(*args, _original=original_public, _store=observed_store,
+                                  _method=observed_method, **kwargs):
+                        value = _original(*args, **kwargs)
+                        completed.append((_store, _method, repr(args), repr(sorted(kwargs.items()))))
+                        return value
+                    spy.setattr(store, observed_method, committed)
+                public = getattr(getattr(env, store_name), method)
                 spy.setattr(getattr(env, store_name), method, interrupted)
-                with principal_scope(env.principal), pytest.raises(KeyboardInterrupt):
+                with principal_scope(env.principal), pytest.raises(KeyboardInterrupt) as caught:
                     run()
+                assert caught.value is interruption
             assert fired == [True]
+            expected_prefix = [identity for _, identity in trace[:trace.index((target_unit, target_identity))]]
+            assert completed == expected_prefix
+            assert [identity for _, identity in observed] == expected_prefix
+            assert method_calls == target_index + 1
+            prefixes.append(completed)
             prefix_states.append(env.snapshot())
-            env.run(*_SECOND, env.d / "resume")
+            with principal_scope(env.principal):
+                rerun = run()
+            rerun_results.append((_result(rerun),
+                                  getattr(rerun, "ingest_err", None),
+                                  getattr(rerun, "cleanup_err", None)))
+            final_results.append(env.run(*_SECOND, env.d / "resume"))
             assert set(audit_before).issubset(set(_audit_rows(env)))
             assert len(_audit_rows(env)) > len(audit_before)
             final_states.append(env.snapshot())
         finally:
             env.close()
+    assert prefixes[0] == prefixes[1]
     assert prefix_states[0] == prefix_states[1]
+    assert rerun_results[0] == rerun_results[1]
+    assert final_results[0] == final_results[1]
     assert final_states[0] == final_states[1]
     uninterrupted = _Env("single", tmp_path / "uninterrupted", monkeypatch)
     try:
@@ -649,6 +881,207 @@ def test_delete_prefix_interrupt_matches_modes_and_reexecution_recovers(tmp_path
         assert final_states[1] == uninterrupted.snapshot()
     finally:
         uninterrupted.close()
+
+
+@pytest.mark.parametrize("boundary", [*_DELETE_SITES, "builder", "chunk"])
+def test_same_generation_owner_change_rejects_next_unit(tmp_path, monkeypatch, boundary):
+    from opencrab.pack import ownership
+    from opencrab.stores import sql_store
+
+    env = _Env("single", tmp_path / "single", monkeypatch)
+    try:
+        replacement = create_user(env.sql, "replacement", is_local=False)
+        original_unit = sql_store.shared_write_unit
+        unit = [0]
+        trace = []
+        if boundary in _DELETE_SITES:
+            run = _deletion_setup(env, monkeypatch, boundary)
+            @contextlib.contextmanager
+            def counted(sql, **kwargs):
+                unit[0] += 1
+                with original_unit(sql, **kwargs) as conn:
+                    yield conn
+            # 정상 control은 별도 DB에 같은 입력을 넣는다.
+            control = _Env("single", tmp_path / "control", monkeypatch)
+            try:
+                control_run = _deletion_setup(control, monkeypatch, boundary)
+                with monkeypatch.context() as spy:
+                    _patch_write_unit(spy, counted)
+                    _observe_deletes(control, spy, trace, unit)
+                    with principal_scope(control.principal):
+                        control_run()
+                target_unit, _ = _target_delete(trace, boundary)
+            finally:
+                control.close()
+            monkeypatch.setenv("LOCAL_DATA_DIR", str(env.d))
+        else:
+            path = _write_jsonl(env.d / "input.jsonl",
+                                [_node("new-node")] if boundary == "builder" else [_chunk("new")])
+            if boundary == "builder":
+                def run():
+                    return pack_load.load_nodes_incremental(PACK, path, env.builder, {}, {},
+                        env.graph, env.docs, {}, vec=env.vec, sql=env.sql)
+            else:
+                def run():
+                    return pack_load.load_chunks_incremental(PACK, path, env.vec, env.docs, {}, sql=env.sql)
+            target_unit = None
+        before = env.snapshot()
+        audit_before = _audit_rows(env)
+        incarnation = env.shared.pack_incarnation(PACK)
+        changed = []
+        denied = []
+        at_revoke = []
+        original_authorize = ownership.assert_writable
+        def authorize(sql, principal, pack_id, **kwargs):
+            try:
+                return original_authorize(sql, principal, pack_id, **kwargs)
+            except ownership.PackNotFoundError:
+                denied.append((principal, pack_id, env.shared.in_unit_of_work,
+                               env.shared._uow.requested_pack,
+                               dict(env.shared._uow.validated_packs)))
+                raise
+        def revoke():
+            at_revoke.append((env.snapshot(), _audit_rows(env)))
+            assert not env.shared.in_unit_of_work
+            with sqlite3.connect(env.paths["registry"]) as conn:
+                assert conn.execute("UPDATE packs SET owner_id=? WHERE pack_id=?",
+                                    (replacement, PACK)).rowcount == 1
+            assert env.shared.pack_incarnation(PACK) == incarnation
+            changed.append(True)
+        @contextlib.contextmanager
+        def injected(sql, **kwargs):
+            unit[0] += 1
+            if unit[0] == target_unit:
+                revoke()
+            with original_unit(sql, **kwargs) as conn:
+                yield conn
+        original_embedding = env.vec._ef
+        def embedding(texts):
+            result = original_embedding(texts)
+            if not changed:
+                revoke()
+            return result
+        unit[0] = 0
+        with monkeypatch.context() as spy:
+            spy.setattr(ownership, "assert_writable", authorize)
+            _patch_write_unit(spy, injected)
+            if target_unit is None:
+                spy.setattr(env.vec, "_ef", embedding)
+            with principal_scope(env.principal):
+                try:
+                    run()
+                except ownership.PackNotFoundError:
+                    pass
+        assert changed == [True]
+        assert denied
+        assert (env.principal, PACK, True, PACK, {PACK: incarnation}) in denied
+        assert all(row[:2] == (env.principal, PACK) for row in denied)
+        assert env.shared.pack_incarnation(PACK) == incarnation
+        # 삭제 전 선행 단위는 커밋될 수 있다. 거부 뒤에는 기반 행과 감사가 바뀌지 않는다.
+        assert (env.snapshot(), _audit_rows(env)) == at_revoke[0]
+        if target_unit is None:
+            assert env.snapshot() == before
+            assert _audit_rows(env) == audit_before
+        assert _other_rows(env)
+        assert not env.shared.in_unit_of_work
+        assert not env.shared.connection().in_transaction
+    finally:
+        env.close()
+
+
+def test_builder_and_chunk_writes_follow_real_authorization(tmp_path, monkeypatch):
+    from opencrab.stores import sql_store
+
+    env = _Env("single", tmp_path / "single", monkeypatch)
+    unit = [0]
+    writes = []
+    original = sql_store.shared_write_unit
+    @contextlib.contextmanager
+    def counted(sql, **kwargs):
+        unit[0] += 1
+        with original(sql, **kwargs) as conn:
+            yield conn
+    try:
+        with monkeypatch.context() as spy:
+            _patch_write_unit(spy, counted)
+            authorized = _observe_authorization(env, spy, unit)
+            for store, method in ((env.graph, "upsert_node"), (env.graph, "upsert_edge"),
+                                  (env.docs, "upsert_node_doc"), (env.docs, "upsert_source"),
+                                  (env.vec, "upsert_precomputed"), (env.sql, "register_node"),
+                                  (env.sql, "register_edge")):
+                original_write = getattr(store, method)
+                def observe(*args, _original=original_write, _method=method, **kwargs):
+                    _assert_authorized(env, authorized, unit)
+                    writes.append((_method, unit[0]))
+                    return _original(*args, **kwargs)
+                spy.setattr(store, method, observe)
+            env.run(*_FIRST, env.d / "first")
+        assert {name for name, _ in writes} == {"upsert_node", "upsert_edge", "upsert_node_doc",
+                                               "upsert_source", "upsert_precomputed",
+                                               "register_node", "register_edge"}
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("table,column,value", [
+    ("graph_nodes", "space_id", "changed-space"),
+    ("graph_edges", "from_type", "ChangedType"),
+    ("graph_edges", "to_type", "ChangedType"),
+    ("doc_source_integrity", "source_integrity", '{"state":"changed"}'),
+    ("ontology_edges", "from_space", "changed-space"),
+    ("vectors_kure", "pack_id", "changed-pack"),
+    ("graph_nodes", "owner_id", "changed-owner"),
+])
+def test_snapshot_detects_semantic_column_change(tmp_path, monkeypatch, table, column, value):
+    env = _Env("single", tmp_path / "single", monkeypatch)
+    try:
+        env.run(*_FIRST, env.d / "initial")
+        before = env.snapshot()
+        with _connection(env.path) as conn:
+            if column == "owner_id":
+                raw = conn.execute("SELECT properties FROM graph_nodes WHERE node_id='n1'").fetchone()[0]
+                props = json.loads(raw)
+                assert props["owner_id"] == env.user_id
+                props["owner_id"] = value
+                conn.execute("UPDATE graph_nodes SET properties=? WHERE node_id='n1'", (json.dumps(props),))
+            elif table == "vectors_kure":
+                cursor = conn.execute('SELECT * FROM vectors_kure WHERE node_id=?', ("c1",))
+                columns = [item[0] for item in cursor.description]
+                row = dict(zip(columns, cursor.fetchone()))
+                row[column] = value
+                assert conn.execute('DELETE FROM vectors_kure WHERE node_id=?', ("c1",)).rowcount == 1
+                names = ','.join('"' + name + '"' for name in columns)
+                placeholders = ','.join('?' for _ in columns)
+                conn.execute(f'INSERT INTO vectors_kure ({names}) VALUES ({placeholders})',
+                             tuple(row[name] for name in columns))
+            else:
+                conn.execute(f'UPDATE "{table}" SET "{column}"=?', (value,))
+            conn.commit()
+        assert env.snapshot() != before
+    finally:
+        env.close()
+
+
+def test_snapshot_rejects_mapping_and_stats_corrupted_together(tmp_path, monkeypatch):
+    env = _Env("single", tmp_path / "single", monkeypatch)
+    try:
+        env.run(*_FIRST, env.d / "initial")
+        with _connection(env.path) as conn:
+            assert conn.execute("UPDATE doc_nodes_bm25_docs SET dl=dl+1 WHERE node_id='n1'").rowcount == 1
+            assert conn.execute("UPDATE doc_nodes_bm25_stats SET total_len=total_len+1 WHERE id=1").rowcount == 1
+            conn.commit()
+        with pytest.raises(AssertionError):
+            env.snapshot()
+    finally:
+        env.close()
+
+
+def test_result_comparison_preserves_returned_ids_and_named_errors():
+    original = pack_load.NodeIncrementalResult((1, 0, 0, 0, 0, {"first"}, 0), ingest_err=0, cleanup_err=0)
+    changed = pack_load.NodeIncrementalResult((1, 0, 0, 0, 0, {"other"}, 0), ingest_err=0, cleanup_err=0)
+    assert _result(original) != _result(changed)
+    changed_errors = pack_load.NodeIncrementalResult(tuple(original), ingest_err=1, cleanup_err=1)
+    assert (original.ingest_err, original.cleanup_err) != (changed_errors.ingest_err, changed_errors.cleanup_err)
 
 
 def _audit_rows(env):
@@ -736,6 +1169,6 @@ def test_shared_edge_failure_warning_contains_complete_key(tmp_path, monkeypatch
             result = pack_load.load_edges(PACK, path, env.builder,
                 {source: ("resource", "Document"), target: ("resource", "Document")})
         assert result == (0, 0, 1)
-        assert f"{source}-cites->{target}" in caplog.text
+        assert f"resource/{source}-cites->resource/{target}" in caplog.text
     finally:
         env.close()

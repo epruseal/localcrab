@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sqlite3
 
 import pytest
 
@@ -246,7 +247,8 @@ def test_missing_source_preserves_derived_rows(guarded_docs, derived, operation,
                 else:
                     docs.rewrite_source_metadata("source-target", {"pack_id": "p"}, state)
     assert _snapshot(conn) == before
-    assert "source-target" in caplog.text and "derived rows remain" in caplog.text
+    assert "source-target" in caplog.text
+    assert ("derived_protection_rejected" if operation != "delete" else "source_derived_rows_preserved") in caplog.text
 
 
 @pytest.mark.parametrize("operation", ["delete", "upsert", "metadata"])
@@ -367,9 +369,10 @@ def test_source_temp_vocab_definition_checked_every_call(guarded_docs):
     conn.execute(f"DROP TABLE temp.{sfts._PROTECTED_VOCAB}")
     conn.execute(f"CREATE TEMP TABLE {sfts._PROTECTED_VOCAB} (doc INTEGER)")
     before = _snapshot(conn)
-    with pytest.raises(sfts.DerivedRowProtectionError, match="definition"):
+    with pytest.raises(sfts.DerivedRowProtectionError, match="derived_protection_rejected") as caught:
         with _unit(shared):
             docs.upsert_source("source-target", "new", {"pack_id": "p"})
+    assert "definition" in str(caught.value.__cause__)
     assert _snapshot(conn) == before
 
 
@@ -479,11 +482,12 @@ def test_metadata_state_failure_rolls_back_preceding_shared_mutation(guarded_doc
         docs.upsert_source("source-target", "old", {"pack_id": "p"})
     state = docs.read_source_state_exact("source-target")
     before = _snapshot(conn)
-    with pytest.raises(sfts.DerivedRowProtectionError, match="state changed"):
+    with pytest.raises(sfts.DerivedRowProtectionError, match="derived_protection_rejected") as caught:
         with _unit(shared):
             docs.upsert_node_doc("s", "Document", "earlier", {"pack_id": "p"})
             docs.upsert_source("source-target", "changed", {"pack_id": "p"})
             docs.rewrite_source_metadata("source-target", {"pack_id": "p"}, state)
+    assert "state changed" in str(caught.value.__cause__)
     assert _snapshot(conn) == before
 
 
@@ -497,3 +501,282 @@ def test_caught_protection_exception_still_rolls_back_outer_unit(guarded_docs):
             with pytest.raises(sfts.DerivedRowProtectionError):
                 docs.delete_node_doc("s", "target")
     assert _snapshot(conn) == before
+
+
+class _ConnectionProbe:
+    def __init__(self, connection, execute):
+        self.connection = connection
+        self.execute = execute
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+def test_bm25_second_owner_read_failure_rolls_back_whole_unit(guarded_docs, monkeypatch, caplog):
+    docs, shared, conn = guarded_docs
+    with _unit(shared):
+        docs.upsert_node_doc("s", "Document", "target", {"pack_id": "p", "text": "old"})
+    before = _snapshot(conn)
+    failure = sqlite3.OperationalError("owner-read-private-sentinel")
+    reads = []
+
+    def execute(sql, parameters=()):
+        if sql.startswith(f"SELECT pack_id FROM main.{nbm.DOCS}"):
+            reads.append(sql)
+            if len(reads) == 2:
+                assert json.loads(conn.execute(
+                    "SELECT properties FROM doc_nodes WHERE node_id='target'"
+                ).fetchone()[0])["text"] == "new"
+                raise failure
+        return conn.execute(sql, parameters)
+
+    monkeypatch.setattr(shared.local, "conn", _ConnectionProbe(conn, execute))
+    with pytest.raises(sfts.DerivedRowProtectionError) as caught:
+        with _unit(shared):
+            docs.upsert_source("earlier", "roll back", {"pack_id": "p"})
+            docs.upsert_node_doc("s", "Document", "target", {"pack_id": "p", "text": "new"})
+    assert len(reads) == 2
+    causes = []
+    cause = caught.value
+    while cause is not None:
+        causes.append(cause)
+        cause = cause.__cause__
+    assert failure in causes
+    assert "owner-read-private-sentinel" not in caplog.text
+    assert "owner-read-private-sentinel" not in str(caught.value)
+    assert _snapshot(conn) == before
+
+
+_QUOTES = [("", ""), ('"', '"'), ("[", "]"), ("`", "`"), ("'", "'")]
+
+
+@pytest.mark.parametrize("left,right", _QUOTES, ids=["bare", "double", "bracket", "backtick", "single"])
+def test_source_vocab_reuses_normal_quoted_declaration(guarded_docs, left, right):
+    docs, shared, conn = guarded_docs
+    name = sfts._PROTECTED_VOCAB.upper()
+    conn.execute(f"CREATE VIRTUAL TABLE temp.{left}{name}{right} "
+                 "USING fts5vocab([main], `doc_sources_fts`, 'instance')")
+    declared = conn.execute("SELECT sql FROM temp.sqlite_master WHERE name=?", (name,)).fetchone()[0]
+    assert name in declared
+    conn.execute(f"INSERT INTO main.{sfts.FTS}(rowid, source_id, text) VALUES (41, 'foreign', 'mainword')")
+    conn.execute(f"CREATE VIRTUAL TABLE temp.{sfts.FTS} USING fts5(source_id, text)")
+    conn.execute(f"INSERT INTO temp.{sfts.FTS}(rowid, source_id, text) VALUES (81, 'decoy', 'decoyword')")
+    conn.commit()
+    assert conn.execute(f"SELECT doc FROM temp.{name} WHERE term='mainword'").fetchone()[0] == 41
+    assert conn.execute(f"SELECT doc FROM temp.{name} WHERE term='decoyword'").fetchone() is None
+    conn.execute(f"DROP TABLE temp.{sfts.FTS}")
+    conn.commit()
+    for text in ("firstword", "secondword"):
+        with _unit(shared):
+            docs.upsert_source("source-target", text, {"pack_id": "p"})
+        assert conn.execute("SELECT sql FROM temp.sqlite_master WHERE name=?", (name,)).fetchone()[0] == declared
+        assert sfts.require_protection_vocab(conn) == f"temp.{name}"
+        rowid = conn.execute(f"SELECT id FROM main.{sfts.CONTENT} WHERE c0='source-target'").fetchone()[0]
+        assert conn.execute(f"SELECT doc FROM temp.{name} WHERE term=?", (text,)).fetchone()[0] == rowid
+    assert conn.execute(f"SELECT doc FROM temp.{name} WHERE term='mainword'").fetchone()[0] == 41
+
+
+@pytest.mark.parametrize("left,right", _QUOTES, ids=["bare", "double", "bracket", "backtick", "single"])
+@pytest.mark.parametrize("arguments", [
+    "main, 'wrong_target', 'instance'", "main, 'doc_sources_fts', 'row'",
+    "temp, 'doc_sources_fts', 'instance'",
+])
+def test_source_vocab_rejects_wrong_existing_declaration(guarded_docs, left, right, arguments):
+    docs, shared, conn = guarded_docs
+    name = sfts._PROTECTED_VOCAB.upper()
+    conn.execute(f"CREATE VIRTUAL TABLE temp.{left}{name}{right} USING fts5vocab({arguments})")
+    assert conn.execute("SELECT type FROM temp.sqlite_master WHERE name=?", (name,)).fetchone()[0] == "table"
+    before = _snapshot(conn)
+    for _ in range(2):
+        with pytest.raises(sfts.DerivedRowProtectionError):
+            sfts.require_protection_vocab(conn)
+        with pytest.raises(sfts.DerivedRowProtectionError):
+            with _unit(shared):
+                docs.upsert_source("source-target", "new", {"pack_id": "p"})
+    assert _snapshot(conn) == before
+    assert [row[0] for row in conn.execute("SELECT name FROM temp.sqlite_master")] == [name]
+
+
+@pytest.mark.parametrize("declaration", [
+    "CREATE VIRTUAL TABLE source_fts_protection_vinst USING fts5vocab(main, 'doc_sources_fts', 'instance', 'extra')",
+    "CREATE VIRTUAL TABLE source_fts_protection_vinst USING fts5vocab(main, 'doc_sources_fts', 'instance'); SELECT 1",
+    "CREATE VIRTUAL TABLE wrong_name USING fts5vocab(main, 'doc_sources_fts', 'instance')",
+])
+def test_source_vocab_definition_rejects_extra_tokens(guarded_docs, declaration):
+    docs, shared, conn = guarded_docs
+    name = sfts._PROTECTED_VOCAB
+    conn.execute(f"CREATE VIRTUAL TABLE temp.{name} USING fts5vocab(main, '{sfts.FTS}', 'instance')")
+
+    class _Cursor:
+        def fetchall(self):
+            return [(name, "table", declaration)]
+
+    def execute(sql, parameters=()):
+        if "FROM temp.sqlite_master" in sql:
+            return _Cursor()
+        return conn.execute(sql, parameters)
+
+    with pytest.raises(sfts.DerivedRowProtectionError):
+        sfts.require_protection_vocab(_ConnectionProbe(conn, execute))
+
+
+def test_source_vocab_selection_avoids_main_ascii_collisions_without_creation(guarded_docs):
+    docs, shared, conn = guarded_docs
+    for name in (sfts._PROTECTED_VOCAB.upper(), sfts._PROTECTED_VOCAB + "_1"):
+        conn.execute(f"CREATE TABLE main.{name}(value TEXT)")
+        conn.execute(f"INSERT INTO main.{name} VALUES ('keep')")
+    conn.commit()
+    selected = sfts.require_protection_vocab(conn)
+    assert selected == f"temp.{sfts._PROTECTED_VOCAB}_2"
+    assert conn.execute("SELECT count(*) FROM temp.sqlite_master").fetchone()[0] == 0
+    for text in ("firstword", "secondword"):
+        with _unit(shared):
+            docs.upsert_source("source-target", text, {"pack_id": "p"})
+        assert sfts.require_protection_vocab(conn) == selected
+        assert conn.execute(f"SELECT doc FROM {selected} WHERE term=?", (text,)).fetchone() is not None
+        assert conn.execute(f"SELECT value FROM {sfts._PROTECTED_VOCAB}").fetchone()[0] == "keep"
+    conn.execute(f"DROP TABLE {selected}")
+    conn.execute(f"CREATE TEMP TABLE {sfts._PROTECTED_VOCAB}_2(doc INTEGER)")
+    with pytest.raises(sfts.DerivedRowProtectionError):
+        sfts.require_protection_vocab(conn)
+    assert conn.execute("SELECT count(*) FROM temp.sqlite_master").fetchone()[0] == 1
+
+
+def test_source_vocab_does_not_shadow_actual_vector_collection(guarded_docs):
+    import sqlite_vec
+
+    docs, shared, conn = guarded_docs
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    name = sfts._PROTECTED_VOCAB
+    conn.execute(f"CREATE VIRTUAL TABLE {name} USING vec0(embedding float[2])")
+    conn.execute(f"INSERT INTO {name}(rowid, embedding) VALUES (17, ?)",
+                 (sqlite_vec.serialize_float32([0.25, 0.5]),))
+    conn.commit()
+    before = [tuple(row) for row in conn.execute(f"SELECT rowid, embedding FROM main.{name}")]
+    for text in ("firstword", "secondword"):
+        with _unit(shared):
+            docs.upsert_source("source-target", text, {"pack_id": "p"})
+        assert [tuple(row) for row in conn.execute(f"SELECT rowid, embedding FROM {name}")] == before
+        assert sfts.require_protection_vocab(conn) == f"temp.{name}_1"
+        assert conn.execute(f"SELECT doc FROM temp.{name}_1 WHERE term=?", (text,)).fetchone() is not None
+
+
+@pytest.mark.parametrize("origin", ["decoder", "validator"])
+def test_shared_source_depth_classification_preserves_origin(guarded_docs, monkeypatch, origin):
+    from opencrab.common import graph_identity
+
+    docs, shared, conn = guarded_docs
+    conn.execute("INSERT INTO doc_sources VALUES ('target', 'body', '{\"pack_id\":\"p\"}', 'old')")
+    conn.commit()
+    failure = RecursionError("depth-private-sentinel")
+    reads = []
+    original = graph_identity.json.loads
+
+    def decode(value, *args, **kwargs):
+        reads.append(value)
+        if origin == "decoder":
+            raise failure
+        return original(value, *args, **kwargs)
+
+    def validate(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(graph_identity.json, "loads", decode)
+    if origin == "validator":
+        monkeypatch.setattr(graph_identity, "_validate_json", validate)
+    expected = graph_identity.PropertyDecodeDepthError if origin == "decoder" else RecursionError
+    with pytest.raises(expected) as caught:
+        docs.get_source("target")
+    if origin == "decoder":
+        assert caught.value.__cause__ is failure
+    else:
+        assert caught.value is failure
+    assert reads == ['{"pack_id":"p"}']
+
+
+@pytest.mark.parametrize("raw", ['{"pack_id":', '{"pack_id":"p","pack_id":"q"}', '[]'])
+def test_shared_source_corrupt_metadata_uses_one_decoder_read(guarded_docs, monkeypatch, raw):
+    from opencrab.common import graph_identity
+
+    docs, shared, conn = guarded_docs
+    conn.execute("INSERT INTO doc_sources VALUES ('target', 'body', ?, 'old')", (raw,))
+    conn.commit()
+    original = graph_identity.json.loads
+    reads = []
+
+    def decode(value, *args, **kwargs):
+        reads.append(value)
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(graph_identity.json, "loads", decode)
+    source = docs.get_source("target")
+    assert source == {"source_id": "target", "text": "body", "metadata": {},
+                      "ingested_at": "old", "property_decode_error": True}
+    assert reads == [raw]
+
+
+@pytest.mark.parametrize("probe", ["_read_only_fts_ok", "_read_only_node_bm25_ok"])
+@pytest.mark.parametrize("safe_log", [False, True])
+def test_capability_probe_safe_log_preserves_result(guarded_docs, caplog, probe, safe_log):
+    docs, shared, conn = guarded_docs
+    failure = sqlite3.OperationalError("capability-private-sentinel")
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    assert getattr(docs, probe)(conn, safe_log=safe_log) is True
+    assert getattr(docs, probe)(_ConnectionProbe(conn, fail), safe_log=safe_log) is False
+    assert ("capability-private-sentinel" in caplog.text) is (not safe_log)
+
+
+def test_guarded_safe_log_keeps_general_bm25_savepoint_contract(guarded_docs, monkeypatch, caplog):
+    docs, shared, conn = guarded_docs
+    failure = ValueError("bm25-private-sentinel")
+    statements = []
+
+    def execute(sql, parameters=()):
+        statements.append(sql)
+        return conn.execute(sql, parameters)
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(shared.local, "conn", _ConnectionProbe(conn, execute))
+    monkeypatch.setattr(nbm, "node_terms", fail)
+    with shared.unit_of_work(safe_log=True):
+        shared.validate_pack_writes({"p": "first"})
+        shared._uow.requested_pack = "p"
+        docs.upsert_node_doc("s", "Document", "target", {"pack_id": "p"})
+    assert conn.execute("SELECT count(*) FROM doc_nodes").fetchone()[0] == 1
+    assert conn.execute(f"SELECT count(*) FROM {nbm.PENDING}").fetchone()[0] == 1
+    assert conn.execute(f"SELECT count(*) FROM {nbm.DOCS}").fetchone()[0] == 0
+    assert "SAVEPOINT node_bm25" in statements
+    assert "ROLLBACK TO SAVEPOINT node_bm25" in statements
+    assert "RELEASE SAVEPOINT node_bm25" in statements
+    assert "bm25-private-sentinel" not in caplog.text
+    assert any("bm25_sync_failed" in record.getMessage() for record in caplog.records)
+
+
+def test_bm25_stats_match_base_documents_not_other_derived_rows(guarded_docs):
+    from opencrab.ontology.bm25 import max_text_chars_setting
+
+    docs, shared, conn = guarded_docs
+    for owner, incarnation in (("p", "first"), ("q", "second")):
+        with _unit(shared, requested=owner, validated={owner: incarnation}):
+            docs.upsert_node_doc("s", "Document", owner, {"pack_id": owner, "text": "one two three"})
+    with _unit(shared):
+        docs.upsert_node_doc("s", "Document", "p", {"pack_id": "p", "text": "replacement with four tokens"})
+        docs.upsert_node_doc("s", "Document", "extra", {"pack_id": "p", "label": "extra"})
+    rows = conn.execute("SELECT space, node_id, node_type, properties, updated_at FROM doc_nodes").fetchall()
+    expected = (len(rows), sum(len(nbm.node_terms(docs._row_to_node(row), max_text_chars_setting())) for row in rows))
+    actual = tuple(conn.execute(f"SELECT doc_count, total_len FROM {nbm.STATS}").fetchone())
+    assert actual == expected
+    conn.execute(f"UPDATE {nbm.DOCS} SET dl=dl+1")
+    conn.execute(f"UPDATE {nbm.STATS} SET total_len=total_len+?", (len(rows),))
+    assert tuple(conn.execute(f"SELECT doc_count, total_len FROM {nbm.STATS}").fetchone()) == tuple(
+        conn.execute(f"SELECT count(*), sum(dl) FROM {nbm.DOCS}").fetchone()
+    )
+    assert tuple(conn.execute(f"SELECT doc_count, total_len FROM {nbm.STATS}").fetchone()) != expected
+    conn.rollback()

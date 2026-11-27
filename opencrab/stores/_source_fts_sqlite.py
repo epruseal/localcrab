@@ -16,6 +16,7 @@ See docs/issue-642-source-fts-lookup.md for the decisions and the tests.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -65,25 +66,65 @@ def delete_sql(source_id_condition: str) -> str:
 
 
 _PROTECTED_VOCAB = "source_fts_protection_vinst"
-_VOCAB_DDL = (
-    f"CREATE VIRTUAL TABLE {_PROTECTED_VOCAB} "
-    f"USING fts5vocab(main, '{FTS}', 'instance')"
+_VOCAB_ATOM = r'''(?:[A-Za-z_][A-Za-z_0-9]*|"(?:[^"]|"")*"|'(?:[^']|'')*'|`(?:[^`]|``)*`|\[[^\]]*\])'''
+_VOCAB_DECLARATION = re.compile(
+    rf"CREATE\s+VIRTUAL\s+TABLE\s+({_VOCAB_ATOM})\s+"
+    rf"USING\s+({_VOCAB_ATOM})\s*\(\s*({_VOCAB_ATOM})\s*,\s*"
+    rf"({_VOCAB_ATOM})\s*,\s*({_VOCAB_ATOM})\s*\)\s*;?\s*",
+    re.IGNORECASE | re.ASCII,
 )
 
 
-def _protected_vocab(conn: sqlite3.Connection) -> str:
-    """호출마다 TEMP vocab의 정의와 main 참조를 확인한다."""
-    row = conn.execute(
-        "SELECT type, sql FROM temp.sqlite_master WHERE name=?", (_PROTECTED_VOCAB,)
-    ).fetchone()
+def _vocab_atom(token: str) -> str:
+    if token[0] == "[":
+        return token[1:-1]
+    if token[0] in "\"'`":
+        quote = token[0]
+        return token[1:-1].replace(quote * 2, quote)
+    return token
+
+
+def require_protection_vocab(conn: sqlite3.Connection, *, create: bool = False) -> str:
+    """main 이름 충돌을 피하고 고정 TEMP vocab 선언을 검사한다."""
+    from opencrab.stores._single_file import ascii_identifier
+
+    main_names = {ascii_identifier(row[0]) for row in conn.execute(
+        "SELECT name FROM main.sqlite_master"
+    )}
+    name = _PROTECTED_VOCAB
+    suffix = 0
+    while ascii_identifier(name) in main_names:
+        suffix += 1
+        name = f"{_PROTECTED_VOCAB}_{suffix}"
+    rows = conn.execute("SELECT name, type, sql FROM temp.sqlite_master").fetchall()
+    row = next((row for row in rows if ascii_identifier(row[0]) == ascii_identifier(name)), None)
+    if row is None and create:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE temp.{name} USING fts5vocab(main, '{FTS}', 'instance')"
+        )
+        rows = conn.execute("SELECT name, type, sql FROM temp.sqlite_master").fetchall()
+        row = next((row for row in rows if ascii_identifier(row[0]) == ascii_identifier(name)), None)
+        if row is None:
+            raise DerivedRowProtectionError("source FTS TEMP vocabulary definition missing")
     if row is None:
-        conn.execute(_VOCAB_DDL.replace("CREATE VIRTUAL TABLE ", "CREATE VIRTUAL TABLE temp.", 1))
-        row = conn.execute(
-            "SELECT type, sql FROM temp.sqlite_master WHERE name=?", (_PROTECTED_VOCAB,)
-        ).fetchone()
-    if row is None or tuple(row) != ("table", _VOCAB_DDL):
+        return f"temp.{name}"
+    actual_name, kind, declaration = row
+    match = _VOCAB_DECLARATION.fullmatch(declaration or "")
+    expected = (name, "fts5vocab", "main", FTS, "instance")
+    if kind != "table" or match is None or tuple(
+        ascii_identifier(_vocab_atom(token)) for token in match.groups()
+    ) != tuple(ascii_identifier(token) for token in expected):
         raise DerivedRowProtectionError("source FTS TEMP vocabulary definition differs")
-    return f"temp.{_PROTECTED_VOCAB}"
+    quoted_name = '"' + actual_name.replace('"', '""') + '"'
+    columns = [entry[1] for entry in conn.execute(f"PRAGMA temp.table_info({quoted_name})")]
+    if columns != ["term", "doc", "col", "offset"]:
+        raise DerivedRowProtectionError("source FTS TEMP vocabulary layout differs")
+    return f"temp.{actual_name}"
+
+
+def _protected_vocab(conn: sqlite3.Connection) -> str:
+    """파생 쓰기에 필요한 vocab만 생성하고 기존 선언을 다시 검사한다."""
+    return require_protection_vocab(conn, create=True)
 
 
 def _rowid_occupied(conn: sqlite3.Connection, vocab: str, rowid: int) -> bool:

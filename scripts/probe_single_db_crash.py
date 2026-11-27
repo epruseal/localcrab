@@ -65,7 +65,7 @@ def _paths(layout: str, d: Path) -> tuple[Path, Path]:
     return d / "doc_store.db", d / "vectors.db"
 
 
-def _supported_single_fixture(directory: Path, *, dim: int) -> Path:
+def _supported_single_fixture(directory: Path, *, dim: int, collection_name: str = "vectors_kure") -> Path:
     """실제 이관기가 만든 빈 지원 스키마를 합성 시험에 제공한다."""
     from opencrab.stores.local_graph_store import LocalGraphStore
     from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
@@ -78,7 +78,8 @@ def _supported_single_fixture(directory: Path, *, dim: int) -> Path:
     stores = [
         LocalGraphStore(str(source / "graph.db")),
         LocalSQLDocStore(str(source / "doc_store.db")),
-        SqliteVecStore(str(source / "vectors.db"), embedding_function=_embed, dim=dim),
+        SqliteVecStore(str(source / "vectors.db"), embedding_function=_embed, dim=dim,
+                       collection_name=collection_name),
         SQLStore(f"sqlite:///{source / 'opencrab.db'}"),
         SQLStore(f"sqlite:///{source / 'billing.db'}"),
     ]

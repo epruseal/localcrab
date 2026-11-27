@@ -3445,6 +3445,7 @@ def test_node_update_rejects_other_pack_edge_even_when_both_validated(stores):
         with pytest.raises(RuntimeError, match="requested pack"):
             with shared.unit_of_work():
                 shared.validate_pack_writes({"p": "first", "other": "second"})
+                shared._uow.requested_pack = "p"
                 graph.update_node("n", digest, "Other", {"pack_id": "p"}, "concept")
         assert conn.execute("SELECT * FROM graph_nodes").fetchall() == before_nodes
         assert conn.execute("SELECT * FROM graph_edges").fetchall() == before_edges
@@ -3465,10 +3466,12 @@ def test_node_update_rejects_duplicate_owner_keys(stores):
     conn.execute("INSERT INTO packs (pack_id, owner_id, incarnation) VALUES ('p', 'owner', 'first')")
     conn.commit()
     try:
-        with pytest.raises(RuntimeError, match="requested pack"):
+        with pytest.raises(RuntimeError, match="graph ownership cannot be decoded") as caught:
             with shared.unit_of_work():
                 shared.validate_pack_writes({"p": "first"})
                 graph.update_node("n", digest, "Other", {"pack_id": "p"}, "concept")
+        assert isinstance(caught.value.__cause__, ValueError)
+        assert conn.execute("SELECT properties FROM graph_nodes WHERE node_id='n'").fetchone()[0] == '{"pack_id":"other","pack_id":"p"}'
     finally:
         sql.close()
 
@@ -4238,12 +4241,12 @@ def test_nested_builder_failure_returns_rollback_receipt(stores, monkeypatch):
         sql.close()
 
 
-def test_builder_rejects_pending_deletion_for_node_and_edge(stores):
+def test_builder_rejects_pending_deletion_for_node_and_edge(supported_stores):
     from opencrab.auth import Principal, create_user, principal_scope
     from opencrab.ontology.builder import OntologyBuilder
     from opencrab.pack.ownership import create_pack
 
-    path, shared, graph, docs, vec = stores
+    path, shared, graph, docs, vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     create_pack(sql, owner, "p")
@@ -4254,10 +4257,8 @@ def test_builder_rejects_pending_deletion_for_node_and_edge(stores):
             for node in ("n1", "n2"):
                 builder.add_node("resource", "Document", node, {"title": node}, pack_id="p")
             conn = shared.connection()
-            conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-            conn.execute("UPDATE packs SET incarnation='first' WHERE pack_id='p'")
-            conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
-            conn.execute("INSERT INTO pack_delete_operations VALUES ('op', 'p', 'first', 'pending')")
+            conn.execute("INSERT INTO pack_delete_operations(operation_id, pack_id, incarnation, state) "
+                         "VALUES ('op', 'p', ?, 'pending')", (shared.pack_incarnation("p"),))
             conn.commit()
             node_result = builder.add_node("resource", "Document", "n3", {"title": "t"}, pack_id="p")
             edge_result = builder.add_edge("resource", "n1", "cites", "resource", "n2", pack_id="p")
@@ -4270,20 +4271,15 @@ def test_builder_rejects_pending_deletion_for_node_and_edge(stores):
         sql.close()
 
 
-def test_builder_single_db_guard_allows_valid_node_and_edge(stores):
+def test_builder_single_db_guard_allows_valid_node_and_edge(supported_stores):
     from opencrab.auth import Principal, create_user, principal_scope
     from opencrab.ontology.builder import OntologyBuilder
     from opencrab.pack.ownership import create_pack
 
-    path, shared, graph, docs, vec = stores
+    path, shared, graph, docs, vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     create_pack(sql, owner, "p")
-    conn = shared.connection()
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("UPDATE packs SET incarnation='first' WHERE pack_id='p'")
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
-    conn.commit()
     builder = OntologyBuilder(graph, docs, sql, vec=vec)
     try:
         with principal_scope(Principal(user_id=owner, is_local=True, disabled=False)):
@@ -5056,5 +5052,220 @@ print("REAL_GETTER_AND_LOADER_CONFIRMED", flush=True)
         if failure != "decoder":
             assert source_id in caplog.text
         assert graph.get_node("Document", source_id) is None
+    finally:
+        sql.close()
+
+
+@pytest.fixture
+def request_stores(supported_stores):
+    from opencrab.auth import create_user
+    from opencrab.pack.ownership import create_pack
+
+    path, shared, graph, docs, vec = supported_stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    user = create_user(sql, "owner", is_local=True)
+    for pack in ("p", "q"):
+        create_pack(sql, user, pack)
+    generations = {pack: shared.pack_incarnation(pack) for pack in ("p", "q")}
+    with shared.unit_of_work():
+        shared.validate_pack_writes({"q": generations["q"]})
+        shared._uow.requested_pack = "q"
+        graph.upsert_node("Document", "foreign", {"pack_id": "q"}, "resource")
+        graph.upsert_node("Document", "foreign-target", {"pack_id": "q"}, "resource")
+        graph.upsert_edge("Document", "foreign", "cites", "Document", "foreign-target", {"pack_id": "q"})
+        vec.upsert_texts(["foreign"], [{"pack_id": "q"}], ["foreign"])
+    yield shared, graph, docs, vec, sql, generations
+    sql.close()
+
+
+@pytest.mark.parametrize("operation", ["add", "import", "upsert", "delete", "registry_node", "registry_edge",
+                                       "graph_node", "graph_edge", "graph_update_node", "graph_update_edge",
+                                       "graph_delete_edge", "graph_delete_node"])
+@pytest.mark.parametrize("requested", ["p", None])
+def test_request_pack_guards_reject_union_and_restore_prior_write(request_stores, operation, requested):
+    shared, graph, _docs, vec, sql, generations = request_stores
+    conn = shared.connection()
+    before = {
+        table: [tuple(row) for row in conn.execute(f'SELECT * FROM "{table}"')]
+        for table in ("graph_nodes", "graph_edges", "vectors_kure", "ontology_nodes", "ontology_edges")
+    }
+    with pytest.raises(RuntimeError, match="rollback"):
+        with shared.unit_of_work():
+            shared.validate_pack_writes(generations)
+            shared._uow.requested_pack = "p"
+            graph.upsert_node("Document", "prior-p", {"pack_id": "p"}, "resource")
+            shared._uow.requested_pack = requested
+            with pytest.raises(RuntimeError):
+                if operation == "add":
+                    vec.add_texts(["new"], [{"pack_id": "q"}], ["empty-slot"])
+                elif operation == "import":
+                    vec.import_vectors([{"id": "empty-slot", "document": "new", "metadata": {"pack_id": "q"},
+                                         "embedding": _embed(["new"])[0]}], pack_id="q")
+                elif operation == "upsert":
+                    vec.upsert_texts(["changed"], [{"pack_id": "q"}], ["foreign"])
+                elif operation == "delete":
+                    vec.delete(["foreign"])
+                elif operation == "registry_node":
+                    sql.register_node("resource", "Document", "foreign")
+                elif operation == "registry_edge":
+                    sql.register_edge("resource", "foreign", "cites", "resource", "foreign-target")
+                elif operation == "graph_node":
+                    graph.upsert_node("Document", "empty-slot", {"pack_id": "q"}, "resource")
+                elif operation == "graph_edge":
+                    graph.upsert_edge("Document", "foreign", "cites", "Document", "foreign-target", {"pack_id": "q"})
+                elif operation == "graph_update_node":
+                    graph.update_node("foreign", graph.get_node_digest("foreign"), "Concept", {"pack_id": "q"}, "concept")
+                elif operation == "graph_update_edge":
+                    graph.update_edge("Document", "foreign", "cites", "Document", "foreign-target", {"pack_id": "q"},
+                                      expected_current_digest="unused", owner_pack_id="q")
+                elif operation == "graph_delete_edge":
+                    graph.delete_edge("foreign", "cites", "foreign-target", owner_pack_id="q")
+                else:
+                    graph.delete_node("Document", "foreign")
+    assert {
+        table: [tuple(row) for row in conn.execute(f'SELECT * FROM "{table}"')]
+        for table in before
+    } == before
+
+
+@pytest.mark.parametrize("state", ["missing", "wrong_type_without_edge", "wrong_type_with_foreign_edge"])
+@pytest.mark.parametrize("requested", ["p", None])
+def test_request_delete_preserves_missing_and_foreign_incident_rules(request_stores, state, requested):
+    shared, graph, _docs, _vec, _sql, generations = request_stores
+    node_id = "absent" if state == "missing" else "foreign"
+    if state == "wrong_type_without_edge":
+        with shared.unit_of_work():
+            shared.validate_pack_writes({"q": generations["q"]})
+            shared._uow.requested_pack = "q"
+            assert graph.delete_edge("foreign", "cites", "foreign-target", owner_pack_id="q")
+    if state == "wrong_type_with_foreign_edge":
+        with pytest.raises(RuntimeError, match="rollback"):
+            with shared.unit_of_work():
+                shared.validate_pack_writes({"p": generations["p"]})
+                shared._uow.requested_pack = requested
+                with pytest.raises(RuntimeError):
+                    graph.delete_node("Concept", node_id)
+        assert graph.get_edge("Document", "foreign", "cites", "Document", "foreign-target") is not None
+    else:
+        with shared.unit_of_work():
+            shared.validate_pack_writes({"p": generations["p"]})
+            shared._uow.requested_pack = requested
+            assert graph.delete_node("Concept", node_id) is False
+    assert graph.get_node("Document", "foreign") is not None
+
+
+@pytest.mark.parametrize("shadow", [False, True])
+@pytest.mark.parametrize("collection", ["custom_vectors", "source_fts_protection_vinst"])
+def test_loader_custom_vector_layout_and_protected_objects(tmp_path, monkeypatch, collection, shadow):
+    from scripts.probe_single_db_crash import _supported_single_fixture
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    path = str(_supported_single_fixture(tmp_path, dim=DIM, collection_name=collection))
+    shared = SharedSqliteFile(path)
+    graph = LocalGraphStore(path, shared=shared)
+    docs = LocalSQLDocStore(path, shared=shared)
+    vec = SqliteVecStore(path, embedding_function=_embed, dim=DIM, collection_name=collection, shared=shared)
+    try:
+        with shared.unit_of_work():
+            shared.require_write_layout(node_indexes=True, docs=docs, graph=graph, vec=vec)
+        conn = shared.connection()
+        protected_name = collection + "_info" if shadow else collection
+        conn.execute(f'CREATE TEMP TABLE "{protected_name}"(value TEXT)')
+        with pytest.raises(RuntimeError, match="temporary"):
+            with shared.unit_of_work():
+                shared.require_write_layout(node_indexes=True, docs=docs, graph=graph, vec=vec)
+    finally:
+        for store in (vec, docs, graph):
+            store.close()
+
+
+@pytest.mark.parametrize("action", ["trigger", "CASCADE", "SET NULL", "SET DEFAULT"])
+def test_custom_vector_shadow_trigger_and_child_actions_are_rejected(tmp_path, monkeypatch, action):
+    from scripts.probe_single_db_crash import _supported_single_fixture
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    path = str(_supported_single_fixture(tmp_path, dim=DIM, collection_name="custom_vectors"))
+    shared = SharedSqliteFile(path)
+    graph = LocalGraphStore(path, shared=shared)
+    docs = LocalSQLDocStore(path, shared=shared)
+    vec = SqliteVecStore(path, embedding_function=_embed, dim=DIM, collection_name="custom_vectors", shared=shared)
+    conn = shared.connection()
+    try:
+        if action == "trigger":
+            conn.execute("CREATE TEMP TRIGGER custom_guard AFTER INSERT ON main.custom_vectors_info BEGIN SELECT 1; END")
+            assert conn.execute("SELECT 1 FROM temp.sqlite_master WHERE name='custom_guard'").fetchone()
+        else:
+            conn.execute(f"CREATE TABLE custom_child(value TEXT REFERENCES custom_vectors_info(key) ON DELETE {action})")
+            assert conn.execute("PRAGMA main.foreign_key_list(custom_child)").fetchone()[6] == action
+        conn.commit()
+        with pytest.raises(RuntimeError):
+            with shared.unit_of_work():
+                shared.require_write_layout(node_indexes=True, docs=docs, graph=graph, vec=vec)
+    finally:
+        for store in (vec, docs, graph):
+            store.close()
+
+
+def test_vector_existing_guard_uses_ascii_identity_with_graph_lower_hook(tmp_path):
+    path = str(tmp_path / "ascii-guard.db")
+    shared = SharedSqliteFile(path)
+    graph = LocalGraphStore(path, shared=shared)
+    conn = shared.connection()
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.execute("CREATE VIRTUAL TABLE \"vectors_Kure\" USING vec0(node_id TEXT PRIMARY KEY, embedding float[7])")
+    assert conn.execute("SELECT lower('vectors_Kure')").fetchone()[0] == "vectors_kure"
+    vec = SqliteVecStore(path, embedding_function=_embed, dim=DIM, shared=shared)
+    try:
+        vec._table = "VECTORS_KURE"
+        vec._check_existing_table(conn)
+    finally:
+        vec.close()
+        graph.close()
+
+
+def test_loader_layout_accepts_ascii_vector_alias(supported_stores):
+    _path, shared, graph, docs, vec = supported_stores
+    vec._table = "VECTORS_KURE"
+    vec._check_existing_table(shared.connection())
+    with shared.unit_of_work():
+        shared.require_write_layout(node_indexes=True, docs=docs, graph=graph, vec=vec)
+
+
+@pytest.mark.parametrize("index", ["idx_packs_incarnation", "idx_pack_delete_pending", "idx_pack_delete_successor"])
+def test_loader_layout_requires_journal_unique_indexes(supported_stores, index):
+    _path, shared, graph, docs, vec = supported_stores
+    shared.connection().execute(f'DROP INDEX "{index}"')
+    with pytest.raises(RuntimeError):
+        with shared.unit_of_work():
+            shared.require_write_layout(node_indexes=False, docs=docs, graph=graph, vec=vec)
+
+
+def test_chunk_layout_ignores_unused_tables(supported_stores):
+    _path, shared, graph, docs, vec = supported_stores
+    conn = shared.connection()
+    for table in ("ontology_nodes", "ontology_edges", "doc_nodes", "audit_log"):
+        conn.execute(f'DROP TABLE "{table}"')
+    conn.commit()
+    with shared.unit_of_work():
+        shared.require_write_layout(node_indexes=False, docs=docs, graph=graph, vec=vec)
+
+
+def test_requested_pack_rejects_ambiguous_empty_delete_and_rolls_back(supported_stores):
+    from opencrab.auth import create_user
+    from opencrab.pack.ownership import create_pack
+
+    path, shared, graph, _docs, _vec = supported_stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    user = create_user(sql, "owner", is_local=True)
+    for pack in ("p", "q"):
+        create_pack(sql, user, pack)
+    try:
+        with pytest.raises(RuntimeError, match="rollback"):
+            with shared.unit_of_work():
+                shared.validate_pack_writes({pack: shared.pack_incarnation(pack) for pack in ("p", "q")})
+                with pytest.raises(RuntimeError):
+                    graph.delete_node("Document", "missing")
     finally:
         sql.close()

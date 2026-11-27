@@ -33,6 +33,7 @@ from opencrab.grammar.validator import validate_edge, validate_node, validate_no
 from opencrab.pack.write_gate import (
     EDGE_STAMPED,
     NODE_STAMPED,
+    IdentityWriteRejectedError,
     authorize,
     authorize_fork_copy,
     edge_identity_conflict,
@@ -71,9 +72,8 @@ def _safe_store_status(exc: Exception) -> str:
     `f"error: {exc}"` shape used: `store_write_failures()` (this module)
     detects a per-store failure via `status.startswith("error:")`, and
     changing that prefix would silently stop this new failure shape from
-    being recognized there. The existing `logger.warning(...)` call
-    immediately above each call site (unchanged by this fix) keeps the
-    full exception detail on the operator-only log channel.
+    being recognized there. 독립 호출의 경고는 기존 예외 정보를 유지한다.
+    로더 내부 표식이 켜진 경로는 고정 사유 코드만 기록한다.
     """
     return f"error: {type(exc).__name__}"
 
@@ -170,6 +170,7 @@ class OntologyBuilder:
         _atomic_inner: bool = False,
         _precomputed_vector: Any = None,
         _expected_pack_incarnation: str | None = None,
+        _loader_write: bool = False,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -374,7 +375,7 @@ class OntologyBuilder:
             space=space, node_type=node_type, node_id=node_id, pack_id=pack_id,
         )
         if reason:
-            raise ValueError(identity_reject_message("node", node_id, reason))
+            raise IdentityWriteRejectedError(identity_reject_message("node", node_id, reason))
 
         required = [self._neo4j, self._mongo, self._sql]
         if self._vec is not None:
@@ -397,7 +398,10 @@ class OntologyBuilder:
                     try:
                         prepared = self._vec.prepare_upsert_vectors([vector_text])
                     except Exception as exc:
-                        logger.warning("Node embedding preparation failed: %s", exc, exc_info=True)
+                        if _loader_write:
+                            logger.warning("노드 쓰기 %s/%s/%s reason=embedding_preparation_failed", space, node_type, node_id)
+                        else:
+                            logger.warning("Node embedding preparation failed: %s", exc, exc_info=True)
                         return {
                             "node_id": node_id, "space": space, "node_type": node_type,
                             "properties": props, "receipt_id": f"rcpt_{uuid.uuid4().hex[:12]}",
@@ -408,8 +412,12 @@ class OntologyBuilder:
                         }
             output = None
             try:
-                manager = pg_uow.unit_of_work() if pg_uow is not None else shared_write_unit(self._sql)
+                manager = pg_uow.unit_of_work() if pg_uow is not None else shared_write_unit(self._sql, safe_log=_loader_write)
                 with manager:
+                    if _loader_write and shared is not None:
+                        shared.require_write_layout(
+                            node_indexes=True, docs=self._mongo, graph=self._neo4j, vec=self._vec,
+                        )
                     if incarnation is not None:
                         shared.validate_pack_writes({pack_id: incarnation})
                         shared._uow.requested_pack = pack_id
@@ -420,6 +428,7 @@ class OntologyBuilder:
                         _expected_current_digest=_expected_current_digest,
                         _atomic_inner=True, _precomputed_vector=prepared,
                         _expected_pack_incarnation=incarnation,
+                        _loader_write=_loader_write,
                     )
                     stores = output["stores"]
                     mandatory = ["graph", "docs", "sql"]
@@ -511,10 +520,16 @@ class OntologyBuilder:
                 raise
             except RuntimeError as exc:
                 self._raise_graph_gate(exc)
-                logger.warning("Neo4j node write failed for %s: %s", node_id, exc)
+                if _loader_write:
+                    logger.warning("노드 쓰기 %s/%s/%s reason=graph_write_failed", space, node_type, node_id)
+                else:
+                    logger.warning("Neo4j node write failed for %s: %s", node_id, exc)
                 output["stores"]["graph"] = _safe_store_status(exc)
             except Exception as exc:
-                logger.warning("Neo4j node write failed for %s: %s", node_id, exc)
+                if _loader_write:
+                    logger.warning("노드 쓰기 %s/%s/%s reason=graph_write_failed", space, node_type, node_id)
+                else:
+                    logger.warning("Neo4j node write failed for %s: %s", node_id, exc)
                 output["stores"]["graph"] = _safe_store_status(exc)
         else:
             output["stores"]["graph"] = "unavailable"
@@ -523,7 +538,7 @@ class OntologyBuilder:
         # the graph holds this exact write anyway (ambiguous commit). See the
         # "Graph failure" section of this method's docstring.
         if output["stores"]["graph"] != "ok":
-            held = self._graph_holds_node(node_type, node_id, props, space)
+            held = self._graph_holds_node(node_type, node_id, props, space, _safe_log=_loader_write)
             if held is not True:
                 leg = SKIPPED_GRAPH_WRITE_FAILED if held is False else GRAPH_STATE_UNKNOWN
                 for key in ("docs", "audit", "sql", "vector"):
@@ -544,7 +559,10 @@ class OntologyBuilder:
             try:
                 mongo_id = self._mongo.upsert_node_doc(space, node_type, node_id, props)
             except Exception as exc:
-                logger.warning("MongoDB node write failed for %s: %s", node_id, exc)
+                if _loader_write:
+                    logger.warning("노드 쓰기 %s/%s/%s reason=doc_write_failed", space, node_type, node_id)
+                else:
+                    logger.warning("MongoDB node write failed for %s: %s", node_id, exc)
                 output["stores"]["docs"] = _safe_store_status(exc)
                 output["stores"]["audit"] = "skipped (doc write failed)"
             else:
@@ -563,7 +581,10 @@ class OntologyBuilder:
                     )
                     output["stores"]["audit"] = "ok"
                 except Exception as exc:
-                    logger.warning("MongoDB audit log write failed for %s: %s", node_id, exc)
+                    if _loader_write:
+                        logger.warning("노드 쓰기 %s/%s/%s reason=audit_write_failed", space, node_type, node_id)
+                    else:
+                        logger.warning("MongoDB audit log write failed for %s: %s", node_id, exc)
                     output["stores"]["audit"] = _safe_store_status(exc)
         else:
             output["stores"]["docs"] = "unavailable"
@@ -575,7 +596,10 @@ class OntologyBuilder:
                 self._sql.register_node(space, node_type, node_id)
                 output["stores"]["sql"] = "ok"
             except Exception as exc:
-                logger.warning("SQL node registry write failed for %s: %s", node_id, exc)
+                if _loader_write:
+                    logger.warning("노드 쓰기 %s/%s/%s reason=registry_write_failed", space, node_type, node_id)
+                else:
+                    logger.warning("SQL node registry write failed for %s: %s", node_id, exc)
                 output["stores"]["sql"] = _safe_store_status(exc)
         else:
             output["stores"]["sql"] = "unavailable"
@@ -616,7 +640,10 @@ class OntologyBuilder:
                 else:
                     output["stores"]["vector"] = "skipped (no text)"
             except Exception as exc:
-                logger.warning("Chroma node write failed for %s: %s", node_id, exc)
+                if _loader_write:
+                    logger.warning("노드 쓰기 %s/%s/%s reason=vector_write_failed", space, node_type, node_id)
+                else:
+                    logger.warning("Chroma node write failed for %s: %s", node_id, exc)
                 output["stores"]["vector"] = _safe_store_status(exc)
         else:
             output["stores"]["vector"] = "unavailable"
@@ -625,7 +652,7 @@ class OntologyBuilder:
         return output
 
     def _graph_holds_node(
-        self, node_type: str, node_id: str, props: dict[str, Any], space: str
+        self, node_type: str, node_id: str, props: dict[str, Any], space: str, *, _safe_log: bool = False
     ) -> bool | None:
         """#495: does the graph hold exactly this node write? True/False, or
         None when the graph cannot be asked. Both qualified stores compute
@@ -637,11 +664,14 @@ class OntologyBuilder:
             expected = prepare_node(node_type, node_id, props, space)[3]
             return getter(node_id, node_type=node_type) == expected
         except Exception as exc:  # noqa: BLE001 -- unknown is the answer
-            logger.warning("graph digest read failed for %s: %s", node_id, exc)
+            if _safe_log:
+                logger.warning("노드 확인 %s/%s/%s reason=graph_digest_unavailable", space, node_type, node_id)
+            else:
+                logger.warning("graph digest read failed for %s: %s", node_id, exc)
             return None
 
     def _graph_holds_edge(
-        self, from_type: str, from_id: str, relation: str, to_type: str, to_id: str
+        self, from_type: str, from_id: str, relation: str, to_type: str, to_id: str, *, _safe_log: bool = False
     ) -> bool | None:
         """#495: does the graph hold this edge? True/False, or None when the
         graph cannot be asked."""
@@ -651,7 +681,10 @@ class OntologyBuilder:
         try:
             return getter(from_type, from_id, relation, to_type, to_id) is not None
         except Exception as exc:  # noqa: BLE001 -- unknown is the answer
-            logger.warning("graph edge read failed for %s -[%s]-> %s: %s", from_id, relation, to_id, exc)
+            if _safe_log:
+                logger.warning("엣지 확인 %s/%s-%s->%s/%s reason=graph_edge_unavailable", from_type, from_id, relation, to_type, to_id)
+            else:
+                logger.warning("graph edge read failed for %s -[%s]-> %s: %s", from_id, relation, to_id, exc)
             return None
 
     # ------------------------------------------------------------------
@@ -672,6 +705,7 @@ class OntologyBuilder:
         fork_copy: bool = False,
         replace_own: bool = False,
         _atomic_inner: bool = False,
+        _loader_write: bool = False,
     ) -> dict[str, Any]:
         """
         Add a directed edge between two nodes.
@@ -760,7 +794,7 @@ class OntologyBuilder:
             incarnation = shared.pack_incarnation(pack_id) if shared is not None else None
             output = None
             try:
-                manager = pg_uow.unit_of_work() if pg_uow is not None else shared_write_unit(self._sql)
+                manager = pg_uow.unit_of_work() if pg_uow is not None else shared_write_unit(self._sql, safe_log=_loader_write)
                 with manager:
                     if incarnation is not None:
                         shared.validate_pack_writes({pack_id: incarnation})
@@ -769,6 +803,7 @@ class OntologyBuilder:
                         from_space, from_id, relation, to_space, to_id, properties,
                         pack_id=pack_id, origin=origin, fork_copy=fork_copy,
                         replace_own=replace_own, _atomic_inner=True,
+                        _loader_write=_loader_write,
                     )
                     if not all(store_write_succeeded(output["stores"], key) for key in ("graph", "sql")):
                         (pg_uow if pg_uow is not None else shared).mark_rollback_only()
@@ -873,11 +908,15 @@ class OntologyBuilder:
             # goes to the operator log; the caller gets only the same
             # curated `GraphReadCapabilityUnavailable` shape this function
             # already uses for its documented "cannot tell" case.
-            logger.error(
-                "lookup_node_type raised an undocumented exception type "
-                "resolving an edge endpoint: %s: %s", type(exc).__name__, exc,
-                exc_info=True,
-            )
+            if _loader_write:
+                logger.warning("엣지 확인 %s/%s-%s->%s/%s reason=endpoint_lookup_failed",
+                               from_space, from_id, relation, to_space, to_id)
+            else:
+                logger.error(
+                    "lookup_node_type raised an undocumented exception type "
+                    "resolving an edge endpoint: %s: %s", type(exc).__name__, exc,
+                    exc_info=True,
+                )
             output["stores"] = {
                 "graph": "unavailable (endpoint type lookup failed: "
                 "lookup_node_type: unexpected failure resolving endpoint type)",
@@ -909,7 +948,7 @@ class OntologyBuilder:
                     self._neo4j, endpoint_type, endpoint_id, pack_id
                 )
                 if reason:
-                    raise ValueError(
+                    raise IdentityWriteRejectedError(
                         identity_reject_message("edge", endpoint_id, reason)
                     )
 
@@ -926,7 +965,7 @@ class OntologyBuilder:
                 relation=relation, to_type=to_type, to_id=to_id, pack_id=pack_id,
             )
             if reason:
-                raise ValueError(identity_reject_message("edge", from_id, reason))
+                raise IdentityWriteRejectedError(identity_reject_message("edge", from_id, reason))
 
         # --- Neo4j write ---
         if missing:
@@ -969,10 +1008,16 @@ class OntologyBuilder:
                 raise
             except RuntimeError as exc:
                 self._raise_graph_gate(exc)
-                logger.warning("Neo4j edge write failed: %s", exc)
+                if _loader_write:
+                    logger.warning("엣지 쓰기 %s/%s-%s->%s/%s reason=graph_write_failed", from_space, from_id, relation, to_space, to_id)
+                else:
+                    logger.warning("Neo4j edge write failed: %s", exc)
                 output["stores"]["graph"] = _safe_store_status(exc)
             except Exception as exc:
-                logger.warning("Neo4j edge write failed: %s", exc)
+                if _loader_write:
+                    logger.warning("엣지 쓰기 %s/%s-%s->%s/%s reason=graph_write_failed", from_space, from_id, relation, to_space, to_id)
+                else:
+                    logger.warning("Neo4j edge write failed: %s", exc)
                 output["stores"]["graph"] = _safe_store_status(exc)
         else:
             output["stores"]["graph"] = "unavailable"
@@ -988,7 +1033,7 @@ class OntologyBuilder:
         elif output["stores"]["graph"] != "ok":
             graph_status = output["stores"]["graph"]
             held = (
-                self._graph_holds_edge(from_type, from_id, relation, to_type, to_id)
+                self._graph_holds_edge(from_type, from_id, relation, to_type, to_id, _safe_log=_loader_write)
                 if isinstance(graph_status, str) and graph_status.startswith("error:")
                 else False
             )
@@ -1003,7 +1048,10 @@ class OntologyBuilder:
                 self._sql.register_edge(from_space, from_id, relation, to_space, to_id)
                 output["stores"]["sql"] = "ok"
             except Exception as exc:
-                logger.warning("SQL edge registry failed: %s", exc)
+                if _loader_write:
+                    logger.warning("엣지 쓰기 %s/%s-%s->%s/%s reason=registry_write_failed", from_space, from_id, relation, to_space, to_id)
+                else:
+                    logger.warning("SQL edge registry failed: %s", exc)
                 output["stores"]["sql"] = _safe_store_status(exc)
         else:
             output["stores"]["sql"] = "unavailable"
@@ -1028,7 +1076,10 @@ class OntologyBuilder:
                 # not a stored copy of the edge.
                 output["stores"]["docs"] = "audited"
             except Exception as exc:
-                logger.warning("MongoDB audit log write failed: %s", exc)
+                if _loader_write:
+                    logger.warning("엣지 쓰기 %s/%s-%s->%s/%s reason=audit_write_failed", from_space, from_id, relation, to_space, to_id)
+                else:
+                    logger.warning("MongoDB audit log write failed: %s", exc)
                 output["stores"]["docs"] = _safe_store_status(exc)
         else:
             output["stores"]["docs"] = "unavailable"

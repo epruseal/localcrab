@@ -244,8 +244,10 @@ class PropertyDecodeDepthError(GraphPropertyValidationError):
     """JSON 디코더가 중첩 깊이를 처리하지 못했다."""
 
 
-def parse_properties_object(value: Any) -> dict[str, Any]:
+def parse_properties_object(value: Any, *, _classify_decode_depth: bool = False) -> dict[str, Any]:
     """Decode a stored graph-properties value without accepting duplicate keys.
+
+    ``_classify_decode_depth``는 공유 원본 getter의 직접 디코더 오류만 분류한다.
 
     SQLite returns JSON text while PostgreSQL and the native graph drivers
     may already return a mapping.  Provenance plans must observe the same
@@ -275,6 +277,8 @@ def parse_properties_object(value: Any) -> dict[str, Any]:
     try:
         parsed = json.loads(value, object_pairs_hook=pairs)
     except RecursionError as exc:
+        if not _classify_decode_depth:
+            raise
         raise PropertyDecodeDepthError("graph property JSON exceeds decoder depth") from exc
     except (TypeError, ValueError, UnicodeError) as exc:
         raise GraphPropertyValidationError("malformed graph properties") from exc
