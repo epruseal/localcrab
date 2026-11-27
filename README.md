@@ -213,7 +213,7 @@ python -m opencrab.stores.backup --to <백업경로>             # 서비스 실
 python -m opencrab.stores.backup --verify <백업경로>/backup.<세트 식별자>   # 쓰기 없이 검증
 ```
 
-서비스 중지와 재기동이 필요 없다. 이 명령을 직접 실행할 때 읽기는 `write.lock`에 막히지 않는다. 쓰기는 백업이 `write.lock`을 쥔 구간만 기다린다. WAL 모드 파일은 그 구간에 고정만 하므로 짧고, WAL이 아닌 SQLite 파일과 디렉터리형 대상은 잠금 안에서 복사하므로 크기에 비례해 늘어난다. 이 명령을 부르는 스크립트가 이미 `write.lock`을 쥐고 있으면 그 스크립트가 풀 때까지 쓰기가 기다린다. 다른 저장소나 다른 장치의 작업이 도는 중에도 같은 명령을 쓴다. 파일 사이 정렬 보장의 범위(`write.lock`을 지키는 쓰기 주체에 한함), `--verify`의 한계, 복원 절차(복원은 서비스를 멈추고 한다), 부하 제한 예시는 [docs/live-backup.md](./docs/live-backup.md)에 있다. `SINGLE_SQLITE_FILE`을 쓰는 단일 root는 같은 명령이 `single.db`와 `billing.db`만 담은 세트를 만들고, 복원은 `python -m opencrab.stores.single_restore <세트>`(기본 dry-run, `--apply`로 적용)다.
+서비스 중지와 재기동이 필요 없다. 이 명령을 직접 실행할 때 읽기는 `write.lock`에 막히지 않는다. 쓰기는 백업이 `write.lock`을 쥔 구간만 기다린다. WAL 모드 파일은 그 구간에 고정만 하므로 짧고, WAL이 아닌 SQLite 파일과 디렉터리형 대상은 잠금 안에서 복사하므로 크기에 비례해 늘어난다. 이 명령을 부르는 스크립트가 이미 `write.lock`을 쥐고 있으면 그 스크립트가 풀 때까지 쓰기가 기다린다. 다른 저장소나 다른 장치의 작업이 도는 중에도 같은 명령을 쓴다. 파일 사이 정렬 보장의 범위(`write.lock`을 지키는 쓰기 주체에 한함), `--verify`의 한계, 복원 절차(복원은 서비스를 멈추고 한다), 부하 제한 예시는 [docs/live-backup.md](./docs/live-backup.md)에 있다. `SINGLE_SQLITE_FILE`을 쓰는 단일 root는 같은 명령이 `single.db`와 `billing.db`만 담은 세트를 만들고, 서비스가 도는 중에 만든 단일 root 세트는 `single.db`와 `billing.db`를 같은 커밋 시점의 상태로 담는다. 백업이 `billing.db.lock`을 쥐는 동안 질의의 이벤트 기록은 기다릴 수 있다(범위와 한계는 `docs/live-backup.md`). 복원은 `python -m opencrab.stores.single_restore <세트>`(기본 dry-run, `--apply`로 적용)다.
 
 ---
 

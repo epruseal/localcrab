@@ -21,12 +21,14 @@ writes mid-copy, SQLite restarts the copy rather than emitting a torn page.
 
 WHAT THIS DOES NOT GUARANTEE
 ----------------------------
-Per-file transactional consistency only. ``.backup()`` says nothing about two
+The SQLite backup API guarantees per-file transactional consistency only. ``.backup()`` says nothing about two
 different files agreeing on a point in time. The cross-process ``write.lock``
 held while the files are captured narrows that window for every writer that
-honours it, but not every writer does -- ``billing.db`` is deliberately
-written outside it (#105), and the ownership map has known holes (#141). Say
-exactly this and no more, in the output and in the docs.
+honours it, but not every writer does -- in the five-file layout a query
+event in ``billing.db`` is deliberately written outside it (#105), and the
+ownership map has known holes (#141). Single mode also holds
+``billing.db.lock`` while it captures (#718). Say exactly this and no more,
+in the output and in the docs.
 
 LIVE BACKUP (#510)
 ------------------
@@ -122,6 +124,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable, Iterable
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -186,6 +189,9 @@ _COPY_FLUSH_BYTES = 32 << 20
 _FREE_SPACE_RESERVE = 1 << 30
 
 _UNLOCKED_WRITER_LABELS = frozenset({"billing.db"})
+
+#: Lock file of the billing.db event writers in single mode (#718); the order is write.lock first.
+_BILLING_LOCK = "billing.db.lock"
 
 _DATA_DIR_MISMATCH = "data-dir이 설정의 단일 root와 다르다"
 
@@ -1574,9 +1580,11 @@ def backup_single_root(
     쓰고 게시 전에 verify_backup_set으로 검증한다. 순서는 hold_single_file(결속과 공유 수명 잠금),
     write.lock, 스냅샷 고정이다. 체크포인트를 명령하지 않는다. 백업 연결이 마지막 연결이면 닫을 때 SQLite가
     체크포인트한다. 목적지는 root 밖 디렉터리여야 한다.
-    정지 상태는 강제하지 않는다. 파일 사이 정렬은 write.lock을 지키는 쓰기에만 걸린다(billing.db 제외).
+    정지 상태는 강제하지 않는다(#718). write.lock을 얻은 뒤 billing.db.lock을 얻고 두 파일을 포착한 다음 함께 푼다.
+    서비스가 도는 중에 만든 세트는 두 파일을 같은 커밋 시점으로 담는다. 범위는 두 잠금을 지키는 쓰기와 롤백 저널 모드의 billing.db다.
+    lock_timeout은 두 잠금의 얻기에 각각 쓴다.
     """
-    from opencrab.locking import write_lock
+    from opencrab.locking import file_lock, write_lock
     from opencrab.stores._single_file import reject_single_root_under
     from opencrab.stores.factory import hold_single_file
 
@@ -1632,15 +1640,28 @@ def backup_single_root(
             staging_owned = False
             wait_started = time.monotonic()
             try:
-                with write_lock(str(data_dir), timeout=timeout):
+                with ExitStack() as locks:
+                    locks.enter_context(write_lock(str(data_dir), timeout=timeout))
                     acquired = time.monotonic()
                     acquired_at = datetime.now(UTC)
+                    # #718: billing.db is a rollback-journal file whose event writers (queries) do not
+                    # take write.lock. Hold its own lock, inside write.lock, until both captures are done.
+                    try:
+                        locks.enter_context(file_lock(_BILLING_LOCK, str(data_dir), timeout=timeout))
+                    except TimeoutError as exc:
+                        raise TimeoutError(
+                            f"timed out after {timeout}s waiting for {_BILLING_LOCK} in {data_dir} "
+                            f"(waited {time.monotonic() - acquired:.1f}s while holding write.lock). "
+                            "Wait for the lock to become available, then run this again."
+                        ) from exc
+                    billing_acquired = time.monotonic()
                     os.mkdir(staging, 0o700)
                     staging_owned = True
                     outcome = _run_targets(targets, data_dir, staging, final, say, timeout, pins=pins, jobs=jobs)
                 released = time.monotonic()
                 lock_info = {
                     "wait_seconds": round(acquired - wait_started, 3),
+                    "billing_lock_wait_seconds": round(billing_acquired - acquired, 3),
                     "held_seconds": round(released - acquired, 3),
                     "acquired_at": acquired_at.isoformat(timespec="milliseconds"),
                     "released_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
@@ -1683,8 +1704,8 @@ def backup_single_root(
         sizes = ", ".join(f"{e.label}={e.destination.stat().st_size}" for e in outcome.entries if e.destination)
         say(f"backup set {final.name}: {sizes}; single_db_recovery 블록을 기록하고 verify_backup_set을 통과했다")
         say(
-            "write.lock 블록 안에서 포착했다. 파일 사이 정렬은 write.lock을 지키는 쓰기에만 걸린다"
-            "(billing.db는 제외). 서비스 정지 확인은 운영 절차의 몫이다."
+            "write.lock과 billing.db.lock을 쥔 채 포착했다. 두 잠금을 지키는 쓰기에 대해 두 파일은 같은 커밋 시점이다"
+            "(롤백 저널 모드 billing.db 기준). 복원 전 서비스 정지 확인은 운영 절차의 몫이다."
         )
     except _CallbackError as cf:
         raise cf.exc
@@ -2010,7 +2031,8 @@ def _main(argv: list[str] | None = None) -> int:
         "--to",
         default=None,
         help=(
-            "where to create the backup set (default: alongside the data itself). "
+            "where to create the backup set (default: alongside the data in five-file mode; "
+            "required outside the root in single mode). "
             "This is taken as the location you chose: it is not containment-checked, "
             "so a symlinked ancestor is followed. A single SQLite root is refused."
         ),
@@ -2026,7 +2048,7 @@ def _main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="SECONDS",
         help=(
-            "how long to wait for write.lock before giving up "
+            "how long to wait for write.lock (and, in single mode, billing.db.lock) before giving up "
             f"(default: ${_TIMEOUT_ENV} or {DEFAULT_LOCK_TIMEOUT:g})"
         ),
     )

@@ -125,8 +125,8 @@ def apply_promotion_package(
     # Live write. issue #141 항목 1: 스토어 생성부터 노드/엣지 쓰기까지
     # write.lock 으로 감싼다 — 이전에는 이 함수가 write.lock 을 전혀 잡지
     # 않아 harness_promotion_apply(MCP 트윈, 같은 잠금을 쥔다)와 동시에
-    # 돌면 그래프/문서/SQL 스토어에 레이스가 났다. billing 이벤트 기록은
-    # 별도 파일(billing.db)이라 락 바깥에 그대로 둔다.
+    # 돌면 그래프/문서/SQL 스토어에 레이스가 났다. billing 이벤트 기록(#718)은
+    # 데이터 쓰기와 같은 write.lock 구간 안에서 한다.
     #
     # B11: SINGLE_SQLITE_FILE 없이 단일 root를 받으면 잠금 파일이 생기기 전에 거부한다.
     # 단일 모드에서는 root의 write.lock이 정상 구성원이므로 건너뛴다. 대신 hold_single_file이
@@ -200,50 +200,52 @@ def apply_promotion_package(
                     "error": str(exc),
                 })
 
-    # #66: this path had zero billing callers (see opencrab/billing/hooks.py's
-    # module docstring) — bill it the same way harness_promotion_apply (the
-    # MCP twin of this function) does, counting only nodes that actually
-    # landed in the graph. builder.add_node() doesn't raise for a per-store
-    # failure (see builder.py's module docstring), so len(node_receipts)
-    # alone would overcount — graph_write_failed() filters those out.
-    #
-    # #66 codex re-review, finding [4]: on_harness_apply() itself never
-    # raises (emit() is fire-and-forget by contract — see hooks.py), it
-    # returns {"ok": False, "error": ...} on a failed persist instead. The
-    # outer try/except below only catches actual exceptions (e.g. a broken
-    # BillingHooks import/construction), so a soft ok=False was previously
-    # discarded with zero visibility — not even a log line, since nothing
-    # inspected the return value. `billing` in the returned dict (which
-    # crabharness/cli.py's `_write()` prints as part of the command's own
-    # JSON output, not just a log line #105 already flagged as insufficient
-    # for this exact class of failure) makes both cases visible: how many
-    # nodes were actually billed, and whether the persist itself failed.
-    billing_status: dict[str, Any] = {"billed_node_count": 0, "ok": True}
-    try:
-        from opencrab.billing.hooks import BillingHooks
+        # #718: the event write stays inside the write.lock hold of the data writes. A backup that
+        # takes write.lock then cannot capture a state between the data and its event.
+        # #66: this path had zero billing callers (see opencrab/billing/hooks.py's
+        # module docstring) — bill it the same way harness_promotion_apply (the
+        # MCP twin of this function) does, counting only nodes that actually
+        # landed in the graph. builder.add_node() doesn't raise for a per-store
+        # failure (see builder.py's module docstring), so len(node_receipts)
+        # alone would overcount — graph_write_failed() filters those out.
+        #
+        # #66 codex re-review, finding [4]: on_harness_apply() itself never
+        # raises (emit() is fire-and-forget by contract — see hooks.py), it
+        # returns {"ok": False, "error": ...} on a failed persist instead. The
+        # outer try/except below only catches actual exceptions (e.g. a broken
+        # BillingHooks import/construction), so a soft ok=False was previously
+        # discarded with zero visibility — not even a log line, since nothing
+        # inspected the return value. `billing` in the returned dict (which
+        # crabharness/cli.py's `_write()` prints as part of the command's own
+        # JSON output, not just a log line #105 already flagged as insufficient
+        # for this exact class of failure) makes both cases visible: how many
+        # nodes were actually billed, and whether the persist itself failed.
+        billing_status: dict[str, Any] = {"billed_node_count": 0, "ok": True}
+        try:
+            from opencrab.billing.hooks import BillingHooks
 
-        billed_node_count = sum(
-            1 for r in node_receipts if not graph_write_failed(r.get("stores") or {})
-        )
-        billing_status["billed_node_count"] = billed_node_count
-        if billed_node_count > 0:
-            # issue #105: billing gets its own SQLite file in local/kuzu mode
-            # (no-op passthrough to `sql` in pg/docker) -- see
-            # make_billing_sql_store's docstring.
-            billing_result = BillingHooks(make_billing_sql_store(settings, sql)).on_harness_apply(
-                tenant_id, subject_id, package.package_id, billed_node_count
+            billed_node_count = sum(
+                1 for r in node_receipts if not graph_write_failed(r.get("stores") or {})
             )
-            if not billing_result.get("ok"):
-                billing_status["ok"] = False
-                billing_status["error"] = billing_result.get("error")
-                logger.warning(
-                    "harness_apply billing event failed to persist (package_id=%s): %s",
-                    package.package_id, billing_result.get("error"),
+            billing_status["billed_node_count"] = billed_node_count
+            if billed_node_count > 0:
+                # issue #105: billing gets its own SQLite file in local/kuzu mode
+                # (no-op passthrough to `sql` in pg/docker) -- see
+                # make_billing_sql_store's docstring.
+                billing_result = BillingHooks(make_billing_sql_store(settings, sql)).on_harness_apply(
+                    tenant_id, subject_id, package.package_id, billed_node_count
                 )
-    except Exception as exc:  # noqa: BLE001 — billing is fire-and-forget, never blocks apply
-        billing_status["ok"] = False
-        billing_status["error"] = str(exc)
-        logger.warning("harness_apply billing failed: %s", exc)
+                if not billing_result.get("ok"):
+                    billing_status["ok"] = False
+                    billing_status["error"] = billing_result.get("error")
+                    logger.warning(
+                        "harness_apply billing event failed to persist (package_id=%s): %s",
+                        package.package_id, billing_result.get("error"),
+                    )
+        except Exception as exc:  # noqa: BLE001 — billing is fire-and-forget, never blocks apply
+            billing_status["ok"] = False
+            billing_status["error"] = str(exc)
+            logger.warning("harness_apply billing failed: %s", exc)
 
     return {
         "package_id": package.package_id,
