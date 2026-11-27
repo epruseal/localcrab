@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from opencrab.common.hashing import file_sha256
+from opencrab.grammar.manifest import GRAMMAR_VERSION
 from opencrab.pack.jsonl_io import iter_jsonl, jsonl_exists
 from opencrab.pack.ownership import PACK_ID_RE as _PACK_ID_RE
 
@@ -145,7 +146,7 @@ def _manifest(pack_id: str, title: str, nodes: list[dict[str, Any]], edges: list
         "pack_id": pack_id,
         "title": title,
         "version": "1.0.0",
-        "grammar_version": "1.0.0",
+        "grammar_version": GRAMMAR_VERSION,
         "created_at": datetime.now(UTC).isoformat(),
         "created_by": "LocalCrab",
         "license": {"scope": "personal", "name": "unspecified"},

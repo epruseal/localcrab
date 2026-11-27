@@ -18,6 +18,7 @@ from typing import Any
 import pyarrow.parquet as pq
 
 from opencrab.config import Settings
+from opencrab.grammar.manifest import GRAMMAR_VERSION
 from opencrab.stores._single_file import reject_single_root_under
 
 REPO_ID = "nvidia/Nemotron-Personas-Korea"
@@ -510,7 +511,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "pack_id": PACK_ID,
         "title": TITLE,
         "version": "1.0.0",
-        "grammar_version": "1.0.0",
+        "grammar_version": GRAMMAR_VERSION,
         "created_at": now(),
         "created_by": "LocalCrab",
         "license": {"scope": "public-dataset", "name": LICENSE},

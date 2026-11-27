@@ -34,6 +34,7 @@ def test_assemble_pack_v1_from_neo4j_ingest(tmp_path: Path):
         assert "neo4j/opencrab_ingest.jsonl" in names
         manifest = json.loads(archive.read("manifest.json"))
     assert manifest["format_version"] == "opencrab-pack-v1"
+    assert manifest["grammar_version"] == "1.1.0"
     assert manifest["counts"]["nodes"] == 2
 
 
