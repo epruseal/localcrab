@@ -116,9 +116,23 @@ def shared_write_unit(sql_store: Any, *, outcome: dict | None = None):
     """독립 쓰기는 write.lock 뒤 공유 트랜잭션을 연다."""
     shared = sql_store.shared_file
     lock = contextlib.nullcontext() if shared.in_unit_of_work else write_lock_for_store(sql_store)
-    with lock:
-        with shared.unit_of_work(outcome=outcome) as conn:
-            yield conn
+    entered_lock = False
+    unit_error = None
+    try:
+        with lock:
+            entered_lock = True
+            try:
+                with shared.unit_of_work(outcome=outcome) as conn:
+                    yield conn
+            except BaseException as exc:
+                unit_error = exc
+                if outcome is not None:
+                    outcome["unit_error"] = exc
+                raise
+    except BaseException as exc:
+        if outcome is not None and entered_lock and exc is not unit_error:
+            outcome["cleanup_error"] = exc
+        raise
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 from pathlib import Path
@@ -39,7 +40,9 @@ class _Env:
         self.layout = layout
         self.d = d
         if layout == "single":
-            self.doc_path = self.vec_path = d / "single.db"
+            from scripts.probe_single_db_crash import _supported_single_fixture
+
+            self.doc_path = self.vec_path = _supported_single_fixture(d, dim=DIM)
             shared = SharedSqliteFile(str(self.doc_path))
             kw = {"shared": shared}
         else:
@@ -155,11 +158,12 @@ def test_chunk_transaction_failure_never_retries_unknown(tmp_path, monkeypatch, 
 
     def prepare(texts):
         calls.append(len(texts))
-        return original_prepare(texts)
+        result = original_prepare(texts)
+        monkeypatch.setattr(shared, "connection", lambda: proxy)
+        return result
 
     if failure == "rollback":
         env.inject_doc_error("c3")
-    monkeypatch.setattr(shared, "connection", lambda: proxy)
     monkeypatch.setattr(env.vec, "prepare_upsert_vectors", prepare)
     principal = Principal(user_id=env.user_id, is_local=True, disabled=False)
     try:
@@ -205,7 +209,14 @@ def test_single_retry_commit_unknown_propagates(tmp_path, monkeypatch, increment
             raise RuntimeError("batch failure")
         return original(source_id, text, metadata)
 
-    monkeypatch.setattr(env.vec.shared_file, "connection", lambda: ConnectionProxy())
+    prepare = env.vec.prepare_upsert_vectors
+
+    def armed_prepare(texts):
+        result = prepare(texts)
+        monkeypatch.setattr(env.vec.shared_file, "connection", lambda: ConnectionProxy())
+        return result
+
+    monkeypatch.setattr(env.vec, "prepare_upsert_vectors", armed_prepare)
     monkeypatch.setattr(env.docs, "upsert_source", fail_batch)
     principal = Principal(user_id=env.user_id, is_local=True, disabled=False)
     try:
@@ -322,11 +333,7 @@ def test_chunk_rejects_registry_outside_shared_file(tmp_path, monkeypatch):
 def test_chunks_reject_pending_deletion_during_embedding(tmp_path, monkeypatch, incremental):
     monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
     env = _Env("single", tmp_path)
-    conn = env.vec.shared_file.connection()
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("UPDATE packs SET incarnation='first' WHERE pack_id=?", (PACK,))
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
-    conn.commit()
+    incarnation = env.vec.shared_file.pack_incarnation(PACK)
     prepare = env.vec.prepare_upsert_vectors
     reserved = False
 
@@ -335,7 +342,8 @@ def test_chunks_reject_pending_deletion_during_embedding(tmp_path, monkeypatch, 
         vectors = prepare(texts)
         if not reserved:
             with sqlite3.connect(env.doc_path) as other:
-                other.execute("INSERT INTO pack_delete_operations VALUES ('op', ?, 'first', 'pending')", (PACK,))
+                other.execute("INSERT INTO pack_delete_operations(operation_id, pack_id, incarnation, state) "
+                              "VALUES ('op', ?, ?, 'pending')", (PACK, incarnation))
             reserved = True
         return vectors
 
@@ -378,7 +386,7 @@ def test_chunks_reject_outer_shared_uow(tmp_path, monkeypatch, incremental, roll
         env.close()
 
 
-def test_short_embedding_batch_falls_back_to_single(tmp_path, monkeypatch):
+def test_short_embedding_batch_counts_preparation_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
     env = _Env("single", tmp_path)
     def embed(texts):
@@ -386,8 +394,8 @@ def test_short_embedding_batch_falls_back_to_single(tmp_path, monkeypatch):
         return vectors[:-1] if len(texts) > 1 else vectors
     env.vec._ef = embed
     try:
-        assert env.run() == (N, 0)
-        assert env.ids()[0] == env.ids()[1]
+        assert env.run() == (0, N)
+        assert env.ids() == (set(), set())
     finally:
         env.close()
 
@@ -444,9 +452,8 @@ def test_incremental_rejects_unknown_shared_metadata_updater(tmp_path, monkeypat
         assert env.run() == (N, 0)
         live = {f"c{i}": (f"본문 {i} alpha", {"pack_id": PACK, "old": "value"}) for i in range(N)}
         monkeypatch.setattr(env.vec, "update_metadata", lambda *_args: calls.append(True), raising=False)
-        with principal_scope(principal):
-            result = pack_load.load_chunks_incremental(PACK, env.chunks, env.vec, env.docs, live, sql=env.sql)
-        assert result[4] == N
+        with principal_scope(principal), pytest.raises(RuntimeError, match="metadata updater"):
+            pack_load.load_chunks_incremental(PACK, env.chunks, env.vec, env.docs, live, sql=env.sql)
         assert calls == []
     finally:
         env.close()
@@ -491,7 +498,7 @@ def test_incremental_doc_failure_rolls_back_vector(tmp_path, monkeypatch):
         env.close()
 
 
-def test_batch_embedding_failure_retries_each_chunk(tmp_path, monkeypatch):
+def test_shared_batch_embedding_failure_does_not_retry(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
     env = _Env("single", tmp_path)
     def embed(texts):
@@ -501,8 +508,8 @@ def test_batch_embedding_failure_retries_each_chunk(tmp_path, monkeypatch):
         return _embed(texts)
     env.vec._ef = embed
     try:
-        assert env.run() == (N, 0)
-        assert env.ids()[0] == env.ids()[1]
+        assert env.run() == (0, N)
+        assert env.ids() == (set(), set())
     finally:
         env.close()
 
@@ -538,3 +545,260 @@ def test_vector_write_failure_leaves_no_row_on_either_layout(env, bad):
     vec_ids, doc_ids = env.ids()
     assert bad not in vec_ids and bad not in doc_ids
     assert vec_ids == doc_ids and len(doc_ids) == N - 1
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+@pytest.mark.parametrize("failure", ["rollback_only", "cleanup", "cancel", "uncertain_class", "cleanup_class", "start_class"])
+def test_shared_outcome_uses_failure_boundary(tmp_path, monkeypatch, incremental, failure):
+    from opencrab.stores import sql_store
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    env = _Env("single", tmp_path)
+    original = env.docs.upsert_source
+    calls = []
+    real_lock = sql_store.write_lock_for_store
+    cleanup = RuntimeError("injected cleanup")
+
+    @contextlib.contextmanager
+    def bad_lock(sql):
+        with real_lock(sql):
+            try:
+                yield
+            finally:
+                raise cleanup
+
+    def write(source_id, text, metadata):
+        calls.append(source_id)
+        if source_id == "c3":
+            if failure == "rollback_only":
+                env.vec.shared_file.mark_rollback_only()
+            elif failure == "cancel":
+                raise KeyboardInterrupt("body cancel")
+            elif failure == "uncertain_class":
+                raise pack_load.ChunkTransactionUncertainError("ordinary body failure")
+            elif failure == "cleanup_class":
+                raise pack_load.LoaderWriteCleanupError("ordinary body failure")
+            elif failure == "start_class":
+                raise pack_load._ChunkTransactionStartError(RuntimeError("ordinary body failure"))
+            elif failure == "cleanup":
+                monkeypatch.setattr(sql_store, "write_lock_for_store", bad_lock)
+        return original(source_id, text, metadata)
+
+    def run():
+        with principal_scope(Principal(user_id=env.user_id, is_local=True, disabled=False)):
+            if incremental:
+                return pack_load.load_chunks_incremental(PACK, env.chunks, env.vec, env.docs,
+                                                         {}, batch_size=B, sql=env.sql)
+            return env.run()
+
+    monkeypatch.setattr(env.docs, "upsert_source", write)
+    if failure == "cleanup":
+        prepare = env.vec.prepare_upsert_vectors
+        def arm(texts):
+            vectors = prepare(texts)
+            monkeypatch.setattr(sql_store, "write_lock_for_store", bad_lock)
+            return vectors
+        monkeypatch.setattr(env.vec, "prepare_upsert_vectors", arm)
+    try:
+        if failure in {"uncertain_class", "cleanup_class", "start_class"}:
+            result = run()
+            assert (result[0], result[4]) == (N - 1, 1) if incremental else result == (N - 1, 1)
+            assert calls.count("c0") == 2
+            assert env.ids()[0] == env.ids()[1] == {f"c{i}" for i in range(N)} - {"c3"}
+        else:
+            expected = {"rollback_only": pack_load.LoaderRollbackOnlyError,
+                        "cleanup": pack_load.LoaderWriteCleanupError,
+                        "cancel": KeyboardInterrupt}[failure]
+            with pytest.raises(expected) as caught:
+                run()
+            assert calls.count("c0") == 1
+            if failure == "cleanup":
+                assert caught.value.outcome["state"] == "committed"
+                assert caught.value.cleanup_error is cleanup
+                assert env.ids() == ({f"c{i}" for i in range(B)}, {f"c{i}" for i in range(B)})
+            else:
+                assert env.ids() == (set(), set())
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+@pytest.mark.parametrize("defect", ["vector_unavailable", "fts_flag", "source_reader", "metadata_hook", "raw_transaction"])
+def test_shared_entry_rejects_before_first_data_write(tmp_path, monkeypatch, incremental, defect):
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    env = _Env("single", tmp_path)
+    try:
+        if defect == "vector_unavailable":
+            env.vec._available = False
+        elif defect == "fts_flag":
+            env.docs._fts_ok = False
+        elif defect == "source_reader":
+            env.docs.read_source_state_exact = None
+        elif defect == "metadata_hook":
+            env.vec.update_metadata = lambda *_: None
+        else:
+            env.vec.shared_file.connection().execute("BEGIN")
+        if not incremental and defect in {"source_reader", "metadata_hook"}:
+            assert env.run() == (N, 0)
+        else:
+            with principal_scope(Principal(user_id=env.user_id, is_local=True, disabled=False)):
+                with pytest.raises(RuntimeError):
+                    if incremental:
+                        pack_load.load_chunks_incremental(PACK, env.chunks, env.vec, env.docs, {}, sql=env.sql)
+                    else:
+                        env.run()
+            assert env.ids() == (set(), set())
+    finally:
+        env.vec.shared_file.connection().rollback()
+        env.close()
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+def test_changed_generation_after_successful_embedding_is_rejected(tmp_path, monkeypatch, incremental):
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    env = _Env("single", tmp_path)
+    old_generation = env.sql.shared_file.pack_incarnation(PACK)
+    prepare = env.vec.prepare_upsert_vectors
+    prepared = []
+
+    def replace_pack(texts):
+        vectors = prepare(texts)
+        with sqlite3.connect(env.doc_path) as other:
+            other.execute("DELETE FROM packs WHERE pack_id=?", (PACK,))
+        create_pack(env.sql, env.user_id, PACK)
+        assert env.sql.shared_file.pack_incarnation(PACK) != old_generation
+        prepared.append(len(vectors))
+        return vectors
+
+    monkeypatch.setattr(env.vec, "prepare_upsert_vectors", replace_pack)
+    try:
+        with principal_scope(Principal(user_id=env.user_id, is_local=True, disabled=False)):
+            if incremental:
+                result = pack_load.load_chunks_incremental(PACK, env.chunks, env.vec, env.docs, {}, batch_size=B, sql=env.sql)
+                assert result[0] == 0 and result[4] == N
+            else:
+                assert env.run() == (0, N)
+        assert prepared == [B, B, N - 2 * B]
+        assert env.ids() == (set(), set())
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("auxiliary", ["callback", "checkpoint"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_committed_cancel_preserves_original_and_never_retries(tmp_path, monkeypatch, caplog,
+                                                              auxiliary, cleanup_failure):
+    from opencrab.stores import sql_store
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    env = _Env("single", tmp_path)
+    cancel = KeyboardInterrupt("auxiliary cancel")
+    cleanup = RuntimeError("lock cleanup failed")
+    original_write = env.docs.upsert_source
+    real_lock = sql_store.write_lock_for_store
+    calls = []
+
+    @contextlib.contextmanager
+    def lock(sql):
+        with real_lock(sql):
+            try:
+                yield
+            finally:
+                if cleanup_failure:
+                    raise cleanup
+
+    def cancel_auxiliary(*_):
+        raise cancel
+
+    def write(source_id, text, metadata):
+        calls.append(source_id)
+        original_write(source_id, text, metadata)
+        if source_id == "c0":
+            if auxiliary == "callback":
+                env.vec.shared_file.after_commit(cancel_auxiliary)
+            else:
+                monkeypatch.setattr(env.vec.shared_file._checkpointer,
+                                    "_checkpoint_if_wal_large", cancel_auxiliary)
+
+    prepare = env.vec.prepare_upsert_vectors
+    def arm(texts):
+        result = prepare(texts)
+        monkeypatch.setattr(sql_store, "write_lock_for_store", lock)
+        return result
+
+    monkeypatch.setattr(env.docs, "upsert_source", write)
+    monkeypatch.setattr(env.vec, "prepare_upsert_vectors", arm)
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            env.run()
+        assert caught.value is cancel
+        assert calls == [f"c{i}" for i in range(B)]
+        assert env.ids() == ({f"c{i}" for i in range(B)}, {f"c{i}" for i in range(B)})
+        if cleanup_failure:
+            assert "잠금 정리 실패" in caplog.text
+    finally:
+        env.close()
+
+
+def test_body_rollback_and_cleanup_errors_keep_all_causes(tmp_path, monkeypatch):
+    from opencrab.stores import sql_store
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    env = _Env("single", tmp_path)
+    conn = env.vec.shared_file.connection()
+    body = ValueError("body failed")
+    rollback = RuntimeError("rollback failed")
+    cleanup = RuntimeError("cleanup failed")
+    real_lock = sql_store.write_lock_for_store
+
+    @contextlib.contextmanager
+    def lock(sql):
+        with real_lock(sql):
+            try:
+                yield
+            finally:
+                raise cleanup
+
+    class ConnectionProxy:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+        def rollback(self):
+            raise rollback
+
+    prepare = env.vec.prepare_upsert_vectors
+    def arm(texts):
+        result = prepare(texts)
+        monkeypatch.setattr(env.vec.shared_file, "connection", lambda: ConnectionProxy())
+        monkeypatch.setattr(sql_store, "write_lock_for_store", lock)
+        return result
+    def fail(*_):
+        raise body
+    monkeypatch.setattr(env.vec, "prepare_upsert_vectors", arm)
+    monkeypatch.setattr(env.docs, "upsert_source", fail)
+    try:
+        with pytest.raises(pack_load.ChunkTransactionUncertainError) as caught:
+            env.run()
+        assert caught.value.body_error is body
+        assert caught.value.rollback_error is rollback
+        assert caught.value.cleanup_error is cleanup
+    finally:
+        conn.rollback()
+        env.close()
+
+
+@pytest.mark.parametrize("layout", ["single", "five"])
+def test_batch_preparation_failure_has_mode_specific_retries(tmp_path, monkeypatch, layout):
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    env = _Env(layout, tmp_path)
+    calls = []
+    def embed(texts):
+        calls.append(len(texts))
+        if len(texts) > 1:
+            raise RuntimeError("batch preparation failed")
+        return _embed(texts)
+    env.vec._ef = embed
+    try:
+        assert env.run() == ((0, N) if layout == "single" else (N, 0))
+        assert calls.count(1) == (0 if layout == "single" else N)
+    finally:
+        env.close()

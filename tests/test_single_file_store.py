@@ -45,6 +45,21 @@ def stores(tmp_path, monkeypatch):
         store.close()
 
 
+@pytest.fixture
+def supported_stores(tmp_path, monkeypatch):
+    from scripts.probe_single_db_crash import _supported_single_fixture
+
+    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
+    path = str(_supported_single_fixture(tmp_path, dim=DIM))
+    shared = SharedSqliteFile(path)
+    graph = LocalGraphStore(path, shared=shared)
+    docs = LocalSQLDocStore(path, shared=shared)
+    vec = SqliteVecStore(path, embedding_function=_embed, dim=DIM, shared=shared)
+    yield path, shared, graph, docs, vec
+    for store in (graph, docs, vec):
+        store.close()
+
+
 def _counts(path: str) -> tuple[int, int, int]:
     conn = sqlite3.connect(path)
     conn.enable_load_extension(True)
@@ -751,40 +766,33 @@ def test_shared_vector_pack_delete_reports_confirmed_count(stores):
     assert vec.get_by_id("b") is None
 
 
-def test_default_pack_single_db_creates_user_and_pack_atomically(stores):
+def test_default_pack_single_db_creates_user_and_pack_atomically(supported_stores):
     from opencrab.auth import create_user
     from opencrab.pack.ownership import ensure_default_pack
 
-    path, shared, _graph, _docs, _vec = stores
+    path, shared, _graph, _docs, _vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     conn = shared.connection()
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("CREATE TRIGGER fill_incarnation AFTER INSERT ON packs BEGIN UPDATE packs SET incarnation='first' WHERE pack_id=NEW.pack_id; END")
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
     conn.commit()
     try:
         owner = create_user(sql, "owner", is_local=True)
         default = ensure_default_pack(sql, owner)
-        assert conn.execute("SELECT owner_id, incarnation FROM packs WHERE pack_id=?", (default,)).fetchone()[:] == (owner, "first")
+        row = conn.execute("SELECT owner_id, incarnation FROM packs WHERE pack_id=?", (default,)).fetchone()
+        assert row[0] == owner and len(row[1]) == 32
         assert ensure_default_pack(sql, owner) == default
     finally:
         sql.close()
 
 
-def test_default_pack_single_db_concurrent_creation(tmp_path, monkeypatch):
+def test_default_pack_single_db_concurrent_creation(supported_stores):
     from opencrab.auth import create_user
     from opencrab.pack.ownership import ensure_default_pack
 
-    monkeypatch.setenv("LOCAL_DATA_DIR", str(tmp_path))
-    path = str(tmp_path / "single.db")
-    shared = SharedSqliteFile(path)
+    path, shared, _graph, _docs, _vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     conn = shared.connection()
     conn.execute("DELETE FROM packs WHERE owner_id=?", (owner,))
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("CREATE TRIGGER fill_incarnation AFTER INSERT ON packs BEGIN UPDATE packs SET incarnation=lower(hex(randomblob(16))) WHERE pack_id=NEW.pack_id; END")
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
     conn.commit()
     barrier = threading.Barrier(2)
     results = []
@@ -836,19 +844,15 @@ def test_existing_default_pack_pending_marks_outer_rollback(stores):
         sql.close()
 
 
-def test_default_pack_single_db_retries_existing_candidate(stores, monkeypatch):
+def test_default_pack_single_db_retries_existing_candidate(supported_stores, monkeypatch):
     from opencrab.auth import create_user
     from opencrab.pack import ownership
 
-    path, shared, _graph, _docs, _vec = stores
+    path, shared, _graph, _docs, _vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     old_owner = create_user(sql, "old", is_local=False)
     ownership.create_pack(sql, old_owner, "taken")
     conn = shared.connection()
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("UPDATE packs SET incarnation='old'")
-    conn.execute("CREATE TRIGGER fill_incarnation AFTER INSERT ON packs BEGIN UPDATE packs SET incarnation='new' WHERE pack_id=NEW.pack_id; END")
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
     conn.commit()
     candidates = iter(("taken", "free"))
     monkeypatch.setattr(ownership, "new_default_pack_id", lambda: next(candidates))
@@ -2473,7 +2477,7 @@ def test_single_file_sql_writer_waits_for_backup_lock(stores, kind):
 
 
 @pytest.mark.parametrize("kind", ["create", "default", "ready", "visibility"])
-def test_single_file_pack_writer_waits_for_backup_lock(stores, kind):
+def test_single_file_pack_writer_waits_for_backup_lock(supported_stores, kind):
     from opencrab.auth import Principal, create_user
     from opencrab.locking import write_lock
     from opencrab.pack.ownership import (
@@ -2484,14 +2488,10 @@ def test_single_file_pack_writer_waits_for_backup_lock(stores, kind):
         set_visibility,
     )
 
-    path, shared, _graph, _docs, _vec = stores
+    path, shared, _graph, _docs, _vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     conn = shared.connection()
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("UPDATE packs SET incarnation=pack_id")
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
-    conn.execute("CREATE TRIGGER new_pack_incarnation AFTER INSERT ON packs WHEN NEW.incarnation IS NULL BEGIN UPDATE packs SET incarnation=NEW.pack_id WHERE pack_id=NEW.pack_id; END")
     conn.commit()
     principal = Principal(user_id=owner, is_local=True, disabled=False)
     if kind == "ready":
@@ -3361,6 +3361,118 @@ def test_delete_reference_owner_classifies_strictly(tmp_path):
         conn.close()
 
 
+def test_pack_validation_reads_main_tables_with_temp_shadows(stores):
+    path, shared, _graph, _docs, _vec = stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    conn = shared.connection()
+    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
+    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
+    conn.execute("INSERT INTO users (user_id, display_name, is_local) VALUES ('owner', 'owner', 0)")
+    conn.execute("INSERT INTO main.packs (pack_id, owner_id, incarnation) VALUES ('p', 'owner', 'first')")
+    conn.execute("INSERT INTO main.pack_delete_operations VALUES ('op', 'p', 'first', 'pending')")
+    conn.execute("CREATE TEMP TABLE PACKS (pack_id TEXT, incarnation TEXT)")
+    conn.execute("INSERT INTO temp.packs VALUES ('p', 'fake')")
+    conn.execute("CREATE TEMP TABLE pack_delete_operations (pack_id TEXT, state TEXT)")
+    conn.commit()
+    try:
+        assert shared.pack_incarnation("p") == "first"
+        with pytest.raises(RuntimeError, match="temporary object"):
+            with shared.unit_of_work():
+                shared.validate_pack_writes({"p": "first"})
+        conn.execute("DROP TABLE temp.packs")
+        conn.execute("DROP TABLE temp.pack_delete_operations")
+        with pytest.raises(RuntimeError, match="pending"):
+            with shared.unit_of_work():
+                shared.validate_pack_writes({"p": "first"})
+    finally:
+        sql.close()
+
+
+def test_pack_validation_rejects_temp_trigger_on_protected_table(stores):
+    path, shared, _graph, _docs, _vec = stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    conn = shared.connection()
+    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
+    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
+    conn.execute("INSERT INTO users (user_id, display_name, is_local) VALUES ('owner', 'owner', 0)")
+    conn.execute("INSERT INTO packs (pack_id, owner_id, incarnation) VALUES ('p', 'owner', 'first')")
+    conn.execute("CREATE TEMP TRIGGER rogue AFTER UPDATE ON main.packs BEGIN SELECT 1; END")
+    conn.commit()
+    try:
+        with pytest.raises(RuntimeError, match="temporary object"):
+            with shared.unit_of_work():
+                shared.validate_pack_writes({"p": "first"})
+    finally:
+        sql.close()
+
+
+def test_pack_validation_rejects_unexpected_foreign_key_cascade(stores):
+    path, shared, _graph, _docs, _vec = stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    conn = shared.connection()
+    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
+    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
+    conn.execute("INSERT INTO users (user_id, display_name, is_local) VALUES ('owner', 'owner', 0)")
+    conn.execute("INSERT INTO packs (pack_id, owner_id, incarnation) VALUES ('p', 'owner', 'first')")
+    conn.execute("CREATE TABLE unexpected_child (pack_id TEXT REFERENCES packs(pack_id) ON DELETE CASCADE)")
+    conn.commit()
+    try:
+        with pytest.raises(RuntimeError, match="foreign key"):
+            with shared.unit_of_work():
+                shared.validate_pack_writes({"p": "first"})
+    finally:
+        sql.close()
+
+
+def test_node_update_rejects_other_pack_edge_even_when_both_validated(stores):
+    path, shared, graph, _docs, _vec = stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    graph.upsert_node("Thing", "n", {"pack_id": "p"}, "concept")
+    graph.upsert_node("Thing", "other", {"pack_id": "other"}, "concept")
+    graph.upsert_edge("Thing", "n", "rel", "Thing", "other", {"pack_id": "other"})
+    digest = graph.get_node_digest("n", node_type="Thing")
+    conn = shared.connection()
+    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
+    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
+    conn.execute("INSERT INTO users (user_id, display_name, is_local) VALUES ('owner', 'owner', 0)")
+    conn.execute("INSERT INTO packs (pack_id, owner_id, incarnation) VALUES ('p', 'owner', 'first')")
+    conn.execute("INSERT INTO packs (pack_id, owner_id, incarnation) VALUES ('other', 'owner', 'second')")
+    conn.commit()
+    before_nodes = conn.execute("SELECT * FROM graph_nodes").fetchall()
+    before_edges = conn.execute("SELECT * FROM graph_edges").fetchall()
+    assert before_edges
+    try:
+        with pytest.raises(RuntimeError, match="requested pack"):
+            with shared.unit_of_work():
+                shared.validate_pack_writes({"p": "first", "other": "second"})
+                graph.update_node("n", digest, "Other", {"pack_id": "p"}, "concept")
+        assert conn.execute("SELECT * FROM graph_nodes").fetchall() == before_nodes
+        assert conn.execute("SELECT * FROM graph_edges").fetchall() == before_edges
+    finally:
+        sql.close()
+
+
+def test_node_update_rejects_duplicate_owner_keys(stores):
+    path, shared, graph, _docs, _vec = stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    graph.upsert_node("Thing", "n", {"pack_id": "p"}, "concept")
+    digest = graph.get_node_digest("n", node_type="Thing")
+    conn = shared.connection()
+    conn.execute("UPDATE graph_nodes SET properties=? WHERE node_id='n'", ('{"pack_id":"other","pack_id":"p"}',))
+    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
+    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
+    conn.execute("INSERT INTO users (user_id, display_name, is_local) VALUES ('owner', 'owner', 0)")
+    conn.execute("INSERT INTO packs (pack_id, owner_id, incarnation) VALUES ('p', 'owner', 'first')")
+    conn.commit()
+    try:
+        with pytest.raises(RuntimeError, match="requested pack"):
+            with shared.unit_of_work():
+                shared.validate_pack_writes({"p": "first"})
+                graph.update_node("n", digest, "Other", {"pack_id": "p"}, "concept")
+    finally:
+        sql.close()
+
+
 def test_delete_operation_does_not_authorize_general_writes(stores):
     path, shared, _graph, docs, _vec = stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
@@ -3373,7 +3485,7 @@ def test_delete_operation_does_not_authorize_general_writes(stores):
     conn.execute("INSERT INTO pack_delete_operations VALUES ('op', 'p', 'first', 'pending')")
     conn.commit()
     try:
-        with pytest.raises(RuntimeError, match="not validated"):
+        with pytest.raises(RuntimeError, match="validated"):
             with shared.unit_of_work():
                 shared.validate_delete_operation("p", "first", "op")
                 docs.delete_sources_with_state(["s"])
@@ -3668,28 +3780,30 @@ def test_single_file_delete_reserves_before_external_journal(stores, monkeypatch
         sql.close()
 
 
-def test_source_rejects_recreated_pack_during_embedding(stores, monkeypatch):
+def test_source_rejects_recreated_pack_during_embedding(supported_stores, monkeypatch):
     from opencrab.auth import Principal, create_user, principal_scope
     from opencrab.ontology.query import HybridQuery
     from opencrab.pack.ownership import create_pack
     from opencrab.pack.source_writer import write_source
 
-    path, shared, graph, docs, vec = stores
+    path, shared, graph, docs, vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     create_pack(sql, owner, "p")
     conn = shared.connection()
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("UPDATE packs SET incarnation='first' WHERE pack_id='p'")
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
     conn.commit()
     hybrid = HybridQuery(vec, graph, doc_store=docs)
     prepare = vec.prepare_upsert_vectors
+    initial = shared.pack_incarnation("p")
+    prepared = []
 
     def recreate(texts):
         vectors = prepare(texts)
+        prepared.append(vectors)
         with sqlite3.connect(path) as other:
-            other.execute("UPDATE packs SET incarnation='second' WHERE pack_id='p'")
+            other.execute("DELETE FROM packs WHERE pack_id='p'")
+            other.execute("INSERT INTO packs(pack_id, owner_id) VALUES ('p', ?)", (owner,))
+            assert other.execute("SELECT incarnation FROM packs WHERE pack_id='p'").fetchone()[0] != initial
         return vectors
 
     monkeypatch.setattr(vec, "prepare_upsert_vectors", recreate)
@@ -3698,6 +3812,7 @@ def test_source_rejects_recreated_pack_during_embedding(stores, monkeypatch):
             receipt = write_source(sql, hybrid, docs, vec, graph=graph, text="text",
                                    source_id="s1", metadata={}, pack_id="p")
             assert receipt["stores"]["documents"].startswith("error:")
+        assert prepared and prepared[0]
         assert _counts(path) == (0, 0, 0)
         assert conn.execute("SELECT count(*) FROM graph_nodes WHERE node_id='s1'").fetchone()[0] == 0
     finally:
@@ -3705,20 +3820,17 @@ def test_source_rejects_recreated_pack_during_embedding(stores, monkeypatch):
         sql.close()
 
 
-def test_source_rejects_deletion_reserved_during_embedding(stores, monkeypatch):
+def test_source_rejects_deletion_reserved_during_embedding(supported_stores, monkeypatch):
     from opencrab.auth import Principal, create_user, principal_scope
     from opencrab.ontology.query import HybridQuery
     from opencrab.pack.ownership import create_pack
     from opencrab.pack.source_writer import write_source
 
-    path, shared, graph, docs, vec = stores
+    path, shared, graph, docs, vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     create_pack(sql, owner, "p")
     conn = shared.connection()
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("UPDATE packs SET incarnation='first' WHERE pack_id='p'")
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
     conn.commit()
     hybrid = HybridQuery(vec, graph, doc_store=docs)
     prepare = vec.prepare_upsert_vectors
@@ -3726,7 +3838,7 @@ def test_source_rejects_deletion_reserved_during_embedding(stores, monkeypatch):
     def reserve(texts):
         vectors = prepare(texts)
         with sqlite3.connect(path) as other:
-            other.execute("INSERT INTO pack_delete_operations VALUES ('op', 'p', 'first', 'pending')")
+            other.execute("INSERT INTO pack_delete_operations(operation_id, pack_id, incarnation, state) VALUES ('op', 'p', ?, 'pending')", (shared.pack_incarnation("p"),))
         return vectors
 
     monkeypatch.setattr(vec, "prepare_upsert_vectors", reserve)
@@ -3736,6 +3848,7 @@ def test_source_rejects_deletion_reserved_during_embedding(stores, monkeypatch):
                                    source_id="s1", metadata={}, pack_id="p")
             assert receipt["stores"]["documents"].startswith("error:")
             assert receipt["stores"]["chromadb"].startswith("error:")
+        assert conn.execute("SELECT state FROM pack_delete_operations WHERE operation_id='op'").fetchone()[0] == "pending"
         assert _counts(path) == (0, 0, 0)
         assert conn.execute("SELECT count(*) FROM graph_nodes WHERE node_id='s1'").fetchone()[0] == 0
     finally:
@@ -3744,7 +3857,7 @@ def test_source_rejects_deletion_reserved_during_embedding(stores, monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["node", "edge", "source", "chunks"])
-def test_single_file_product_writer_waits_for_backup_lock(stores, tmp_path, kind):
+def test_single_file_product_writer_waits_for_backup_lock(supported_stores, tmp_path, kind):
     from opencrab.auth import Principal, create_user, principal_scope
     from opencrab.locking import write_lock
     from opencrab.ontology.builder import OntologyBuilder
@@ -3753,16 +3866,15 @@ def test_single_file_product_writer_waits_for_backup_lock(stores, tmp_path, kind
     from opencrab.pack.ownership import create_pack
     from opencrab.pack.source_writer import write_source
 
-    path, shared, graph, docs, vec = stores
+    path, shared, graph, docs, vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     create_pack(sql, owner, "p")
-    graph.upsert_node("Document", "a", {"pack_id": "p"}, "resource")
-    graph.upsert_node("Document", "b", {"pack_id": "p"}, "resource")
+    with shared.unit_of_work():
+        shared.validate_pack_writes({"p": shared.pack_incarnation("p")})
+        graph.upsert_node("Document", "a", {"pack_id": "p"}, "resource")
+        graph.upsert_node("Document", "b", {"pack_id": "p"}, "resource")
     conn = shared.connection()
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("UPDATE packs SET incarnation='first' WHERE pack_id='p'")
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
     conn.commit()
     hybrid = HybridQuery(vec, graph, doc_store=docs)
     builder = OntologyBuilder(graph, docs, sql, vec=vec)
@@ -3814,20 +3926,17 @@ def test_single_file_product_writer_waits_for_backup_lock(stores, tmp_path, kind
         sql.close()
 
 
-def test_source_single_db_guard_allows_valid_pack(stores):
+def test_source_single_db_guard_allows_valid_pack(supported_stores):
     from opencrab.auth import Principal, create_user, principal_scope
     from opencrab.ontology.query import HybridQuery
     from opencrab.pack.ownership import create_pack
     from opencrab.pack.source_writer import write_source
 
-    path, shared, graph, docs, vec = stores
+    path, shared, graph, docs, vec = supported_stores
     sql = SQLStore(f"sqlite:///{path}", shared=shared)
     owner = create_user(sql, "owner", is_local=True)
     create_pack(sql, owner, "p")
     conn = shared.connection()
-    conn.execute("ALTER TABLE packs ADD COLUMN incarnation TEXT")
-    conn.execute("UPDATE packs SET incarnation='first' WHERE pack_id='p'")
-    conn.execute("CREATE TABLE pack_delete_operations (operation_id TEXT, pack_id TEXT, incarnation TEXT, state TEXT)")
     conn.commit()
     hybrid = HybridQuery(vec, graph, doc_store=docs)
     try:
@@ -4774,3 +4883,178 @@ def test_single_file_binding_rejects_unknown_state(tmp_path):
     for state in ("weird", "", None, "Ready"):
         with pytest.raises(RuntimeError, match="state argument"):
             validate_single_file_binding(root, db, ledger, manifest, marker, metadata, digest, state=state)
+
+
+@pytest.mark.parametrize("node_indexes", [False, True])
+def test_single_supported_layout_accepts_actual_publication(supported_stores, node_indexes):
+    path, shared, graph, docs, vec = supported_stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    try:
+        with shared.unit_of_work():
+            shared.require_write_layout(node_indexes=node_indexes, docs=docs, graph=graph, vec=vec)
+    finally:
+        sql.close()
+
+
+@pytest.mark.parametrize("mutation", ["trigger", "shadow", "bm25", "journal", "fk"])
+def test_single_layout_rejects_unsupported_objects(supported_stores, mutation):
+    path, shared, graph, docs, vec = supported_stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    conn = shared.connection()
+    if mutation == "trigger":
+        conn.execute("DROP TRIGGER doc_nodes_bm25_ai")
+        conn.execute("CREATE TRIGGER doc_nodes_bm25_ai AFTER INSERT ON doc_nodes BEGIN DELETE FROM doc_sources; END")
+    elif mutation == "shadow":
+        conn.execute("DROP TABLE vectors_kure_info")
+        conn.execute("CREATE TABLE vectors_kure_info(key TEXT, value TEXT)")
+    elif mutation == "bm25":
+        conn.execute("DROP TABLE doc_nodes_bm25_vrow")
+        conn.execute("CREATE TABLE doc_nodes_bm25_vrow(term TEXT, doc INTEGER, cnt INTEGER)")
+    elif mutation == "journal":
+        conn.execute("DROP TABLE pack_delete_active")
+        conn.execute("CREATE TABLE pack_delete_active(pack_id TEXT)")
+    else:
+        conn.execute("CREATE TABLE extra(pack_id TEXT REFERENCES packs(pack_id) ON UPDATE SET NULL)")
+    conn.commit()
+    try:
+        with pytest.raises(RuntimeError):
+            with shared.unit_of_work():
+                shared.require_write_layout(node_indexes=True, docs=docs, graph=graph, vec=vec)
+    finally:
+        sql.close()
+
+
+def test_unit_outcome_records_commit_before_callback_cancel(stores):
+    _path, shared, _graph, _docs, _vec = stores
+    outcome = {}
+    cancel = KeyboardInterrupt("callback cancel")
+
+    def stop():
+        raise cancel
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        with shared.unit_of_work(outcome=outcome) as conn:
+            conn.execute("CREATE TABLE outcome_probe(value TEXT)")
+            conn.execute("INSERT INTO outcome_probe VALUES ('committed')")
+            shared.after_commit(stop)
+    assert caught.value is cancel
+    assert outcome["state"] == "committed"
+    assert shared.connection().execute("SELECT value FROM outcome_probe").fetchone()[0] == "committed"
+
+
+@pytest.mark.parametrize("failure", ["decoder", "validator", "getter"])
+def test_single_source_real_decode_depth_and_original_error(supported_stores, tmp_path, monkeypatch, caplog, failure):
+    from opencrab.auth import Principal, create_user, principal_scope
+    from opencrab.common import graph_identity
+    from opencrab.ontology.builder import OntologyBuilder
+    from opencrab.pack.load import load_nodes_incremental
+    from opencrab.pack.ownership import create_pack
+
+    path, shared, graph, docs, vec = supported_stores
+    sql = SQLStore(f"sqlite:///{path}", shared=shared)
+    owner = create_user(sql, "owner", is_local=True)
+    create_pack(sql, owner, "p")
+    source_id = "complete-source-identifier-with-decoder-depth"
+    metadata = '{"pack_id":"p","deep":' + '[' * 2000 + '0' + ']' * 2000 + '}'
+    conn = shared.connection()
+    conn.execute("INSERT INTO doc_sources(source_id, text, metadata, ingested_at) VALUES (?, 'text', ?, 'fixed')",
+                 (source_id, metadata if failure == "decoder" else '{"pack_id":"p"}'))
+    conn.commit()
+    if failure != "decoder":
+        assert docs.get_source(source_id)["metadata"] == {"pack_id": "p"}
+    original = RecursionError(f"{failure} recursion")
+    if failure == "validator":
+        def reject(_value):
+            raise original
+        monkeypatch.setattr(graph_identity, "_validate_json", reject)
+    elif failure == "getter":
+        original_getter = docs._fetch_one
+        def reject(sql, params):
+            if "FROM main.doc_sources WHERE" in sql:
+                raise original
+            return original_getter(sql, params)
+        monkeypatch.setattr(docs, "_fetch_one", reject)
+    nodes = tmp_path / "depth-nodes.jsonl"
+    nodes.write_text(json.dumps({"id": source_id, "node_type": "Document", "space": "resource", "label": "depth"}) + "\n")
+    try:
+        with principal_scope(Principal(user_id=owner, is_local=True, disabled=False)):
+            if failure == "decoder":
+                script = tmp_path / "source-depth-child.py"
+                script.write_text("""
+import json
+import logging
+import sys
+from pathlib import Path
+from opencrab.auth import Principal, principal_scope
+from opencrab.common.graph_identity import PropertyDecodeDepthError
+from opencrab.ontology.builder import OntologyBuilder
+from opencrab.pack.load import load_nodes_incremental
+from opencrab.stores._single_file import SharedSqliteFile
+from opencrab.stores.local_graph_store import LocalGraphStore
+from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+from opencrab.stores.sql_store import SQLStore
+from opencrab.stores.sqlite_vec_store import SqliteVecStore
+
+path, owner, source_id, nodes = sys.argv[1:]
+shared = SharedSqliteFile(path)
+graph = LocalGraphStore(path, shared=shared)
+docs = LocalSQLDocStore(path, shared=shared)
+vec = SqliteVecStore(path, embedding_function=lambda texts: [[1.,0.,0.,0.] for _ in texts], dim=4, shared=shared)
+sql = SQLStore(f"sqlite:///{path}", shared=shared)
+
+def pairs(items):
+    result = {}
+    for key, value in items:
+        assert key not in result
+        result[key] = value
+    return result
+
+json.scanner.make_scanner = json.scanner.py_make_scanner
+sys.setrecursionlimit(100)
+raw = '{"pack_id":"p","deep":' + '[' * 2000 + '0' + ']' * 2000 + '}'
+try:
+    json.loads(raw, object_pairs_hook=pairs)
+except RecursionError:
+    print("DIRECT_DECODER_DEPTH_CONFIRMED", flush=True)
+else:
+    raise AssertionError("the direct JSON decoder did not reach its depth boundary")
+conn = shared.connection()
+conn.execute("UPDATE doc_sources SET metadata=? WHERE source_id=?", (raw, source_id))
+conn.commit()
+try:
+    docs.get_source(source_id)
+except PropertyDecodeDepthError:
+    pass
+else:
+    raise AssertionError("the real getter did not preserve decoder depth")
+rows = [{"id": source_id, "node_type":"Document", "space":"resource", "label":"depth"},
+        {"id":"normal-after-depth", "node_type":"Document", "space":"resource", "label":"normal"}]
+Path(nodes).write_text(''.join(json.dumps(row) + chr(10) for row in rows))
+logging.basicConfig(level=logging.WARNING)
+with principal_scope(Principal(user_id=owner, is_local=True, disabled=False)):
+    result = load_nodes_incremental("p", Path(nodes), OntologyBuilder(graph, docs, sql, vec=vec),
+                                   {}, {}, graph, docs, {}, vec=vec, sql=sql)
+assert result.ingest_err == 1
+assert result[0] == 1
+assert graph.get_node("Document", source_id) is None
+assert graph.get_node("Document", "normal-after-depth") is not None
+for store in (vec, docs, graph, sql):
+    store.close()
+print("REAL_GETTER_AND_LOADER_CONFIRMED", flush=True)
+""", encoding="utf-8")
+                child = subprocess.run([sys.executable, str(script), path, owner, source_id, str(nodes)],
+                                       capture_output=True, text=True, timeout=30)
+                assert child.returncode == 0, child.stdout + child.stderr
+                assert "DIRECT_DECODER_DEPTH_CONFIRMED" in child.stdout
+                assert "REAL_GETTER_AND_LOADER_CONFIRMED" in child.stdout
+                assert source_id in child.stderr
+            else:
+                with pytest.raises(RecursionError) as caught:
+                    load_nodes_incremental("p", nodes, OntologyBuilder(graph, docs, sql, vec=vec),
+                                           {}, {}, graph, docs, {}, vec=vec, sql=sql)
+                assert caught.value is original
+        if failure != "decoder":
+            assert source_id in caplog.text
+        assert graph.get_node("Document", source_id) is None
+    finally:
+        sql.close()

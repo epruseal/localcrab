@@ -20,6 +20,34 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+def _schema_tokens(sql: str) -> tuple[str, ...]:
+    import re
+
+    tokens = re.findall(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[a-zA-Z_][a-zA-Z_0-9]*|[^\s]", sql or "")
+    result = tuple(token if token.startswith("'") else token.strip('"').lower() for token in tokens)
+    return tuple(token for index, token in enumerate(result) if not (
+        token == "if" and result[index:index + 3] == ("if", "not", "exists")
+        or token == "not" and index and result[index - 1:index + 2] == ("if", "not", "exists")
+        or token == "exists" and index > 1 and result[index - 2:index + 1] == ("if", "not", "exists")
+    ))
+
+
+_PACK_WRITE_TRIGGERS = (
+    'CREATE TRIGGER pack_incarnation_new AFTER INSERT ON packs\n            WHEN NEW.incarnation IS NULL\n            BEGIN\n                UPDATE packs SET incarnation = lower(hex(randomblob(16))) WHERE pack_id = NEW.pack_id;\n            END',
+    "CREATE TRIGGER pack_incarnation_valid BEFORE INSERT ON packs\n            WHEN NEW.incarnation IS NOT NULL AND\n                 (length(NEW.incarnation) != 32 OR NEW.incarnation GLOB '*[^0-9a-f]*')\n            BEGIN\n                SELECT RAISE(ABORT, 'invalid pack incarnation');\n            END",
+    "CREATE TRIGGER pack_incarnation_immutable BEFORE UPDATE OF incarnation ON packs\n            WHEN OLD.incarnation IS NOT NULL AND NEW.incarnation IS NOT OLD.incarnation\n            BEGIN\n                SELECT RAISE(ABORT, 'pack incarnation is immutable');\n            END",
+    "CREATE TRIGGER pack_delete_active_valid_insert BEFORE INSERT ON pack_delete_active\n            WHEN NOT EXISTS (\n                SELECT 1 FROM pack_delete_operations o JOIN packs p ON p.pack_id = o.pack_id\n                WHERE o.operation_id = NEW.operation_id AND o.pack_id = NEW.pack_id\n                  AND o.incarnation = NEW.incarnation AND p.incarnation = NEW.incarnation\n                  AND (NEW.state != 'handoff' OR\n                       (o.state = 'pending' AND o.predecessor = NEW.expected_pointer))\n                  AND (NEW.state != 'clear_intent' OR o.state = 'committed')\n            )\n            BEGIN\n                SELECT RAISE(ABORT, 'invalid active delete operation');\n            END",
+    "CREATE TRIGGER pack_delete_active_valid_update BEFORE UPDATE ON pack_delete_active\n            WHEN NOT EXISTS (\n                SELECT 1 FROM pack_delete_operations o JOIN packs p ON p.pack_id = o.pack_id\n                WHERE o.operation_id = NEW.operation_id AND o.pack_id = NEW.pack_id\n                  AND o.incarnation = NEW.incarnation AND p.incarnation = NEW.incarnation\n                  AND (NEW.state != 'handoff' OR\n                       (o.state = 'pending' AND o.predecessor = NEW.expected_pointer))\n                  AND (NEW.state != 'clear_intent' OR o.state = 'committed')\n            )\n            BEGIN\n                SELECT RAISE(ABORT, 'invalid active delete operation');\n            END",
+    "CREATE TRIGGER pack_delete_predecessor_valid BEFORE INSERT ON pack_delete_operations\n            WHEN NEW.predecessor IS NOT NULL AND NOT EXISTS (\n                SELECT 1 FROM pack_delete_operations\n                WHERE operation_id = NEW.predecessor AND pack_id = NEW.pack_id\n                  AND incarnation = NEW.incarnation AND state = 'committed'\n            )\n            BEGIN\n                SELECT RAISE(ABORT, 'invalid delete predecessor');\n            END",
+    "CREATE TRIGGER pack_delete_identity_immutable BEFORE UPDATE OF operation_id, pack_id, incarnation, predecessor\n            ON pack_delete_operations\n            WHEN NEW.operation_id IS NOT OLD.operation_id OR NEW.pack_id IS NOT OLD.pack_id\n              OR NEW.incarnation IS NOT OLD.incarnation OR NEW.predecessor IS NOT OLD.predecessor\n            BEGIN\n                SELECT RAISE(ABORT, 'delete operation identity is immutable');\n            END",
+    "CREATE TRIGGER pack_delete_committed_immutable BEFORE UPDATE ON pack_delete_operations\n            WHEN OLD.state = 'committed'\n            BEGIN\n                SELECT RAISE(ABORT, 'committed delete operation is immutable');\n            END",
+    "CREATE TRIGGER pack_delete_committed_no_delete BEFORE DELETE ON pack_delete_operations\n            WHEN OLD.state = 'committed'\n            BEGIN\n                SELECT RAISE(ABORT, 'committed delete operation is immutable');\n            END",
+)
+
+
+_PACK_WRITE_TABLES = ("CREATE TABLE pack_delete_operations (\n                operation_id TEXT PRIMARY KEY,\n                pack_id TEXT NOT NULL,\n                incarnation TEXT NOT NULL,\n                predecessor TEXT REFERENCES pack_delete_operations(operation_id),\n                state TEXT NOT NULL CHECK (state IN ('pending', 'committed')),\n                result_json TEXT,\n                evidence_json TEXT,\n                CHECK ((state = 'pending' AND result_json IS NULL AND evidence_json IS NULL) OR\n                       (state = 'committed' AND result_json IS NOT NULL AND evidence_json IS NOT NULL))\n            )", "CREATE TABLE pack_delete_active (\n                pack_id TEXT PRIMARY KEY,\n                incarnation TEXT NOT NULL,\n                operation_id TEXT NOT NULL UNIQUE REFERENCES pack_delete_operations(operation_id),\n                state TEXT NOT NULL CHECK (state IN ('stable', 'handoff', 'clear_intent')),\n                expected_pointer TEXT,\n                CHECK ((state = 'handoff' AND expected_pointer IS NOT NULL) OR\n                       (state != 'handoff' AND expected_pointer IS NULL))\n            )")
+
+
 ConnHook = Callable[[sqlite3.Connection], None]
 _failed_shared_files: dict[str, set[SharedSqliteFile]] = {}
 _failed_shared_files_lock = threading.RLock()
@@ -639,14 +667,153 @@ class SharedSqliteFile:
         """전환 스키마가 있으면 쓰기 전에 팩 세대를 읽는다."""
         conn = self.connection()
         marker = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='pack_delete_operations'"
         ).fetchone()
         if marker is None:
             return None
-        row = conn.execute("SELECT incarnation FROM packs WHERE pack_id = ?", (pack_id,)).fetchone()
+        if "incarnation" not in {row[1] for row in conn.execute("PRAGMA main.table_info(packs)")}:
+            raise PackWriteRejectedError("single SQLite pack incarnation schema is missing")
+        row = conn.execute("SELECT incarnation FROM main.packs WHERE pack_id = ?", (pack_id,)).fetchone()
         if row is None or not row[0]:
             raise RuntimeError("pack incarnation is missing")
         return str(row[0])
+
+    def _require_unshadowed_storage(self, conn) -> None:
+        from opencrab.stores import _node_bm25_sqlite as nbm
+
+        protected = {
+            "packs", "pack_delete_operations", "pack_delete_active", "doc_nodes",
+            "doc_sources", "doc_source_integrity", "audit_log", "ontology_nodes",
+            "ontology_edges", "graph_nodes", "graph_edges", "idx_doc_sources_fts_source_id",
+        }
+        protected.update(
+            row[0].lower() for row in conn.execute("SELECT name FROM main.sqlite_master")
+            if row[0].lower().startswith(("doc_nodes_bm25", "doc_sources_fts", "vectors_", "graph_"))
+        )
+        protected.update(
+            row[0].lower() for row in conn.execute("SELECT name FROM main.sqlite_master WHERE type='index'")
+            if row[0].lower().startswith(("idx_nodes_", "idx_edges_", "idx_doc_", "idx_audit_", "idx_pack_", "idx_packs_"))
+        )
+        for name, kind, table in conn.execute("SELECT name, type, tbl_name FROM temp.sqlite_master"):
+            if name.lower() in protected or (kind == "trigger" and table.lower() in protected):
+                raise PackWriteRejectedError("temporary object shadows protected SQLite storage")
+        expected = {ddl.split()[5]: ddl for ddl in nbm.ddl_statements() if ddl.startswith("CREATE TRIGGER")}
+        expected.update({ddl.split()[2]: ddl for ddl in _PACK_WRITE_TRIGGERS})
+        for name, table, ddl in conn.execute(
+            "SELECT name, tbl_name, sql FROM main.sqlite_master WHERE type='trigger'"
+        ):
+            if table.lower() in protected and (
+                name not in expected or _schema_tokens(ddl) != _schema_tokens(expected[name])
+            ):
+                raise PackWriteRejectedError("unexpected trigger on protected SQLite storage")
+        for (table_name,) in conn.execute("SELECT name FROM main.sqlite_master WHERE type='table'").fetchall():
+            escaped = table_name.replace('"', '""')
+            for key in conn.execute(f'PRAGMA main.foreign_key_list("{escaped}")'):
+                # 지원 스키마의 FK는 NO ACTION이다. 연쇄 동작은 별도 자식 표에서도 거부한다.
+                if key[2].lower() in protected and any(
+                    str(action).upper() in {"CASCADE", "SET NULL", "SET DEFAULT"} for action in (key[5], key[6])
+                ):
+                    raise PackWriteRejectedError("unexpected foreign key action on protected SQLite storage")
+
+    def require_write_layout(self, *, node_indexes: bool, docs=None, graph=None, vec=None) -> None:
+        """현재 쓰기 연결에서 로더가 사용하는 객체와 쓰기 분기를 확인한다."""
+        from opencrab.stores import _node_bm25_sqlite as nbm
+        from opencrab.stores import _source_fts_sqlite as sfts
+        from opencrab.stores._sql_dialect import SQLITE
+        from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA
+
+        conn = self.connection()
+        self._require_unshadowed_storage(conn)
+        objects = {name: (kind, table, ddl) for kind, name, table, ddl in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM main.sqlite_master"
+        )}
+
+        def require(name, kind="table", ddl=None):
+            found = objects.get(name)
+            if found is None or found[0] != kind or (ddl is not None and _schema_tokens(found[2]) != _schema_tokens(ddl)):
+                raise PackWriteRejectedError(f"unsupported single SQLite object: {name}")
+
+        require("packs")
+        from opencrab.stores.sql_store import _TABLES_SQL_SQLITE
+
+        for ddl in _TABLES_SQL_SQLITE:
+            words = ddl.split()
+            if len(words) > 5 and words[1:5] == ["TABLE", "IF", "NOT", "EXISTS"]:
+                name = words[5]
+                if name in {"ontology_nodes", "ontology_edges"}:
+                    require(name, ddl=ddl)
+                elif name == "packs":
+                    require(name, ddl=ddl.rstrip().removesuffix(")") + ", incarnation TEXT)")
+        for ddl in _PACK_WRITE_TABLES:
+            require(ddl.split()[2], ddl=ddl)
+        journal_columns = {row[1] for row in conn.execute("PRAGMA main.table_info(pack_delete_operations)")}
+        if journal_columns != {"operation_id", "pack_id", "incarnation", "predecessor", "state", "result_json", "evidence_json"}:
+            raise PackWriteRejectedError("unsupported single SQLite deletion journal")
+        for ddl in _PACK_WRITE_TRIGGERS:
+            require(ddl.split()[2], "trigger", ddl)
+        for ddl in SQLITE.render_ddl(DOC_STORE_SCHEMA):
+            tokens = ddl.split()
+            kind = tokens[1].lower()
+            name = tokens[5] if tokens[2:5] == ["IF", "NOT", "EXISTS"] else tokens[2]
+            require(name.strip('"'), kind, ddl)
+        require(sfts.FTS, ddl="CREATE VIRTUAL TABLE doc_sources_fts USING fts5(source_id UNINDEXED, text, tokenize='unicode61 remove_diacritics 0')")
+        require(sfts.INDEX, "index", sfts.INDEX_DDL)
+        if docs is None or not docs.available or not docs._fts_ok or not docs._read_only_fts_ok(conn):
+            raise PackWriteRejectedError("single SQLite source FTS is unavailable")
+        virtuals = [sfts.FTS]
+        if node_indexes:
+            if graph is None or graph._classify_schema(conn) != "target":
+                raise PackWriteRejectedError("single SQLite graph schema is unavailable")
+            graph._require_write_available()
+            if not docs._node_bm25_ok or not docs._read_only_node_bm25_ok(conn):
+                raise PackWriteRejectedError("single SQLite node BM25 is unavailable")
+            for ddl in nbm.ddl_statements():
+                tokens = ddl.split()
+                kind = "table" if tokens[1] == "VIRTUAL" else tokens[1].lower()
+                name = tokens[6] if tokens[1] == "VIRTUAL" else tokens[5]
+                require(name, kind, ddl)
+            virtuals.append(nbm.FTS)
+        if vec is None or not vec.available:
+            raise PackWriteRejectedError("single SQLite vector store is unavailable")
+        vec._check_existing_table(conn)
+        require(vec._table, ddl=vec._create_table_sql(with_bit=vec._has_bit_column))
+        virtuals.append(vec._table)
+        table_types = {row[1]: row[2] for row in conn.execute("PRAGMA main.table_list")}
+        for name in virtuals:
+            if table_types.get(name) != "virtual":
+                raise PackWriteRejectedError(f"single SQLite virtual table is unavailable: {name}")
+            if name == vec._table:
+                suffixes = ["_info", "_chunks", "_rowids", "_vector_chunks00", "_auxiliary"]
+                if vec._has_bit_column:
+                    suffixes.append("_vector_chunks01")
+            else:
+                suffixes = ["_data", "_idx", "_docsize", "_config"]
+                if name == sfts.FTS:
+                    suffixes.append("_content")
+            for suffix in suffixes:
+                shadow = name + suffix
+                require(shadow)
+                if name == vec._table:
+                    layouts = {
+                        "_info": f'CREATE TABLE "{name}_info" (key text primary key, value any)',
+                        "_chunks": f'CREATE TABLE "{name}_chunks"(chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,size INTEGER NOT NULL,sequence_id integer,partition00,validity BLOB NOT NULL, rowids BLOB NOT NULL)',
+                        "_rowids": f'CREATE TABLE "{name}_rowids"(rowid INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,chunk_id INTEGER,chunk_offset INTEGER)',
+                        "_auxiliary": f'CREATE TABLE "{name}_auxiliary"( rowid integer PRIMARY KEY , value00, value01)',
+                    }
+                    shadow_ddl = layouts.get(suffix, f'CREATE TABLE "{shadow}"(rowid PRIMARY KEY,vectors BLOB NOT NULL)')
+                else:
+                    layouts = {
+                        "_data": "(id INTEGER PRIMARY KEY, block BLOB)",
+                        "_idx": "(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+                        "_docsize": "(id INTEGER PRIMARY KEY, sz BLOB" + (", origin INTEGER)" if name == nbm.FTS else ")"),
+                        "_config": "(k PRIMARY KEY, v) WITHOUT ROWID",
+                        "_content": "(id INTEGER PRIMARY KEY, c0, c1)",
+                    }
+                    shadow_ddl = f"CREATE TABLE '{shadow}'" + layouts[suffix]
+                require(shadow, ddl=shadow_ddl)
+                allowed_types = {"table", "shadow"} if name == vec._table else {"shadow"}
+                if table_types.get(shadow) not in allowed_types:
+                    raise PackWriteRejectedError(f"single SQLite shadow table is unavailable: {shadow}")
 
     def validate_pack_writes(self, packs: dict[str, str]) -> None:
         """열린 쓰기 트랜잭션에서 팩 세대와 삭제 예약을 확인한다."""
@@ -658,6 +825,7 @@ class SharedSqliteFile:
             if self._uow.delete_operation is not None:
                 raise PackWriteRejectedError("general writes are forbidden during deletion")
             conn = self.connection()
+            self._require_unshadowed_storage(conn)
             for pack_id, incarnation in sorted(packs.items()):
                 if not pack_id or not incarnation:
                     raise RuntimeError("pack identity is missing")
@@ -665,12 +833,12 @@ class SharedSqliteFile:
                 if previous is not None and previous != incarnation:
                     raise PackWriteRejectedError("pack incarnation changed within unit of work")
                 row = conn.execute(
-                    "SELECT incarnation FROM packs WHERE pack_id = ?", (pack_id,)
+                    "SELECT incarnation FROM main.packs WHERE pack_id = ?", (pack_id,)
                 ).fetchone()
                 if row is None or row[0] != incarnation:
                     raise PackWriteRejectedError("pack incarnation changed or is missing")
                 pending = conn.execute(
-                    "SELECT 1 FROM pack_delete_operations WHERE pack_id = ? AND state = 'pending'",
+                    "SELECT 1 FROM main.pack_delete_operations WHERE pack_id = ? AND state = 'pending'",
                     (pack_id,),
                 ).fetchone()
                 if pending is not None:
@@ -695,7 +863,7 @@ class SharedSqliteFile:
             conn = self.connection()
             row = conn.execute(
                 "SELECT p.incarnation, o.incarnation, o.state "
-                "FROM packs p JOIN pack_delete_operations o ON o.pack_id = p.pack_id "
+                "FROM main.packs p JOIN main.pack_delete_operations o ON o.pack_id = p.pack_id "
                 "WHERE p.pack_id = ? AND o.operation_id = ?",
                 (pack_id, operation_id),
             ).fetchone()
@@ -728,6 +896,9 @@ class SharedSqliteFile:
                 self._uow.delete_operation = None
                 self._uow.after_commit = []
             prior_validated = self._uow.validated_packs.copy()
+            prior_requested = getattr(self._uow, "requested_pack", None)
+            if depth == 0:
+                self._uow.requested_pack = None
             prior_delete_operation = self._uow.delete_operation
             self._uow.depth = depth + 1
             try:
@@ -736,8 +907,11 @@ class SharedSqliteFile:
                     yield conn
                 finally:
                     _active_units.depth -= 1
-            except BaseException:
+            except BaseException as body_exc:
                 self._uow.depth = depth
+                self._uow.requested_pack = prior_requested
+                if depth == 0 and outcome is not None:
+                    outcome["body_error"] = body_exc
                 self._uow.validated_packs = prior_validated
                 self._uow.delete_operation = prior_delete_operation
                 self._uow.rollback_only = True
@@ -748,28 +922,42 @@ class SharedSqliteFile:
                         if outcome is not None:
                             outcome["state"] = "rolled_back"
                     except BaseException as rollback_exc:
+                        if outcome is not None:
+                            outcome["rollback_error"] = rollback_exc
                         logger.error(
                             "SharedSqliteFile.unit_of_work: rollback failed "
                             "(original exception still raised): %s", rollback_exc,
                         )
                 raise
             self._uow.depth = depth
+            self._uow.requested_pack = prior_requested
             self._uow.delete_operation = prior_delete_operation
             if depth == 0:
                 if self._uow.rollback_only:
                     self._uow.after_commit = []
-                    conn.rollback()
+                    if outcome is not None:
+                        outcome["rollback_only"] = True
+                    try:
+                        conn.rollback()
+                    except BaseException as rollback_exc:
+                        if outcome is not None:
+                            outcome["rollback_error"] = rollback_exc
+                        raise
                     if outcome is not None:
                         outcome["state"] = "rolled_back"
                     raise RollbackOnlyError("shared unit of work is rollback-only")
                 try:
                     conn.commit()
+                    if outcome is not None:
+                        outcome["state"] = "committed"
                 except BaseException:
                     self._uow.after_commit = []
                     # commit이 실패하면 열린 트랜잭션이 연결에 남지 않게 되돌린다.
                     try:
                         conn.rollback()
                     except BaseException as rollback_exc:
+                        if outcome is not None:
+                            outcome["rollback_error"] = rollback_exc
                         logger.error(
                             "SharedSqliteFile.unit_of_work: rollback after failed commit: %s",
                             rollback_exc,

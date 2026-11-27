@@ -259,7 +259,7 @@ def decode_properties(value: Any) -> tuple[dict[str, Any], bool]:
         return value, False
     try:
         return parse_properties_object(value), False
-    except GraphPropertyValidationError:
+    except (GraphPropertyValidationError, RecursionError):
         return {}, True
 
 

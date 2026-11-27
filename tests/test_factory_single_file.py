@@ -1290,13 +1290,9 @@ def test_single_build_context_failure_closes_all(tmp_path, monkeypatch, _fresh_s
 
 
 def test_single_write_gates_stay_fail_closed(tmp_path, monkeypatch):
-    """T-N7(증분 정리 한 곳): 게시 DB는 pack_delete_operations 표를 가지고 증분 정리는 단일 모드에서 거부된다.
-
-    팩 인가를 지나야 이 거부에 닿으므로 소유자 principal로 부른다. 삭제와 fork의 같은 거부는 인자가 무거워 S6로 넘긴다.
-    """
-    from pathlib import Path as _Path
-
+    """게시 DB의 증분 노드 적재는 실제 빌더와 입력으로 완료된다."""
     from opencrab.auth import Principal, principal_scope
+    from opencrab.ontology.builder import OntologyBuilder
     from opencrab.pack.load import load_nodes_incremental
 
     built = _authorized_and_pointed(tmp_path, monkeypatch)
@@ -1307,11 +1303,21 @@ def test_single_write_gates_stay_fail_closed(tmp_path, monkeypatch):
         ).fetchone()
         assert marker is not None
         principal = Principal(user_id=built.owner, is_local=True, disabled=False)
+        nodes = tmp_path / "nodes.jsonl"
+        nodes.write_text(
+            json.dumps({"id": "new-node", "label": "New node", "node_type": "Document", "space": "resource"})
+            + "\n",
+            encoding="utf-8",
+        )
+        builder = OntologyBuilder(graph, docs, sql, vec=vec)
         with principal_scope(principal):
-            with pytest.raises(RuntimeError, match="single SQLite incremental node cleanup is not yet supported"):
-                load_nodes_incremental(
-                    built.pack_id, _Path("unused.jsonl"), None, {}, {}, graph, docs, {}, vec=vec, sql=sql
-                )
+            result = load_nodes_incremental(
+                built.pack_id, nodes, builder, {}, {}, graph, docs, {}, vec=vec, sql=sql
+            )
+        assert result.ingest_err == 0
+        assert result.cleanup_err == 0
+        assert result[0] == 1
+        assert graph.get_node("Document", "new-node") is not None
     finally:
         _close_all((graph, docs, vec, sql))
 

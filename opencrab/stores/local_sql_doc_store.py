@@ -53,6 +53,7 @@ from opencrab.locking import StoreBootstrapLockTimeoutError
 from opencrab.stores import _node_bm25_cache as _ncache
 from opencrab.stores import _node_bm25_sqlite as _nbm
 from opencrab.stores import _source_fts_sqlite as _sfts
+from opencrab.stores._graph_common import decode_properties
 from opencrab.stores._sql_dialect import SQLITE
 from opencrab.stores._sql_doc_base import DOC_STORE_SCHEMA, _SqlDocStoreBase
 from opencrab.stores._sqlite_base import _SqliteConnMixin
@@ -234,7 +235,7 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         if self._shared is None:
             return False
         return self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='pack_delete_operations'"
         ).fetchone() is not None
 
     def _read_only_fts_ok(self, conn: Any) -> bool:
@@ -374,18 +375,38 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         return bool(self._available and self._node_bm25_ok)
 
     def _exec_node_write(self, sql: str, params: dict[str, Any], space: str, node_id: str) -> int:
-        """Write one doc_nodes row and reindex its key in the same transaction.
+        """문서와 해당 BM25 키를 같은 트랜잭션에서 쓴다.
 
-        The reindex runs in a SAVEPOINT. A failure rolls back only the index
-        change; the trigger's pending row and the document write stay (design 4.4).
+        일반 색인 실패는 색인 저장점만 되돌린다. 단일 모드 보호 실패는 전체 작업 단위를
+        롤백한다. 기반 문서가 없는 삭제는 자기 팩 매핑과 대기 키도 보존한다.
         """
         with self._tx() as conn:
+            requested_pack = self._requested_pack((space, node_id))
+            if requested_pack is not None:
+                try:
+                    old = conn.execute(
+                        "SELECT properties FROM main.doc_nodes WHERE space=? AND node_id=?",
+                        (space, node_id),
+                    ).fetchone()
+                    if old is not None:
+                        self._require_owner(old[0], requested_pack, (space, node_id))
+                    if "properties" in params:
+                        self._require_owner(params["properties"], requested_pack, (space, node_id))
+                    _nbm.require_mapping_owner(conn, space, node_id, requested_pack)
+                    if old is None and "properties" not in params:
+                        return 0
+                except Exception as exc:
+                    self._reject_derived((space, node_id), exc)
             rowcount = conn.execute(sql, params).rowcount
             if self._node_bm25_ok:
                 conn.execute("SAVEPOINT node_bm25")
                 try:
-                    _nbm.reindex_key(conn, self._row_to_node, space, node_id)
-                except Exception as exc:  # noqa: BLE001 -- the doc write must not fail
+                    _nbm.reindex_key(
+                        conn, self._row_to_node, space, node_id, requested_pack=requested_pack
+                    )
+                except _sfts.DerivedRowProtectionError as exc:
+                    self._reject_derived((space, node_id), exc)
+                except Exception as exc:  # noqa: BLE001 -- 일반 색인 실패는 문서를 보존한다.
                     conn.execute("ROLLBACK TO SAVEPOINT node_bm25")
                     logger.warning("node BM25 index sync failed for one key: %s", exc)
                 conn.execute("RELEASE SAVEPOINT node_bm25")
@@ -542,51 +563,56 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             )
         return event_id
 
-    def upsert_node_doc(self, space: str, node_type: str, node_id: str, properties: dict[str, Any]) -> str:
-        if self._shared is not None and self._shared.in_unit_of_work:
-            conn = self._shared.connection()
-            marker = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-            ).fetchone()
-            if marker is not None:
-                validated = self._shared._uow.validated_packs
-                owners = [properties.get("pack_id") if isinstance(properties, dict) else None]
-                row = conn.execute(
-                    "SELECT properties FROM doc_nodes WHERE space=? AND node_id=?", (space, node_id)
-                ).fetchone()
-                if row is not None:
-                    import json
+    def _reject_derived(self, identity: Any, reason: Exception) -> None:
+        logger.warning("single SQLite derived protection rejected %r: %s", identity, reason)
+        self._shared.mark_rollback_only()
+        raise _sfts.DerivedRowProtectionError(f"{identity!r}: {reason}") from reason
 
-                    try:
-                        owners.append(json.loads(row[0]).get("pack_id"))
-                    except (TypeError, ValueError, AttributeError):
-                        owners.append(None)
-                if any(not isinstance(owner, str) or owner not in validated for owner in owners):
-                    self._shared.mark_rollback_only()
-                    raise RuntimeError("node document owner is not validated")
-        return super().upsert_node_doc(space, node_type, node_id, properties)
+    def _requested_pack(self, identity: Any) -> str | None:
+        if self._shared is None or not self._shared.in_unit_of_work or not self._shared_guarded():
+            return None
+        validated = self._shared._uow.validated_packs
+        requested = getattr(self._shared._uow, "requested_pack", None)
+        if requested is None and len(validated) == 1:
+            requested = next(iter(validated))
+        if not isinstance(requested, str) or not requested or requested not in validated:
+            self._reject_derived(identity, RuntimeError("request pack is not validated"))
+        return requested
 
-    def delete_node_doc(self, space: str, node_id: str) -> bool:
-        if self._shared is not None and self._shared.in_unit_of_work:
-            conn = self._shared.connection()
-            marker = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-            ).fetchone()
-            if marker is not None:
-                import json
+    def _require_owner(self, raw: Any, requested: str, identity: Any, *, source: bool = False) -> None:
+        try:
+            properties, corrupted = decode_properties(raw)
+            owner = properties.get("pack_id")
+            if source and (
+                owner is None or owner is False or owner == ""
+                or (isinstance(owner, (int, float)) and not isinstance(owner, bool) and owner == 0)
+            ):
+                owner = properties.get("source")
+            if corrupted or not isinstance(owner, str) or owner != requested:
+                raise RuntimeError("stored owner differs from request pack")
+        except Exception as exc:
+            self._reject_derived(identity, exc)
 
-                row = conn.execute(
-                    "SELECT properties FROM doc_nodes WHERE space=? AND node_id=?", (space, node_id)
-                ).fetchone()
-                if row is not None:
-                    try:
-                        owner = json.loads(row[0]).get("pack_id")
-                    except (TypeError, ValueError, AttributeError):
-                        owner = None
-                    if not isinstance(owner, str) or owner not in self._shared._uow.validated_packs:
-                        self._shared.mark_rollback_only()
-                        raise RuntimeError("node document owner is not validated")
-        return super().delete_node_doc(space, node_id)
+    def _source_guard(self, conn: Any, source_id: str, metadata: Any = None, *, writing: bool = False) -> bool:
+        """동일 쓰기 단위에서 소유와 기반 행 없는 파생 행을 확인한다."""
+        requested = self._requested_pack(source_id)
+        row = conn.execute("SELECT metadata FROM main.doc_sources WHERE source_id=?", (source_id,)).fetchone()
+        if writing:
+            self._require_owner(metadata, requested, source_id, source=True)
+        if row is not None:
+            self._require_owner(row[0], requested, source_id, source=True)
+            return True
+        derived = conn.execute(
+            "SELECT 1 FROM main.doc_source_integrity WHERE source_id=?", (source_id,)
+        ).fetchone() or conn.execute(
+            f"SELECT 1 FROM main.{_sfts.CONTENT} WHERE c0=? LIMIT 1", (source_id,)
+        ).fetchone()
+        if derived:
+            reason = RuntimeError("source base row is absent; derived rows remain")
+            if writing:
+                self._reject_derived(source_id, reason)
+            logger.warning("single SQLite source %r preserved: %s", source_id, reason)
+        return False
 
     def _write_source_state(
         self,
@@ -596,29 +622,22 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
         source_integrity: dict[str, str | int],
     ) -> str:
         """Write source state and the FTS shadow entry in one transaction."""
-        if self._shared is not None and self._shared.in_unit_of_work:
-            conn = self._shared.connection()
-            marker = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-            ).fetchone()
-            if marker is not None:
-                validated = self._shared._uow.validated_packs
-                owner = metadata.get("pack_id")
-                row = conn.execute("SELECT metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchone()
-                if not isinstance(owner, str) or owner not in validated:
-                    self._shared.mark_rollback_only()
-                    raise RuntimeError("source owner is not validated")
-                if row is not None:
-                    import json
-
-                    try:
-                        old = json.loads(row[0])
-                        old_owner = old.get("pack_id") or old.get("source")
-                    except (TypeError, ValueError, AttributeError):
-                        old_owner = None
-                    if not isinstance(old_owner, str) or old_owner not in validated:
-                        self._shared.mark_rollback_only()
-                        raise RuntimeError("existing source owner is not validated")
+        if self._shared_guarded():
+            with self._tx() as conn:
+                try:
+                    self._source_guard(conn, source_id, metadata, writing=True)
+                    source_params, integrity_params = self._source_write_params(
+                        source_id, text, metadata, source_integrity
+                    )
+                    if self._fts_ok:
+                        _sfts.delete_protected(conn, source_id)
+                    conn.execute(self._source_upsert_sql(), source_params)
+                    conn.execute(self._source_integrity_upsert_sql(), integrity_params)
+                    if self._fts_ok:
+                        _sfts.insert_protected(conn, source_id, text)
+                except Exception as exc:
+                    self._reject_derived(source_id, exc)
+            return source_id
         source_params, integrity_params = self._source_write_params(
             source_id, text, metadata, source_integrity
         )
@@ -650,52 +669,72 @@ class LocalSQLDocStore(_SqliteConnMixin, _SqlDocStoreBase):
             return self.write_source_original(source_id, text, metadata)
         return self.write_source_copy(source_id, text, metadata, state)
 
-    def rewrite_source_metadata(self, source_id, metadata, source_state):
-        if self._shared is not None and self._shared.in_unit_of_work:
-            conn = self._shared.connection()
-            marker = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-            ).fetchone()
-            if marker is not None:
-                import json
+    def get_source(self, source_id: str) -> dict[str, Any] | None:
+        if not self._shared_guarded():
+            return super().get_source(source_id)
+        from opencrab.common.graph_identity import (
+            GraphPropertyValidationError,
+            PropertyDecodeDepthError,
+            parse_properties_object,
+        )
 
-                row = conn.execute("SELECT metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchone()
-                try:
-                    previous = json.loads(row[0]) if row is not None else None
-                    old_owner = previous.get("pack_id") or previous.get("source")
-                    new_owner = metadata.get("pack_id")
-                except (TypeError, ValueError, AttributeError):
-                    old_owner = new_owner = None
-                validated = self._shared._uow.validated_packs
-                if any(not isinstance(owner, str) or owner not in validated for owner in (old_owner, new_owner)):
-                    self._shared.mark_rollback_only()
-                    raise RuntimeError("source owner is not validated")
-        return super().rewrite_source_metadata(source_id, metadata, source_state)
+        self._require_available()
+        row = self._fetch_one(
+            "SELECT source_id, text, metadata, ingested_at FROM main.doc_sources WHERE source_id=:source_id",
+            {"source_id": source_id},
+        )
+        if row is None:
+            return None
+        try:
+            metadata = parse_properties_object(self._row_get(row, "metadata"))
+        except PropertyDecodeDepthError:
+            raise
+        except GraphPropertyValidationError:
+            return self._row_to_source(row)
+        from opencrab.stores._sql_doc_base import _ts_str
+
+        return {
+            "source_id": self._row_get(row, "source_id"),
+            "text": self._row_get(row, "text"),
+            "metadata": metadata,
+            "ingested_at": _ts_str(self._row_get(row, "ingested_at")),
+        }
+
+    def rewrite_source_metadata(self, source_id, metadata, source_state):
+        if not self._shared_guarded():
+            return super().rewrite_source_metadata(source_id, metadata, source_state)
+        with self._tx(immediate=True) as conn:
+            try:
+                self._source_guard(conn, source_id, metadata, writing=True)
+                row = conn.execute(
+                    self._source_state_join("s.source_id=:source_id"), {"source_id": source_id}
+                ).fetchone()
+                current = self._source_state_from_row(row) if row is not None else None
+                if current is None or current != source_state:
+                    raise ValueError("source state changed before metadata rewrite")
+                return self.write_source_copy(source_id, current.text, metadata, current)
+            except Exception as exc:
+                self._reject_derived(source_id, exc)
 
     def delete_sources_with_state(self, source_ids: list[str]) -> int:
         if not source_ids:
             return 0
-        if self._shared is not None and self._shared.in_unit_of_work:
-            conn = self._shared.connection()
-            marker = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
-            ).fetchone()
-            if marker is not None:
-                import json
-
-                validated = self._shared._uow.validated_packs
+        if self._shared_guarded():
+            with self._tx() as conn:
+                count = 0
                 for source_id in source_ids:
-                    row = conn.execute("SELECT metadata FROM doc_sources WHERE source_id=?", (source_id,)).fetchone()
-                    if row is None:
-                        continue
                     try:
-                        metadata = json.loads(row[0])
-                        owner = metadata.get("pack_id") or metadata.get("source")
-                    except (TypeError, ValueError, AttributeError):
-                        owner = None
-                    if not isinstance(owner, str) or owner not in validated:
-                        self._shared.mark_rollback_only()
-                        raise RuntimeError("source owner is not validated")
+                        if not self._source_guard(conn, source_id):
+                            continue
+                        if self._fts_ok:
+                            _sfts.delete_protected(conn, source_id)
+                        conn.execute("DELETE FROM main.doc_source_integrity WHERE source_id=?", (source_id,))
+                        count += conn.execute(
+                            "DELETE FROM main.doc_sources WHERE source_id=?", (source_id,)
+                        ).rowcount
+                    except Exception as exc:
+                        self._reject_derived(source_id, exc)
+            return count
         placeholders = ", ".join(f":sid_{index}" for index in range(len(source_ids)))
         params = {f"sid_{index}": source_id for index, source_id in enumerate(source_ids)}
         statements = [

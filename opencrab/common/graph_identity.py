@@ -240,6 +240,10 @@ def canonical_json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+class PropertyDecodeDepthError(GraphPropertyValidationError):
+    """JSON 디코더가 중첩 깊이를 처리하지 못했다."""
+
+
 def parse_properties_object(value: Any) -> dict[str, Any]:
     """Decode a stored graph-properties value without accepting duplicate keys.
 
@@ -270,6 +274,8 @@ def parse_properties_object(value: Any) -> dict[str, Any]:
 
     try:
         parsed = json.loads(value, object_pairs_hook=pairs)
+    except RecursionError as exc:
+        raise PropertyDecodeDepthError("graph property JSON exceeds decoder depth") from exc
     except (TypeError, ValueError, UnicodeError) as exc:
         raise GraphPropertyValidationError("malformed graph properties") from exc
     if not isinstance(parsed, dict):

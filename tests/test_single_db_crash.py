@@ -82,5 +82,6 @@ def test_single_file_leaves_no_orphans_and_died_inside_an_open_transaction(tmp_p
 def test_completed_run_writes_everything_without_orphans(tmp_path, layout):
     result = _run(tmp_path, layout, "--none")
     assert result["killed"] is False
+    assert result["child_returncode"] == 0
     assert result["vec_rows"] == result["doc_rows"] == result["expected_rows"]
     assert all(result[k] == 0 for k in ORPHAN_KEYS)

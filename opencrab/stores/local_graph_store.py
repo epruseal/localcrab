@@ -81,13 +81,12 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
                 row = conn.execute("SELECT properties FROM graph_nodes WHERE node_id=?", (node_id,)).fetchone()
                 owners = [owner]
                 if row is not None:
-                    import json
+                    from opencrab.stores._graph_common import decode_properties
 
-                    try:
-                        owners.append(json.loads(row[0]).get("pack_id"))
-                    except (TypeError, ValueError, AttributeError):
-                        owners.append(None)
-                if any(not isinstance(item, str) or item not in validated for item in owners):
+                    previous, corrupt = decode_properties(row[0])
+                    owners.append(None if corrupt else previous.get("pack_id"))
+                requested = getattr(self._shared._uow, "requested_pack", None) or owner
+                if requested not in validated or any(not isinstance(item, str) or item != requested for item in owners):
                     self._shared.mark_rollback_only()
                     raise RuntimeError("graph node owner is not validated")
         return super().upsert_node(node_type, node_id, properties, space_id, return_receipt=return_receipt)
@@ -129,7 +128,7 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
             ).fetchone()
             if marker is not None:
-                import json
+                from opencrab.stores._graph_common import decode_properties
 
                 owners = [new_properties.get("pack_id") if isinstance(new_properties, dict) else None]
                 rows = conn.execute(
@@ -138,13 +137,14 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
                     (node_id, node_id, node_id),
                 ).fetchall()
                 for row in rows:
-                    try:
-                        owners.append(json.loads(row[0]).get("pack_id"))
-                    except (TypeError, ValueError, AttributeError):
-                        owners.append(None)
-                if any(not isinstance(owner, str) or owner not in self._shared._uow.validated_packs for owner in owners):
+                    properties, corrupt = decode_properties(row[0])
+                    owners.append(None if corrupt else properties.get("pack_id"))
+                requested_owner = getattr(self._shared._uow, "requested_pack", None) or owners[0]
+                validated = self._shared._uow.validated_packs
+                if (not isinstance(requested_owner, str) or requested_owner not in validated
+                        or any(owner != requested_owner for owner in owners)):
                     self._shared.mark_rollback_only()
-                    raise RuntimeError("graph owner is not validated")
+                    raise RuntimeError("graph owner is not validated for the requested pack")
         return super().update_node(
             node_id, expected_current_digest, new_type, new_properties, new_space_id, return_receipt=return_receipt
         )
@@ -156,7 +156,7 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
             ).fetchone()
             if marker is not None:
-                import json
+                from opencrab.stores._graph_common import decode_properties
 
                 owners = [properties.get("pack_id") if isinstance(properties, dict) else None]
                 row = conn.execute(
@@ -164,11 +164,12 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
                     (from_id, relation, to_id),
                 ).fetchone()
                 if row is not None:
-                    try:
-                        owners.append(json.loads(row[0]).get("pack_id"))
-                    except (TypeError, ValueError, AttributeError):
-                        owners.append(None)
-                if any(not isinstance(owner, str) or owner not in self._shared._uow.validated_packs for owner in owners):
+                    previous, corrupt = decode_properties(row[0])
+                    owners.append(None if corrupt else previous.get("pack_id"))
+                requested = getattr(self._shared._uow, "requested_pack", None) or owners[0]
+                if requested not in self._shared._uow.validated_packs or any(
+                    not isinstance(owner, str) or owner != requested for owner in owners
+                ):
                     self._shared.mark_rollback_only()
                     raise RuntimeError("graph edge owner is not validated")
         return super().upsert_edge(
@@ -184,7 +185,10 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
             marker = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
             ).fetchone()
-            if marker is not None and owner_pack_id not in self._shared._uow.validated_packs:
+            requested = getattr(self._shared._uow, "requested_pack", None) or owner_pack_id
+            if marker is not None and (
+                owner_pack_id != requested or owner_pack_id not in self._shared._uow.validated_packs
+            ):
                 self._shared.mark_rollback_only()
                 raise RuntimeError("graph edge owner is not validated")
         return super().update_edge(
@@ -199,7 +203,10 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
             marker = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
             ).fetchone()
-            if marker is not None and owner_pack_id not in self._shared._uow.validated_packs:
+            requested = getattr(self._shared._uow, "requested_pack", None) or owner_pack_id
+            if marker is not None and (
+                owner_pack_id != requested or owner_pack_id not in self._shared._uow.validated_packs
+            ):
                 self._shared.mark_rollback_only()
                 raise RuntimeError("graph edge owner is not validated")
         return super().delete_edge(from_id, relation, to_id, owner_pack_id=owner_pack_id)
@@ -211,7 +218,7 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pack_delete_operations'"
             ).fetchone()
             if marker is not None:
-                import json
+                from opencrab.stores._graph_common import decode_properties
 
                 rows = conn.execute(
                     "SELECT properties FROM graph_nodes WHERE node_id=? AND node_type=? "
@@ -219,12 +226,13 @@ class LocalGraphStore(_SqliteConnMixin, _SqlGraphStoreBase):
                     (node_id, node_type, node_id, node_id),
                 ).fetchall()
                 validated = self._shared._uow.validated_packs
+                requested = getattr(self._shared._uow, "requested_pack", None)
+                if requested is None and len(validated) == 1:
+                    requested = next(iter(validated))
                 for row in rows:
-                    try:
-                        owner = json.loads(row[0]).get("pack_id")
-                    except (TypeError, ValueError, AttributeError):
-                        owner = None
-                    if not isinstance(owner, str) or owner not in validated:
+                    previous, corrupt = decode_properties(row[0])
+                    owner = None if corrupt else previous.get("pack_id")
+                    if not isinstance(owner, str) or owner != requested or owner not in validated:
                         self._shared.mark_rollback_only()
                         raise RuntimeError("graph owner is not validated")
         return super().delete_node(node_type, node_id)

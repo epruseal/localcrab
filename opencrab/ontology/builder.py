@@ -169,6 +169,7 @@ class OntologyBuilder:
         _expected_current_digest: str | None = None,
         _atomic_inner: bool = False,
         _precomputed_vector: Any = None,
+        _expected_pack_incarnation: str | None = None,
     ) -> dict[str, Any]:
         """
         Add or update a node in all stores.
@@ -381,7 +382,9 @@ class OntologyBuilder:
         pg_uow = common_pg_uow(*required)
         if not _atomic_inner and (pg_uow is not None or is_single_file(*required)):
             shared = self._sql.shared_file
-            incarnation = shared.pack_incarnation(pack_id) if shared is not None else None
+            incarnation = _expected_pack_incarnation
+            if incarnation is None and shared is not None:
+                incarnation = shared.pack_incarnation(pack_id)
             active = pg_uow.active if pg_uow is not None else shared.in_unit_of_work
             if active and write_vector:
                 raise RuntimeError("builder vector must be prepared before the shared unit")
@@ -409,12 +412,14 @@ class OntologyBuilder:
                 with manager:
                     if incarnation is not None:
                         shared.validate_pack_writes({pack_id: incarnation})
+                        shared._uow.requested_pack = pack_id
                     output = self.add_node(
                         space, node_type, node_id, properties, pack_id=pack_id, origin=origin,
                         pack_anchor=pack_anchor, fork_copy=fork_copy, write_vector=write_vector,
                         _allow_ready_anchor=_allow_ready_anchor,
                         _expected_current_digest=_expected_current_digest,
                         _atomic_inner=True, _precomputed_vector=prepared,
+                        _expected_pack_incarnation=incarnation,
                     )
                     stores = output["stores"]
                     mandatory = ["graph", "docs", "sql"]
@@ -759,6 +764,7 @@ class OntologyBuilder:
                 with manager:
                     if incarnation is not None:
                         shared.validate_pack_writes({pack_id: incarnation})
+                        shared._uow.requested_pack = pack_id
                     output = self.add_edge(
                         from_space, from_id, relation, to_space, to_id, properties,
                         pack_id=pack_id, origin=origin, fork_copy=fork_copy,

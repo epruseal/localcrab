@@ -65,6 +65,34 @@ def _paths(layout: str, d: Path) -> tuple[Path, Path]:
     return d / "doc_store.db", d / "vectors.db"
 
 
+def _supported_single_fixture(directory: Path, *, dim: int) -> Path:
+    """실제 이관기가 만든 빈 지원 스키마를 합성 시험에 제공한다."""
+    from opencrab.stores.local_graph_store import LocalGraphStore
+    from opencrab.stores.local_sql_doc_store import LocalSQLDocStore
+    from opencrab.stores.sql_store import SQLStore
+    from opencrab.stores.sqlite_vec_store import SqliteVecStore
+    from scripts.merge_sqlite_stores import FILES, finalize, merge, plan
+
+    source = directory / "fixture-source"
+    source.mkdir()
+    stores = [
+        LocalGraphStore(str(source / "graph.db")),
+        LocalSQLDocStore(str(source / "doc_store.db")),
+        SqliteVecStore(str(source / "vectors.db"), embedding_function=_embed, dim=dim),
+        SQLStore(f"sqlite:///{source / 'opencrab.db'}"),
+        SQLStore(f"sqlite:///{source / 'billing.db'}"),
+    ]
+    for store in reversed(stores):
+        store.close()
+    output = directory / "single.db"
+    layout = plan(source, FILES, immutable=True)
+    assert not layout["collisions"]
+    result = merge(source, output, FILES, layout, immutable=True, cache_kib=1024,
+                   min_free_gib=0, log=lambda _: None)
+    finalize(Path(result["partial"]), output)
+    return output
+
+
 def child(args: argparse.Namespace) -> int:
     d = Path(args.dir)
     os.environ["LOCAL_DATA_DIR"] = str(d)
@@ -81,6 +109,7 @@ def child(args: argparse.Namespace) -> int:
     if args.layout == "single":
         from opencrab.stores._single_file import SharedSqliteFile
 
+        _supported_single_fixture(d, dim=DIM)
         shared = SharedSqliteFile(str(doc_path))
     kw = {"shared": shared} if shared is not None else {}
     docs = LocalSQLDocStore(str(doc_path), **kw)
